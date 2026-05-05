@@ -1,17 +1,15 @@
 use std::{
-    fs::{self, OpenOptions},
-    path::{Path, PathBuf},
-    process::Stdio,
+    fs, path::Path, path::PathBuf, process::Stdio,
 };
 
 use russel_core::config::Russelfile;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 #[derive(Debug, Clone)]
 pub struct GeneratedMicrovmConfig {
-    pub path: PathBuf,
-    pub contents: String,
-    pub flake_dir: PathBuf,
+    pub service_id: String,
+    pub store_path: PathBuf,
+    pub flake_path: PathBuf,
     pub log_path: PathBuf,
 }
 
@@ -27,12 +25,9 @@ impl MicrovmConfigGenerator {
         host_port: u16,
         guest_port: u16,
     ) -> anyhow::Result<GeneratedMicrovmConfig> {
-        let repo_root = std::env::current_dir()?;
-        let microvm_input = repo_root.join("microvm.nix");
-        let flake_dir = PathBuf::from(format!("/tmp/russel/microvms/{service_id}"));
-        let log_path = flake_dir.join("console.log");
+        let flake_dir = PathBuf::from(format!("/tmp/russel/flakes/{service_id}"));
+        let log_path = PathBuf::from(format!("/var/lib/microvms/{service_id}/console.log"));
         let contents = flake_template()
-            .replace("%MICROVM_INPUT%", &microvm_input.display().to_string())
             .replace("%STORE_PATH%", &store_path.display().to_string())
             .replace("%SERVICE_ID%", service_id)
             .replace(
@@ -44,9 +39,9 @@ impl MicrovmConfigGenerator {
             .replace("%BINARY_NAME%", &config.service.name);
 
         Ok(GeneratedMicrovmConfig {
-            path: flake_dir.join("flake.nix"),
-            contents,
-            flake_dir,
+            service_id: service_id.to_string(),
+            store_path: store_path.to_path_buf(),
+            flake_path: flake_dir.join("flake.nix"),
             log_path,
         })
     }
@@ -54,67 +49,21 @@ impl MicrovmConfigGenerator {
 
 impl GeneratedMicrovmConfig {
     pub fn persist(&self) -> anyhow::Result<()> {
-        fs::create_dir_all(&self.flake_dir)?;
-        fs::write(&self.path, &self.contents)?;
+        if let Some(parent) = self.flake_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&self.flake_path, self.contents())?;
         Ok(())
     }
-}
 
-#[derive(Debug)]
-pub struct StartedMicrovm {
-    pub runner_path: PathBuf,
-    pub child: Child,
-}
-
-#[derive(Debug, Default)]
-pub struct MicrovmRunner;
-
-impl MicrovmRunner {
-    pub async fn build_runner(&self, config: &GeneratedMicrovmConfig) -> anyhow::Result<PathBuf> {
-        let flake_ref = format!("path:{}#default", config.flake_dir.display());
-        let output = Command::new("nix")
-            .arg("build")
-            .arg(&flake_ref)
-            .arg("--print-out-paths")
-            .arg("--no-link")
-            .arg("--impure")
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-        }
-
-        let runner_path = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .into();
-
-        Ok(runner_path)
-    }
-
-    pub async fn start(
-        &self,
-        config: &GeneratedMicrovmConfig,
-        runner_path: PathBuf,
-    ) -> anyhow::Result<StartedMicrovm> {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.log_path)?;
-        let log_err = log.try_clone()?;
-        let runner = runner_path.join("bin/microvm-run");
-
-        let child = Command::new(&runner)
-            .current_dir(&config.flake_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err))
-            .spawn()?;
-
-        Ok(StartedMicrovm { runner_path, child })
+    fn contents(&self) -> String {
+        flake_template()
+            .replace("%STORE_PATH%", &self.store_path.display().to_string())
+            .replace("%SERVICE_ID%", &self.service_id)
+            .replace("%BINARY_NAME%", &self.service_id)
+            .replace("%MEMORY%", "512")
+            .replace("%HOST_PORT%", "8080")
+            .replace("%GUEST_PORT%", "8080")
     }
 }
 
@@ -125,7 +74,7 @@ fn flake_template() -> &'static str {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     microvm = {
-      url = "path:%MICROVM_INPUT%";
+      url = "github:mic92/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -195,4 +144,48 @@ fn flake_template() -> &'static str {
     };
 }
 "#
+}
+
+#[derive(Debug)]
+pub struct StartedMicrovm {
+    pub service_id: String,
+    pub child: Child,
+}
+
+#[derive(Debug, Default)]
+pub struct MicrovmRunner;
+
+impl MicrovmRunner {
+    pub async fn create(&self, config: &GeneratedMicrovmConfig) -> anyhow::Result<()> {
+        let output = tokio::process::Command::new("sudo")
+            .arg("microvm")
+            .arg("-c")
+            .arg(&config.service_id)
+            .arg("-f")
+            .arg(&config.flake_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "microvm create failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn start(&self, service_id: &str) -> anyhow::Result<StartedMicrovm> {
+        let child = tokio::process::Command::new("sudo")
+            .arg("microvm")
+            .arg("-r")
+            .arg(service_id)
+            .spawn()?;
+
+        Ok(StartedMicrovm {
+            service_id: service_id.to_string(),
+            child,
+        })
+    }
 }
