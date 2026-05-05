@@ -176,4 +176,61 @@ impl MicrovmRunner {
 
         Ok(StartedMicrovm { child })
     }
+
+    pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
+        let output = tokio::process::Command::new("sudo")
+            .arg("systemctl")
+            .arg("stop")
+            .arg(format!("microvm@{}.service", service_id))
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to stop microvm: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
+        let output = tokio::process::Command::new("sudo")
+            .arg("rm")
+            .arg("-rf")
+            .arg(format!("/var/lib/microvms/{}", service_id))
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to destroy microvm: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn list(&self) -> anyhow::Result<Vec<String>> {
+        let output = tokio::process::Command::new("microvm")
+            .arg("-l")
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        let output = String::from_utf8_lossy(&output.stdout);
+        let vms: Vec<String> = output
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split(':').next().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        Ok(vms)
+    }
 }
