@@ -66,12 +66,10 @@ impl DeployPipeline {
                     status: "deployed".to_string(),
                     store_path: Some(output.store_path.display().to_string()),
                     microvm_config_path: Some(output.microvm_config_path.display().to_string()),
-                    runner_path: Some(output.runner_path.display().to_string()),
+                    runner_path: None,
                     port: Some(output.port),
                     elapsed_ms: started.elapsed().as_millis(),
-                    message:
-                        "microVM is running through microvm.nix; forwarded port passed health check"
-                            .to_string(),
+                    message: "microVM running via system microvm; health check passed".to_string(),
                 }
             }
             Err(error) => {
@@ -117,8 +115,9 @@ impl DeployPipeline {
             port.guest,
         )?;
         vm_config.persist()?;
-        let runner_path = self.runner.build_runner(&vm_config).await?;
-        let mut started = self.runner.start(&vm_config, runner_path).await?;
+
+        self.runner.create(&vm_config).await?;
+        let mut started = self.runner.start(service_id).await?;
 
         self.traefik.register(service_id, port.host).await?;
         let _healthy = self
@@ -128,18 +127,16 @@ impl DeployPipeline {
         if !wait_for_health(&mut started.child, port.host, Duration::from_secs(60)) {
             let _ = started.child.kill().await;
             anyhow::bail!(
-                "microVM started but health check did not pass on http://127.0.0.1:{}/health; see {}",
-                port.host,
-                vm_config.log_path.display()
+                "microVM started but health check did not pass on http://127.0.0.1:{}/health",
+                port.host
             );
         }
-        let microvm_config_path = vm_config.path.clone();
-        self.state.attach_vm_config(service_id, vm_config);
+
+        self.state.attach_vm_config(service_id, vm_config.clone());
 
         Ok(DeployOutput {
             store_path: build.store_path,
-            microvm_config_path,
-            runner_path: started.runner_path,
+            microvm_config_path: vm_config.flake_path,
             child: started.child,
             port,
         })
@@ -150,7 +147,6 @@ impl DeployPipeline {
 struct DeployOutput {
     store_path: PathBuf,
     microvm_config_path: PathBuf,
-    runner_path: PathBuf,
     child: tokio::process::Child,
     port: PortMapping,
 }

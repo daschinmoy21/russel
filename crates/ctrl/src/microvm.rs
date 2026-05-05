@@ -1,11 +1,12 @@
 use std::{
-    fs, path::Path, path::PathBuf, process::Stdio,
+    fs, path::Path, path::PathBuf,
 };
 
 use russel_core::config::Russelfile;
 use tokio::process::Child;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GeneratedMicrovmConfig {
     pub service_id: String,
     pub store_path: PathBuf,
@@ -27,16 +28,6 @@ impl MicrovmConfigGenerator {
     ) -> anyhow::Result<GeneratedMicrovmConfig> {
         let flake_dir = PathBuf::from(format!("/tmp/russel/flakes/{service_id}"));
         let log_path = PathBuf::from(format!("/var/lib/microvms/{service_id}/console.log"));
-        let contents = flake_template()
-            .replace("%STORE_PATH%", &store_path.display().to_string())
-            .replace("%SERVICE_ID%", service_id)
-            .replace(
-                "%MEMORY%",
-                &config.service.memory.as_mebibytes().to_string(),
-            )
-            .replace("%HOST_PORT%", &host_port.to_string())
-            .replace("%GUEST_PORT%", &guest_port.to_string())
-            .replace("%BINARY_NAME%", &config.service.name);
 
         Ok(GeneratedMicrovmConfig {
             service_id: service_id.to_string(),
@@ -147,8 +138,8 @@ fn flake_template() -> &'static str {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StartedMicrovm {
-    pub service_id: String,
     pub child: Child,
 }
 
@@ -183,9 +174,6 @@ impl MicrovmRunner {
             .arg(service_id)
             .spawn()?;
 
-        Ok(StartedMicrovm {
-            service_id: service_id.to_string(),
-            child,
-        })
+        Ok(StartedMicrovm { child })
     }
 }

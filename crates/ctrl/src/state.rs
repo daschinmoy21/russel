@@ -74,9 +74,9 @@ impl AppState {
         let mut inner = self.inner.lock().expect("state lock poisoned");
         inner.service_id = service_id.to_string();
         inner.logs.push_str(&format!(
-            "generated microvm.nix config at {} ({} bytes)\n",
-            config.path.display(),
-            config.contents.len()
+            "generated flake at {} (service_id: {})\n",
+            config.flake_path.display(),
+            config.service_id
         ));
         inner.vm_config = Some(config);
     }
