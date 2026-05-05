@@ -1,0 +1,11 @@
+[service]
+name = "api"
+source = "."
+port = 3000
+memory = "256mb"
+
+[database.postgres]
+enabled = false
+
+[database.redis]
+enabled = false
