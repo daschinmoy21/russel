@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use russel_core::api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse};
+use russel_core::api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse};
 
 #[derive(Debug, Parser)]
 #[command(name = "russel", about = "Deploy Nix-built services into microVMs")]
@@ -26,6 +26,9 @@ pub enum Command {
     Deploy(DeployArgs),
     Status,
     Logs,
+    Vms,
+    Stop(StopArgs),
+    Destroy(DestroyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -41,6 +44,18 @@ pub struct DeployArgs {
 
     #[arg(long, default_value = "Russelfile.toml")]
     pub config: String,
+}
+
+#[derive(Debug, Args)]
+pub struct StopArgs {
+    #[arg(value_name = "ID")]
+    pub id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DestroyArgs {
+    #[arg(value_name = "ID")]
+    pub id: String,
 }
 
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
@@ -166,6 +181,54 @@ pub async fn logs(control_plane: &str) -> Result<()> {
         .await?;
 
     print!("{}", response.output);
+
+    Ok(())
+}
+
+pub async fn vms(control_plane: &str) -> Result<()> {
+    let response = reqwest::get(format!("{control_plane}/vms"))
+        .await?
+        .error_for_status()?
+        .json::<VmsResponse>()
+        .await?;
+
+    if response.vms.is_empty() {
+        println!("No microVMs running");
+    } else {
+        for vm in response.vms {
+            println!("{}", vm);
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{control_plane}/vm/{id}/stop"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<String>()
+        .await?;
+
+    println!("{}", response);
+
+    Ok(())
+}
+
+pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .delete(format!("{control_plane}/vm/{id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<String>()
+        .await?;
+
+    println!("{}", response);
 
     Ok(())
 }

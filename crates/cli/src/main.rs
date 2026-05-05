@@ -15,6 +15,9 @@ async fn main() -> Result<()> {
         Command::Deploy(args) => commands::deploy(args, &cli.control_plane).await?,
         Command::Status => commands::status(&cli.control_plane).await?,
         Command::Logs => commands::logs(&cli.control_plane).await?,
+        Command::Vms => commands::vms(&cli.control_plane).await?,
+        Command::Stop(args) => commands::stop_vm(&args.id, &cli.control_plane).await?,
+        Command::Destroy(args) => commands::destroy_vm(&args.id, &cli.control_plane).await?,
     }
 
     Ok(())

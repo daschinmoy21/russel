@@ -39,3 +39,8 @@ pub struct StatusResponse {
 pub struct LogsResponse {
     pub output: String,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VmsResponse {
+    pub vms: Vec<String>,
+}
