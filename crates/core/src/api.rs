@@ -19,6 +19,21 @@ pub struct DeployResponse {
     pub port: Option<PortMapping>,
     pub elapsed_ms: u128,
     pub message: String,
+    /// Per-step timing breakdown (ms each step took).
+    pub timing: Option<DeployTiming>,
+    /// Direct VM IP for diagnostics (e.g. `curl 10.0.x.2:3000`).
+    pub vm_ip: Option<String>,
+}
+
+/// Millisecond breakdown of each deploy phase, included in every successful response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeployTiming {
+    pub resolve_ms: u128,
+    pub build_ms: u128,
+    pub create_ms: u128,
+    pub start_ms: u128,
+    pub network_ms: u128,
+    pub ready_ms: u128,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -43,4 +58,12 @@ pub struct LogsResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VmsResponse {
     pub vms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DeployEvent {
+    Progress { phase: String, description: String },
+    Complete(DeployResponse),
+    Error(String),
 }

@@ -59,27 +59,29 @@ pub struct DestroyArgs {
 }
 
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
-    let started = Instant::now();
+    let wall = Instant::now();
     let repo_url = normalize_repo_arg(&args.repo)?;
     let port = args.port.as_deref().map(parse_port_mapping).transpose()?;
 
-    println!("-> Initializing microVM runtime...");
-    println!("-> Resolving deployment source...");
-    if let Some(vm_id) = &args.vm_id {
-        println!("-> Reserving VM id `{vm_id}`...");
-    }
-    if let Some(port) = &port {
-        println!(
-            "-> Publishing localhost:{} -> guest:{}...",
-            port.host, port.guest
-        );
-    }
-    println!("-> Loading Nix foundation layer...");
-    println!("-> Mapping code payload...");
+    // ── Pre-flight banner ──────────────────────────────────────────────────
+    println!();
+    println!("  \x1b[1;36mrussel deploy\x1b[0m");
+    println!("  \x1b[2m{}\x1b[0m", repo_url);
+    println!();
 
+    if let Some(vm_id) = &args.vm_id {
+        step("vm-id", &format!("\x1b[1m{vm_id}\x1b[0m"), "");
+    }
+    if let Some(p) = &port {
+        step("publish", &format!("localhost:\x1b[1m{}\x1b[0m → guest:\x1b[1m{}\x1b[0m", p.host, p.guest), "");
+    }
+    println!();
+
+    // ── Send deploy request ────────────────────────────────────────────────
     let client = reqwest::Client::new();
-    let response = client
+    let mut response = client
         .post(format!("{control_plane}/deploy"))
+        .timeout(Duration::from_secs(300))
         .json(&DeployRequest {
             repo_url,
             config_path: args.config,
@@ -88,13 +90,118 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         })
         .send()
         .await?
-        .error_for_status()?
-        .json::<DeployResponse>()
-        .await?;
+        .error_for_status()?;
 
-    print_deploy_response(response, started.elapsed());
+    let mut buffer = String::new();
+    let mut final_response = None;
+
+    while let Some(chunk) = response.chunk().await? {
+        if let Ok(s) = std::str::from_utf8(&chunk) {
+            buffer.push_str(s);
+            while let Some(i) = buffer.find('\n') {
+                let line = buffer[..i].to_string();
+                buffer = buffer[i + 1..].to_string();
+                
+                if line.trim().is_empty() {
+                    continue;
+                }
+                
+                let event: russel_core::api::DeployEvent = serde_json::from_str(&line)
+                    .with_context(|| format!("failed to parse event from control plane: {}", line))?;
+                
+                match event {
+                    russel_core::api::DeployEvent::Progress { phase: p, description: d } => {
+                        phase(&p, &d);
+                    }
+                    russel_core::api::DeployEvent::Complete(resp) => {
+                        final_response = Some(resp);
+                    }
+                    russel_core::api::DeployEvent::Error(err) => {
+                        anyhow::bail!("deploy failed: {}", err);
+                    }
+                }
+            }
+        }
+    }
+
+    let response = final_response.ok_or_else(|| anyhow::anyhow!("control plane closed connection before complete"))?;
+
+    println!();
+    print_deploy_response(response, wall.elapsed());
 
     Ok(())
+}
+
+fn step(label: &str, value: &str, suffix: &str) {
+    println!("  \x1b[2m{label:>10}\x1b[0m  {value}{suffix}");
+}
+
+fn phase(label: &str, desc: &str) {
+    println!("  \x1b[2m{label:>10}\x1b[0m  \x1b[2m· {desc}\x1b[0m");
+}
+
+fn ms(v: u128) -> String {
+    if v >= 1000 {
+        format!("{:.1}s", v as f64 / 1000.0)
+    } else {
+        format!("{v}ms")
+    }
+}
+
+fn print_deploy_response(r: DeployResponse, wall: Duration) {
+    let ok = r.status == "deployed";
+    let icon = if ok { "\x1b[1;32m✓\x1b[0m" } else { "\x1b[1;31m✗\x1b[0m" };
+    let label = if ok { "Deployed" } else { "Failed" };
+
+    println!("  {icon} {label} in \x1b[1m{}\x1b[0m  (server: {})", ms(wall.as_millis()), ms(r.elapsed_ms));
+    println!();
+
+    step("vm-id",   &r.vm_id, "");
+    step("status",  &r.status, "");
+
+    if let Some(p) = &r.port {
+        step("port", &format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, p.guest), "");
+    }
+    if let Some(ip) = &r.vm_ip {
+        let gp = r.port.as_ref().map(|p| p.guest.to_string()).unwrap_or_default();
+        step("vm-ip", &format!("\x1b[2m{ip}\x1b[0m"), &format!("  \x1b[2m(direct: curl {ip}:{gp})\x1b[0m"));
+    }
+    if let Some(store) = &r.store_path {
+        step("store", &format!("\x1b[2m{store}\x1b[0m"), "");
+    }
+    if let Some(flake) = &r.microvm_config_path {
+        step("deploy.nix", &format!("\x1b[2m{flake}\x1b[0m"), "");
+    }
+
+    // ── Timing breakdown ───────────────────────────────────────────────────
+    if let Some(t) = &r.timing {
+        println!();
+        println!("  \x1b[1;2mPhase timing:\x1b[0m");
+        timing_row("resolve",  t.resolve_ms,  "repo + Russelfile");
+        timing_row("build",    t.build_ms,    "nix build (package)");
+        timing_row("create",   t.create_ms,   "deploy.nix + microvm register");
+        timing_row("start",    t.start_ms,    "systemctl start");
+        timing_row("network",  t.network_ms,  "tap + iptables");
+        timing_row("ready",    t.ready_ms,    "VM service reachable");
+    }
+
+    println!();
+    println!("  \x1b[2mnote: {}\x1b[0m", r.message);
+
+    if ok {
+        if let Some(p) = &r.port {
+            println!();
+            println!("  \x1b[1mTest:\x1b[0m  curl -I http://127.0.0.1:{}/", p.host);
+        }
+    }
+    println!();
+}
+
+fn timing_row(label: &str, val_ms: u128, desc: &str) {
+    let bar_len = ((val_ms / 200).min(30)) as usize;
+    let bar = "█".repeat(bar_len);
+    println!("  \x1b[2m{label:>10}\x1b[0m  \x1b[1m{:>6}\x1b[0m  \x1b[32m{bar}\x1b[0m  \x1b[2m{desc}\x1b[0m",
+        ms(val_ms));
 }
 
 fn normalize_repo_arg(repo: &str) -> Result<String> {
@@ -106,129 +213,59 @@ fn normalize_repo_arg(repo: &str) -> Result<String> {
             .display()
             .to_string());
     }
-
     Ok(repo.to_string())
 }
 
 fn parse_port_mapping(value: &str) -> Result<PortMapping> {
     let (host, guest) = value
         .split_once(':')
-        .ok_or_else(|| anyhow!("port mapping must be HOST:GUEST, for example 3000:3000"))?;
-
+        .ok_or_else(|| anyhow!("port mapping must be HOST:GUEST, e.g. 8080:3000"))?;
     Ok(PortMapping {
-        host: host
-            .parse()
-            .with_context(|| format!("invalid host port in {value}"))?,
-        guest: guest
-            .parse()
-            .with_context(|| format!("invalid guest port in {value}"))?,
+        host: host.parse().with_context(|| format!("invalid host port in {value}"))?,
+        guest: guest.parse().with_context(|| format!("invalid guest port in {value}"))?,
     })
 }
 
-fn print_deploy_response(response: DeployResponse, client_elapsed: Duration) {
-    if response.status == "deployed" {
-        println!("✓ Deployed in {}ms", response.elapsed_ms);
-    } else {
-        println!("✗ Deploy failed in {}ms", response.elapsed_ms);
-    }
-
-    println!("  vm_id: {}", response.vm_id);
-    println!("  service: {}", response.service_id);
-    println!("  status: {}", response.status);
-
-    if let Some(port) = &response.port {
-        println!("  port: localhost:{} -> guest:{}", port.host, port.guest);
-    }
-    if let Some(store_path) = response.store_path {
-        println!("  store: {store_path}");
-    }
-    if let Some(path) = response.microvm_config_path {
-        println!("  flake: {path}");
-    }
-    if let Some(path) = response.runner_path {
-        println!("  runner: {path}");
-    }
-
-    println!("  note: {}", response.message);
-    if response.status == "deployed" {
-        if let Some(port) = &response.port {
-            println!("  test: curl -I http://127.0.0.1:{}/", port.host);
-        }
-    }
-    println!("  roundtrip: {}ms", client_elapsed.as_millis());
-}
-
 pub async fn status(control_plane: &str) -> Result<()> {
-    let response = reqwest::get(format!("{control_plane}/status"))
-        .await?
-        .error_for_status()?
-        .json::<StatusResponse>()
-        .await?;
-
-    println!("service_id={}", response.service_id);
-    println!("status={}", response.status);
-    println!("vm_state={}", response.vm_state);
-    println!("uptime_seconds={}", response.uptime_seconds);
-
+    let r = reqwest::get(format!("{control_plane}/status"))
+        .await?.error_for_status()?.json::<StatusResponse>().await?;
+    println!("service_id={}", r.service_id);
+    println!("status={}", r.status);
+    println!("vm_state={}", r.vm_state);
+    println!("uptime_seconds={}", r.uptime_seconds);
     Ok(())
 }
 
 pub async fn logs(control_plane: &str) -> Result<()> {
-    let response = reqwest::get(format!("{control_plane}/logs"))
-        .await?
-        .error_for_status()?
-        .json::<LogsResponse>()
-        .await?;
-
-    print!("{}", response.output);
-
+    let r = reqwest::get(format!("{control_plane}/logs"))
+        .await?.error_for_status()?.json::<LogsResponse>().await?;
+    print!("{}", r.output);
     Ok(())
 }
 
 pub async fn vms(control_plane: &str) -> Result<()> {
-    let response = reqwest::get(format!("{control_plane}/vms"))
-        .await?
-        .error_for_status()?
-        .json::<VmsResponse>()
-        .await?;
-
-    if response.vms.is_empty() {
-        println!("No microVMs running");
+    let r = reqwest::get(format!("{control_plane}/vms"))
+        .await?.error_for_status()?.json::<VmsResponse>().await?;
+    if r.vms.is_empty() {
+        println!("no microVMs registered");
     } else {
-        for vm in response.vms {
-            println!("{}", vm);
-        }
+        for vm in r.vms { println!("{}", vm); }
     }
-
     Ok(())
 }
 
 pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let response = client
+    let r = reqwest::Client::new()
         .post(format!("{control_plane}/vm/{id}/stop"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<String>()
-        .await?;
-
-    println!("{}", response);
-
+        .send().await?.error_for_status()?.json::<String>().await?;
+    println!("{}", r);
     Ok(())
 }
 
 pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let response = client
+    let r = reqwest::Client::new()
         .delete(format!("{control_plane}/vm/{id}"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<String>()
-        .await?;
-
-    println!("{}", response);
-
+        .send().await?.error_for_status()?.json::<String>().await?;
+    println!("{}", r);
     Ok(())
 }

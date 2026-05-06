@@ -1,236 +1,233 @@
-use std::{
-    fs, path::Path, path::PathBuf,
-};
-
+use std::path::Path;
 use russel_core::config::Russelfile;
-use tokio::process::Child;
+use crate::network::SubnetAllocation;
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct GeneratedMicrovmConfig {
-    pub service_id: String,
-    pub store_path: PathBuf,
-    pub flake_path: PathBuf,
-    pub log_path: PathBuf,
-}
+/// Generate a self-contained `deploy.nix` that imports the project's `flake.nix`
+/// and defines a NixOS system for the MicroVM.
+pub fn generate_deploy_flake(
+    service_id: &str,
+    _repo_path: &Path,
+    config: &Russelfile,
+    alloc: &SubnetAllocation,
+    guest_port: u16,
+    app_store_path: &Path,
+    nixpkgs_path: &str,
+) -> String {
+    let mem_mb = config.service.memory.as_mebibytes();
+    let service_name = &config.service.name;
+    let host_ip = &alloc.host_ip;
+    let vm_ip = &alloc.vm_ip;
+    let tap_id = &alloc.tap_id;
+    let mac = &alloc.mac;
+    let bin_name = config.service.bin_name();
+    let app_store = app_store_path.display();
 
-#[derive(Debug, Default)]
-pub struct MicrovmConfigGenerator;
+    format!(r#"{{
+  description = "Russel deployment: {service_id}";
 
-impl MicrovmConfigGenerator {
-    pub fn generate(
-        &self,
-        service_id: &str,
-        config: &Russelfile,
-        store_path: &Path,
-        host_port: u16,
-        guest_port: u16,
-    ) -> anyhow::Result<GeneratedMicrovmConfig> {
-        let flake_dir = PathBuf::from(format!("/tmp/russel/flakes/{service_id}"));
-        let log_path = PathBuf::from(format!("/var/lib/microvms/{service_id}/console.log"));
-
-        Ok(GeneratedMicrovmConfig {
-            service_id: service_id.to_string(),
-            store_path: store_path.to_path_buf(),
-            flake_path: flake_dir.join("flake.nix"),
-            log_path,
-        })
-    }
-}
-
-impl GeneratedMicrovmConfig {
-    pub fn persist(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.flake_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.flake_path, self.contents())?;
-        Ok(())
-    }
-
-    fn contents(&self) -> String {
-        flake_template()
-            .replace("%STORE_PATH%", &self.store_path.display().to_string())
-            .replace("%SERVICE_ID%", &self.service_id)
-            .replace("%BINARY_NAME%", &self.service_id)
-            .replace("%MEMORY%", "512")
-            .replace("%HOST_PORT%", "8080")
-            .replace("%GUEST_PORT%", "8080")
-    }
-}
-
-fn flake_template() -> &'static str {
-    r#"{
-  description = "Russel generated microVM";
-
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    microvm = {
-      url = "github:mic92/microvm.nix";
+  inputs = {{
+    nixpkgs.url = "path:{nixpkgs_path}";
+    microvm = {{
+      url = "path:/home/crimxnhaze/russel-dev/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
-    };
-  };
+    }};
+    app-pkg = {{
+      url = "path:{app_store}";
+      flake = false;
+    }};
+  }};
 
-  outputs = { self, nixpkgs, microvm }:
+  outputs = {{ self, nixpkgs, microvm, app-pkg }}:
     let
       system = "x86_64-linux";
-      app = %STORE_PATH%;
-    in {
-      packages.${system}.default =
-        self.nixosConfigurations."%SERVICE_ID%".config.microvm.declaredRunner;
-
-      nixosConfigurations."%SERVICE_ID%" = nixpkgs.lib.nixosSystem {
+    in {{
+      nixosConfigurations.{service_id} = nixpkgs.lib.nixosSystem {{
         inherit system;
         modules = [
           microvm.nixosModules.microvm
-          ({ config, lib, pkgs, ... }: {
-            system.stateVersion = lib.trivial.release;
-            networking.hostName = "%SERVICE_ID%";
-            networking.firewall.allowedTCPPorts = [ %GUEST_PORT% ];
+          ({{ config, lib, pkgs, ... }}: {{
+            system.stateVersion = config.system.nixos.release;
+            networking.hostName = "{service_id}";
 
-            microvm = {
-              hypervisor = "qemu";
-              mem = %MEMORY%;
-              interfaces = [
-                {
-                  type = "user";
-                  id = "qemu";
-                  mac = "02:00:00:01:01:01";
-                }
-              ];
-              forwardPorts = [
-                {
-                  from = "host";
-                  host.address = "127.0.0.1";
-                  host.port = %HOST_PORT%;
-                  guest.port = %GUEST_PORT%;
-                }
-              ];
-              shares = [
-                {
-                  tag = "ro-store";
-                  source = "/nix/store";
-                  mountPoint = "/nix/.ro-store";
-                  proto = "9p";
-                }
-              ];
-            };
+            # ── Standard Fast Boot ──────────────────────────────────────────
+            boot.kernelParams = [
+              "quiet" "loglevel=3"
+              "systemd.show_status=false"
+              "rd.udev.log_level=3"
+              "panic=-1"
+              "random.trust_cpu=on"
+              "console=ttyS0"
+            ];
+            
+            # Disable documentation to save closure size
+            documentation.enable = false;
 
-            environment.systemPackages = [ app ];
+            # ── Networking ──────────────────────────────────────────────────
+            networking.useNetworkd = true;
+            networking.useDHCP = false;
+            networking.firewall.enable = false;
+            networking.usePredictableInterfaceNames = false;
 
-            systemd.services.russel-app = {
+            systemd.network = {{
+              enable = true;
+              wait-online.enable = false;
+              networks."10-eth" = {{
+                matchConfig.Name = "eth0";
+                networkConfig = {{
+                  Address = "{vm_ip}/30";
+                  Gateway = "{host_ip}";
+                  IPv6AcceptRA = false;
+                }};
+                linkConfig.RequiredForOnline = "no";
+              }};
+            }};
+
+            # ── microVM hardware ────────────────────────────────────────────
+            microvm = {{
+              hypervisor = "cloud-hypervisor";
+              mem = {mem_mb};
+              vcpu = 1;
+              vsock.cid = 100;
+              graphics.enable = false;
+              interfaces = [{{
+                type = "tap";
+                id = "{tap_id}";
+                mac = "{mac}";
+              }}];
+              shares = [{{
+                tag = "ro-store";
+                source = "/nix/store";
+                mountPoint = "/nix/.ro-store";
+                proto = "virtiofs";
+              }}];
+            }};
+
+            # ── Application ─────────────────────────────────────────────────
+            systemd.services.russel-app = {{
+              description = "{service_name}";
               wantedBy = [ "multi-user.target" ];
-              after = [ "network-online.target" ];
-              wants = [ "network-online.target" ];
-              serviceConfig = {
-                ExecStart = "${app}/bin/%BINARY_NAME%";
-                Environment = "PORT=%GUEST_PORT%";
-                DynamicUser = true;
-                NoNewPrivileges = true;
-                Restart = "on-failure";
-              };
-            };
-          })
+              after = [ "network.target" ];
+              serviceConfig = {{
+                ExecStart = "${{app-pkg}}/bin/{bin_name}";
+                Environment = "PORT={guest_port}";
+                Restart = "always";
+                RestartSec = "1s";
+                StandardOutput = "journal+console";
+              }};
+            }};
+          }})
         ];
-      };
-    };
-}
-"#
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct StartedMicrovm {
-    pub child: Child,
+      }};
+    }};
+}}
+"#)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct MicrovmRunner;
 
 impl MicrovmRunner {
-    pub async fn create(&self, config: &GeneratedMicrovmConfig) -> anyhow::Result<()> {
-        let output = tokio::process::Command::new("sudo")
-            .arg("microvm")
-            .arg("-c")
-            .arg(&config.service_id)
-            .arg("-f")
-            .arg(&config.flake_path)
-            .output()
-            .await?;
+    pub async fn create(
+        &self,
+        service_id: &str,
+        repo_path: &Path,
+        config: &Russelfile,
+        alloc: &SubnetAllocation,
+        guest_port: u16,
+        app_store_path: &Path,
+    ) -> anyhow::Result<()> {
+        // Hard cleanup to bypass "already exists" errors
+        let _ = self.destroy(service_id).await;
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "microvm create failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        let deploy_dir = std::path::PathBuf::from(format!("/var/lib/russel/{}", service_id));
+        std::fs::create_dir_all(&deploy_dir)?;
+        
+        let nixpkgs_output = tokio::process::Command::new("nix-instantiate")
+            .args(["--eval", "-E", "(import <nixpkgs> {}).path"])
+            .output().await?;
+        
+        let nixpkgs_path = String::from_utf8_lossy(&nixpkgs_output.stdout)
+            .trim()
+            .trim_matches('"')
+            .to_string();
+
+        if nixpkgs_path.is_empty() {
+            anyhow::bail!("failed to resolve <nixpkgs> path");
         }
 
+        let deploy_nix = generate_deploy_flake(
+            service_id, 
+            repo_path, 
+            config, 
+            alloc, 
+            guest_port, 
+            app_store_path,
+            &nixpkgs_path
+        );
+        std::fs::write(deploy_dir.join("flake.nix"), deploy_nix)?;
+
+        let flake_ref = format!("path:{}", deploy_dir.display());
+        tracing::info!(service_id, flake_ref, "registering microvm (nix evaluation)");
+        
+        let status = tokio::process::Command::new("microvm")
+            .args(["-c", service_id, "-f", &flake_ref])
+            .env("NIX_CONFIG", "experimental-features = nix-command flakes")
+            .spawn()?
+            .wait()
+            .await?;
+
+        if !status.success() {
+            anyhow::bail!("microvm create failed for {}", service_id);
+        }
         Ok(())
     }
 
     pub async fn start(&self, service_id: &str) -> anyhow::Result<StartedMicrovm> {
-        let child = tokio::process::Command::new("sudo")
-            .arg("microvm")
-            .arg("-r")
-            .arg(service_id)
+        let unit = format!("microvm@{}.service", service_id);
+        let _ = tokio::process::Command::new("systemctl").args(["enable", &unit]).output().await;
+        
+        let mut child = tokio::process::Command::new("systemctl")
+            .args(["start", &unit])
             .spawn()?;
-
+        
+        child.wait().await?;
         Ok(StartedMicrovm { child })
     }
 
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
-        let output = tokio::process::Command::new("sudo")
-            .arg("systemctl")
-            .arg("stop")
-            .arg(format!("microvm@{}.service", service_id))
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "failed to stop microvm: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
+        let unit = format!("microvm@{}.service", service_id);
+        let _ = tokio::process::Command::new("systemctl").args(["stop", &unit]).output().await;
         Ok(())
     }
 
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
-        let output = tokio::process::Command::new("sudo")
-            .arg("rm")
-            .arg("-rf")
-            .arg(format!("/var/lib/microvms/{}", service_id))
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "failed to destroy microvm: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
+        let _ = self.stop(service_id).await;
+        // Manual cleanup of the microvm state directory and GC roots
+        let _ = tokio::process::Command::new("rm").args(["-rf", &format!("/var/lib/microvms/{}", service_id)]).output().await;
+        let _ = tokio::process::Command::new("rm").args(["-rf", &format!("/var/lib/russel/{}", service_id)]).output().await;
+        let _ = tokio::process::Command::new("rm").args(["-f", &format!("/nix/var/nix/gcroots/microvm/{}", service_id)]).output().await;
+        let _ = tokio::process::Command::new("rm").args(["-f", &format!("/nix/var/nix/gcroots/microvm/booted-{}", service_id)]).output().await;
         Ok(())
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<String>> {
-        let output = tokio::process::Command::new("microvm")
-            .arg("-l")
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            return Ok(Vec::new());
+        let mut vms = Vec::new();
+        let state_dir = Path::new("/var/lib/microvms");
+        if state_dir.exists() {
+            if let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_type().await?.is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            vms.push(name.to_string());
+                        }
+                    }
+                }
+            }
         }
-
-        let output = String::from_utf8_lossy(&output.stdout);
-        let vms: Vec<String> = output
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| line.split(':').next().unwrap_or("").to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
         Ok(vms)
     }
+}
+
+pub struct StartedMicrovm {
+    pub child: tokio::process::Child,
 }

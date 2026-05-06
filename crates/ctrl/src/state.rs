@@ -6,8 +6,6 @@ use std::{
 use russel_core::api::{LogsResponse, StatusResponse};
 use tokio::process::Child;
 
-use crate::microvm::GeneratedMicrovmConfig;
-
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<Mutex<StateInner>>,
@@ -20,9 +18,11 @@ struct StateInner {
     vm_state: String,
     logs: String,
     started_at: Instant,
-    vm_config: Option<GeneratedMicrovmConfig>,
+    flake_path: Option<std::path::PathBuf>,
     vm_pid: Option<u32>,
     vm_process: Option<Child>,
+    /// Auxiliary child processes (socat forwarders, etc.) that must stay alive.
+    aux_processes: Vec<Child>,
 }
 
 impl Default for AppState {
@@ -34,9 +34,10 @@ impl Default for AppState {
                 vm_state: "none".to_string(),
                 logs: String::new(),
                 started_at: Instant::now(),
-                vm_config: None,
+                flake_path: None,
                 vm_pid: None,
                 vm_process: None,
+                aux_processes: Vec::new(),
             })),
         }
     }
@@ -70,15 +71,21 @@ impl AppState {
         inner.logs.push('\n');
     }
 
-    pub fn attach_vm_config(&self, service_id: &str, config: GeneratedMicrovmConfig) {
+    pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
         let mut inner = self.inner.lock().expect("state lock poisoned");
         inner.service_id = service_id.to_string();
         inner.logs.push_str(&format!(
-            "generated flake at {} (service_id: {})\n",
-            config.flake_path.display(),
-            config.service_id
+            "using flake at {} (service_id: {})\n",
+            flake_path.display(),
+            service_id
         ));
-        inner.vm_config = Some(config);
+        inner.flake_path = Some(flake_path);
+    }
+
+    /// Park a child process (e.g. socat) so it stays alive as long as the state exists.
+    pub fn store_aux_process(&self, child: Child) {
+        let mut inner = self.inner.lock().expect("state lock poisoned");
+        inner.aux_processes.push(child);
     }
 
     pub fn status(&self) -> StatusResponse {

@@ -21,6 +21,15 @@ pub struct ServiceConfig {
     pub source: String,
     pub port: u16,
     pub memory: Memory,
+    /// Name of the binary produced by the build.
+    /// Defaults to `name` if not specified.
+    pub bin: Option<String>,
+}
+
+impl ServiceConfig {
+    pub fn bin_name(&self) -> &str {
+        self.bin.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
