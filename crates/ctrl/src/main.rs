@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 }
 
 async fn cleanup_all_vms() {
-    let runner = crate::microvm::MicrovmRunner;
+    let runner = crate::microvm::MicrovmRunner::new();
     if let Ok(vms) = runner.list().await {
         let mut tasks = Vec::new();
         for vm_id in vms {

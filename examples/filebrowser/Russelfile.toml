@@ -1,0 +1,6 @@
+[service]
+name = "filebrowser"
+source = "."
+port = 8080
+memory = "256mb"
+bin = "filebrowser"

@@ -70,7 +70,7 @@ async fn logs(State(state): State<AppState>) -> Json<LogsResponse> {
 
 async fn vms_list() -> Json<VmsResponse> {
     tracing::debug!("GET /vms");
-    let runner = MicrovmRunner;
+    let runner = MicrovmRunner::new();
     let vms = runner.list().await.unwrap_or_default();
     tracing::debug!(count = vms.len(), "GET /vms -> {} VMs", vms.len());
     Json(VmsResponse { vms })
@@ -78,7 +78,7 @@ async fn vms_list() -> Json<VmsResponse> {
 
 async fn vm_stop(Path(id): Path<String>) -> Json<String> {
     tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
-    let runner = MicrovmRunner;
+    let runner = MicrovmRunner::new();
     match runner.stop(&id).await {
         Ok(_) => {
             tracing::info!(vm_id = %id, "stopped microvm");
@@ -93,7 +93,7 @@ async fn vm_stop(Path(id): Path<String>) -> Json<String> {
 
 async fn vm_destroy(Path(id): Path<String>) -> Json<String> {
     tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
-    let runner = MicrovmRunner;
+    let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {
             tracing::info!(vm_id = %id, "destroyed microvm");
