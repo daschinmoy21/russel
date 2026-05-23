@@ -23,6 +23,7 @@ pub struct DeployPipeline {
     state: AppState,
     git: GitClient,
     builder: NixBuilder,
+    #[allow(dead_code)]
     database: DatabaseProvisioner,
     runner: MicrovmRunner,
     ports: PortAllocator,
