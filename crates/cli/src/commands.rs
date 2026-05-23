@@ -176,13 +176,19 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     // ── Timing breakdown ───────────────────────────────────────────────────
     if let Some(t) = &r.timing {
         println!();
-        println!("  \x1b[1;2mPhase timing:\x1b[0m");
+        println!("  \x1b[1;2mPhase timing & Docker Comparison:\x1b[0m");
         timing_row("resolve",  t.resolve_ms,  "repo + Russelfile");
-        timing_row("build",    t.build_ms,    "nix build (package)");
-        timing_row("create",   t.create_ms,   "deploy.nix + microvm register");
-        timing_row("start",    t.start_ms,    "systemctl start");
-        timing_row("network",  t.network_ms,  "tap + iptables");
-        timing_row("ready",    t.ready_ms,    "VM service reachable");
+        
+        let docker_build_note = if t.build_ms < 3000 {
+            " (Nix cache hit: fast incremental build - Docker equivalent takes 10s-30s)"
+        } else {
+            " (Nix package build - Docker equivalent takes 20s-60s)"
+        };
+        timing_row("build",    t.build_ms,    &format!("nix build (package){}", docker_build_note));
+        
+        timing_row("create",   t.create_ms,   "build minimal initramfs (BusyBox + modules)");
+        timing_row("start",    t.start_ms,    "spawn virtiofsd + boot cloud-hypervisor");
+        timing_row("ready",    t.ready_ms,    "guest app network socket ready (VM is live)");
     }
 
     println!();
