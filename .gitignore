@@ -3,5 +3,4 @@ target/
 crates/*/target/
 result
 result-*
-*.md
 microvm.nix/
