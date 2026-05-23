@@ -1,0 +1,6 @@
+[service]
+name = "static-test"
+source = "."
+port = 8000
+memory = "256mb"
+bin = "app"

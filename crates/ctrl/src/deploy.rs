@@ -134,12 +134,7 @@ impl DeployPipeline {
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(service_id, service_name = %config.service.name, resolve_ms, "repo resolved");
 
-        if !repo_path.join("flake.nix").exists() {
-            anyhow::bail!(
-                "no flake.nix in '{}' — required for packages.default",
-                repo_path.display()
-            );
-        }
+
 
         // ── 2. Nix build app + ensure kernel + busybox + modules ──────────
         let t = Instant::now();

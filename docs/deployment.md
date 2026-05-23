@@ -2,9 +2,14 @@
 
 This guide describes how to configure and deploy any application onto the Russel platform.
 
-Deploying an application onto Russel requires two configuration files in the root of your repository:
-1. **`Russelfile.toml`**: Configures microVM resources (CPU, Memory, Ports) and metadata.
-2. **`flake.nix`**: Defines the Nix package build process, specifying dependencies and compiling your application into a reproducible Nix store path.
+## Zero-Config Deployment (Automatic flake.nix)
+
+By default, Russel features **Zero-Config deployment**. If your repository does not contain a `flake.nix`, the Russel control plane will automatically detect your project type and generate a default `flake.nix` for you:
+- **Rust projects**: Detected by `Cargo.toml`. Auto-generates a flake using `Cargo.lock` to fetch and compile dependencies.
+- **Go projects**: Detected by `go.mod`. Auto-generates a Go build module.
+- **Static files / scripts / others**: Auto-generates a lightweight static server powered by Python's `http.server` to host directory files.
+
+If you are a power user or need custom native dependencies/system libraries, you can write your own `flake.nix` in the root of your repository to gain full control over the build environment.
 
 ---
 

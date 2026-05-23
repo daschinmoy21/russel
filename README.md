@@ -65,7 +65,7 @@ russel destroy <vm-id>
 
 ## Project Requirements
 
-A repository you want to deploy must contain configuration files in its root. For a complete guide, templates, and language references, see the [Application Deployment Guide](docs/deployment.md).
+A repository you want to deploy must contain configuration files in its root. For a complete guide, templates, and language references, see the [Application Deployment Guide](docs/deployment.md). Russel also supports Zero-Config deployments by automatically generating `flake.nix` files based on project signatures. For details, see the [Flake Auto-Generation Architecture](docs/auto-generation.md).
 
 At a minimum, it must contain:
 
