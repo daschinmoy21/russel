@@ -78,3 +78,92 @@ impl<'de> Deserialize<'de> for Memory {
         Ok(Self::Mebibytes(mebibytes))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal_russelfile() {
+        let toml = r#"
+[service]
+name = "my-app"
+source = "."
+port = 3000
+memory = "256mb"
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.name, "my-app");
+        assert_eq!(config.service.port, 3000);
+        assert_eq!(config.service.bin_name(), "my-app");
+        assert_eq!(config.service.memory.as_mebibytes(), 256);
+    }
+
+    #[test]
+    fn custom_bin_name_takes_priority() {
+        let toml = r#"
+[service]
+name = "my-app"
+source = "."
+port = 3000
+memory = "256mb"
+bin = "custom-binary"
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.bin_name(), "custom-binary");
+    }
+
+    #[test]
+    fn memory_parses_mb_and_mib() {
+        let toml_mb = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "512mb"
+"#;
+        let config: Russelfile = toml::from_str(toml_mb).unwrap();
+        assert_eq!(config.service.memory.as_mebibytes(), 512);
+
+        let toml_mib = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "1024mib"
+"#;
+        let config: Russelfile = toml::from_str(toml_mib).unwrap();
+        assert_eq!(config.service.memory.as_mebibytes(), 1024);
+    }
+
+    #[test]
+    fn memory_rejects_invalid_suffix() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "512gb"
+"#;
+        let err = toml::from_str::<Russelfile>(toml).unwrap_err();
+        assert!(err.to_string().contains("mb"));
+    }
+
+    #[test]
+    fn parse_optional_database_config() {
+        let toml = r#"
+[service]
+name = "db-app"
+source = "."
+port = 5432
+memory = "512mb"
+
+[database.postgres]
+enabled = true
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        let db = config.database.unwrap();
+        assert!(db.postgres.unwrap().enabled);
+        assert!(db.redis.is_none());
+    }
+}

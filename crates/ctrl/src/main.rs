@@ -9,6 +9,9 @@ mod network;
 mod state;
 mod traefik;
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("russel-ctrl requires Linux — it depends on cloud-hypervisor, iptables, socat, and TAP networking");
+
 use anyhow::Result;
 use axum::Router;
 use tokio::net::TcpListener;
@@ -54,17 +57,26 @@ async fn main() -> Result<()> {
 
 async fn cleanup_all_vms() {
     let runner = crate::microvm::MicrovmRunner::new();
-    if let Ok(vms) = runner.list().await {
-        let mut tasks = Vec::new();
-        for vm_id in vms {
-            let runner = runner.clone();
-            tasks.push(tokio::spawn(async move {
-                info!(vm_id = %vm_id, "destroying microVM during shutdown");
-                let _ = runner.destroy(&vm_id).await;
-            }));
+    match runner.list().await {
+        Ok(vms) => {
+            let mut tasks = Vec::new();
+            for vm_id in vms {
+                let runner = runner.clone();
+                tasks.push(tokio::spawn(async move {
+                    info!(vm_id = %vm_id, "destroying microVM during shutdown");
+                    if let Err(e) = runner.destroy(&vm_id).await {
+                        tracing::warn!(vm_id = %vm_id, error = %e, "failed to destroy microVM during shutdown");
+                    }
+                }));
+            }
+            for task in tasks {
+                if let Err(e) = task.await {
+                    tracing::warn!(error = %e, "shutdown cleanup task panicked");
+                }
+            }
         }
-        for task in tasks {
-            let _ = task.await;
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list VMs during shutdown cleanup");
         }
     }
     cleanup_stale_resources().await;
@@ -73,14 +85,19 @@ async fn cleanup_all_vms() {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut sigterm = signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM signal handler");
+        let sigterm = signal(SignalKind::terminate());
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received SIGINT, shutting down control plane...");
             }
-            _ = sigterm.recv() => {
+            _ = async {
+                if let Ok(mut sigterm) = sigterm {
+                    sigterm.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
                 tracing::info!("received SIGTERM, shutting down control plane...");
             }
         }
@@ -90,7 +107,7 @@ async fn shutdown_signal() {
     {
         tokio::signal::ctrl_c()
             .await
-            .expect("failed to install CTRL+C signal handler");
+            .ok();
         tracing::info!("received SIGINT, shutting down control plane...");
     }
 }
@@ -100,22 +117,36 @@ async fn cleanup_stale_resources() {
     use tokio::process::Command;
 
     // 1. Flush iptables rules
-    let _ = Command::new("iptables").args(["-t", "nat", "-F", "OUTPUT"]).output().await;
-    let _ = Command::new("iptables").args(["-t", "nat", "-F", "POSTROUTING"]).output().await;
-    let _ = Command::new("iptables").args(["-F", "FORWARD"]).output().await;
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.route_localnet=0"]).output().await;
+    if let Err(e) = Command::new("iptables").args(["-t", "nat", "-F", "OUTPUT"]).output().await {
+        tracing::warn!(error = %e, "failed to flush iptables NAT OUTPUT");
+    }
+    if let Err(e) = Command::new("iptables").args(["-t", "nat", "-F", "POSTROUTING"]).output().await {
+        tracing::warn!(error = %e, "failed to flush iptables NAT POSTROUTING");
+    }
+    if let Err(e) = Command::new("iptables").args(["-F", "FORWARD"]).output().await {
+        tracing::warn!(error = %e, "failed to flush iptables FORWARD");
+    }
+    if let Err(e) = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.route_localnet=0"]).output().await {
+        tracing::warn!(error = %e, "failed to reset route_localnet sysctl");
+    }
 
     // 2. Remove stale tap interfaces
-    let output = Command::new("ip").args(["-o", "link", "show"]).output().await;
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            if line.contains("vm-") {
-                if let Some(name) = line.split_whitespace().nth(1) {
-                    let name = name.trim_matches(':');
-                    let _ = Command::new("ip").args(["link", "delete", name]).output().await;
+    match Command::new("ip").args(["-o", "link", "show"]).output().await {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains("vm-") {
+                    if let Some(name) = line.split_whitespace().nth(1) {
+                        let name = name.trim_matches(':');
+                        if let Err(e) = Command::new("ip").args(["link", "delete", name]).output().await {
+                            tracing::warn!(tap = name, error = %e, "failed to delete stale tap interface");
+                        }
+                    }
                 }
             }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list network interfaces during cleanup");
         }
     }
 

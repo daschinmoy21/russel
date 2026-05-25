@@ -4,3 +4,4 @@ crates/*/target/
 result
 result-*
 microvm.nix/
+.commandcode/

@@ -125,7 +125,19 @@ impl TapForwarder {
 
 async fn sysctl(key: &str, val: &str) {
     let kv = format!("{key}={val}");
-    let _ = Command::new("sysctl").args(["-w", &kv]).output().await;
+    match Command::new("sysctl").args(["-w", &kv]).output().await {
+        Ok(out) if !out.status.success() => {
+            tracing::warn!(
+                "sysctl {kv} exited with status {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to run sysctl {kv}");
+        }
+        _ => {}
+    }
 }
 
 async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
@@ -135,4 +147,64 @@ async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
             String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subnet_for_is_deterministic() {
+        let a1 = subnet_for("my-service");
+        let a2 = subnet_for("my-service");
+        assert_eq!(a1.host_ip, a2.host_ip);
+        assert_eq!(a1.vm_ip, a2.vm_ip);
+        assert_eq!(a1.mac, a2.mac);
+    }
+
+    #[test]
+    fn subnet_for_different_services_differ() {
+        let a = subnet_for("service-a");
+        let b = subnet_for("service-b");
+        // Different services should (usually) get different subnets
+        assert_ne!(a.host_ip, b.host_ip);
+    }
+
+    #[test]
+    fn subnet_for_produces_valid_tap_id() {
+        let a = subnet_for("foo");
+        assert!(a.tap_id.starts_with("vm-"));
+        assert!(a.tap_id.contains("foo"));
+    }
+
+    #[test]
+    fn subnet_for_produces_valid_mac() {
+        let a = subnet_for("bar");
+        assert!(a.mac.starts_with("02:00:00:00:"));
+        // MAC format: 02:00:00:00:XX:01 (6 octets = 17 chars)
+        assert_eq!(a.mac.len(), 17);
+    }
+
+    #[test]
+    fn subnet_index_bounded() {
+        for s in &["a", "b", "long-service-name-123", "edge", "max"] {
+            let a = subnet_for(s);
+            let idx = a.host_ip
+                .trim_start_matches("10.0.")
+                .trim_end_matches(".1");
+            let n: u8 = idx.parse().unwrap();
+            assert!(n < 200, "index {} out of range for service {}", n, s);
+        }
+    }
+
+    #[test]
+    fn port_allocator_increments() {
+        let alloc = PortAllocator::default();
+        let p1 = alloc.next();
+        let p2 = alloc.next();
+        let p3 = alloc.next();
+        assert_eq!(p1, 3100);
+        assert_eq!(p2, 3101);
+        assert_eq!(p3, 3102);
+    }
 }

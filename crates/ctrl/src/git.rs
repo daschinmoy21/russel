@@ -17,16 +17,18 @@ impl GitClient {
         fs::create_dir_all(&checkout_root).context("failed to create checkout directory")?;
 
         let checkout = checkout_root.join(sanitize_repo_name(repo));
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("clone")
             .arg(repo)
             .arg(&checkout)
-            .status()
+            .output()
             .await?;
 
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
-                "repo path was not found locally and git clone failed for {repo}; use an absolute path for local deploys"
+                "git clone failed for {repo}: {}.\nUse an absolute path for local deploys.",
+                stderr.trim()
             );
         }
 

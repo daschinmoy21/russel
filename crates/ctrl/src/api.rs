@@ -47,14 +47,26 @@ async fn deploy(
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
         .map(|msg| {
-            let json = serde_json::to_string(&msg).unwrap();
-            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!("{}\n", json)))
+            let json = serde_json::to_string(&msg).map_err(|e| {
+                tracing::error!(error = %e, "failed to serialize deploy event");
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })?;
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
         });
 
     axum::response::Response::builder()
         .header("Content-Type", "application/x-ndjson")
         .body(axum::body::Body::from_stream(stream))
-        .unwrap()
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build NDJSON stream response");
+            e
+        })
+        .unwrap_or_else(|e| {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from(e.to_string()))
+                .expect("500 response")
+        })
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -68,40 +80,43 @@ async fn logs(State(state): State<AppState>) -> Json<LogsResponse> {
     Json(state.logs())
 }
 
-async fn vms_list() -> Json<VmsResponse> {
+async fn vms_list() -> Result<Json<VmsResponse>, (axum::http::StatusCode, String)> {
     tracing::debug!("GET /vms");
     let runner = MicrovmRunner::new();
-    let vms = runner.list().await.unwrap_or_default();
+    let vms = runner.list().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to list VMs");
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("failed to list VMs: {}", e))
+    })?;
     tracing::debug!(count = vms.len(), "GET /vms -> {} VMs", vms.len());
-    Json(VmsResponse { vms })
+    Ok(Json(VmsResponse { vms }))
 }
 
-async fn vm_stop(Path(id): Path<String>) -> Json<String> {
+async fn vm_stop(Path(id): Path<String>) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
     let runner = MicrovmRunner::new();
     match runner.stop(&id).await {
         Ok(_) => {
             tracing::info!(vm_id = %id, "stopped microvm");
-            Json(format!("stopped {}", id))
+            Ok(Json(format!("stopped {}", id)))
         }
         Err(e) => {
             tracing::error!(vm_id = %id, error = %e, "failed to stop microvm");
-            Json(format!("error: {}", e))
+            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
 }
 
-async fn vm_destroy(Path(id): Path<String>) -> Json<String> {
+async fn vm_destroy(Path(id): Path<String>) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
     let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {
             tracing::info!(vm_id = %id, "destroyed microvm");
-            Json(format!("destroyed {}", id))
+            Ok(Json(format!("destroyed {}", id)))
         }
         Err(e) => {
             tracing::error!(vm_id = %id, error = %e, "failed to destroy microvm");
-            Json(format!("error: {}", e))
+            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
 }

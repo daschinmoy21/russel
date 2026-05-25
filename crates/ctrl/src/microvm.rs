@@ -32,13 +32,8 @@ impl MicrovmRunner {
     /// Get or build the Linux kernel (bzImage) from nixpkgs.
     /// Result is cached in-memory for the lifetime of the runner.
     pub async fn ensure_kernel(&self) -> anyhow::Result<PathBuf> {
-        {
-            let cache = self.kernel_cache.lock().unwrap();
-            if let Some(ref path) = *cache {
-                if path.exists() {
-                    return Ok(path.clone());
-                }
-            }
+        if let Some(path) = self.check_cache(&self.kernel_cache) {
+            return Ok(path);
         }
 
         tracing::info!("building kernel from nixpkgs (cached after first run)");
@@ -62,21 +57,19 @@ impl MicrovmRunner {
         let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let kernel = PathBuf::from(format!("{}/bzImage", store_path));
 
-        let mut cache = self.kernel_cache.lock().unwrap();
-        *cache = Some(kernel.clone());
+        if let Ok(mut cache) = self.kernel_cache.lock() {
+            *cache = Some(kernel.clone());
+        } else {
+            tracing::warn!("kernel cache lock poisoned, skipping cache update");
+        }
         tracing::info!(kernel = %kernel.display(), "kernel cached");
         Ok(kernel)
     }
 
     /// Get or build busybox from nixpkgs (provides sh, mount, ip, etc.).
     pub async fn ensure_busybox(&self) -> anyhow::Result<PathBuf> {
-        {
-            let cache = self.busybox_cache.lock().unwrap();
-            if let Some(ref path) = *cache {
-                if path.exists() {
-                    return Ok(path.clone());
-                }
-            }
+        if let Some(path) = self.check_cache(&self.busybox_cache) {
+            return Ok(path);
         }
 
         tracing::info!("building busybox from nixpkgs (cached after first run)");
@@ -99,8 +92,11 @@ impl MicrovmRunner {
 
         let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-        let mut cache = self.busybox_cache.lock().unwrap();
-        *cache = Some(PathBuf::from(store_path.clone()));
+        if let Ok(mut cache) = self.busybox_cache.lock() {
+            *cache = Some(PathBuf::from(store_path.clone()));
+        } else {
+            tracing::warn!("busybox cache lock poisoned, skipping cache update");
+        }
         tracing::info!(busybox = %store_path, "busybox cached");
         Ok(PathBuf::from(store_path))
     }
@@ -109,13 +105,8 @@ impl MicrovmRunner {
     /// The stock nixpkgs kernel compiles virtio drivers as modules (=m),
     /// so we need these to load them in the initramfs init script.
     pub async fn ensure_kernel_modules(&self) -> anyhow::Result<PathBuf> {
-        {
-            let cache = self.modules_cache.lock().unwrap();
-            if let Some(ref path) = *cache {
-                if path.exists() {
-                    return Ok(path.clone());
-                }
-            }
+        if let Some(path) = self.check_cache(&self.modules_cache) {
+            return Ok(path);
         }
 
         tracing::info!("resolving kernel modules from nixpkgs");
@@ -138,10 +129,26 @@ impl MicrovmRunner {
 
         let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-        let mut cache = self.modules_cache.lock().unwrap();
-        *cache = Some(PathBuf::from(store_path.clone()));
+        if let Ok(mut cache) = self.modules_cache.lock() {
+            *cache = Some(PathBuf::from(store_path.clone()));
+        } else {
+            tracing::warn!("kernel modules cache lock poisoned, skipping cache update");
+        }
         tracing::info!(modules = %store_path, "kernel modules cached");
         Ok(PathBuf::from(store_path))
+    }
+
+    fn check_cache(&self, cache: &Mutex<Option<PathBuf>>) -> Option<PathBuf> {
+        if let Ok(cache) = cache.lock() {
+            if let Some(ref path) = *cache {
+                if path.exists() {
+                    return Some(path.clone());
+                }
+            }
+        } else {
+            tracing::warn!("cache lock poisoned, re-building from scratch");
+        }
+        None
     }
 
     /// Build a minimal CPIO initramfs containing ONLY:
@@ -166,23 +173,14 @@ impl MicrovmRunner {
         let initramfs_file = deploy_dir.join("initramfs.cpio");
         let work = deploy_dir.join("initramfs.d");
 
-        // Clean any previous work dir
-        let _ = std::fs::remove_dir_all(&work);
+        if let Err(e) = std::fs::remove_dir_all(&work) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous initramfs work dir");
+            }
+        }
         std::fs::create_dir_all(&work)?;
 
-        // ── Copy needed kernel modules into /modules/ ────────────────────
-        let modules_dest = work.join("modules");
-        std::fs::create_dir_all(&modules_dest)?;
-
-        // Find the kernel version subdirectory
-        let kver = self.find_kver(kernel_modules_path)?;
-        let kmod_base = kernel_modules_path
-            .join("lib/modules")
-            .join(&kver)
-            .join("kernel");
-
-        // Modules needed, in insmod load order (dependencies first):
-        let needed_modules = [
+        let needed_modules: &[&str] = &[
             "drivers/virtio/virtio_ring.ko.xz",
             "drivers/virtio/virtio.ko.xz",
             "drivers/virtio/virtio_pci_modern_dev.ko.xz",
@@ -194,14 +192,53 @@ impl MicrovmRunner {
             "fs/fuse/fuse.ko.xz",
             "fs/fuse/virtiofs.ko.xz",
         ];
+        self.copy_kernel_modules(kernel_modules_path, &work, needed_modules)?;
 
-        for module_rel in &needed_modules {
+        let bb_bin = format!("{}/bin/busybox", busybox_path.display());
+        let init = self.generate_init_script(alloc, guest_port, app_store_path, bin_name, needed_modules);
+        use std::os::unix::fs::PermissionsExt;
+        let init_path = work.join("init");
+        std::fs::write(&init_path, &init)?;
+        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))?;
+
+        self.create_busybox_symlinks(&work, &bb_bin)?;
+        self.copy_closure_to(busybox_path, &work).await?;
+        self.pack_cpio(&work, &initramfs_file, &bb_bin).await?;
+
+        if let Err(e) = std::fs::remove_dir_all(&work) {
+            tracing::warn!(dir = %work.display(), error = %e, "failed to remove initramfs work dir");
+        }
+
+        tracing::info!(
+            initramfs = %initramfs_file.display(),
+            size_bytes = std::fs::metadata(&initramfs_file).map(|m| m.len()).unwrap_or(0),
+            "initramfs built (minimal: busybox + virtio modules, app via virtiofs)"
+        );
+
+        Ok(initramfs_file)
+    }
+
+    fn copy_kernel_modules(
+        &self,
+        kernel_modules_path: &Path,
+        work: &Path,
+        needed_modules: &[&str],
+    ) -> anyhow::Result<()> {
+        let modules_dest = work.join("modules");
+        std::fs::create_dir_all(&modules_dest)?;
+
+        let kver = self.find_kver(kernel_modules_path)?;
+        let kmod_base = kernel_modules_path
+            .join("lib/modules")
+            .join(&kver)
+            .join("kernel");
+
+        for module_rel in needed_modules {
             let src = kmod_base.join(module_rel);
             let name = Path::new(module_rel)
                 .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap();
+                .and_then(|n| n.to_str())
+                .unwrap_or(module_rel);
             let dest = modules_dest.join(name);
             if src.exists() {
                 std::fs::copy(&src, &dest)?;
@@ -210,20 +247,26 @@ impl MicrovmRunner {
                 tracing::warn!(module = %module_rel, "kernel module not found, skipping");
             }
         }
+        Ok(())
+    }
 
-        // ── /init shell script ──────────────────────────────────────────────
-        // 1. Mount pseudo-filesystems
-        // 2. Decompress + insmod virtio drivers (networking + virtiofs)
-        // 3. Mount host /nix/store via virtiofs
-        // 4. Configure networking
-        // 5. Exec the app
+    fn generate_init_script(
+        &self,
+        alloc: &SubnetAllocation,
+        guest_port: u16,
+        app_store_path: &Path,
+        bin_name: &str,
+        needed_modules: &[&str],
+    ) -> String {
         let app = app_store_path.display();
 
-        // Build insmod commands — decompress .ko.xz then insmod with status checking
         let insmod_cmds: String = needed_modules
             .iter()
             .map(|m| {
-                let xz_name = Path::new(m).file_name().unwrap().to_str().unwrap();
+                let xz_name = Path::new(m)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(m);
                 let ko_name = xz_name.trim_end_matches(".xz");
                 format!(
                     "echo \"Loading module {ko_name}...\"\n\
@@ -233,7 +276,7 @@ impl MicrovmRunner {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let init = format!(
+        format!(
             r#"#!/bin/sh
 echo "=== RUSSEL INIT STARTING ==="
 /bin/mkdir -p /proc /sys /dev /nix/store /tmp
@@ -288,27 +331,30 @@ exec /bin/sh
             port = guest_port,
             app = app,
             bin = bin_name,
-        );
-        use std::os::unix::fs::PermissionsExt;
-        let init_path = work.join("init");
-        std::fs::write(&init_path, &init)?;
-        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))?;
+        )
+    }
 
-        // ── /bin symlinks → busybox ──────────────────────────────────────
-        let bb = busybox_path.display();
+    fn create_busybox_symlinks(&self, work: &Path, bb_bin: &str) -> anyhow::Result<()> {
         let bin_dir = work.join("bin");
         std::fs::create_dir_all(&bin_dir)?;
-        let bb_bin = format!("{}/bin/busybox", bb);
         for name in &["sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat"] {
             let dest = bin_dir.join(name);
-            let _ = std::fs::remove_file(&dest);
-            std::os::unix::fs::symlink(&bb_bin, &dest)?;
+            if let Err(e) = std::fs::remove_file(&dest) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(file = %dest.display(), error = %e, "failed to remove previous symlink");
+                }
+            }
+            std::os::unix::fs::symlink(bb_bin, &dest)?;
         }
+        Ok(())
+    }
 
-        // ── Copy ONLY busybox runtime closure (no app — it lives on host /nix/store)
-        self.copy_closure_to(busybox_path, &work).await?;
-
-        // ── Pack CPIO archive (using busybox find + cpio) ────────────────
+    async fn pack_cpio(
+        &self,
+        work: &Path,
+        initramfs_file: &Path,
+        bb_bin: &str,
+    ) -> anyhow::Result<()> {
         let script = format!(
             "cd '{}' && '{}' find . | '{}' cpio -o -H newc > '{}'",
             work.display(),
@@ -316,7 +362,7 @@ exec /bin/sh
             bb_bin,
             initramfs_file.display(),
         );
-        let status = Command::new(&bb_bin)
+        let status = Command::new(bb_bin)
             .arg("sh")
             .arg("-c")
             .arg(&script)
@@ -329,17 +375,7 @@ exec /bin/sh
                 String::from_utf8_lossy(&status.stderr).trim()
             );
         }
-
-        // ── Cleanup work dir ───────────────────────────────────────────────
-        let _ = std::fs::remove_dir_all(&work);
-
-        tracing::info!(
-            initramfs = %initramfs_file.display(),
-            size_bytes = std::fs::metadata(&initramfs_file).map(|m| m.len()).unwrap_or(0),
-            "initramfs built (minimal: busybox + virtio modules, app via virtiofs)"
-        );
-
-        Ok(initramfs_file)
+        Ok(())
     }
 
     /// Find the kernel version subdirectory in a modules store path.
@@ -455,15 +491,24 @@ exec /bin/sh
         let sock_dir = format!("/var/lib/russel/{}", service_id);
         std::fs::create_dir_all(&sock_dir)?;
         let console_log = format!("{}/console.log", sock_dir);
-        let _ = std::fs::remove_file(&console_log);
+        if let Err(e) = std::fs::remove_file(&console_log) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(file = %console_log, error = %e, "failed to remove previous console log");
+            }
+        }
         if let Ok(file) = std::fs::File::create(&console_log) {
             use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
+            if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o666)) {
+                tracing::warn!(file = %console_log, error = %e, "failed to set permissions on console log");
+            }
         }
 
         let virtiofs_sock = format!("{}/virtiofs.sock", sock_dir);
-        // Remove stale socket
-        let _ = std::fs::remove_file(&virtiofs_sock);
+        if let Err(e) = std::fs::remove_file(&virtiofs_sock) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(file = %virtiofs_sock, error = %e, "failed to remove stale virtiofs socket");
+            }
+        }
 
         tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store");
         let virtiofsd_child = Command::new("virtiofsd")
@@ -534,43 +579,64 @@ exec /bin/sh
     /// Stop a running VM by killing the cloud-hypervisor process.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
         let unit = format!("microvm@{}.service", service_id);
-        let _ = Command::new("systemctl")
+        match Command::new("systemctl")
             .args(["stop", &unit])
             .output()
-            .await;
-        // Also kill any orphaned cloud-hypervisor
-        let _ = Command::new("pkill")
+            .await
+        {
+            Ok(out) if !out.status.success() => {
+                tracing::warn!(unit = %unit, "systemctl stop failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            Err(e) => {
+                tracing::warn!(unit = %unit, error = %e, "failed to run systemctl stop");
+            }
+            _ => {}
+        }
+        match Command::new("pkill")
             .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}", service_id)])
             .output()
-            .await;
+            .await
+        {
+            Ok(out) if !out.status.success() => {
+                tracing::warn!(service_id = %service_id, "pkill cloud-hypervisor failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            Err(e) => {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to run pkill");
+            }
+            _ => {}
+        }
         Ok(())
     }
 
     /// Destroy all state for a microVM.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
-        let _ = self.stop(service_id).await;
-        let _ = Command::new("rm")
-            .args(["-rf", &format!("/var/lib/microvms/{}", service_id)])
-            .output()
-            .await;
-        let _ = Command::new("rm")
-            .args(["-rf", &format!("/var/lib/russel/{}", service_id)])
-            .output()
-            .await;
-        let _ = Command::new("rm")
-            .args([
-                "-f",
-                &format!("/nix/var/nix/gcroots/microvm/{}", service_id),
-            ])
-            .output()
-            .await;
-        let _ = Command::new("rm")
-            .args([
-                "-f",
-                &format!("/nix/var/nix/gcroots/microvm/booted-{}", service_id),
-            ])
-            .output()
-            .await;
+        if let Err(e) = self.stop(service_id).await {
+            tracing::warn!(service_id = %service_id, error = %e, "stop during destroy failed");
+        }
+        for dir in &[
+            format!("/var/lib/microvms/{}", service_id),
+            format!("/var/lib/russel/{}", service_id),
+        ] {
+            if let Err(e) = Command::new("rm")
+                .args(["-rf", dir])
+                .output()
+                .await
+            {
+                tracing::warn!(dir = %dir, error = %e, "failed to rm dir during destroy");
+            }
+        }
+        for file in &[
+            format!("/nix/var/nix/gcroots/microvm/{}", service_id),
+            format!("/nix/var/nix/gcroots/microvm/booted-{}", service_id),
+        ] {
+            if let Err(e) = Command::new("rm")
+                .args(["-f", file])
+                .output()
+                .await
+            {
+                tracing::warn!(file = %file, error = %e, "failed to rm gcroot during destroy");
+            }
+        }
         Ok(())
     }
 
