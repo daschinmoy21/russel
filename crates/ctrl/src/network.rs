@@ -80,8 +80,8 @@ impl TapForwarder {
         // 3. Enable IP forwarding (needed for host → VM traffic via TAP).
         sysctl("net.ipv4.ip_forward", "1").await;
 
-        // 4. Spawn socat: listens on 0.0.0.0:<host_port>, forwards to VM.
-        let listen = format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", host_port);
+        // 4. Spawn socat: listens on 127.0.0.1:<host_port>, forwards to VM.
+        let listen = format!("TCP-LISTEN:{},fork,reuseaddr,bind=127.0.0.1", host_port);
         let connect = format!("TCP:{}:{}", vm_ip, guest_port);
 
         tracing::info!(
@@ -103,7 +103,7 @@ impl TapForwarder {
 
         tracing::info!(
             tap, host_port, vm_ip, guest_port,
-            "port forwarding active: 0.0.0.0:{host_port} -> {vm_ip}:{guest_port}"
+            "port forwarding active: 127.0.0.1:{host_port} -> {vm_ip}:{guest_port}"
         );
 
         Ok(child)
