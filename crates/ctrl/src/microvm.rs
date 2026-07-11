@@ -578,7 +578,6 @@ exec /bin/sh
 
     /// Stop a running VM by killing the cloud-hypervisor, virtiofsd, and socat processes.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
-        let alloc = crate::network::subnet_for(service_id);
         let unit = format!("microvm@{}.service", service_id);
         match Command::new("systemctl")
             .args(["stop", &unit])
@@ -628,7 +627,7 @@ exec /bin/sh
 
             // Kill socat
             let _ = Command::new("pkill")
-                .args(["-f", &format!("socat.*TCP:{}:", alloc.vm_ip)])
+                .args(["-f", &format!("socat-russel-{}", escaped_id)])
                 .output()
                 .await;
         }

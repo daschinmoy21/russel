@@ -63,6 +63,7 @@ impl TapForwarder {
     ///
     /// All steps run sequentially — the TAP must exist before the VM boots.
     pub async fn setup(
+        service_id: &str,
         alloc: &SubnetAllocation,
         host_port: u16,
         guest_port: u16,
@@ -94,6 +95,7 @@ impl TapForwarder {
         );
 
         let child = Command::new("socat")
+            .arg0(format!("socat-russel-{}", service_id))
             .arg(&listen)
             .arg(&connect)
             .kill_on_drop(true)
@@ -117,8 +119,7 @@ impl TapForwarder {
     pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
         let tap = &alloc.tap_id;
         tracing::info!(tap, "tearing down tap interface");
-        let _ = run_ip(&["link", "del", tap]).await; // best-effort
-        Ok(())
+        run_ip(&["link", "del", tap]).await
     }
 
     /// Poll until guest_port is reachable at vm_ip.

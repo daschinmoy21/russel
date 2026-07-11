@@ -227,7 +227,7 @@ impl DeployPipeline {
             tracing::info!(service_id, "setting up TAP + socat + booting VM (serial)");
 
             // Step A: create TAP + setup port forwarding (socat)
-            let socat_child = TapForwarder::setup(&alloc, port.host, port.guest).await?;
+            let socat_child = TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
 
             // Step B: boot cloud-hypervisor with virtiofsd + minimal initramfs
             let BootOutput { vm_child, virtiofsd_child } = self
@@ -302,45 +302,52 @@ impl DeployPipeline {
             Err(deploy_err) => {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — initiating rollback to previous VM");
                 if has_backup {
-                    let _ = self.runner.destroy(service_id).await;
-                    let _ = tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await;
-                    let _ = tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await;
-                    let old_metadata_path = format!("{}/metadata.json", russel_dir);
-                    if let Ok(content) = std::fs::read_to_string(&old_metadata_path) {
-                        if let Ok(old_meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                            let old_host_port = old_meta["host_port"].as_u64().unwrap_or(3100) as u16;
-                            let old_guest_port = old_meta["guest_port"].as_u64().unwrap_or(3000) as u16;
-                            let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
-                            let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
-                            let old_initramfs_path = PathBuf::from(format!("{}/initramfs.img", russel_dir));
-                            let old_alloc = subnet_for(service_id);
-                            if let Ok(old_socat) = TapForwarder::setup(&old_alloc, old_host_port, old_guest_port).await {
-                                if let Ok(old_boot) = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await {
-                                    let old_vm_pid = old_boot.vm_child.id();
-                                    let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
-                                    let old_socat_pid = old_socat.id();
+                    let rollback_res = async {
+                        let _ = self.runner.destroy(service_id).await;
+                        tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await?;
+                        tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await?;
+                        let old_metadata_path = format!("{}/metadata.json", russel_dir);
+                        let content = std::fs::read_to_string(&old_metadata_path)?;
+                        let old_meta: serde_json::Value = serde_json::from_str(&content)?;
+                        let old_host_port = old_meta["host_port"].as_u64().ok_or_else(|| anyhow::anyhow!("missing host_port"))? as u16;
+                        let old_guest_port = old_meta["guest_port"].as_u64().ok_or_else(|| anyhow::anyhow!("missing guest_port"))? as u16;
+                        let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
+                        let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
+                        let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
+                        let old_alloc = subnet_for(service_id);
+                        
+                        let old_socat = TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
+                        let old_boot = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await?;
+                        
+                        let old_vm_pid = old_boot.vm_child.id();
+                        let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
+                        let old_socat_pid = old_socat.id();
 
-                                    self.state.mark_deployed(service_id, old_boot.vm_child);
-                                    self.state.store_aux_process(old_socat);
-                                    self.state.store_aux_process(old_boot.virtiofsd_child);
-                                    let new_metadata = serde_json::json!({
-                                        "service_id": service_id,
-                                        "host_port": old_host_port,
-                                        "guest_port": old_guest_port,
-                                        "vm_ip": old_meta["vm_ip"],
-                                        "vm_pid": old_vm_pid,
-                                        "virtiofsd_pid": old_virtiofsd_pid,
-                                        "socat_pid": old_socat_pid,
-                                        "kernel_path": old_kernel_path.to_string_lossy(),
-                                        "mem_mb": old_mem_mb,
-                                    });
-                                    if let Ok(c) = serde_json::to_string_pretty(&new_metadata) {
-                                        let _ = std::fs::write(old_metadata_path, c);
-                                    }
-                                    tracing::info!(service_id, "Rollback to previous VM succeeded");
-                                }
-                            }
+                        self.state.mark_deployed(service_id, old_boot.vm_child);
+                        self.state.store_aux_process(old_socat);
+                        self.state.store_aux_process(old_boot.virtiofsd_child);
+                        
+                        let new_metadata = serde_json::json!({
+                            "service_id": service_id,
+                            "host_port": old_host_port,
+                            "guest_port": old_guest_port,
+                            "vm_ip": old_meta["vm_ip"],
+                            "vm_pid": old_vm_pid,
+                            "virtiofsd_pid": old_virtiofsd_pid,
+                            "socat_pid": old_socat_pid,
+                            "kernel_path": old_kernel_path.to_string_lossy(),
+                            "mem_mb": old_mem_mb,
+                        });
+                        if let Ok(c) = serde_json::to_string_pretty(&new_metadata) {
+                            let _ = std::fs::write(old_metadata_path, c);
                         }
+                        Ok::<(), anyhow::Error>(())
+                    }.await;
+
+                    if let Err(rollback_err) = rollback_res {
+                        tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
+                    } else {
+                        tracing::info!(service_id, "Rollback to previous VM succeeded");
                     }
                 }
                 return Err(deploy_err);
