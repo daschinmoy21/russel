@@ -121,6 +121,16 @@ impl DeployPipeline {
         request: DeployRequest,
         tx: tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<DeployOutput> {
+        // Ensure clean state before spawning the new instance
+        let _ = self.runner.destroy(service_id).await;
+        let (vm_proc, aux_procs) = self.state.clear_processes_if_matches(service_id, "building", "pending");
+        if let Some(mut p) = vm_proc {
+            let _ = p.kill().await;
+        }
+        for mut p in aux_procs {
+            let _ = p.kill().await;
+        }
+
         // ── 1. Resolve repo ──────────────────────────────────────────────────
         let t = Instant::now();
         let _ = tx

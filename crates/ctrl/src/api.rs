@@ -91,8 +91,18 @@ async fn vms_list() -> Result<Json<VmsResponse>, (axum::http::StatusCode, String
     Ok(Json(VmsResponse { vms }))
 }
 
-async fn vm_stop(Path(id): Path<String>) -> Result<Json<String>, (axum::http::StatusCode, String)> {
+async fn vm_stop(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
+    let (vm_child, aux_processes) = state.clear_processes_if_matches(&id, "stopped", "none");
+    if let Some(mut child) = vm_child {
+        let _ = child.kill().await;
+    }
+    for mut child in aux_processes {
+        let _ = child.kill().await;
+    }
     let runner = MicrovmRunner::new();
     match runner.stop(&id).await {
         Ok(_) => {
@@ -106,8 +116,18 @@ async fn vm_stop(Path(id): Path<String>) -> Result<Json<String>, (axum::http::St
     }
 }
 
-async fn vm_destroy(Path(id): Path<String>) -> Result<Json<String>, (axum::http::StatusCode, String)> {
+async fn vm_destroy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
+    let (vm_child, aux_processes) = state.clear_processes_if_matches(&id, "destroyed", "none");
+    if let Some(mut child) = vm_child {
+        let _ = child.kill().await;
+    }
+    for mut child in aux_processes {
+        let _ = child.kill().await;
+    }
     let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {

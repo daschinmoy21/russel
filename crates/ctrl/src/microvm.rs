@@ -576,8 +576,9 @@ exec /bin/sh
         })
     }
 
-    /// Stop a running VM by killing the cloud-hypervisor process.
+    /// Stop a running VM by killing the cloud-hypervisor, virtiofsd, and socat processes.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
+        let alloc = crate::network::subnet_for(service_id);
         let unit = format!("microvm@{}.service", service_id);
         match Command::new("systemctl")
             .args(["stop", &unit])
@@ -592,27 +593,45 @@ exec /bin/sh
             }
             _ => {}
         }
-        match Command::new("pkill")
+
+        // Kill cloud-hypervisor
+        let _ = Command::new("pkill")
             .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}", service_id)])
             .output()
-            .await
-        {
-            Ok(out) if !out.status.success() => {
-                tracing::warn!(service_id = %service_id, "pkill cloud-hypervisor failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-            }
-            Err(e) => {
-                tracing::warn!(service_id = %service_id, error = %e, "failed to run pkill");
-            }
-            _ => {}
-        }
+            .await;
+
+        // Kill virtiofsd
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("virtiofsd.*russel/{}", service_id)])
+            .output()
+            .await;
+
+        // Kill socat
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("socat.*TCP:{}:", alloc.vm_ip)])
+            .output()
+            .await;
+
         Ok(())
     }
 
     /// Destroy all state for a microVM.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
+        let alloc = crate::network::subnet_for(service_id);
+
         if let Err(e) = self.stop(service_id).await {
             tracing::warn!(service_id = %service_id, error = %e, "stop during destroy failed");
         }
+
+        // Teardown the TAP device
+        if let Err(e) = crate::network::TapForwarder::teardown(&alloc).await {
+            tracing::warn!(service_id = %service_id, error = %e, "tap teardown during destroy failed");
+        }
+
+        // Release port and subnet
+        crate::network::PortAllocator::release(service_id);
+        crate::network::release_subnet(service_id);
+
         for dir in &[
             format!("/var/lib/microvms/{}", service_id),
             format!("/var/lib/russel/{}", service_id),

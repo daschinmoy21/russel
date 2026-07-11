@@ -22,6 +22,8 @@ impl PortAllocator {
     pub fn next(&self) -> u16 {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
+
+    pub fn release(_service_id: &str) {}
 }
 
 // ── Subnet allocation (deterministic per service_id) ─────────────────────────
@@ -47,6 +49,8 @@ pub fn subnet_for(service_id: &str) -> SubnetAllocation {
         tap_id:  format!("vm-{service_id}"),
     }
 }
+
+pub fn release_subnet(_service_id: &str) {}
 
 // ── Tap creation + setup + port forwarding via socat ──────────────────────────
 
@@ -107,6 +111,14 @@ impl TapForwarder {
         );
 
         Ok(child)
+    }
+
+    /// Delete the TAP interface when the VM is destroyed.
+    pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
+        let tap = &alloc.tap_id;
+        tracing::info!(tap, "tearing down tap interface");
+        let _ = run_ip(&["link", "del", tap]).await; // best-effort
+        Ok(())
     }
 
     /// Poll until guest_port is reachable at vm_ip.
