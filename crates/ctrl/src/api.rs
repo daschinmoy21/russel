@@ -96,7 +96,8 @@ async fn vm_stop(
     Path(id): Path<String>,
 ) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
-    let (vm_child, aux_processes) = state.clear_processes_if_matches(&id, "stopped", "none");
+    state.set_status_if_matches(&id, "stopping", "pending");
+    let (vm_child, aux_processes) = state.take_processes_if_matches(&id);
     if let Some(mut child) = vm_child {
         let _ = child.kill().await;
     }
@@ -107,10 +108,12 @@ async fn vm_stop(
     match runner.stop(&id).await {
         Ok(_) => {
             tracing::info!(vm_id = %id, "stopped microvm");
+            state.set_status_if_matches(&id, "stopped", "none");
             Ok(Json(format!("stopped {}", id)))
         }
         Err(e) => {
             tracing::error!(vm_id = %id, error = %e, "failed to stop microvm");
+            state.set_status_if_matches(&id, "failed", "failed");
             Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
@@ -121,7 +124,8 @@ async fn vm_destroy(
     Path(id): Path<String>,
 ) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
-    let (vm_child, aux_processes) = state.clear_processes_if_matches(&id, "destroyed", "none");
+    state.set_status_if_matches(&id, "destroying", "pending");
+    let (vm_child, aux_processes) = state.take_processes_if_matches(&id);
     if let Some(mut child) = vm_child {
         let _ = child.kill().await;
     }
@@ -132,10 +136,12 @@ async fn vm_destroy(
     match runner.destroy(&id).await {
         Ok(_) => {
             tracing::info!(vm_id = %id, "destroyed microvm");
+            state.set_status_if_matches(&id, "destroyed", "none");
             Ok(Json(format!("destroyed {}", id)))
         }
         Err(e) => {
             tracing::error!(vm_id = %id, error = %e, "failed to destroy microvm");
+            state.set_status_if_matches(&id, "failed", "failed");
             Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }

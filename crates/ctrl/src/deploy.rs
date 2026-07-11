@@ -121,16 +121,6 @@ impl DeployPipeline {
         request: DeployRequest,
         tx: tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<DeployOutput> {
-        // Ensure clean state before spawning the new instance
-        let _ = self.runner.destroy(service_id).await;
-        let (vm_proc, aux_procs) = self.state.clear_processes_if_matches(service_id, "building", "pending");
-        if let Some(mut p) = vm_proc {
-            let _ = p.kill().await;
-        }
-        for mut p in aux_procs {
-            let _ = p.kill().await;
-        }
-
         // ── 1. Resolve repo ──────────────────────────────────────────────────
         let t = Instant::now();
         let _ = tx
@@ -168,6 +158,16 @@ impl DeployPipeline {
             build_ms,
             "build complete (kernel + busybox + modules cached)"
         );
+
+        // Now that the build has succeeded, we can safely teardown the old VM
+        let _ = self.runner.destroy(service_id).await;
+        let (vm_proc, aux_procs) = self.state.take_processes_if_matches(service_id);
+        if let Some(mut p) = vm_proc {
+            let _ = p.kill().await;
+        }
+        for mut p in aux_procs {
+            let _ = p.kill().await;
+        }
 
         // ── 3. Allocate port + subnet ──────────────────────────────────────
         let port = request.port.unwrap_or_else(|| PortMapping {
@@ -227,6 +227,20 @@ impl DeployPipeline {
             .runner
             .boot(service_id, &kernel, &initramfs_path, &alloc, mem_mb)
             .await?;
+
+        // Write metadata.json for precise and secure cleanup
+        let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
+        let metadata = serde_json::json!({
+            "service_id": service_id,
+            "host_port": port.host,
+            "vm_ip": alloc.vm_ip,
+            "vm_pid": vm_child.id(),
+            "virtiofsd_pid": virtiofsd_child.id(),
+            "socat_pid": socat_child.id(),
+        });
+        if let Ok(content) = serde_json::to_string_pretty(&metadata) {
+            let _ = std::fs::write(metadata_path, content);
+        }
 
         let start_ms = t.elapsed().as_millis();
         let network_ms = 0u128; // included in start_ms (serial)

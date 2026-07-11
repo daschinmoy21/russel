@@ -110,7 +110,7 @@ impl AppState {
         inner.aux_processes.push(child);
     }
 
-    pub fn clear_processes_if_matches(&self, service_id: &str, status: &str, vm_state: &str) -> (Option<Child>, Vec<Child>) {
+    pub fn take_processes_if_matches(&self, service_id: &str) -> (Option<Child>, Vec<Child>) {
         let Ok(mut inner) = self.lock_inner() else {
             return (None, Vec::new());
         };
@@ -118,11 +118,19 @@ impl AppState {
             let vm = inner.vm_process.take();
             let aux = std::mem::take(&mut inner.aux_processes);
             inner.vm_pid = None;
-            inner.status = status.to_string();
-            inner.vm_state = vm_state.to_string();
             (vm, aux)
         } else {
             (None, Vec::new())
+        }
+    }
+
+    pub fn set_status_if_matches(&self, service_id: &str, status: &str, vm_state: &str) {
+        let Ok(mut inner) = self.lock_inner() else {
+            return;
+        };
+        if inner.service_id == service_id {
+            inner.status = status.to_string();
+            inner.vm_state = vm_state.to_string();
         }
     }
 

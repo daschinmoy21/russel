@@ -594,23 +594,44 @@ exec /bin/sh
             _ => {}
         }
 
-        // Kill cloud-hypervisor
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}", service_id)])
-            .output()
-            .await;
+        // Try to read metadata first
+        let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
+        let mut killed_any = false;
+        if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(vm_pid) = metadata.get("vm_pid").and_then(|v| v.as_u64()) {
+                    let _ = Command::new("kill").arg(vm_pid.to_string()).output().await;
+                }
+                if let Some(virtiofsd_pid) = metadata.get("virtiofsd_pid").and_then(|v| v.as_u64()) {
+                    let _ = Command::new("kill").arg(virtiofsd_pid.to_string()).output().await;
+                }
+                if let Some(socat_pid) = metadata.get("socat_pid").and_then(|v| v.as_u64()) {
+                    let _ = Command::new("kill").arg(socat_pid.to_string()).output().await;
+                }
+                killed_any = true;
+            }
+        }
 
-        // Kill virtiofsd
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("virtiofsd.*russel/{}", service_id)])
-            .output()
-            .await;
+        if !killed_any {
+            let escaped_id = escape_regex(service_id);
+            // Kill cloud-hypervisor
+            let _ = Command::new("pkill")
+                .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}(,|$)", escaped_id)])
+                .output()
+                .await;
 
-        // Kill socat
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("socat.*TCP:{}:", alloc.vm_ip)])
-            .output()
-            .await;
+            // Kill virtiofsd
+            let _ = Command::new("pkill")
+                .args(["-f", &format!("virtiofsd.*russel/{}/", escaped_id)])
+                .output()
+                .await;
+
+            // Kill socat
+            let _ = Command::new("pkill")
+                .args(["-f", &format!("socat.*TCP:{}:", alloc.vm_ip)])
+                .output()
+                .await;
+        }
 
         Ok(())
     }
@@ -682,4 +703,15 @@ exec /bin/sh
 pub struct BootOutput {
     pub vm_child: tokio::process::Child,
     pub virtiofsd_child: tokio::process::Child,
+}
+
+fn escape_regex(s: &str) -> String {
+    let mut escaped = String::new();
+    for c in s.chars() {
+        if ".+*?^$()[]{}|\\".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
