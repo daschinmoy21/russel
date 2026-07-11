@@ -98,12 +98,35 @@ async fn vm_stop(
     tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
     state.set_status_if_matches(&id, "stopping", "pending");
     let (vm_child, aux_processes) = state.take_processes_if_matches(&id);
+
+    let mut vm_failed = None;
+    let mut aux_failed = Vec::new();
+    let mut has_kill_failure = false;
+
     if let Some(mut child) = vm_child {
-        let _ = child.kill().await;
+        if let Err(e) = child.kill().await {
+            tracing::error!(vm_id = %id, error = %e, "failed to kill VM process");
+            vm_failed = Some(child);
+            has_kill_failure = true;
+        }
     }
     for mut child in aux_processes {
-        let _ = child.kill().await;
+        if let Err(e) = child.kill().await {
+            tracing::error!(vm_id = %id, error = %e, "failed to kill aux process");
+            aux_failed.push(child);
+            has_kill_failure = true;
+        }
     }
+
+    if has_kill_failure {
+        state.restore_processes(&id, vm_failed, aux_failed);
+        state.set_status_if_matches(&id, "failed", "failed");
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to kill child processes".to_string(),
+        ));
+    }
+
     let runner = MicrovmRunner::new();
     match runner.stop(&id).await {
         Ok(_) => {
@@ -126,12 +149,35 @@ async fn vm_destroy(
     tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
     state.set_status_if_matches(&id, "destroying", "pending");
     let (vm_child, aux_processes) = state.take_processes_if_matches(&id);
+
+    let mut vm_failed = None;
+    let mut aux_failed = Vec::new();
+    let mut has_kill_failure = false;
+
     if let Some(mut child) = vm_child {
-        let _ = child.kill().await;
+        if let Err(e) = child.kill().await {
+            tracing::error!(vm_id = %id, error = %e, "failed to kill VM process during destroy");
+            vm_failed = Some(child);
+            has_kill_failure = true;
+        }
     }
     for mut child in aux_processes {
-        let _ = child.kill().await;
+        if let Err(e) = child.kill().await {
+            tracing::error!(vm_id = %id, error = %e, "failed to kill aux process during destroy");
+            aux_failed.push(child);
+            has_kill_failure = true;
+        }
     }
+
+    if has_kill_failure {
+        state.restore_processes(&id, vm_failed, aux_failed);
+        state.set_status_if_matches(&id, "failed", "failed");
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to kill child processes during destroy".to_string(),
+        ));
+    }
+
     let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {

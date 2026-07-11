@@ -640,14 +640,10 @@ exec /bin/sh
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
         let alloc = crate::network::subnet_for(service_id);
 
-        if let Err(e) = self.stop(service_id).await {
-            tracing::warn!(service_id = %service_id, error = %e, "stop during destroy failed");
-        }
+        self.stop(service_id).await?;
 
         // Teardown the TAP device
-        if let Err(e) = crate::network::TapForwarder::teardown(&alloc).await {
-            tracing::warn!(service_id = %service_id, error = %e, "tap teardown during destroy failed");
-        }
+        crate::network::TapForwarder::teardown(&alloc).await?;
 
         // Release port and subnet
         crate::network::PortAllocator::release(service_id);
@@ -657,24 +653,30 @@ exec /bin/sh
             format!("/var/lib/microvms/{}", service_id),
             format!("/var/lib/russel/{}", service_id),
         ] {
-            if let Err(e) = Command::new("rm")
-                .args(["-rf", dir])
-                .output()
-                .await
-            {
-                tracing::warn!(dir = %dir, error = %e, "failed to rm dir during destroy");
+            let path = std::path::Path::new(dir);
+            if path.exists() {
+                let out = Command::new("rm")
+                    .args(["-rf", dir])
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    anyhow::bail!("failed to remove directory {}: {}", dir, String::from_utf8_lossy(&out.stderr).trim());
+                }
             }
         }
         for file in &[
             format!("/nix/var/nix/gcroots/microvm/{}", service_id),
             format!("/nix/var/nix/gcroots/microvm/booted-{}", service_id),
         ] {
-            if let Err(e) = Command::new("rm")
-                .args(["-f", file])
-                .output()
-                .await
-            {
-                tracing::warn!(file = %file, error = %e, "failed to rm gcroot during destroy");
+            let path = std::path::Path::new(file);
+            if path.exists() {
+                let out = Command::new("rm")
+                    .args(["-f", file])
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    anyhow::bail!("failed to remove gcroot {}: {}", file, String::from_utf8_lossy(&out.stderr).trim());
+                }
             }
         }
         Ok(())

@@ -134,6 +134,19 @@ impl AppState {
         }
     }
 
+    pub fn restore_processes(&self, service_id: &str, vm_process: Option<Child>, aux_processes: Vec<Child>) {
+        let Ok(mut inner) = self.lock_inner() else {
+            return;
+        };
+        if inner.service_id == service_id {
+            if let Some(p) = vm_process {
+                inner.vm_pid = p.id();
+                inner.vm_process = Some(p);
+            }
+            inner.aux_processes.extend(aux_processes);
+        }
+    }
+
     pub fn status(&self) -> StatusResponse {
         let Ok(inner) = self.lock_inner() else {
             return StatusResponse {

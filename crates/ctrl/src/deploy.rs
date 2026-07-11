@@ -2,6 +2,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+use tokio::process::Command;
 
 use russel_core::{
     api::{DeployRequest, DeployResponse, DeployEvent, DeployTiming, PortMapping},
@@ -159,119 +160,192 @@ impl DeployPipeline {
             "build complete (kernel + busybox + modules cached)"
         );
 
-        // Now that the build has succeeded, we can safely teardown the old VM
+        // Now that the build has succeeded, we can prepare the backup and rollback path
+        let russel_dir = format!("/var/lib/russel/{}", service_id);
+        let microvms_dir = format!("/var/lib/microvms/{}", service_id);
+        let has_backup = std::path::Path::new(&russel_dir).exists();
+        if has_backup {
+            let _ = tokio::fs::rename(&russel_dir, format!("{}.bak", russel_dir)).await;
+            let _ = tokio::fs::rename(&microvms_dir, format!("{}.bak", microvms_dir)).await;
+        }
+
+        // Take the old processes from state
+        let (old_vm_proc, old_aux_procs) = self.state.take_processes_if_matches(service_id);
+
+        // Teardown the old VM (it will stop systemd service, delete old TAP, release ports)
+        // Since the directories are renamed to .bak, they are not deleted.
         let _ = self.runner.destroy(service_id).await;
-        let (vm_proc, aux_procs) = self.state.take_processes_if_matches(service_id);
-        if let Some(mut p) = vm_proc {
-            let _ = p.kill().await;
-        }
-        for mut p in aux_procs {
-            let _ = p.kill().await;
-        }
 
-        // ── 3. Allocate port + subnet ──────────────────────────────────────
-        let port = request.port.unwrap_or_else(|| PortMapping {
-            host: self.ports.next(),
-            guest: config.service.port,
-        });
-        let alloc: SubnetAllocation = subnet_for(service_id);
-        tracing::info!(
-            service_id,
-            host = port.host,
-            guest = port.guest,
-            vm_ip = %alloc.vm_ip,
-            "allocated"
-        );
-
-        // ── 4. Create initramfs (minimal rootfs with app + init) ───────────
-        let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "create".into(),
-                description: "Building minimal initramfs".into(),
-            })
-            .await;
-        let bin_name = config.service.bin_name().to_string();
-        let mem_mb = config.service.memory.as_mebibytes();
-
-        let initramfs_path = self
-            .runner
-            .build_initramfs(
+        let deploy_result = async {
+            let port = request.port.clone().unwrap_or_else(|| PortMapping {
+                host: self.ports.next(),
+                guest: config.service.port,
+            });
+            let alloc: SubnetAllocation = subnet_for(service_id);
+            tracing::info!(
                 service_id,
-                &alloc,
+                host = port.host,
+                guest = port.guest,
+                vm_ip = %alloc.vm_ip,
+                "allocated"
+            );
+
+            // ── 4. Create initramfs (minimal rootfs with app + init) ───────────
+            let t = Instant::now();
+            let _ = tx
+                .send(DeployEvent::Progress {
+                    phase: "create".into(),
+                    description: "Building minimal initramfs".into(),
+                })
+                .await;
+            let bin_name = config.service.bin_name().to_string();
+            let mem_mb = config.service.memory.as_mebibytes();
+
+            let initramfs_path = self
+                .runner
+                .build_initramfs(
+                    service_id,
+                    &alloc,
+                    port.guest,
+                    &build.store_path,
+                    &bin_name,
+                    &busybox,
+                    &kernel_modules,
+                )
+                .await?;
+            let create_ms = t.elapsed().as_millis();
+            tracing::info!(service_id, create_ms, "initramfs ready");
+
+            // ── 5. TAP + socat + boot VM (serial, as user requested) ──────────
+            let t = Instant::now();
+            let _ = tx
+                .send(DeployEvent::Progress {
+                    phase: "start".into(),
+                    description: "Setting up network + booting VM".into(),
+                })
+                .await;
+            tracing::info!(service_id, "setting up TAP + socat + booting VM (serial)");
+
+            // Step A: create TAP + setup port forwarding (socat)
+            let socat_child = TapForwarder::setup(&alloc, port.host, port.guest).await?;
+
+            // Step B: boot cloud-hypervisor with virtiofsd + minimal initramfs
+            let BootOutput { vm_child, virtiofsd_child } = self
+                .runner
+                .boot(service_id, &kernel, &initramfs_path, &alloc, mem_mb)
+                .await?;
+
+            // Write metadata.json for precise and secure cleanup
+            let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
+            let metadata = serde_json::json!({
+                "service_id": service_id,
+                "host_port": port.host,
+                "guest_port": port.guest,
+                "vm_ip": alloc.vm_ip,
+                "vm_pid": vm_child.id(),
+                "virtiofsd_pid": virtiofsd_child.id(),
+                "socat_pid": socat_child.id(),
+                "kernel_path": kernel.to_string_lossy(),
+                "mem_mb": mem_mb,
+            });
+            if let Ok(content) = serde_json::to_string_pretty(&metadata) {
+                let _ = std::fs::write(metadata_path, content);
+            }
+
+            let start_ms = t.elapsed().as_millis();
+            let network_ms = 0u128; // included in start_ms (serial)
+            tracing::info!(service_id, start_ms, "VM booted + network configured");
+
+            // ── 6. Wait for VM service to be reachable ───────────────────────────
+            let t = Instant::now();
+            let _ = tx
+                .send(DeployEvent::Progress {
+                    phase: "ready".into(),
+                    description: "Waiting for VM service to be reachable".into(),
+                })
+                .await;
+            tracing::info!(
+                service_id,
+                vm_ip = %alloc.vm_ip,
+                guest_port = port.guest,
+                "polling VM readiness"
+            );
+            let up = TapForwarder::wait_for_vm_port(
+                &alloc.vm_ip,
                 port.guest,
-                &build.store_path,
-                &bin_name,
-                &busybox,
-                &kernel_modules,
+                Duration::from_secs(10),
             )
-            .await?;
-        let create_ms = t.elapsed().as_millis();
-        tracing::info!(service_id, create_ms, "initramfs ready");
-
-        // ── 5. TAP + socat + boot VM (serial, as user requested) ──────────
-        let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "start".into(),
-                description: "Setting up network + booting VM".into(),
-            })
             .await;
-        tracing::info!(service_id, "setting up TAP + socat + booting VM (serial)");
-
-        // Step A: create TAP + setup port forwarding (socat)
-        let socat_child = TapForwarder::setup(&alloc, port.host, port.guest).await?;
-
-        // Step B: boot cloud-hypervisor with virtiofsd + minimal initramfs
-        let BootOutput { vm_child, virtiofsd_child } = self
-            .runner
-            .boot(service_id, &kernel, &initramfs_path, &alloc, mem_mb)
-            .await?;
-
-        // Write metadata.json for precise and secure cleanup
-        let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
-        let metadata = serde_json::json!({
-            "service_id": service_id,
-            "host_port": port.host,
-            "vm_ip": alloc.vm_ip,
-            "vm_pid": vm_child.id(),
-            "virtiofsd_pid": virtiofsd_child.id(),
-            "socat_pid": socat_child.id(),
-        });
-        if let Ok(content) = serde_json::to_string_pretty(&metadata) {
-            let _ = std::fs::write(metadata_path, content);
-        }
-
-        let start_ms = t.elapsed().as_millis();
-        let network_ms = 0u128; // included in start_ms (serial)
-        tracing::info!(service_id, start_ms, "VM booted + network configured");
-
-        // ── 6. Wait for VM service to be reachable ───────────────────────────
-        let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "ready".into(),
-                description: "Waiting for VM service to be reachable".into(),
-            })
-            .await;
-        tracing::info!(
-            service_id,
-            vm_ip = %alloc.vm_ip,
-            guest_port = port.guest,
-            "polling VM readiness"
-        );
-        let up = TapForwarder::wait_for_vm_port(
-            &alloc.vm_ip,
-            port.guest,
-            Duration::from_secs(10),
-        )
-        .await;
-        let ready_ms = t.elapsed().as_millis();
-        if up {
+            let ready_ms = t.elapsed().as_millis();
+            if !up {
+                anyhow::bail!("VM not reachable in 10s");
+            }
             tracing::info!(service_id, ready_ms, "VM service reachable");
-        } else {
-            tracing::warn!(service_id, "VM not reachable in 10s — continuing");
-        }
+
+            Ok::<_, anyhow::Error>((port, alloc, vm_child, virtiofsd_child, socat_child, initramfs_path, create_ms, start_ms, network_ms, ready_ms))
+        }.await;
+
+        let (port, alloc, vm_child, virtiofsd_child, socat_child, initramfs_path, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
+            Ok(val) => {
+                if has_backup {
+                    let _ = Command::new("rm").args(["-rf", &format!("{}.bak", russel_dir)]).output().await;
+                    let _ = Command::new("rm").args(["-rf", &format!("{}.bak", microvms_dir)]).output().await;
+                }
+                if let Some(mut p) = old_vm_proc {
+                    let _ = p.kill().await;
+                }
+                for mut p in old_aux_procs {
+                    let _ = p.kill().await;
+                }
+                val
+            }
+            Err(deploy_err) => {
+                tracing::error!(service_id, error = %deploy_err, "Deployment failed — initiating rollback to previous VM");
+                if has_backup {
+                    let _ = self.runner.destroy(service_id).await;
+                    let _ = tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await;
+                    let _ = tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await;
+                    let old_metadata_path = format!("{}/metadata.json", russel_dir);
+                    if let Ok(content) = std::fs::read_to_string(&old_metadata_path) {
+                        if let Ok(old_meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let old_host_port = old_meta["host_port"].as_u64().unwrap_or(3100) as u16;
+                            let old_guest_port = old_meta["guest_port"].as_u64().unwrap_or(3000) as u16;
+                            let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
+                            let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
+                            let old_initramfs_path = PathBuf::from(format!("{}/initramfs.img", russel_dir));
+                            let old_alloc = subnet_for(service_id);
+                            if let Ok(old_socat) = TapForwarder::setup(&old_alloc, old_host_port, old_guest_port).await {
+                                if let Ok(old_boot) = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await {
+                                    let old_vm_pid = old_boot.vm_child.id();
+                                    let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
+                                    let old_socat_pid = old_socat.id();
+
+                                    self.state.mark_deployed(service_id, old_boot.vm_child);
+                                    self.state.store_aux_process(old_socat);
+                                    self.state.store_aux_process(old_boot.virtiofsd_child);
+                                    let new_metadata = serde_json::json!({
+                                        "service_id": service_id,
+                                        "host_port": old_host_port,
+                                        "guest_port": old_guest_port,
+                                        "vm_ip": old_meta["vm_ip"],
+                                        "vm_pid": old_vm_pid,
+                                        "virtiofsd_pid": old_virtiofsd_pid,
+                                        "socat_pid": old_socat_pid,
+                                        "kernel_path": old_kernel_path.to_string_lossy(),
+                                        "mem_mb": old_mem_mb,
+                                    });
+                                    if let Ok(c) = serde_json::to_string_pretty(&new_metadata) {
+                                        let _ = std::fs::write(old_metadata_path, c);
+                                    }
+                                    tracing::info!(service_id, "Rollback to previous VM succeeded");
+                                }
+                            }
+                        }
+                    }
+                }
+                return Err(deploy_err);
+            }
+        };
 
         self.traefik.register(service_id, port.host).await?;
         self.state.attach_flake_path(service_id, repo_path.clone());
