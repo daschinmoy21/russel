@@ -49,12 +49,10 @@ async fn deploy(
     let tx_monitor = tx.clone();
     tokio::spawn(async move {
         if let Err(e) = handle.await {
-            if e.is_panic() {
-                tracing::error!(error = ?e, "deploy task panicked");
-                let _ = tx_monitor.send(DeployEvent::Error(
-                    format!("Control plane deployment task panicked: {:?}", e),
-                )).await;
-            }
+            tracing::error!(error = ?e, "deploy task failed");
+            let _ = tx_monitor.send(DeployEvent::Error(
+                format!("Control plane deployment task failed: {:?}", e),
+            )).await;
         }
     });
 
