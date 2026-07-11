@@ -160,10 +160,16 @@ impl DeployPipeline {
         );
 
         // ── 3. Allocate port + subnet ──────────────────────────────────────
-        let port = request.port.unwrap_or_else(|| PortMapping {
-            host: self.ports.next(),
-            guest: config.service.port,
-        });
+        let port = match request.port {
+            Some(p) => {
+                PortAllocator::reserve(service_id, p.host)?;
+                p
+            }
+            None => PortMapping {
+                host: self.ports.next(service_id)?,
+                guest: config.service.port,
+            },
+        };
         let alloc: SubnetAllocation = subnet_for(service_id);
         tracing::info!(
             service_id,

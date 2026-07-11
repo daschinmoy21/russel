@@ -1,5 +1,6 @@
 use std::{
-    sync::{Arc, atomic::{AtomicU16, Ordering}},
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -7,20 +8,70 @@ use tokio::process::Command;
 
 // ── Port allocator ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-pub struct PortAllocator {
-    next: Arc<AtomicU16>,
+struct PortRegistry {
+    allocations: HashMap<String, u16>,
+    busy_ports: HashSet<u16>,
 }
 
-impl Default for PortAllocator {
-    fn default() -> Self {
-        Self { next: Arc::new(AtomicU16::new(3100)) }
-    }
-}
+static PORT_REGISTRY: LazyLock<Mutex<PortRegistry>> = LazyLock::new(|| {
+    Mutex::new(PortRegistry {
+        allocations: HashMap::new(),
+        busy_ports: HashSet::new(),
+    })
+});
+
+#[derive(Debug, Clone, Default)]
+pub struct PortAllocator;
 
 impl PortAllocator {
-    pub fn next(&self) -> u16 {
-        self.next.fetch_add(1, Ordering::Relaxed)
+    pub fn next(&self, service_id: &str) -> anyhow::Result<u16> {
+        let mut registry = PORT_REGISTRY.lock().unwrap();
+        if let Some(old_port) = registry.allocations.remove(service_id) {
+            registry.busy_ports.remove(&old_port);
+        }
+        let mut port: u32 = 3100;
+        loop {
+            if port > 65535 {
+                anyhow::bail!("Port exhaustion: no ports available between 3100 and 65535");
+            }
+            let port_u16 = port as u16;
+            if !registry.busy_ports.contains(&port_u16) {
+                if std::net::TcpListener::bind(("127.0.0.1", port_u16)).is_ok() {
+                    registry.busy_ports.insert(port_u16);
+                    registry.allocations.insert(service_id.to_string(), port_u16);
+                    return Ok(port_u16);
+                }
+            }
+            port += 1;
+        }
+    }
+
+    pub fn reserve(service_id: &str, port: u16) -> anyhow::Result<()> {
+        let mut registry = PORT_REGISTRY.lock().unwrap();
+        if let Some(&existing_port) = registry.allocations.get(service_id) {
+            if existing_port == port {
+                return Ok(());
+            }
+        }
+        if registry.busy_ports.contains(&port) {
+            anyhow::bail!("Port {} is already reserved or in use", port);
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            anyhow::bail!("Port {} cannot be bound on 127.0.0.1", port);
+        }
+        if let Some(old_port) = registry.allocations.remove(service_id) {
+            registry.busy_ports.remove(&old_port);
+        }
+        registry.busy_ports.insert(port);
+        registry.allocations.insert(service_id.to_string(), port);
+        Ok(())
+    }
+
+    pub fn release(service_id: &str) {
+        let mut registry = PORT_REGISTRY.lock().unwrap();
+        if let Some(port) = registry.allocations.remove(service_id) {
+            registry.busy_ports.remove(&port);
+        }
     }
 }
 
@@ -200,11 +251,24 @@ mod tests {
     #[test]
     fn port_allocator_increments() {
         let alloc = PortAllocator::default();
-        let p1 = alloc.next();
-        let p2 = alloc.next();
-        let p3 = alloc.next();
+        let p1 = alloc.next("service-1").unwrap();
+        let p2 = alloc.next("service-2").unwrap();
+        let p3 = alloc.next("service-3").unwrap();
         assert_eq!(p1, 3100);
         assert_eq!(p2, 3101);
         assert_eq!(p3, 3102);
+    }
+
+    #[test]
+    fn port_allocator_reserve_and_release() {
+        // Reserve a specific port
+        assert!(PortAllocator::reserve("custom-service", 4000).is_ok());
+        // Reserve the same port for another service should fail
+        assert!(PortAllocator::reserve("another-service", 4000).is_err());
+        // Release it
+        PortAllocator::release("custom-service");
+        // Now reserve for another service should succeed
+        assert!(PortAllocator::reserve("another-service", 4000).is_ok());
+        PortAllocator::release("another-service");
     }
 }
