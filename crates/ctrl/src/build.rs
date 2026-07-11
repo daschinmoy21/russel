@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use tokio::process::Command;
@@ -8,69 +9,95 @@ pub struct BuildOutput {
     pub store_path: PathBuf,
 }
 
+static CURRENT_SYSTEM: OnceLock<String> = OnceLock::new();
+
+pub async fn current_system() -> String {
+    if let Some(sys) = CURRENT_SYSTEM.get() {
+        return sys.clone();
+    }
+    let out = Command::new("nix")
+        .args(["eval", "--impure", "--raw", "--expr", "builtins.currentSystem"])
+        .output()
+        .await;
+    let sys = match out {
+        Ok(output) if output.status.success() => {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !s.is_empty() {
+                s
+            } else {
+                "x86_64-linux".to_string()
+            }
+        }
+        _ => "x86_64-linux".to_string(),
+    };
+    let _ = CURRENT_SYSTEM.set(sys.clone());
+    sys
+}
+
 #[derive(Debug, Default)]
 pub struct NixBuilder;
 
 impl NixBuilder {
-    pub fn ensure_flake_exists(&self, repo_path: &Path) -> Result<()> {
+    pub async fn ensure_flake_exists(&self, repo_path: &Path) -> Result<()> {
         let flake_path = repo_path.join("flake.nix");
         if flake_path.exists() {
             return Ok(());
         }
 
-        tracing::info!("No flake.nix found. Auto-detecting project type to generate a default flake.");
+        let system = current_system().await;
+        tracing::info!(system = %system, "No flake.nix found. Auto-detecting project type to generate a default flake.");
 
         let flake_content = if repo_path.join("Cargo.toml").exists() {
             tracing::info!("Detected Rust project.");
-            r#"{
+            format!(r#"{{
   description = "Auto-generated Rust flake by Russel";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-  outputs = { self, nixpkgs }:
+  outputs = {{ self, nixpkgs }}:
     let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    in {
-      packages.x86_64-linux.default = pkgs.rustPlatform.buildRustPackage {
+      pkgs = nixpkgs.legacyPackages.{system};
+    in {{
+      packages.{system}.default = pkgs.rustPlatform.buildRustPackage {{
         pname = "app";
         version = "0.1.0";
         src = ./.;
-        cargoLock = {
+        cargoLock = {{
           lockFile = ./Cargo.lock;
-        };
-      };
-    };
-}"#
+        }};
+      }};
+    }};
+}}"#, system = system)
         } else if repo_path.join("go.mod").exists() {
             tracing::info!("Detected Go project.");
-            r#"{
+            format!(r#"{{
   description = "Auto-generated Go flake by Russel";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-  outputs = { self, nixpkgs }:
+  outputs = {{ self, nixpkgs }}:
     let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    in {
-      packages.x86_64-linux.default = pkgs.buildGoModule {
+      pkgs = nixpkgs.legacyPackages.{system};
+    in {{
+      packages.{system}.default = pkgs.buildGoModule {{
         pname = "app";
         version = "0.1.0";
         src = ./.;
         vendorHash = null;
-      };
-    };
-}"#
+      }};
+    }};
+}}"#, system = system)
         } else {
             tracing::info!("Defaulting to static web server flake.");
-            r#"{
+            format!(r#"{{
   description = "Auto-generated Static site flake by Russel";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-  outputs = { self, nixpkgs }:
+  outputs = {{ self, nixpkgs }}:
     let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    in {
-      packages.x86_64-linux.default = pkgs.writeShellScriptBin "app" ''
-        cd ${./.}
-        exec ${pkgs.python3}/bin/python3 -m http.server "$PORT"
+      pkgs = nixpkgs.legacyPackages.{system};
+    in {{
+      packages.{system}.default = pkgs.writeShellScriptBin "app" ''
+        cd ${{./.}}
+        exec ${{pkgs.python3}}/bin/python3 -m http.server "$PORT"
       '';
-    };
-}"#
+    }};
+}}"#, system = system)
         };
 
         std::fs::write(&flake_path, flake_content)?;
@@ -79,13 +106,11 @@ impl NixBuilder {
     }
 
     pub async fn build(&self, repo_path: &Path) -> Result<BuildOutput> {
-        self.ensure_flake_exists(repo_path)?;
+        self.ensure_flake_exists(repo_path).await?;
 
-        // Build the default package from the project flake.
-        // We try `#packages.x86_64-linux.default` first for explicitness; if that
-        // attribute doesn't exist nix will error and we surface the message clearly.
-        let flake_ref = format!("path:{}#packages.x86_64-linux.default", repo_path.display());
-        let output = Command::new("nix")
+        let system = current_system().await;
+        let flake_ref = format!("path:{}#packages.{}.default", repo_path.display(), system);
+        let mut output = Command::new("nix")
             .arg("build")
             .arg(&flake_ref)
             .arg("--no-link")
@@ -95,11 +120,25 @@ impl NixBuilder {
             .await?;
 
         if !output.status.success() {
-            anyhow::bail!(
-                "nix build failed for {}:\n{}",
-                flake_ref,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            let fallback_ref = format!("path:{}#defaultPackage.{}", repo_path.display(), system);
+            tracing::info!(system = %system, "packages.{}.default failed, trying defaultPackage", system);
+            output = Command::new("nix")
+                .arg("build")
+                .arg(&fallback_ref)
+                .arg("--no-link")
+                .arg("--print-out-paths")
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                anyhow::bail!(
+                    "nix build failed for both {} and {}:\n{}",
+                    flake_ref,
+                    fallback_ref,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
         }
 
         let store_path = String::from_utf8_lossy(&output.stdout)
