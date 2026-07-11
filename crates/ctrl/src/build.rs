@@ -127,7 +127,7 @@ impl NixBuilder {
                 .arg(&fallback_ref)
                 .arg("--no-link")
                 .arg("--print-out-paths")
-                .stderr(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::piped())
                 .output()
                 .await?;
 
