@@ -32,6 +32,8 @@ async fn deploy(
     
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
+    let monitor_state = state.clone();
+    let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
 
     let deploy_handle = tokio::spawn(async move {
         let pipeline = DeployPipeline::new(state);
@@ -55,6 +57,7 @@ async fn deploy(
                     .map(|s| s.to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "deploy task panicked".to_string());
+                monitor_state.mark_failed(&service_id, msg.clone());
                 let _ = tx.send(DeployEvent::Error(msg)).await;
             }
             // Cancelled join errors (runtime shutdown) are intentionally dropped

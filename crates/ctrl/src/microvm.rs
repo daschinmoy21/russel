@@ -737,7 +737,7 @@ exec /bin/sh
     }
 
     /// Validate service_id to prevent path traversal and ensure it's a safe identifier.
-    fn validate_service_id(service_id: &str) -> anyhow::Result<()> {
+    pub fn validate_service_id(service_id: &str) -> anyhow::Result<()> {
         if service_id.is_empty() {
             anyhow::bail!("service_id cannot be empty");
         }

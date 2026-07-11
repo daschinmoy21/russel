@@ -187,18 +187,23 @@ impl DeployPipeline {
             "build complete (kernel + busybox + modules cached)"
         );
 
+        // Validate service_id before any filesystem operations
+        MicrovmRunner::validate_service_id(service_id)?;
+
         // Now that the build has succeeded, we can prepare the backup and rollback path
         let russel_dir = format!("/var/lib/russel/{}", service_id);
         let microvms_dir = format!("/var/lib/microvms/{}", service_id);
+        let russel_bak = format!("{}.bak", russel_dir);
+        let microvms_bak = format!("{}.bak", microvms_dir);
         let has_backup = std::path::Path::new(&russel_dir).exists();
         if has_backup {
             // Perform transactional backup: propagate errors and restore on failure
-            if let Err(e) = tokio::fs::rename(&russel_dir, format!("{}.bak", russel_dir)).await {
+            if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
                 anyhow::bail!("failed to backup russel directory: {}", e);
             }
-            if let Err(e) = tokio::fs::rename(&microvms_dir, format!("{}.bak", microvms_dir)).await {
+            if let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await {
                 // Restore the first rename on failure
-                let _ = tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await;
+                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
                 anyhow::bail!("failed to backup microvms directory: {}", e);
             }
         }
@@ -209,10 +214,12 @@ impl DeployPipeline {
         // Teardown the old VM (it will stop systemd service, delete old TAP, release ports)
         // Since the directories are renamed to .bak, they are not deleted.
         if let Err(e) = self.runner.destroy(service_id).await {
+            // Restore processes first so the lifecycle can be re-attempted
+            self.state.restore_processes(service_id, old_vm_proc, old_aux_procs);
             // Restore backups on teardown failure
             if has_backup {
-                let _ = tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await;
-                let _ = tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await;
+                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
             }
             anyhow::bail!("failed to teardown old VM: {}", e);
         }
@@ -334,13 +341,13 @@ impl DeployPipeline {
                 val
             }
             Err(deploy_err) => {
-                tracing::error!(service_id, error = %deploy_err, "Deployment failed — initiating rollback to previous VM");
+                tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
+                // Always tear down any partially-created VM from the failed deployment
+                let _ = self.runner.destroy(service_id).await;
                 if has_backup {
                     let rollback_res = async {
-                        // Ensure teardown succeeds before restoring directories
-                        self.runner.destroy(service_id).await?;
-                        tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await?;
-                        tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await?;
+                        tokio::fs::rename(&russel_bak, &russel_dir).await?;
+                        tokio::fs::rename(&microvms_bak, &microvms_dir).await?;
                         let old_metadata_path = format!("{}/metadata.json", russel_dir);
                         let content = std::fs::read_to_string(&old_metadata_path)?;
                         let old_meta: serde_json::Value = serde_json::from_str(&content)?;
@@ -350,10 +357,10 @@ impl DeployPipeline {
                         let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
                         let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
                         let old_alloc = subnet_for(service_id);
-                        
+
                         let old_socat = TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
                         let old_boot = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await?;
-                        
+
                         let old_vm_pid = old_boot.vm_child.id();
                         let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
                         let old_socat_pid = old_socat.id();
@@ -361,7 +368,7 @@ impl DeployPipeline {
                         self.state.mark_deployed(service_id, old_boot.vm_child);
                         self.state.store_aux_process(old_socat);
                         self.state.store_aux_process(old_boot.virtiofsd_child);
-                        
+
                         let new_metadata = serde_json::json!({
                             "service_id": service_id,
                             "host_port": old_host_port,
