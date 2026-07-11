@@ -124,7 +124,12 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         }
     }
 
-    let response = final_response.ok_or_else(|| anyhow::anyhow!("control plane closed connection before complete"))?;
+    let response = final_response.ok_or_else(|| {
+        anyhow::anyhow!(
+            "control plane closed connection before complete. \
+             Run `russel logs` or check `russel status` for details."
+        )
+    })?;
 
     println!();
     print_deploy_response(response, wall.elapsed());

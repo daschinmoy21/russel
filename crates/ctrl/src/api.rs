@@ -32,9 +32,10 @@ async fn deploy(
     
     let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-    tokio::spawn(async move {
+    let tx_clone = tx.clone();
+    let handle = tokio::spawn(async move {
         let pipeline = DeployPipeline::new(state);
-        let response = pipeline.deploy(request, tx.clone()).await;
+        let response = pipeline.deploy(request, tx_clone.clone()).await;
         let status = response.status.clone();
         let elapsed_ms = response.elapsed_ms;
         tracing::info!(
@@ -42,7 +43,17 @@ async fn deploy(
             elapsed_ms = elapsed_ms,
             "POST /deploy -> {}", status
         );
-        let _ = tx.send(DeployEvent::Complete(response)).await;
+        let _ = tx_clone.send(DeployEvent::Complete(response)).await;
+    });
+
+    let tx_monitor = tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            tracing::error!(error = ?e, "deploy task failed");
+            let _ = tx_monitor.send(DeployEvent::Error(
+                "deploy task failed".to_string(),
+            )).await;
+        }
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
