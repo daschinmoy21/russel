@@ -31,10 +31,11 @@ async fn deploy(
     );
     
     let (tx, rx) = tokio::sync::mpsc::channel(100);
+    let deploy_tx = tx.clone();
 
-    tokio::spawn(async move {
+    let deploy_handle = tokio::spawn(async move {
         let pipeline = DeployPipeline::new(state);
-        let response = pipeline.deploy(request, tx.clone()).await;
+        let response = pipeline.deploy(request, deploy_tx.clone()).await;
         let status = response.status.clone();
         let elapsed_ms = response.elapsed_ms;
         tracing::info!(
@@ -42,7 +43,23 @@ async fn deploy(
             elapsed_ms = elapsed_ms,
             "POST /deploy -> {}", status
         );
-        let _ = tx.send(DeployEvent::Complete(response)).await;
+        let _ = deploy_tx.send(DeployEvent::Complete(response)).await;
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = deploy_handle.await {
+            if e.is_panic() {
+                let panic = e.into_panic();
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "deploy task panicked".to_string());
+                let _ = tx.send(DeployEvent::Error(msg)).await;
+            }
+            // Cancelled join errors (runtime shutdown) are intentionally dropped
+            // so the client falls back to the generic closed-connection message.
+        }
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
