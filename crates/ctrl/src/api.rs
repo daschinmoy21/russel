@@ -96,8 +96,17 @@ async fn vm_stop(
     Path(id): Path<String>,
 ) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
-    state.set_status_if_matches(&id, "stopping", "pending");
-    let (vm_child, aux_processes) = state.take_processes_if_matches(&id);
+
+    // Atomically claim the service for this lifecycle operation
+    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&id, "stopping", "pending") {
+        Some(processes) => processes,
+        None => {
+            return Err((
+                axum::http::StatusCode::CONFLICT,
+                format!("service {} not found or already in use", id),
+            ));
+        }
+    };
 
     let mut vm_failed = None;
     let mut aux_failed = Vec::new();
@@ -127,6 +136,7 @@ async fn vm_stop(
         ));
     }
 
+    // Runner's stop method now only does cleanup that doesn't duplicate child process killing
     let runner = MicrovmRunner::new();
     match runner.stop(&id).await {
         Ok(_) => {
@@ -147,8 +157,17 @@ async fn vm_destroy(
     Path(id): Path<String>,
 ) -> Result<Json<String>, (axum::http::StatusCode, String)> {
     tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
-    state.set_status_if_matches(&id, "destroying", "pending");
-    let (vm_child, aux_processes) = state.take_processes_if_matches(&id);
+
+    // Atomically claim the service for this lifecycle operation
+    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&id, "destroying", "pending") {
+        Some(processes) => processes,
+        None => {
+            return Err((
+                axum::http::StatusCode::CONFLICT,
+                format!("service {} not found or already in use", id),
+            ));
+        }
+    };
 
     let mut vm_failed = None;
     let mut aux_failed = Vec::new();
@@ -178,6 +197,7 @@ async fn vm_destroy(
         ));
     }
 
+    // Runner's destroy method now only does cleanup that doesn't duplicate child process killing
     let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {

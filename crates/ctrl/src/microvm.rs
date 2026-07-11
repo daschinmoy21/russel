@@ -576,7 +576,10 @@ exec /bin/sh
         })
     }
 
-    /// Stop a running VM by killing the cloud-hypervisor, virtiofsd, and socat processes.
+    /// Stop a running VM by terminating systemd service and verifying process cleanup.
+    /// Note: This method assumes the caller (api.rs) has already killed tracked child
+    /// processes from AppState. This method handles only metadata-based or pattern-matched
+    /// process cleanup for cases where processes weren't tracked in state.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
         let unit = format!("microvm@{}.service", service_id);
         match Command::new("systemctl")
@@ -593,50 +596,102 @@ exec /bin/sh
             _ => {}
         }
 
-        // Try to read metadata first
+        // Read metadata to verify/validate PIDs before attempting cleanup
         let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
-        let mut killed_any = false;
+        let mut verified_kills = Vec::new();
         if let Ok(content) = std::fs::read_to_string(&metadata_path) {
             if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+                // Verify and kill each PID only if it still belongs to the expected process
                 if let Some(vm_pid) = metadata.get("vm_pid").and_then(|v| v.as_u64()) {
-                    let _ = Command::new("kill").arg(vm_pid.to_string()).output().await;
+                    if Self::verify_process_ownership(vm_pid as u32, service_id) {
+                        if let Ok(out) = Command::new("kill").arg(vm_pid.to_string()).output().await {
+                            if out.status.success() {
+                                verified_kills.push(("vm", vm_pid));
+                            }
+                        }
+                    }
                 }
                 if let Some(virtiofsd_pid) = metadata.get("virtiofsd_pid").and_then(|v| v.as_u64()) {
-                    let _ = Command::new("kill").arg(virtiofsd_pid.to_string()).output().await;
+                    if Self::verify_process_ownership(virtiofsd_pid as u32, service_id) {
+                        if let Ok(out) = Command::new("kill").arg(virtiofsd_pid.to_string()).output().await {
+                            if out.status.success() {
+                                verified_kills.push(("virtiofsd", virtiofsd_pid));
+                            }
+                        }
+                    }
                 }
                 if let Some(socat_pid) = metadata.get("socat_pid").and_then(|v| v.as_u64()) {
-                    let _ = Command::new("kill").arg(socat_pid.to_string()).output().await;
+                    if Self::verify_process_ownership(socat_pid as u32, service_id) {
+                        if let Ok(out) = Command::new("kill").arg(socat_pid.to_string()).output().await {
+                            if out.status.success() {
+                                verified_kills.push(("socat", socat_pid));
+                            }
+                        }
+                    }
                 }
-                killed_any = true;
             }
         }
 
-        if !killed_any {
+        // Fallback: use pattern-based pkill only if no metadata-based kills succeeded
+        if verified_kills.is_empty() {
             let escaped_id = escape_regex(service_id);
+            let mut pkill_results = Vec::new();
+
             // Kill cloud-hypervisor
-            let _ = Command::new("pkill")
+            if let Ok(out) = Command::new("pkill")
                 .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}(,|$)", escaped_id)])
                 .output()
-                .await;
+                .await
+            {
+                pkill_results.push(("cloud-hypervisor", out.status.success()));
+            }
 
             // Kill virtiofsd
-            let _ = Command::new("pkill")
+            if let Ok(out) = Command::new("pkill")
                 .args(["-f", &format!("virtiofsd.*russel/{}/", escaped_id)])
                 .output()
-                .await;
+                .await
+            {
+                pkill_results.push(("virtiofsd", out.status.success()));
+            }
 
             // Kill socat
-            let _ = Command::new("pkill")
+            if let Ok(out) = Command::new("pkill")
                 .args(["-f", &format!("socat-russel-{}", escaped_id)])
                 .output()
-                .await;
+                .await
+            {
+                pkill_results.push(("socat", out.status.success()));
+            }
+
+            tracing::debug!(service_id, ?pkill_results, "fallback pkill cleanup results");
+        } else {
+            tracing::debug!(service_id, ?verified_kills, "metadata-based process cleanup completed");
         }
 
         Ok(())
     }
 
+    /// Verify that a PID belongs to a process associated with the given service_id.
+    /// This is a best-effort check to avoid killing unrelated processes.
+    fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+            // Check if the command line contains the service_id
+            // For cloud-hypervisor: check for tap=vm-{service_id}
+            // For virtiofsd: check for russel/{service_id}/
+            // For socat: check for socat-russel-{service_id}
+            cmdline.contains(service_id)
+        } else {
+            false
+        }
+    }
+
     /// Destroy all state for a microVM.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
+        // Validate service_id before using it in any paths
+        Self::validate_service_id(service_id)?;
+
         let alloc = crate::network::subnet_for(service_id);
 
         self.stop(service_id).await?;
@@ -677,6 +732,28 @@ exec /bin/sh
                     anyhow::bail!("failed to remove gcroot {}: {}", file, String::from_utf8_lossy(&out.stderr).trim());
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validate service_id to prevent path traversal and ensure it's a safe identifier.
+    fn validate_service_id(service_id: &str) -> anyhow::Result<()> {
+        if service_id.is_empty() {
+            anyhow::bail!("service_id cannot be empty");
+        }
+        if service_id.len() > 128 {
+            anyhow::bail!("service_id too long (max 128 characters)");
+        }
+        // Check for path separators and traversal components
+        if service_id.contains('/') || service_id.contains('\\') {
+            anyhow::bail!("service_id cannot contain path separators");
+        }
+        if service_id.contains("..") || service_id == "." {
+            anyhow::bail!("service_id cannot contain path traversal components");
+        }
+        // Ensure it only contains safe characters (alphanumeric, dash, underscore)
+        if !service_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            anyhow::bail!("service_id can only contain alphanumeric characters, dashes, and underscores");
         }
         Ok(())
     }

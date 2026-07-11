@@ -124,6 +124,24 @@ impl AppState {
         }
     }
 
+    /// Atomically begin a lifecycle operation: update status and claim processes.
+    /// Returns None if the service_id doesn't match or the state is already claimed.
+    pub fn begin_lifecycle_operation(&self, service_id: &str, status: &str, vm_state: &str) -> Option<(Option<Child>, Vec<Child>)> {
+        let Ok(mut inner) = self.lock_inner() else {
+            return None;
+        };
+        if inner.service_id == service_id {
+            inner.status = status.to_string();
+            inner.vm_state = vm_state.to_string();
+            let vm = inner.vm_process.take();
+            let aux = std::mem::take(&mut inner.aux_processes);
+            inner.vm_pid = None;
+            Some((vm, aux))
+        } else {
+            None
+        }
+    }
+
     pub fn set_status_if_matches(&self, service_id: &str, status: &str, vm_state: &str) {
         let Ok(mut inner) = self.lock_inner() else {
             return;

@@ -19,6 +19,7 @@ use crate::{
     traefik::TraefikClient,
 };
 
+
 #[derive(Debug)]
 pub struct DeployPipeline {
     state: AppState,
@@ -92,25 +93,51 @@ impl DeployPipeline {
             }
             Err(error) => {
                 let elapsed = started.elapsed().as_millis();
-                tracing::error!(
-                    service_id = %service_id,
-                    elapsed_ms = elapsed,
-                    error = %error,
-                    "deploy failed"
-                );
-                self.state.mark_failed(&service_id, error.to_string());
-                DeployResponse {
-                    service_id,
-                    vm_id,
-                    status: "failed".to_string(),
-                    store_path: None,
-                    microvm_config_path: None,
-                    runner_path: None,
-                    port: None,
-                    elapsed_ms: elapsed,
-                    timing: None,
-                    vm_ip: None,
-                    message: error.to_string(),
+                let error_msg = error.to_string();
+
+                // Check if this is a successful rollback case
+                if error_msg.starts_with("ROLLBACK_SUCCESS:") {
+                    tracing::info!(
+                        service_id = %service_id,
+                        elapsed_ms = elapsed,
+                        "deploy failed but successfully rolled back to previous VM"
+                    );
+                    // Do NOT mark as failed - the old VM was restored and is running
+                    let original_error = error_msg.trim_start_matches("ROLLBACK_SUCCESS:").trim();
+                    DeployResponse {
+                        service_id,
+                        vm_id,
+                        status: "deployed".to_string(),
+                        store_path: None,
+                        microvm_config_path: None,
+                        runner_path: None,
+                        port: None,
+                        elapsed_ms: elapsed,
+                        timing: None,
+                        vm_ip: None,
+                        message: format!("deployment failed but rolled back successfully: {}", original_error),
+                    }
+                } else {
+                    tracing::error!(
+                        service_id = %service_id,
+                        elapsed_ms = elapsed,
+                        error = %error,
+                        "deploy failed"
+                    );
+                    self.state.mark_failed(&service_id, error.to_string());
+                    DeployResponse {
+                        service_id,
+                        vm_id,
+                        status: "failed".to_string(),
+                        store_path: None,
+                        microvm_config_path: None,
+                        runner_path: None,
+                        port: None,
+                        elapsed_ms: elapsed,
+                        timing: None,
+                        vm_ip: None,
+                        message: error.to_string(),
+                    }
                 }
             }
         }
@@ -165,8 +192,15 @@ impl DeployPipeline {
         let microvms_dir = format!("/var/lib/microvms/{}", service_id);
         let has_backup = std::path::Path::new(&russel_dir).exists();
         if has_backup {
-            let _ = tokio::fs::rename(&russel_dir, format!("{}.bak", russel_dir)).await;
-            let _ = tokio::fs::rename(&microvms_dir, format!("{}.bak", microvms_dir)).await;
+            // Perform transactional backup: propagate errors and restore on failure
+            if let Err(e) = tokio::fs::rename(&russel_dir, format!("{}.bak", russel_dir)).await {
+                anyhow::bail!("failed to backup russel directory: {}", e);
+            }
+            if let Err(e) = tokio::fs::rename(&microvms_dir, format!("{}.bak", microvms_dir)).await {
+                // Restore the first rename on failure
+                let _ = tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await;
+                anyhow::bail!("failed to backup microvms directory: {}", e);
+            }
         }
 
         // Take the old processes from state
@@ -174,7 +208,14 @@ impl DeployPipeline {
 
         // Teardown the old VM (it will stop systemd service, delete old TAP, release ports)
         // Since the directories are renamed to .bak, they are not deleted.
-        let _ = self.runner.destroy(service_id).await;
+        if let Err(e) = self.runner.destroy(service_id).await {
+            // Restore backups on teardown failure
+            if has_backup {
+                let _ = tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await;
+                let _ = tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await;
+            }
+            anyhow::bail!("failed to teardown old VM: {}", e);
+        }
 
         let deploy_result = async {
             let port = request.port.clone().unwrap_or_else(|| PortMapping {
@@ -236,6 +277,7 @@ impl DeployPipeline {
                 .await?;
 
             // Write metadata.json for precise and secure cleanup
+            // This must succeed for deployment to be considered successful
             let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
             let metadata = serde_json::json!({
                 "service_id": service_id,
@@ -248,9 +290,10 @@ impl DeployPipeline {
                 "kernel_path": kernel.to_string_lossy(),
                 "mem_mb": mem_mb,
             });
-            if let Ok(content) = serde_json::to_string_pretty(&metadata) {
-                let _ = std::fs::write(metadata_path, content);
-            }
+            let content = serde_json::to_string_pretty(&metadata)
+                .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
+            std::fs::write(&metadata_path, content)
+                .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", metadata_path, e))?;
 
             let start_ms = t.elapsed().as_millis();
             let network_ms = 0u128; // included in start_ms (serial)
@@ -287,23 +330,15 @@ impl DeployPipeline {
 
         let (port, alloc, vm_child, virtiofsd_child, socat_child, initramfs_path, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
             Ok(val) => {
-                if has_backup {
-                    let _ = Command::new("rm").args(["-rf", &format!("{}.bak", russel_dir)]).output().await;
-                    let _ = Command::new("rm").args(["-rf", &format!("{}.bak", microvms_dir)]).output().await;
-                }
-                if let Some(mut p) = old_vm_proc {
-                    let _ = p.kill().await;
-                }
-                for mut p in old_aux_procs {
-                    let _ = p.kill().await;
-                }
+                // Do NOT delete backups or kill old processes yet - wait until after Traefik registration
                 val
             }
             Err(deploy_err) => {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — initiating rollback to previous VM");
                 if has_backup {
                     let rollback_res = async {
-                        let _ = self.runner.destroy(service_id).await;
+                        // Ensure teardown succeeds before restoring directories
+                        self.runner.destroy(service_id).await?;
                         tokio::fs::rename(format!("{}.bak", russel_dir), &russel_dir).await?;
                         tokio::fs::rename(format!("{}.bak", microvms_dir), &microvms_dir).await?;
                         let old_metadata_path = format!("{}/metadata.json", russel_dir);
@@ -344,17 +379,37 @@ impl DeployPipeline {
                         Ok::<(), anyhow::Error>(())
                     }.await;
 
-                    if let Err(rollback_err) = rollback_res {
-                        tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
-                    } else {
-                        tracing::info!(service_id, "Rollback to previous VM succeeded");
+                    match rollback_res {
+                        Ok(()) => {
+                            tracing::info!(service_id, "Rollback to previous VM succeeded");
+                            // Note: state.mark_deployed was already called inside the rollback closure
+                            // Return an error that indicates rollback succeeded (caller should NOT mark as failed)
+                            return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
+                        }
+                        Err(rollback_err) => {
+                            tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
+                        }
                     }
                 }
                 return Err(deploy_err);
             }
         };
 
+        // Register with Traefik before committing the deployment
         self.traefik.register(service_id, port.host).await?;
+
+        // Only after successful Traefik registration, clean up old resources
+        if has_backup {
+            let _ = Command::new("rm").args(["-rf", &format!("{}.bak", russel_dir)]).output().await;
+            let _ = Command::new("rm").args(["-rf", &format!("{}.bak", microvms_dir)]).output().await;
+        }
+        if let Some(mut p) = old_vm_proc {
+            let _ = p.kill().await;
+        }
+        for mut p in old_aux_procs {
+            let _ = p.kill().await;
+        }
+
         self.state.attach_flake_path(service_id, repo_path.clone());
 
         Ok(DeployOutput {
