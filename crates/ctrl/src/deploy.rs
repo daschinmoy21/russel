@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::process::Command;
@@ -14,7 +15,7 @@ use crate::{
     database::DatabaseProvisioner,
     git::GitClient,
     microvm::{BootOutput, MicrovmRunner},
-    network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
+    network::{PortAllocator, SubnetAllocation, TapForwarder, release_subnet, subnet_for},
     state::AppState,
     traefik::TraefikClient,
 };
@@ -30,6 +31,8 @@ pub struct DeployPipeline {
     runner: MicrovmRunner,
     ports: PortAllocator,
     traefik: TraefikClient,
+    /// Whether the current deploy attempt allocated a NEW subnet slot.
+    subnet_acquired: AtomicBool,
 }
 
 impl DeployPipeline {
@@ -42,6 +45,7 @@ impl DeployPipeline {
             runner: MicrovmRunner::new(),
             ports: PortAllocator::default(),
             traefik: TraefikClient::default(),
+            subnet_acquired: AtomicBool::new(false),
         }
     }
 
@@ -125,6 +129,12 @@ impl DeployPipeline {
                         "deploy failed"
                     );
                     self.state.mark_failed(&service_id, error.to_string());
+                    // ponytail: release subnet only if THIS attempt acquired it.
+                    // If the service was already deployed (re-deploy hit a build error),
+                    // the existing reservation must be left alone.
+                    if self.subnet_acquired.load(Ordering::Relaxed) {
+                        release_subnet(&service_id);
+                    }
                     DeployResponse {
                         service_id,
                         vm_id,
@@ -229,7 +239,9 @@ impl DeployPipeline {
                 host: self.ports.next(),
                 guest: config.service.port,
             });
-            let alloc: SubnetAllocation = subnet_for(service_id);
+            // Allocate subnet and track if it's newly allocated
+            let (alloc, newly_allocated) = subnet_for(service_id)?;
+            self.subnet_acquired.store(newly_allocated, Ordering::Relaxed);
             tracing::info!(
                 service_id,
                 host = port.host,
@@ -344,6 +356,12 @@ impl DeployPipeline {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
                 // Always tear down any partially-created VM from the failed deployment
                 let _ = self.runner.destroy(service_id).await;
+                
+                // Release subnet only if THIS attempt allocated it
+                if self.subnet_acquired.load(Ordering::Relaxed) {
+                    release_subnet(service_id);
+                }
+                
                 if has_backup {
                     let rollback_res = async {
                         tokio::fs::rename(&russel_bak, &russel_dir).await?;
@@ -356,7 +374,7 @@ impl DeployPipeline {
                         let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
                         let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
                         let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
-                        let old_alloc = subnet_for(service_id);
+                        let (old_alloc, _) = subnet_for(service_id)?;
 
                         let old_socat = TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
                         let old_boot = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await?;

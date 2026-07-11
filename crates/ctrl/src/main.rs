@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::state::AppState;
+use crate::network::release_subnet;
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -67,6 +68,7 @@ async fn cleanup_all_vms() {
                     if let Err(e) = runner.destroy(&vm_id).await {
                         tracing::warn!(vm_id = %vm_id, error = %e, "failed to destroy microVM during shutdown");
                     }
+                    release_subnet(&vm_id);
                 }));
             }
             for task in tasks {

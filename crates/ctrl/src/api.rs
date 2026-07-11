@@ -6,7 +6,7 @@ use axum::{
 use russel_core::api::{DeployRequest, DeployEvent, LogsResponse, StatusResponse, VmsResponse};
 use tokio_stream::StreamExt;
 
-use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, state::AppState};
+use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, network::release_subnet, state::AppState};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -165,6 +165,7 @@ async fn vm_stop(
     let runner = MicrovmRunner::new();
     match runner.stop(&id).await {
         Ok(_) => {
+            release_subnet(&id);
             tracing::info!(vm_id = %id, "stopped microvm");
             state.set_status_if_matches(&id, "stopped", "none");
             Ok(Json(format!("stopped {}", id)))
@@ -226,6 +227,7 @@ async fn vm_destroy(
     let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {
+            release_subnet(&id);
             tracing::info!(vm_id = %id, "destroyed microvm");
             state.set_status_if_matches(&id, "destroyed", "none");
             Ok(Json(format!("destroyed {}", id)))
