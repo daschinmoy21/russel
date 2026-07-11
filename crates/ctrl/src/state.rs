@@ -44,28 +44,22 @@ impl Default for AppState {
 }
 
 impl AppState {
-    fn lock_inner(&self) -> anyhow::Result<std::sync::MutexGuard<'_, StateInner>> {
-        self.inner.lock().map_err(|e| {
-            tracing::error!("state lock is poisoned — prior panic in locked section");
-            anyhow::anyhow!("state lock poisoned: {}", e)
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, StateInner> {
+        self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("state lock is poisoned — recovering prior state");
+            e.into_inner()
         })
     }
 
     pub fn mark_building(&self, service_id: &str) {
-        let Ok(mut inner) = self.lock_inner() else {
-            tracing::error!("failed to mark state as building");
-            return;
-        };
+        let mut inner = self.lock_inner();
         inner.service_id = service_id.to_string();
         inner.status = "building".to_string();
         inner.vm_state = "pending".to_string();
     }
 
     pub fn mark_deployed(&self, service_id: &str, child: Child) {
-        let Ok(mut inner) = self.lock_inner() else {
-            tracing::error!("failed to mark state as deployed");
-            return;
-        };
+        let mut inner = self.lock_inner();
         inner.service_id = service_id.to_string();
         inner.status = "deployed".to_string();
         inner.vm_state = "running".to_string();
@@ -75,10 +69,7 @@ impl AppState {
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
-        let Ok(mut inner) = self.lock_inner() else {
-            tracing::error!("failed to mark state as failed");
-            return;
-        };
+        let mut inner = self.lock_inner();
         inner.service_id = service_id.to_string();
         inner.status = "failed".to_string();
         inner.vm_state = "failed".to_string();
@@ -88,10 +79,7 @@ impl AppState {
     }
 
     pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
-        let Ok(mut inner) = self.lock_inner() else {
-            tracing::error!("failed to attach flake path");
-            return;
-        };
+        let mut inner = self.lock_inner();
         inner.service_id = service_id.to_string();
         inner.logs.push_str(&format!(
             "using flake at {} (service_id: {})\n",
@@ -103,22 +91,12 @@ impl AppState {
 
     /// Park a child process (e.g. socat) so it stays alive as long as the state exists.
     pub fn store_aux_process(&self, child: Child) {
-        let Ok(mut inner) = self.lock_inner() else {
-            tracing::error!("failed to store aux process");
-            return;
-        };
+        let mut inner = self.lock_inner();
         inner.aux_processes.push(child);
     }
 
     pub fn status(&self) -> StatusResponse {
-        let Ok(inner) = self.lock_inner() else {
-            return StatusResponse {
-                service_id: "unknown".into(),
-                status: "error".into(),
-                vm_state: "error".into(),
-                uptime_seconds: 0,
-            };
-        };
+        let inner = self.lock_inner();
         StatusResponse {
             service_id: inner.service_id.clone(),
             status: inner.status.clone(),
@@ -128,11 +106,7 @@ impl AppState {
     }
 
     pub fn logs(&self) -> LogsResponse {
-        let Ok(inner) = self.lock_inner() else {
-            return LogsResponse {
-                output: String::new(),
-            };
-        };
+        let inner = self.lock_inner();
         LogsResponse {
             output: inner.logs.clone(),
         }
@@ -142,5 +116,26 @@ impl AppState {
     #[allow(dead_code)]
     pub fn is_healthy(&self) -> bool {
         self.inner.try_lock().is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mutex_poisoning_recovery() {
+        let state = AppState::default();
+        
+        // Poison the lock intentionally in a separate thread/panic
+        let inner_clone = state.inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _lock = inner_clone.lock().unwrap();
+            panic!("poisoning lock");
+        }).join();
+
+        // The lock is now poisoned, but lock_inner should recover it
+        let inner = state.lock_inner();
+        assert_eq!(inner.service_id, "api");
     }
 }
