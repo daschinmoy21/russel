@@ -36,7 +36,8 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        tracing::info!("building kernel from nixpkgs (cached after first run)");
+        let system = crate::build::current_system().await;
+        tracing::info!(system = %system, "building kernel from nixpkgs (cached after first run)");
         let output = Command::new("nix")
             .args([
                 "build",
@@ -44,6 +45,7 @@ impl MicrovmRunner {
                 "--print-out-paths",
                 "-f",
                 "<nixpkgs>",
+                "--argstr", "system", &system,
                 "linux",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -72,7 +74,8 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        tracing::info!("building busybox from nixpkgs (cached after first run)");
+        let system = crate::build::current_system().await;
+        tracing::info!(system = %system, "building busybox from nixpkgs (cached after first run)");
         let output = Command::new("nix")
             .args([
                 "build",
@@ -80,6 +83,7 @@ impl MicrovmRunner {
                 "--print-out-paths",
                 "-f",
                 "<nixpkgs>",
+                "--argstr", "system", &system,
                 "busybox",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -109,7 +113,9 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        tracing::info!("resolving kernel modules from nixpkgs");
+        let system = crate::build::current_system().await;
+        tracing::info!(system = %system, "resolving kernel modules from nixpkgs");
+        let expr = format!("let pkgs = import <nixpkgs> {{ system = \"{}\"; }}; in pkgs.linux.modules", system);
         let output = Command::new("nix")
             .args([
                 "build",
@@ -117,7 +123,7 @@ impl MicrovmRunner {
                 "--no-link",
                 "--print-out-paths",
                 "--expr",
-                "let pkgs = import <nixpkgs> {}; in pkgs.linux.modules",
+                &expr,
             ])
             .stderr(std::process::Stdio::inherit())
             .output()
