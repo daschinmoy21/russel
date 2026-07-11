@@ -51,7 +51,7 @@ async fn deploy(
         if let Err(e) = handle.await {
             tracing::error!(error = ?e, "deploy task failed");
             let _ = tx_monitor.send(DeployEvent::Error(
-                format!("Control plane deployment task failed: {:?}", e),
+                "deploy task failed".to_string(),
             )).await;
         }
     });
