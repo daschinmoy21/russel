@@ -52,13 +52,18 @@ async fn deploy(
         if let Err(e) = deploy_handle.await {
             if e.is_panic() {
                 let panic = e.into_panic();
-                let msg = panic
+                let detail = panic
                     .downcast_ref::<&'static str>()
                     .map(|s| s.to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "deploy task panicked".to_string());
-                monitor_state.mark_failed(&service_id, msg.clone());
-                let _ = tx.send(DeployEvent::Error(msg)).await;
+                tracing::error!(
+                    service_id = %service_id,
+                    panic = %detail,
+                    "deploy task panicked"
+                );
+                monitor_state.mark_failed(&service_id, detail);
+                let _ = tx.send(DeployEvent::Error("deploy task failed".to_string())).await;
             }
             // Cancelled join errors (runtime shutdown) are intentionally dropped
             // so the client falls back to the generic closed-connection message.
