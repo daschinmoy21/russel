@@ -72,8 +72,8 @@ impl DeployPipeline {
                     "deploy succeeded"
                 );
                 self.state.mark_deployed(&service_id, output.vm_child);
-                self.state.store_aux_process(output.socat_child);
-                self.state.store_aux_process(output.virtiofsd_child);
+                self.state.store_aux_process(&service_id, output.socat_child);
+                self.state.store_aux_process(&service_id, output.virtiofsd_child);
                 DeployResponse {
                     service_id,
                     vm_id,
@@ -209,7 +209,7 @@ impl DeployPipeline {
         }
 
         // Take the old processes from state
-        let (old_vm_proc, old_aux_procs) = self.state.take_processes_if_matches(service_id);
+        let (old_vm_proc, old_aux_procs) = self.state.take_processes(service_id).unwrap_or((None, Vec::new()));
 
         // Teardown the old VM (it will stop systemd service, delete old TAP, release ports)
         // Since the directories are renamed to .bak, they are not deleted.
@@ -382,8 +382,8 @@ impl DeployPipeline {
                         let old_socat_pid = old_socat.id();
 
                         self.state.mark_deployed(service_id, old_boot.vm_child);
-                        self.state.store_aux_process(old_socat);
-                        self.state.store_aux_process(old_boot.virtiofsd_child);
+                        self.state.store_aux_process(service_id, old_socat);
+                        self.state.store_aux_process(service_id, old_boot.virtiofsd_child);
 
                         let new_metadata = serde_json::json!({
                             "service_id": service_id,
