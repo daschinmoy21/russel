@@ -55,7 +55,22 @@ impl DeployPipeline {
         let vm_id = service_id.clone();
 
         tracing::info!(service_id = %service_id, repo = %request.repo_url, "deploy started");
-        self.state.mark_building(&service_id);
+        if let Err(e) = self.state.mark_building(&service_id) {
+            tracing::error!(service_id = %service_id, error = %e, "deploy rejected: service busy");
+            return DeployResponse {
+                service_id,
+                vm_id,
+                status: "failed".to_string(),
+                store_path: None,
+                microvm_config_path: None,
+                runner_path: None,
+                port: None,
+                elapsed_ms: started.elapsed().as_millis(),
+                timing: None,
+                vm_ip: None,
+                message: e.to_string(),
+            };
+        }
 
         let result = self.deploy_inner(&service_id, request, tx).await;
 
@@ -71,9 +86,11 @@ impl DeployPipeline {
                     guest_port,
                     "deploy succeeded"
                 );
-                self.state.mark_deployed(&service_id, output.vm_child);
-                self.state.store_aux_process(&service_id, output.socat_child);
-                self.state.store_aux_process(&service_id, output.virtiofsd_child);
+                self.state.mark_deployed_with_aux(
+                    &service_id,
+                    output.vm_child,
+                    vec![output.socat_child, output.virtiofsd_child],
+                );
                 DeployResponse {
                     service_id,
                     vm_id,
@@ -381,9 +398,11 @@ impl DeployPipeline {
                         let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
                         let old_socat_pid = old_socat.id();
 
-                        self.state.mark_deployed(service_id, old_boot.vm_child);
-                        self.state.store_aux_process(service_id, old_socat);
-                        self.state.store_aux_process(service_id, old_boot.virtiofsd_child);
+                        self.state.mark_deployed_with_aux(
+                            service_id,
+                            old_boot.vm_child,
+                            vec![old_socat, old_boot.virtiofsd_child],
+                        );
 
                         let new_metadata = serde_json::json!({
                             "service_id": service_id,

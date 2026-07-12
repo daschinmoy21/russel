@@ -6,36 +6,53 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    rust-overlay,
-    ...
-  }: let
-    supportedSystems = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
-    forEachSupportedSystem = f:
-      nixpkgs.lib.genAttrs supportedSystems (system:
-        f {
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [(import rust-overlay)];
-          };
-        });
-  in {
-    devShells = forEachSupportedSystem ({pkgs}: {
-      default = pkgs.mkShell {
-        packages = with pkgs; [
-          rust-bin.stable.latest.default
-          rust-analyzer
-          pkg-config
-          openssl
-          cloud-hypervisor
-        ];
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
+    let
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      forEachSupportedSystem =
+        f:
+        nixpkgs.lib.genAttrs supportedSystems (
+          system:
+          f {
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [ (import rust-overlay) ];
+            };
+          }
+        );
+    in
+    {
+      devShells = forEachSupportedSystem (
+        { pkgs }: {
+          default = pkgs.mkShell {
+            packages =
+              with pkgs;
+              [
+                rust-bin.stable.latest.default
+                rust-analyzer
+                pkg-config
+                openssl
+              ]
+              # nixpkgs supports cloud-hypervisor only on aarch64-linux and x86_64-linux,
+              # so it must be gated to Linux to avoid Darwin evaluation failures.
+              ++ (lib.optional stdenv.isLinux cloud-hypervisor);
 
-        shellHook = ''
-          echo "Rust development environment loaded!"
-        '';
-      };
-    });
-  };
+            shellHook = ''
+              echo "Rust development environment loaded!"
+            '';
+          };
+        }
+      );
+    };
 }
