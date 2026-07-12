@@ -8,13 +8,13 @@ Power users can still provide and customize a `flake.nix` when they need full Ni
 
 ## Design Goals
 
-Russel should provide a workflow like:
+Russel aims to provide a workflow like:
 
 ```bash
-russel init
-russel develop
-russel build
-russel deploy
+russel init          # planned — not yet implemented
+russel develop       # planned — not yet implemented
+russel build         # planned — not yet implemented
+russel deploy        # implemented — POST /deploy via control plane
 ```
 
 Internally, these commands may invoke Nix, but Nix should be an implementation detail for normal users.
@@ -153,13 +153,15 @@ YAML can represent the complete Russel model directly:
 
 YAML also has risks. Russel should use a YAML 1.2 parser, reject unknown fields, validate types strictly, and avoid surprising implicit values such as `yes`, `no`, or numeric-looking strings. A single canonical filename such as `Russelfile.yaml` is preferable to silently searching many formats.
 
-A practical compatibility plan would be:
+Manifest format contract and precedence
 
-- support the current `Russelfile.toml` during the MVP;
-- make `Russelfile.yaml` the preferred structured format for the richer model;
-- allow `russel init` to generate YAML by default;
-- keep TOML as a backwards-compatible input format;
-- support Dockerfile import or a constrained Dockerfile frontend separately.
+- Russelfile.yaml takes precedence over Russelfile.toml when both exist.
+- If both exist, Russelfile.yaml is used for all generation and runtime behavior.
+- Russelfile.toml remains supported for backwards-compatibility and is used only if YAML is not present.
+- russel init reads Russelfile.yaml when present; if YAML is missing, it reads Russelfile.toml; when both exist, YAML wins.
+- For core commands (russel build, russel deploy, russel check), the same precedence applies: YAML if present, otherwise TOML.
+- In managed mode, custom-flake metadata, and dependency handling, Russelfile.yaml governs the behavior; TOML is only used if YAML is absent.
+- TOML compatibility is maintained: existing TOML inputs should continue to work with legacy flows.
 
 ## Dockerfile Compatibility
 
@@ -598,7 +600,7 @@ Build secrets require additional care. If private dependencies need credentials 
 
 ## Proposed Commands
 
-### `russel init`
+### `russel init` [planned]
 
 Create a starter manifest:
 
@@ -618,7 +620,7 @@ An optional flag can create both the manifest and a generated flake:
 russel init --with-flake
 ```
 
-### `russel develop`
+### `russel develop` [planned]
 
 Start the project's development shell:
 
@@ -636,7 +638,7 @@ The command should use `exec`-style behavior so shell signals and exit codes wor
 
 If a custom `flake.nix` exists, Russel should use its `devShells.<system>.default` output.
 
-### `russel build`
+### `russel build` [planned]
 
 Build the deployment artifact without deploying a microVM:
 
@@ -669,7 +671,7 @@ russel deploy . -p 8080:3000
 
 The deployment path should not maintain a separate or subtly different Nix build implementation.
 
-### `russel check`
+### `russel check` [planned]
 
 Validate the project before building or deploying:
 
