@@ -649,8 +649,10 @@ russel build .
 Internally, this is equivalent to:
 
 ```bash
-nix build path:.#packages.<system>.default --no-link --print-out-paths
+nix build path:.#packages.x86_64-linux.default --no-link --print-out-paths
 ```
+
+Russell substitutes the system placeholder with the actual target system, e.g., x86_64-linux, when constructing the command.
 
 Russel should present a friendly result:
 
@@ -686,39 +688,40 @@ This command should validate the manifest, dependencies, flake outputs, binary c
 For a simple Rust project, Russel could generate a flake conceptually like this:
 
 ```nix
+# Pseudocode illustrating manifest deployment contract (per-system outputs)
 {
   description = "Russel project";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+  # This schematic shows per-system artifacts; real flake would derive these with lib/genAttrs
   outputs = { self, nixpkgs }:
-    let
-      system = builtins.currentSystem;
-      pkgs = nixpkgs.legacyPackages.${system};
-
-      buildInputs = with pkgs; [
-        pkg-config
-        openssl
-      ];
-
-      devInputs = with pkgs; [
-        rust-analyzer
-      ];
-    in {
-      packages.${system}.default =
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "api";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = buildInputs;
-        };
-
-      devShells.${system}.default =
-        pkgs.mkShell {
-          packages = devInputs ++ buildInputs;
-        };
+  {
+    packages = {
+      "x86_64-linux"."default" = nixpkgs.legacyPackages."x86_64-linux".rustPlatform.buildRustPackage {
+        pname = "api"; version = "0.1.0"; src = ./.; cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ nixpkgs.legacyPackages."x86_64-linux".pkg-config ];
+        buildInputs = [ nixpkgs.legacyPackages."x86_64-linux".openssl ];
+      };
+      "aarch64-linux"."default" = nixpkgs.legacyPackages."aarch64-linux".rustPlatform.buildRustPackage {
+        pname = "api"; version = "0.1.0"; src = ./.; cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ nixpkgs.legacyPackages."aarch64-linux".pkg-config ];
+        buildInputs = [ nixpkgs.legacyPackages."aarch64-linux".openssl ];
+      };
     };
+
+    devShells = {
+      "x86_64-linux"."default" = nixpkgs.legacyPackages."x86_64-linux".mkShell {
+        packages = [ nixpkgs.legacyPackages."x86_64-linux".rustAnalyzer ];
+      };
+      "aarch64-linux"."default" = nixpkgs.legacyPackages."aarch64-linux".mkShell {
+        packages = [ nixpkgs.legacyPackages."aarch64-linux".rustAnalyzer ];
+      };
+    };
+
+    # Additional manifest fields such as artifact source/target mappings, runtime checks,
+    # and an exec/apps boot entrypoint would be derived from the Russelfile manifest.
+  };
 }
 ```
 

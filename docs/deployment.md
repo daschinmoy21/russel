@@ -5,6 +5,7 @@ This guide describes how to configure and deploy any application onto the Russel
 ## Zero-Config Deployment (Automatic flake.nix)
 
 By default, Russel features **Zero-Config deployment**. If your repository does not contain a `flake.nix`, the Russel control plane will automatically detect your project type and generate a default `flake.nix` for you:
+
 - **Rust projects**: Detected by `Cargo.toml`. Auto-generates a flake using `Cargo.lock` to fetch and compile dependencies.
 - **Go projects**: Detected by `go.mod`. Auto-generates a Go build module.
 - **Static files / scripts / others**: Auto-generates a lightweight static server powered by Python's `http.server` to host directory files.
@@ -15,7 +16,7 @@ If you are a power user or need custom native dependencies/system libraries, you
 
 ## 1. Russelfile.toml Configuration
 
-The `Russelfile.toml` specifies the runtime requirements of your microVM. 
+The `Russelfile.toml` specifies the runtime requirements of your microVM.
 
 ### Template & Reference
 
@@ -26,7 +27,7 @@ Create a file named `Russelfile.toml` in your project root with the following st
 # The unique name of your service
 name = "my-app"
 
-# The source directory of the project (relative to the repository root)
+# The source directory of the project (reserved for future multi-service repos)
 source = "."
 
 # The internal guest port the application listens on
@@ -40,7 +41,7 @@ memory = "256mb"
 # Defaults to the value of `service.name` if not specified.
 bin = "my-app"
 
-# Optional: Automatic Docker-backed database provisioning on the host
+# Optional: Database provisioning (planned — current: placeholder)
 [database.postgres]
 enabled = false
 
@@ -52,12 +53,13 @@ enabled = false
 
 ## 2. flake.nix Configuration
 
-Russel builds your application using Nix. The control plane specifically builds the **`packages.x86_64-linux.default`** output from your `flake.nix`.
+Russel builds your application using Nix. The control plane builds the **`packages.<system>.default`** output (using your host's detected Nix system), falling back to `#defaultPackage.<system>` if that fails. If no `flake.nix` exists, Russel auto-generates one.
 
 Here are three templates for common application stacks.
 
 ### Template A: Go Application
-For Go applications, use `buildGoModule`. Nix handles vendoring and building automatically:
+
+For Go applications, use `buildGoModule`. The `system` variable should match your host (e.g. `x86_64-linux`, `aarch64-linux`):
 
 ```nix
 {
@@ -74,10 +76,6 @@ For Go applications, use `buildGoModule`. Nix handles vendoring and building aut
         pname = "my-go-app";
         version = "0.1.0";
         src = ./.;
-        
-        # Set to null if using go.mod and dependencies are vendored, 
-        # or specify the sha256 hash of the dependencies:
-        # vendorHash = "sha256-...........................................";
         vendorHash = null;
       };
     };
@@ -85,6 +83,7 @@ For Go applications, use `buildGoModule`. Nix handles vendoring and building aut
 ```
 
 ### Template B: Rust Application
+
 For Rust applications, use `rustPlatform.buildRustPackage`:
 
 ```nix
@@ -111,6 +110,7 @@ For Rust applications, use `rustPlatform.buildRustPackage`:
 ```
 
 ### Template C: Precompiled Binaries & Shell Wrappers
+
 If your app is already distributed as a precompiled binary in Nixpkgs (e.g., Python scripts, Caddy, Node, Jenkins, Filebrowser), you can use a shell script wrapper. This avoids compilation entirely and fetches the package from the Nix cache:
 
 ```nix
@@ -140,13 +140,11 @@ If your app is already distributed as a precompiled binary in Nixpkgs (e.g., Pyt
 
 ---
 
-## 3. Health Checks Requirement
+## 3. Readiness Check
 
-Every application deployed on Russel must expose a HTTP health check endpoint:
-- **Path**: `/health`
-- **Port**: The port specified in `Russelfile.toml` (or read from the `PORT` environment variable).
+Russel verifies deployment readiness by TCP-connecting to the guest port for up to 10 seconds. If the port doesn't respond, the deployment is rolled back to the previous working VM.
 
-Russel polls this endpoint immediately after booting the guest VM. The deployment is considered successful once the endpoint returns a `200 OK` status. If it fails to respond within 10 seconds, the deployment will report a warning.
+**Recommended convention**: Expose a `GET /health` endpoint on your app's `PORT`. While Russel doesn't currently check HTTP status, this endpoint will be used by future Traefik health checks and is a good practice for any service.
 
 ---
 
