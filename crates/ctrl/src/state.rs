@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -13,7 +14,11 @@ pub struct AppState {
 
 #[derive(Debug)]
 struct StateInner {
-    service_id: String,
+    services: HashMap<String, ServiceState>,
+}
+
+#[derive(Debug)]
+struct ServiceState {
     status: String,
     vm_state: String,
     logs: String,
@@ -25,19 +30,26 @@ struct StateInner {
     aux_processes: Vec<Child>,
 }
 
+impl Default for ServiceState {
+    fn default() -> Self {
+        Self {
+            status: "idle".into(),
+            vm_state: "none".into(),
+            logs: String::new(),
+            started_at: Instant::now(),
+            flake_path: None,
+            vm_pid: None,
+            vm_process: None,
+            aux_processes: Vec::new(),
+        }
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(StateInner {
-                service_id: "api".to_string(),
-                status: "idle".to_string(),
-                vm_state: "none".to_string(),
-                logs: String::new(),
-                started_at: Instant::now(),
-                flake_path: None,
-                vm_pid: None,
-                vm_process: None,
-                aux_processes: Vec::new(),
+                services: HashMap::new(),
             })),
         }
     }
@@ -51,112 +63,137 @@ impl AppState {
         })
     }
 
+    pub fn list_services(&self) -> Vec<String> {
+        let inner = self.lock_inner();
+        let mut ids: Vec<String> = inner.services.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     pub fn mark_building(&self, service_id: &str) {
         let mut inner = self.lock_inner();
-        inner.service_id = service_id.to_string();
-        inner.status = "building".to_string();
-        inner.vm_state = "pending".to_string();
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.status = "building".to_string();
+        s.vm_state = "pending".to_string();
     }
 
     pub fn mark_deployed(&self, service_id: &str, child: Child) {
         let mut inner = self.lock_inner();
-        inner.service_id = service_id.to_string();
-        inner.status = "deployed".to_string();
-        inner.vm_state = "running".to_string();
-        inner.started_at = Instant::now();
-        inner.vm_pid = child.id();
-        inner.vm_process = Some(child);
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.status = "deployed".to_string();
+        s.vm_state = "running".to_string();
+        s.started_at = Instant::now();
+        s.vm_pid = child.id();
+        s.vm_process = Some(child);
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
         let mut inner = self.lock_inner();
-        inner.service_id = service_id.to_string();
-        inner.status = "failed".to_string();
-        inner.vm_state = "failed".to_string();
-        inner.vm_pid = None;
-        inner.logs.push_str(&error);
-        inner.logs.push('\n');
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.status = "failed".to_string();
+        s.vm_state = "failed".to_string();
+        s.vm_pid = None;
+        s.logs.push_str(&error);
+        s.logs.push('\n');
     }
 
     pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
         let mut inner = self.lock_inner();
-        inner.service_id = service_id.to_string();
-        inner.logs.push_str(&format!(
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.logs.push_str(&format!(
             "using flake at {} (service_id: {})\n",
             flake_path.display(),
             service_id
         ));
-        inner.flake_path = Some(flake_path);
+        s.flake_path = Some(flake_path);
     }
 
-    /// Park a child process (e.g. socat) so it stays alive as long as the state exists.
-    pub fn store_aux_process(&self, child: Child) {
+    /// Park a child process (e.g. socat) so it stays alive as long as the service exists.
+    pub fn store_aux_process(&self, service_id: &str, child: Child) {
         let mut inner = self.lock_inner();
-        inner.aux_processes.push(child);
-    }
-
-    pub fn take_processes_if_matches(&self, service_id: &str) -> (Option<Child>, Vec<Child>) {
-        let mut inner = self.lock_inner();
-        if inner.service_id == service_id {
-            let vm = inner.vm_process.take();
-            let aux = std::mem::take(&mut inner.aux_processes);
-            inner.vm_pid = None;
-            (vm, aux)
-        } else {
-            (None, Vec::new())
+        if let Some(s) = inner.services.get_mut(service_id) {
+            s.aux_processes.push(child);
         }
     }
 
-    /// Atomically begin a lifecycle operation: update status and claim processes.
-    /// Returns None if the service_id doesn't match or the state is already claimed.
-    pub fn begin_lifecycle_operation(&self, service_id: &str, status: &str, vm_state: &str) -> Option<(Option<Child>, Vec<Child>)> {
+    /// Take processes for a service. Returns None if the service doesn't exist.
+    pub fn take_processes(&self, service_id: &str) -> Option<(Option<Child>, Vec<Child>)> {
         let mut inner = self.lock_inner();
-        if inner.service_id == service_id {
-            inner.status = status.to_string();
-            inner.vm_state = vm_state.to_string();
-            let vm = inner.vm_process.take();
-            let aux = std::mem::take(&mut inner.aux_processes);
-            inner.vm_pid = None;
-            Some((vm, aux))
-        } else {
-            None
+        let s = inner.services.get_mut(service_id)?;
+        let vm = s.vm_process.take();
+        let aux = std::mem::take(&mut s.aux_processes);
+        s.vm_pid = None;
+        Some((vm, aux))
+    }
+
+    /// Atomically begin a lifecycle operation: claim processes and update status.
+    /// Returns None if the service doesn't exist or is already in a lifecycle op.
+    pub fn begin_lifecycle_operation(
+        &self,
+        service_id: &str,
+        status: &str,
+        vm_state: &str,
+    ) -> Option<(Option<Child>, Vec<Child>)> {
+        let mut inner = self.lock_inner();
+        let s = inner.services.get_mut(service_id)?;
+        // Prevent concurrent lifecycle ops on the same service
+        if s.status == "stopping" || s.status == "destroying" || s.status == "building" {
+            return None;
+        }
+        s.status = status.to_string();
+        s.vm_state = vm_state.to_string();
+        let vm = s.vm_process.take();
+        let aux = std::mem::take(&mut s.aux_processes);
+        s.vm_pid = None;
+        Some((vm, aux))
+    }
+
+    pub fn set_status(&self, service_id: &str, status: &str, vm_state: &str) {
+        let mut inner = self.lock_inner();
+        if let Some(s) = inner.services.get_mut(service_id) {
+            s.status = status.to_string();
+            s.vm_state = vm_state.to_string();
         }
     }
 
-    pub fn set_status_if_matches(&self, service_id: &str, status: &str, vm_state: &str) {
+    pub fn restore_processes(
+        &self,
+        service_id: &str,
+        vm_process: Option<Child>,
+        aux_processes: Vec<Child>,
+    ) {
         let mut inner = self.lock_inner();
-        if inner.service_id == service_id {
-            inner.status = status.to_string();
-            inner.vm_state = vm_state.to_string();
-        }
-    }
-
-    pub fn restore_processes(&self, service_id: &str, vm_process: Option<Child>, aux_processes: Vec<Child>) {
-        let mut inner = self.lock_inner();
-        if inner.service_id == service_id {
+        if let Some(s) = inner.services.get_mut(service_id) {
             if let Some(p) = vm_process {
-                inner.vm_pid = p.id();
-                inner.vm_process = Some(p);
+                s.vm_pid = p.id();
+                s.vm_process = Some(p);
             }
-            inner.aux_processes.extend(aux_processes);
+            s.aux_processes.extend(aux_processes);
         }
     }
 
-    pub fn status(&self) -> StatusResponse {
-        let inner = self.lock_inner();
-        StatusResponse {
-            service_id: inner.service_id.clone(),
-            status: inner.status.clone(),
-            vm_state: inner.vm_state.clone(),
-            uptime_seconds: inner.started_at.elapsed().as_secs(),
-        }
+    pub fn remove_service(&self, service_id: &str) {
+        let mut inner = self.lock_inner();
+        inner.services.remove(service_id);
     }
 
-    pub fn logs(&self) -> LogsResponse {
+    pub fn status(&self, service_id: &str) -> Option<StatusResponse> {
         let inner = self.lock_inner();
-        LogsResponse {
-            output: inner.logs.clone(),
-        }
+        let s = inner.services.get(service_id)?;
+        Some(StatusResponse {
+            service_id: service_id.to_string(),
+            status: s.status.clone(),
+            vm_state: s.vm_state.clone(),
+            uptime_seconds: s.started_at.elapsed().as_secs(),
+        })
+    }
+
+    pub fn logs(&self, service_id: &str) -> Option<LogsResponse> {
+        let inner = self.lock_inner();
+        let s = inner.services.get(service_id)?;
+        Some(LogsResponse {
+            output: s.logs.clone(),
+        })
     }
 
     /// Check if the state inner is healthy (not poisoned).
@@ -179,10 +216,77 @@ mod tests {
         let _ = std::thread::spawn(move || {
             let _lock = inner_clone.lock().unwrap();
             panic!("poisoning lock");
-        }).join();
+        })
+        .join();
 
         // The lock is now poisoned, but lock_inner should recover it
         let inner = state.lock_inner();
-        assert_eq!(inner.service_id, "api");
+        assert!(inner.services.is_empty());
+    }
+
+    #[test]
+    fn test_mark_and_status() {
+        let state = AppState::default();
+        state.mark_building("svc-1");
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "building");
+        assert_eq!(status.vm_state, "pending");
+
+        // Unknown service returns None
+        assert!(state.status("svc-2").is_none());
+    }
+
+    #[test]
+    fn test_mark_deployed_then_logs_and_status() {
+        let state = AppState::default();
+        state.mark_building("svc-a");
+        // We can't create a real Child in tests, so mark_failed is the easier path
+        state.mark_failed("svc-a", "test error".into());
+        let status = state.status("svc-a").unwrap();
+        assert_eq!(status.status, "failed");
+        let logs = state.logs("svc-a").unwrap();
+        assert!(logs.output.contains("test error"));
+    }
+
+    #[test]
+    fn test_services_are_independent() {
+        let state = AppState::default();
+        state.mark_building("alpha");
+        state.mark_building("beta");
+        state.mark_failed("beta", "beta error".into());
+
+        let alpha = state.status("alpha").unwrap();
+        assert_eq!(alpha.status, "building");
+        let beta = state.status("beta").unwrap();
+        assert_eq!(beta.status, "failed");
+    }
+
+    #[test]
+    fn test_begin_lifecycle_operation() {
+        let state = AppState::default();
+        state.mark_building("svc-1");
+        // begin_lifecycle_operation should be None while status is "building"
+        assert!(state
+            .begin_lifecycle_operation("svc-1", "stopping", "pending")
+            .is_none());
+    }
+
+    #[test]
+    fn test_remove_service() {
+        let state = AppState::default();
+        state.mark_building("svc-1");
+        assert!(state.status("svc-1").is_some());
+        state.remove_service("svc-1");
+        assert!(state.status("svc-1").is_none());
+    }
+
+    #[test]
+    fn test_list_services() {
+        let state = AppState::default();
+        state.mark_building("z");
+        state.mark_building("a");
+        state.mark_building("m");
+        let ids = state.list_services();
+        assert_eq!(ids, vec!["a", "m", "z"]);
     }
 }
