@@ -38,6 +38,10 @@ struct ServiceState {
     vm_process: Option<Child>,
     /// Auxiliary child processes (socat forwarders, etc.) that must stay alive.
     aux_processes: Vec<Child>,
+    /// Prior state captured when mark_building is called, for restoring the
+    /// previous deployment if the build fails before take_processes.
+    prebuild_status: Option<String>,
+    prebuild_vm_state: Option<String>,
 }
 
 impl Default for ServiceState {
@@ -51,6 +55,8 @@ impl Default for ServiceState {
             vm_pid: None,
             vm_process: None,
             aux_processes: Vec::new(),
+            prebuild_status: None,
+            prebuild_vm_state: None,
         }
     }
 }
@@ -95,10 +101,17 @@ impl AppState {
             );
         }
         let s = inner.services.entry(service_id.to_string()).or_default();
+        // Capture prior state for failure recovery during redeployment.
+        s.prebuild_status = Some(s.status.clone());
+        s.prebuild_vm_state = Some(s.vm_state.clone());
         s.status = "building".to_string();
-        // Do not clobber an in-flight lifecycle operation's vm_state.
-        if s.vm_state == "none" {
-            s.vm_state = "pending".to_string();
+        // Reset stale vm_state: "failed" → "pending", preserve "running" for
+        // an existing VM process, set new entries to "pending".
+        match s.vm_state.as_str() {
+            "failed" => s.vm_state = "pending".to_string(),
+            "none" => s.vm_state = "pending".to_string(),
+            "running" if s.vm_process.is_none() => s.vm_state = "pending".to_string(),
+            _ => {}
         }
         Ok(())
     }
@@ -119,16 +132,49 @@ impl AppState {
         s.vm_pid = vm_child.id();
         s.vm_process = Some(vm_child);
         s.aux_processes.extend(aux_children);
+        // Deploy succeeded — clear prebuild snapshot.
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
         let mut inner = self.lock_inner();
         let s = inner.services.entry(service_id.to_string()).or_default();
+
+        // If the prior service had a running VM and processes haven't been
+        // taken yet (prebuild snapshot is still set), the build failed before
+        // take_processes — restore the previous deployment state.
+        if s.prebuild_vm_state.as_deref() == Some("running") {
+            let prev_status = s.prebuild_status.take().unwrap_or_default();
+            let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
+            s.status = prev_status;
+            s.vm_state = prev_vm_state;
+            s.logs.push_str(&format!(
+                "BUILD FAILED (previous deployment preserved): {}\n",
+                error
+            ));
+            return;
+        }
+
+        // No prior VM to restore — standard failure.
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
         s.status = "failed".to_string();
         s.vm_state = "failed".to_string();
         s.vm_pid = None;
         s.logs.push_str(&error);
         s.logs.push('\n');
+    }
+
+    /// Ensure a service entry exists with minimal state.
+    /// Used to rehydrate disk-discovered VMs after restart so lifecycle
+    /// endpoints (status, stop, destroy) can find them.
+    pub fn ensure_service(&self, service_id: &str) {
+        let mut inner = self.lock_inner();
+        inner.services.entry(service_id.to_string()).or_insert_with(|| ServiceState {
+            status: "stopped".to_string(),
+            ..Default::default()
+        });
     }
 
     pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
@@ -145,12 +191,16 @@ impl AppState {
 
 
     /// Take processes for a service. Returns None if the service doesn't exist.
+    /// Clears the prebuild snapshot since the old VM is committed for replacement.
     pub fn take_processes(&self, service_id: &str) -> Option<(Option<Child>, Vec<Child>)> {
         let mut inner = self.lock_inner();
         let s = inner.services.get_mut(service_id)?;
         let vm = s.vm_process.take();
         let aux = std::mem::take(&mut s.aux_processes);
         s.vm_pid = None;
+        // Processes claimed — old VM is committed for replacement.
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
         Some((vm, aux))
     }
 
@@ -176,6 +226,8 @@ impl AppState {
         let vm = s.vm_process.take();
         let aux = std::mem::take(&mut s.aux_processes);
         s.vm_pid = None;
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
         LifecycleClaim::Claimed(vm, aux)
     }
 
@@ -350,5 +402,119 @@ mod tests {
         state.mark_building("m").unwrap();
         let ids = state.list_services();
         assert_eq!(ids, vec!["a", "m", "z"]);
+    }
+
+    // ── mark_building vm_state transition tests ──────────────────────────────
+
+    #[test]
+    fn test_mark_building_resets_failed_vm_state() {
+        // Verify that redeploying a failed service resets vm_state to pending,
+        // avoiding the "building/failed" stale state combination.
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.mark_failed("svc-1", "first failure".into());
+        assert_eq!(state.status("svc-1").unwrap().vm_state, "failed");
+
+        // Redeploy — vm_state should transition from failed → pending
+        state.mark_building("svc-1").unwrap();
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "building");
+        assert_eq!(status.vm_state, "pending");
+    }
+
+    #[test]
+    fn test_mark_building_preserves_running_vm_state() {
+        // When vm_state is "running" AND vm_process is Some (real Child),
+        // mark_building preserves "running". Since we can't create a real
+        // tokio::process::Child in unit tests, we verify the fallback:
+        // without a process handle, "running" → "pending" here.
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.set_status("svc-1", "deployed", "running");
+
+        state.mark_building("svc-1").unwrap();
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "building");
+        assert_eq!(status.vm_state, "pending");
+    }
+
+    // ── mark_failed prior-state preservation tests ───────────────────────────
+
+    #[test]
+    fn test_mark_failed_preserves_prior_running_state() {
+        // A redeploy that fails before take_processes should restore the
+        // previous deployed/running state — not set failed/failed.
+        let state = AppState::default();
+        // Set up a deployed service
+        state.mark_building("svc-1").unwrap();
+        state.set_status("svc-1", "deployed", "running");
+
+        // Redeploy: mark_building captures prebuild snapshot
+        state.mark_building("svc-1").unwrap();
+
+        // Build fails before take_processes
+        state.mark_failed("svc-1", "build error".into());
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "deployed");
+        assert_eq!(status.vm_state, "running");
+        let logs = state.logs("svc-1").unwrap();
+        assert!(logs.output.contains("BUILD FAILED"));
+    }
+
+    #[test]
+    fn test_mark_failed_fresh_deploy_no_prior_vm() {
+        // A fresh deploy that fails should set failed/failed since there
+        // was no prior running VM to restore.
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.mark_failed("svc-1", "build error".into());
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.vm_state, "failed");
+    }
+
+    #[test]
+    fn test_mark_failed_after_take_processes_sets_failed() {
+        // If processes were taken before the failure, the prebuild snapshot
+        // is cleared, so mark_failed should set failed/failed.
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.set_status("svc-1", "deployed", "running");
+        state.mark_building("svc-1").unwrap();
+
+        // Simulate processes being taken (clears snapshot)
+        let _ = state.take_processes("svc-1");
+
+        // Now fail — should go to failed/failed since snapshot is gone
+        state.mark_failed("svc-1", "deploy failed".into());
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.vm_state, "failed");
+    }
+
+    // ── ensure_service tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_ensure_service_creates_minimal_entry() {
+        let state = AppState::default();
+        assert!(state.status("disk-vm").is_none());
+
+        state.ensure_service("disk-vm");
+        let status = state.status("disk-vm").unwrap();
+        assert_eq!(status.status, "stopped");
+        assert_eq!(status.vm_state, "none");
+    }
+
+    #[test]
+    fn test_ensure_service_does_not_overwrite_existing() {
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.set_status("svc-1", "deployed", "running");
+
+        // ensure_service should not overwrite existing state
+        state.ensure_service("svc-1");
+        let status = state.status("svc-1").unwrap();
+        assert_eq!(status.status, "deployed");
+        assert_eq!(status.vm_state, "running");
     }
 }

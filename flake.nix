@@ -44,7 +44,9 @@
                 pkg-config
                 openssl
               ]
-              ++ (pkgs.lib.optional pkgs.stdenv.isLinux cloud-hypervisor);
+              # nixpkgs supports cloud-hypervisor only on aarch64-linux and x86_64-linux,
+              # so it must be gated to Linux to avoid Darwin evaluation failures.
+              ++ (lib.optional stdenv.isLinux cloud-hypervisor);
 
             shellHook = ''
               echo "Rust development environment loaded!"

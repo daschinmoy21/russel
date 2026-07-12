@@ -159,25 +159,30 @@ async fn vms_list(
 ) -> Json<VmsResponse> {
     // Start with in-memory inventory
     let mut vms = state.list_services();
+    let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
-    // Augment with VMs discovered on disk (to handle restarts/rebuilds)
-    // Look in common persistent locations used by the old system.
-    let mut discovered = Vec::new();
-    for base in &["/var/lib/russel".to_string(), "/var/lib/microvms".to_string()] {
+    // Augment with VMs discovered on disk (to handle restarts/rebuilds).
+    // Rehydrate the state so lifecycle endpoints can find them.
+    for base in &["/var/lib/russel", "/var/lib/microvms"] {
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 if let Ok(file_type) = entry.file_type()
                     && file_type.is_dir()
-                        && let Some(name) = entry.file_name().to_str() {
-                            // ignore known in-memory IDs to avoid duplicates
-                            if !vms.contains(&name.to_string()) {
-                                discovered.push(name.to_string());
-                            }
-                        }
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    // Exclude .bak backup directories
+                    if name.ends_with(".bak") {
+                        continue;
+                    }
+                    // De-duplicate across both disk roots and in-memory services
+                    if seen.insert(name.to_string()) {
+                        state.ensure_service(name);
+                        vms.push(name.to_string());
+                    }
+                }
             }
         }
     }
-    vms.extend(discovered);
 
     tracing::debug!(count = vms.len(), "GET /vms -> {} VMs (from disk+memory)", vms.len());
     Json(VmsResponse { vms })
