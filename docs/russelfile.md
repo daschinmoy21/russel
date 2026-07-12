@@ -8,13 +8,13 @@ Power users can still provide and customize a `flake.nix` when they need full Ni
 
 ## Design Goals
 
-Russel should provide a workflow like:
+Russel aims to provide a workflow like:
 
 ```bash
-russel init
-russel develop
-russel build
-russel deploy
+russel init          # planned — not yet implemented
+russel develop       # planned — not yet implemented
+russel build         # planned — not yet implemented
+russel deploy        # implemented — POST /deploy via control plane
 ```
 
 Internally, these commands may invoke Nix, but Nix should be an implementation detail for normal users.
@@ -598,7 +598,7 @@ Build secrets require additional care. If private dependencies need credentials 
 
 ## Proposed Commands
 
-### `russel init`
+### `russel init` [planned]
 
 Create a starter manifest:
 
@@ -618,7 +618,7 @@ An optional flag can create both the manifest and a generated flake:
 russel init --with-flake
 ```
 
-### `russel develop`
+### `russel develop` [planned]
 
 Start the project's development shell:
 
@@ -636,7 +636,7 @@ The command should use `exec`-style behavior so shell signals and exit codes wor
 
 If a custom `flake.nix` exists, Russel should use its `devShells.<system>.default` output.
 
-### `russel build`
+### `russel build` [planned]
 
 Build the deployment artifact without deploying a microVM:
 
@@ -647,8 +647,10 @@ russel build .
 Internally, this is equivalent to:
 
 ```bash
-nix build path:.#packages.<system>.default --no-link --print-out-paths
+nix build path:.#packages.x86_64-linux.default --no-link --print-out-paths
 ```
+
+Russell substitutes the system placeholder with the actual target system, e.g., x86_64-linux, when constructing the command.
 
 Russel should present a friendly result:
 
@@ -669,7 +671,7 @@ russel deploy . -p 8080:3000
 
 The deployment path should not maintain a separate or subtly different Nix build implementation.
 
-### `russel check`
+### `russel check` [planned]
 
 Validate the project before building or deploying:
 
@@ -684,39 +686,40 @@ This command should validate the manifest, dependencies, flake outputs, binary c
 For a simple Rust project, Russel could generate a flake conceptually like this:
 
 ```nix
+# Pseudocode illustrating manifest deployment contract (per-system outputs)
 {
   description = "Russel project";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+  # This schematic shows per-system artifacts; real flake would derive these with lib/genAttrs
   outputs = { self, nixpkgs }:
-    let
-      system = builtins.currentSystem;
-      pkgs = nixpkgs.legacyPackages.${system};
-
-      buildInputs = with pkgs; [
-        pkg-config
-        openssl
-      ];
-
-      devInputs = with pkgs; [
-        rust-analyzer
-      ];
-    in {
-      packages.${system}.default =
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "api";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = buildInputs;
-        };
-
-      devShells.${system}.default =
-        pkgs.mkShell {
-          packages = devInputs ++ buildInputs;
-        };
+  {
+    packages = {
+      "x86_64-linux"."default" = nixpkgs.legacyPackages."x86_64-linux".rustPlatform.buildRustPackage {
+        pname = "api"; version = "0.1.0"; src = ./.; cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ nixpkgs.legacyPackages."x86_64-linux".pkg-config ];
+        buildInputs = [ nixpkgs.legacyPackages."x86_64-linux".openssl ];
+      };
+      "aarch64-linux"."default" = nixpkgs.legacyPackages."aarch64-linux".rustPlatform.buildRustPackage {
+        pname = "api"; version = "0.1.0"; src = ./.; cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ nixpkgs.legacyPackages."aarch64-linux".pkg-config ];
+        buildInputs = [ nixpkgs.legacyPackages."aarch64-linux".openssl ];
+      };
     };
+
+    devShells = {
+      "x86_64-linux"."default" = nixpkgs.legacyPackages."x86_64-linux".mkShell {
+        packages = [ nixpkgs.legacyPackages."x86_64-linux".rust-analyzer ];
+      };
+      "aarch64-linux"."default" = nixpkgs.legacyPackages."aarch64-linux".mkShell {
+        packages = [ nixpkgs.legacyPackages."aarch64-linux".rust-analyzer ];
+      };
+    };
+
+    # Additional manifest fields such as artifact source/target mappings, runtime checks,
+    # and an exec/apps boot entrypoint would be derived from the Russelfile manifest.
+  };
 }
 ```
 
