@@ -76,6 +76,8 @@ impl DeployPipeline {
                     "deploy succeeded"
                 );
                 self.state.mark_deployed(&service_id, output.vm_child);
+                // The subnet is now owned by the deployed service, not this attempt.
+                self.subnet_acquired.store(false, Ordering::Relaxed);
                 self.state.store_aux_process(output.socat_child);
                 self.state.store_aux_process(output.virtiofsd_child);
                 DeployResponse {
@@ -129,11 +131,27 @@ impl DeployPipeline {
                         "deploy failed"
                     );
                     self.state.mark_failed(&service_id, error.to_string());
-                    // ponytail: release subnet only if THIS attempt acquired it.
-                    // If the service was already deployed (re-deploy hit a build error),
-                    // the existing reservation must be left alone.
+                    // ponytail: tear down before releasing the subnet, and only if THIS
+                    // attempt acquired it. If the service was already deployed (re-deploy
+                    // hit a build error), the existing reservation must be left alone.
                     if self.subnet_acquired.load(Ordering::Relaxed) {
-                        release_subnet(&service_id);
+                        match self.runner.destroy(&service_id).await {
+                            Ok(()) => {
+                                release_subnet(&service_id);
+                                self.subnet_acquired.store(false, Ordering::Relaxed);
+                            }
+                            Err(destroy_error) => {
+                                tracing::error!(
+                                    service_id = %service_id,
+                                    error = %destroy_error,
+                                    "failed to clean up VM after deployment failure"
+                                );
+                                error_msg = format!(
+                                    "{}; cleanup failed: {}",
+                                    error_msg, destroy_error
+                                );
+                            }
+                        }
                     }
                     DeployResponse {
                         service_id,
@@ -354,14 +372,31 @@ impl DeployPipeline {
             }
             Err(deploy_err) => {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
-                // Always tear down any partially-created VM from the failed deployment
-                let _ = self.runner.destroy(service_id).await;
-                
-                // Release subnet only if THIS attempt allocated it
-                if self.subnet_acquired.load(Ordering::Relaxed) {
-                    release_subnet(service_id);
-                }
-                
+                // Always tear down any partially-created VM from the failed deployment.
+                let deploy_err = match self.runner.destroy(service_id).await {
+                    Ok(()) => {
+                        // Release subnet only if THIS attempt allocated it, and only after
+                        // the VM teardown completed successfully.
+                        if self.subnet_acquired.load(Ordering::Relaxed) {
+                            release_subnet(service_id);
+                            self.subnet_acquired.store(false, Ordering::Relaxed);
+                        }
+                        deploy_err
+                    }
+                    Err(destroy_err) => {
+                        tracing::error!(
+                            service_id,
+                            error = %destroy_err,
+                            "failed to tear down VM after deployment failure"
+                        );
+                        anyhow::anyhow!(
+                            "{}; cleanup failed: {}",
+                            deploy_err,
+                            destroy_err
+                        )
+                    }
+                };
+
                 if has_backup {
                     let rollback_res = async {
                         tokio::fs::rename(&russel_bak, &russel_dir).await?;
