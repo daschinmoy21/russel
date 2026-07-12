@@ -1,3 +1,8 @@
+// ponytail: scaffold modules have unused items; allowed deliberately for the MVP.
+// Remove these allows once HealthChecker, DatabaseProvisioner, and TraefikClient
+// are integrated into the deploy pipeline.
+#![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+
 mod api;
 mod build;
 mod database;
@@ -10,28 +15,35 @@ mod state;
 mod traefik;
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("russel-ctrl requires Linux — it depends on cloud-hypervisor, iptables, socat, and TAP networking");
+compile_error!(
+    "russel-ctrl requires Linux — it depends on cloud-hypervisor, iptables, socat, and TAP networking"
+);
 
 use anyhow::Result;
 use axum::Router;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::state::AppState;
 use crate::network::release_subnet;
+use crate::state::AppState;
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(fmt::layer()
-            .with_timer(tracing_subscriber::fmt::time::uptime())
-            .with_target(false))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,russel_ctrl=debug")))
+        .with(
+            fmt::layer()
+                .with_timer(tracing_subscriber::fmt::time::uptime())
+                .with_target(false),
+        )
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,russel_ctrl=debug")),
+        )
         .init();
 
     // Flush stale iptables NAT rules and tap interfaces from previous sessions.
@@ -111,9 +123,7 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .ok();
+        tokio::signal::ctrl_c().await.ok();
         tracing::info!("received SIGINT, shutting down control plane...");
     }
 }
@@ -123,31 +133,56 @@ async fn cleanup_stale_resources() {
     use tokio::process::Command;
 
     // 1. Flush iptables rules
-    if let Err(e) = Command::new("iptables").args(["-t", "nat", "-F", "OUTPUT"]).output().await {
+    if let Err(e) = Command::new("iptables")
+        .args(["-t", "nat", "-F", "OUTPUT"])
+        .output()
+        .await
+    {
         tracing::warn!(error = %e, "failed to flush iptables NAT OUTPUT");
     }
-    if let Err(e) = Command::new("iptables").args(["-t", "nat", "-F", "POSTROUTING"]).output().await {
+    if let Err(e) = Command::new("iptables")
+        .args(["-t", "nat", "-F", "POSTROUTING"])
+        .output()
+        .await
+    {
         tracing::warn!(error = %e, "failed to flush iptables NAT POSTROUTING");
     }
-    if let Err(e) = Command::new("iptables").args(["-F", "FORWARD"]).output().await {
+    if let Err(e) = Command::new("iptables")
+        .args(["-F", "FORWARD"])
+        .output()
+        .await
+    {
         tracing::warn!(error = %e, "failed to flush iptables FORWARD");
     }
-    if let Err(e) = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.route_localnet=0"]).output().await {
+    if let Err(e) = Command::new("sysctl")
+        .args(["-w", "net.ipv4.conf.all.route_localnet=0"])
+        .output()
+        .await
+    {
         tracing::warn!(error = %e, "failed to reset route_localnet sysctl");
     }
 
     // 2. Remove stale tap interfaces
-    match Command::new("ip").args(["-o", "link", "show"]).output().await {
+    match Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .await
+    {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 if line.contains("vm-")
-                    && let Some(name) = line.split_whitespace().nth(1) {
-                        let name = name.trim_matches(':');
-                        if let Err(e) = Command::new("ip").args(["link", "delete", name]).output().await {
-                            tracing::warn!(tap = name, error = %e, "failed to delete stale tap interface");
-                        }
+                    && let Some(name) = line.split_whitespace().nth(1)
+                {
+                    let name = name.trim_matches(':');
+                    if let Err(e) = Command::new("ip")
+                        .args(["link", "delete", name])
+                        .output()
+                        .await
+                    {
+                        tracing::warn!(tap = name, error = %e, "failed to delete stale tap interface");
                     }
+                }
             }
         }
         Err(e) => {

@@ -163,6 +163,21 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 └── README.md
 ```
 
+## Benchmark (2026-07-12)
+
+| Metric | Value |
+|--------|-------|
+| Clean build (debug) | 14.5s |
+| Release build | 26.4s |
+| Incremental build | 1.0s |
+| Tests | 31 passing, 0.8s |
+| Binary size (cli) | 6.6MB |
+| Binary size (ctrl) | 4.5MB |
+| Rust LOC | 3,562 (16 files) |
+| Direct deps | 332 |
+
+Run `./bench.sh` to reproduce.
+
 ## License
 
 MIT
