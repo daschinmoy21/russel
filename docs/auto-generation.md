@@ -26,9 +26,10 @@ graph TD
 ## Generated Templates
 
 ### 1. Rust Projects (`Cargo.toml`)
-If a `Cargo.toml` is detected, Russel writes a flake utilizing `rustPlatform.buildRustPackage`. 
 
-To avoid the necessity of manual `cargoHash` input, we use Nix's `cargoLock` feature which parses the project's checked-in `Cargo.lock` to fetch and verify crate dependencies atomically:
+If a `Cargo.toml` is detected, Russel writes a flake utilizing `rustPlatform.buildRustPackage`.
+
+The system is auto-detected via `builtins.currentSystem` (not hard-coded). To avoid manual `cargoHash`, we use Nix's `cargoLock` feature which parses the project's `Cargo.lock`:
 
 ```nix
 {
@@ -36,9 +37,9 @@ To avoid the necessity of manual `cargoHash` input, we use Nix's `cargoLock` fea
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = { self, nixpkgs }:
     let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};
     in {
-      packages.x86_64-linux.default = pkgs.rustPlatform.buildRustPackage {
+      packages.${builtins.currentSystem}.default = pkgs.rustPlatform.buildRustPackage {
         pname = "app";
         version = "0.1.0";
         src = ./.;
@@ -51,6 +52,7 @@ To avoid the necessity of manual `cargoHash` input, we use Nix's `cargoLock` fea
 ```
 
 ### 2. Go Projects (`go.mod`)
+
 If `go.mod` is found, Russel writes a flake using `pkgs.buildGoModule`:
 
 ```nix
@@ -59,9 +61,9 @@ If `go.mod` is found, Russel writes a flake using `pkgs.buildGoModule`:
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = { self, nixpkgs }:
     let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};
     in {
-      packages.x86_64-linux.default = pkgs.buildGoModule {
+      packages.${builtins.currentSystem}.default = pkgs.buildGoModule {
         pname = "app";
         version = "0.1.0";
         src = ./.;
@@ -72,9 +74,8 @@ If `go.mod` is found, Russel writes a flake using `pkgs.buildGoModule`:
 ```
 
 ### 3. Fallback: Static / Python Web Server
-For frontend projects, static sites, or generic scripts, Russel generates a shell script wrapper via `pkgs.writeShellScriptBin`. 
 
-The source directory `./.` is copied into the Nix store during evaluation, and the script launches Python's built-in `http.server` serving the store path directory on the dynamic guest `PORT`:
+For frontend projects, static sites, or generic scripts, Russel generates a shell script wrapper via `pkgs.writeShellScriptBin`. The script launches Python's built-in `http.server` on the dynamic guest `PORT`:
 
 ```nix
 {
@@ -82,9 +83,9 @@ The source directory `./.` is copied into the Nix store during evaluation, and t
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = { self, nixpkgs }:
     let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};
     in {
-      packages.x86_64-linux.default = pkgs.writeShellScriptBin "app" ''
+      packages.${builtins.currentSystem}.default = pkgs.writeShellScriptBin "app" ''
         cd ${./.}
         exec ${pkgs.python3}/bin/python3 -m http.server "$PORT"
       '';
@@ -96,5 +97,5 @@ The source directory `./.` is copied into the Nix store during evaluation, and t
 
 ## Customizing Builds
 
-The generated `flake.nix` is written directly to the target repository build folder. 
+The generated `flake.nix` is written directly to the repository root.
 If power users need to override this behavior (e.g., adding native dependencies, changing compiler flags, or using newer build pipelines), they can simply commit their own custom `flake.nix` to their repository. When Russel detects a committed `flake.nix`, the auto-generator steps aside completely.

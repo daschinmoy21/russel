@@ -9,17 +9,16 @@ The Russel control plane (`russel-ctrl`) orchestrates builds, microVM lifecycles
 The core deployment pipeline follows these steps:
 
 1. **Resolve**: Clone or locate the source repository, parse `Russelfile.toml`.
-2. **Build**: Build the application using Nix to produce a read-only store path.
-3. **Initramfs**: Assemble a minimal initramfs containing BusyBox and the target kernel modules.
-4. **Auxiliaries**: Spawn a background `virtiofsd` daemon serving the host's `/nix/store` directory.
-5. **Boot**: Direct invocation of `cloud-hypervisor` to boot the kernel and application.
-6. **Network Routing**: Create a host TAP interface, spawn `socat` for TCP port forwarding, and register the backend with Traefik.
+2. **Build**: Auto-generate a `flake.nix` if none exists, then build the application using Nix to produce a read-only store path.
+3. **Initramfs**: Assemble a minimal CPIO initramfs containing BusyBox and the target kernel modules.
+4. **Network + Boot**: Create the host TAP interface, spawn `socat` for TCP port forwarding, spawn `virtiofsd` to serve the host's `/nix/store`, then directly invoke `cloud-hypervisor` to boot the kernel and application.
+5. **Traefik**: Register the backend with Traefik (placeholder — planned for multi-node routing).
 
 ---
 
 ## Cloud Hypervisor Integration
 
-Initially, Russel planned to manage VMs via `microvm.nix` (a systemd-based NixOS microVM manager). We bypassed this layer in favor of **direct Cloud Hypervisor orchestration** to reduce boot latency from 40s+ to under 2s and eliminate guest systemd overhead.
+Initially, Russel planned to manage VMs via `microvm.nix` (a systemd-based NixOS microVM manager). We bypassed this layer in favor of **direct Cloud Hypervisor orchestration** to eliminate guest systemd overhead and achieve faster boot times.
 
 Because we spawn the `cloud-hypervisor` binary directly in the Rust control plane, we have native access to its complete API.
 
@@ -50,20 +49,23 @@ Command::new("cloud-hypervisor")
 
 ---
 
-## Advanced CLI & API Features
+## Future Cloud Hypervisor Features
 
-Direct orchestration allows us to easily implement the following Cloud Hypervisor capabilities:
+Direct orchestration gives us access to Cloud Hypervisor capabilities that can be added as needed:
 
 ### 1. Dynamic VM Management (`--api-socket`)
-By adding `--api-socket /var/lib/russel/<service-id>/api.sock`, Cloud Hypervisor exposes an HTTP REST API over a Unix Domain Socket. This permits `russel-ctrl` to dynamically interact with the running VM:
+
+By adding `--api-socket /var/lib/russel/<service-id>/api.sock`, Cloud Hypervisor exposes an HTTP REST API over a Unix Domain Socket for dynamic VM interaction:
+
 - **Hotplug CPUs**: Add more virtual cores under heavy loads.
 - **Hotplug Memory**: Scale RAM limits dynamically without restarting the VM.
 - **Query Telemetry**: Retrieve virtual machine statistics (CPU usage, network packets, etc.).
 - **Lifecycle Control**: Pause, resume, or cleanly shut down the guest.
 
 ### 2. High-Performance Storage (`--disk`)
-For database services or stateful workloads, we can attach block devices:
-- `path=disk.img,readonly=off` to write state directly to a host image file.
+
+For database services or stateful workloads, we can attach block devices via `--disk path=disk.img,readonly=off`.
 
 ### 3. Entropy Generation (`--rng`)
-Cryptographic applications (like HTTPS servers) need non-blocking entropy. We can append `--rng` to attach a virtio-rng hardware random number generator device to the guest.
+
+For cryptographic applications (HTTPS servers), `--rng` can attach a virtio-rng hardware random number generator device to the guest.
