@@ -23,24 +23,28 @@ static PORT_REGISTRY: LazyLock<Mutex<PortRegistry>> = LazyLock::new(|| {
 #[derive(Debug, Clone, Default)]
 pub struct PortAllocator;
 
+fn port_is_available(port: u16) -> bool {
+    // socat listens on the wildcard address, so check the same address here.
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
 impl PortAllocator {
     pub fn next(&self, service_id: &str) -> anyhow::Result<u16> {
         let mut registry = PORT_REGISTRY.lock().unwrap();
         if let Some(old_port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&old_port);
         }
+
         let mut port: u32 = 3100;
         loop {
-            if port > 65535 {
+            if port > u16::MAX as u32 {
                 anyhow::bail!("Port exhaustion: no ports available between 3100 and 65535");
             }
             let port_u16 = port as u16;
-            if !registry.busy_ports.contains(&port_u16) {
-                if std::net::TcpListener::bind(("127.0.0.1", port_u16)).is_ok() {
-                    registry.busy_ports.insert(port_u16);
-                    registry.allocations.insert(service_id.to_string(), port_u16);
-                    return Ok(port_u16);
-                }
+            if !registry.busy_ports.contains(&port_u16) && port_is_available(port_u16) {
+                registry.busy_ports.insert(port_u16);
+                registry.allocations.insert(service_id.to_string(), port_u16);
+                return Ok(port_u16);
             }
             port += 1;
         }
@@ -48,16 +52,20 @@ impl PortAllocator {
 
     pub fn reserve(service_id: &str, port: u16) -> anyhow::Result<()> {
         let mut registry = PORT_REGISTRY.lock().unwrap();
-        if let Some(&existing_port) = registry.allocations.get(service_id) {
-            if existing_port == port {
-                return Ok(());
+        let existing_port = registry.allocations.get(service_id).copied();
+        if existing_port == Some(port) {
+            // Do not trust the registry alone: the listener may have disappeared,
+            // or another process may have claimed the port since the last deploy.
+            if !port_is_available(port) {
+                anyhow::bail!("Port {} is reserved but cannot be bound on 0.0.0.0", port);
             }
+            return Ok(());
         }
         if registry.busy_ports.contains(&port) {
             anyhow::bail!("Port {} is already reserved or in use", port);
         }
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-            anyhow::bail!("Port {} cannot be bound on 127.0.0.1", port);
+        if !port_is_available(port) {
+            anyhow::bail!("Port {} cannot be bound on 0.0.0.0", port);
         }
         if let Some(old_port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&old_port);
@@ -93,11 +101,13 @@ pub fn subnet_for(service_id: &str) -> SubnetAllocation {
     let idx = (hash % 200) as u8;
     SubnetAllocation {
         host_ip: format!("10.0.{idx}.1"),
-        vm_ip:   format!("10.0.{idx}.2"),
-        mac:     format!("02:00:00:00:{idx:02x}:01"),
-        tap_id:  format!("vm-{service_id}"),
+        vm_ip: format!("10.0.{idx}.2"),
+        mac: format!("02:00:00:00:{idx:02x}:01"),
+        tap_id: format!("vm-{service_id}"),
     }
 }
+
+pub fn release_subnet(_service_id: &str) {}
 
 // ── Tap creation + setup + port forwarding via socat ──────────────────────────
 
@@ -105,11 +115,9 @@ pub struct TapForwarder;
 
 impl TapForwarder {
     /// Create the TAP interface, bring it up with host-side IP, enable IP
-    /// forwarding, then spawn a `socat` TCP forwarder:
-    ///   `0.0.0.0:<host_port>` → `<vm_ip>:<guest_port>`.
-    ///
-    /// All steps run sequentially — the TAP must exist before the VM boots.
+    /// forwarding, then spawn a wildcard-bound socat TCP forwarder.
     pub async fn setup(
+        service_id: &str,
         alloc: &SubnetAllocation,
         host_port: u16,
         guest_port: u16,
@@ -118,49 +126,41 @@ impl TapForwarder {
         let host_ip = &alloc.host_ip;
         let vm_ip = &alloc.vm_ip;
 
-        // 1. Create TAP (destroy first if leftover from a previous run).
         tracing::info!(tap, "creating tap interface");
-        let _ = run_ip(&["link", "del", tap]).await;                // best-effort
+        let _ = run_ip(&["link", "del", tap]).await;
         let _ = run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await;
-
-        // 2. Bring TAP up and assign host-side IP.
         run_ip(&["link", "set", tap, "up"]).await?;
         run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
         tracing::info!(tap, host_ip, "tap configured");
 
-        // 3. Enable IP forwarding (needed for host → VM traffic via TAP).
         sysctl("net.ipv4.ip_forward", "1").await;
 
-        // 4. Spawn socat: listens on 0.0.0.0:<host_port>, forwards to VM.
         let listen = format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", host_port);
         let connect = format!("TCP:{}:{}", vm_ip, guest_port);
-
-        tracing::info!(
-            tap, host_port, vm_ip, guest_port,
-            "spawning socat: {listen} -> {connect}"
-        );
+        tracing::info!(tap, host_port, vm_ip, guest_port, "spawning socat: {listen} -> {connect}");
 
         let child = Command::new("socat")
+            .arg0(format!("socat-russel-{service_id}"))
             .arg(&listen)
             .arg(&connect)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to spawn socat: {}. Install with: nix-env -iA nixpkgs.socat",
-                    e
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("failed to spawn socat: {}. Install with: nix-env -iA nixpkgs.socat", e))?;
 
-        tracing::info!(
-            tap, host_port, vm_ip, guest_port,
-            "port forwarding active: 0.0.0.0:{host_port} -> {vm_ip}:{guest_port}"
-        );
-
+        tracing::info!(tap, host_port, vm_ip, guest_port, "port forwarding active: 0.0.0.0:{host_port} -> {vm_ip}:{guest_port}");
         Ok(child)
     }
 
-    /// Poll until guest_port is reachable at vm_ip.
+    pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
+        let tap = &alloc.tap_id;
+        tracing::info!(tap, "tearing down tap interface");
+        match run_ip(&["link", "del", tap]).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().contains("Cannot find device") || e.to_string().contains("does not exist") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn wait_for_vm_port(vm_ip: &str, guest_port: u16, timeout: Duration) -> bool {
         let addr = format!("{vm_ip}:{guest_port}");
         let deadline = Instant::now() + timeout;
@@ -177,16 +177,8 @@ impl TapForwarder {
 async fn sysctl(key: &str, val: &str) {
     let kv = format!("{key}={val}");
     match Command::new("sysctl").args(["-w", &kv]).output().await {
-        Ok(out) if !out.status.success() => {
-            tracing::warn!(
-                "sysctl {kv} exited with status {:?}: {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to run sysctl {kv}");
-        }
+        Ok(out) if !out.status.success() => tracing::warn!("sysctl {kv} exited with status {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => tracing::warn!(error = %e, "failed to run sysctl {kv}"),
         _ => {}
     }
 }
@@ -194,8 +186,7 @@ async fn sysctl(key: &str, val: &str) {
 async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
     let out = Command::new("ip").args(args).output().await?;
     if !out.status.success() {
-        anyhow::bail!("ip {} failed: {}", args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("ip {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
 }
@@ -215,10 +206,7 @@ mod tests {
 
     #[test]
     fn subnet_for_different_services_differ() {
-        let a = subnet_for("service-a");
-        let b = subnet_for("service-b");
-        // Different services should (usually) get different subnets
-        assert_ne!(a.host_ip, b.host_ip);
+        assert_ne!(subnet_for("service-a").host_ip, subnet_for("service-b").host_ip);
     }
 
     #[test]
@@ -230,21 +218,16 @@ mod tests {
 
     #[test]
     fn subnet_for_produces_valid_mac() {
-        let a = subnet_for("bar");
-        assert!(a.mac.starts_with("02:00:00:00:"));
-        // MAC format: 02:00:00:00:XX:01 (6 octets = 17 chars)
-        assert_eq!(a.mac.len(), 17);
+        assert!(subnet_for("bar").mac.starts_with("02:00:00:00:"));
+        assert_eq!(subnet_for("bar").mac.len(), 17);
     }
 
     #[test]
     fn subnet_index_bounded() {
         for s in &["a", "b", "long-service-name-123", "edge", "max"] {
-            let a = subnet_for(s);
-            let idx = a.host_ip
-                .trim_start_matches("10.0.")
-                .trim_end_matches(".1");
-            let n: u8 = idx.parse().unwrap();
-            assert!(n < 200, "index {} out of range for service {}", n, s);
+            let allocation = subnet_for(s);
+            let idx = allocation.host_ip.trim_start_matches("10.0.").trim_end_matches(".1");
+            assert!(idx.parse::<u8>().unwrap() < 200);
         }
     }
 
@@ -254,21 +237,18 @@ mod tests {
         let p1 = alloc.next("service-1").unwrap();
         let p2 = alloc.next("service-2").unwrap();
         let p3 = alloc.next("service-3").unwrap();
-        assert_eq!(p1, 3100);
-        assert_eq!(p2, 3101);
-        assert_eq!(p3, 3102);
+        assert_eq!((p1, p2, p3), (3100, 3101, 3102));
+        PortAllocator::release("service-1");
+        PortAllocator::release("service-2");
+        PortAllocator::release("service-3");
     }
 
     #[test]
     fn port_allocator_reserve_and_release() {
-        // Reserve a specific port
-        assert!(PortAllocator::reserve("custom-service", 4000).is_ok());
-        // Reserve the same port for another service should fail
+        PortAllocator::reserve("custom-service", 4000).unwrap();
         assert!(PortAllocator::reserve("another-service", 4000).is_err());
-        // Release it
         PortAllocator::release("custom-service");
-        // Now reserve for another service should succeed
-        assert!(PortAllocator::reserve("another-service", 4000).is_ok());
+        PortAllocator::reserve("another-service", 4000).unwrap();
         PortAllocator::release("another-service");
     }
 }

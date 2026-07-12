@@ -36,7 +36,8 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        tracing::info!("building kernel from nixpkgs (cached after first run)");
+        let system = crate::build::current_system().await;
+        tracing::info!(system = %system, "building kernel from nixpkgs (cached after first run)");
         let output = Command::new("nix")
             .args([
                 "build",
@@ -44,6 +45,7 @@ impl MicrovmRunner {
                 "--print-out-paths",
                 "-f",
                 "<nixpkgs>",
+                "--argstr", "system", &system,
                 "linux",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -72,7 +74,8 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        tracing::info!("building busybox from nixpkgs (cached after first run)");
+        let system = crate::build::current_system().await;
+        tracing::info!(system = %system, "building busybox from nixpkgs (cached after first run)");
         let output = Command::new("nix")
             .args([
                 "build",
@@ -80,6 +83,7 @@ impl MicrovmRunner {
                 "--print-out-paths",
                 "-f",
                 "<nixpkgs>",
+                "--argstr", "system", &system,
                 "busybox",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -109,7 +113,9 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        tracing::info!("resolving kernel modules from nixpkgs");
+        let system = crate::build::current_system().await;
+        tracing::info!(system = %system, "resolving kernel modules from nixpkgs");
+        let expr = format!("let pkgs = import <nixpkgs> {{ system = \"{}\"; }}; in pkgs.linux.modules", system);
         let output = Command::new("nix")
             .args([
                 "build",
@@ -117,7 +123,7 @@ impl MicrovmRunner {
                 "--no-link",
                 "--print-out-paths",
                 "--expr",
-                "let pkgs = import <nixpkgs> {}; in pkgs.linux.modules",
+                &expr,
             ])
             .stderr(std::process::Stdio::inherit())
             .output()
@@ -576,7 +582,10 @@ exec /bin/sh
         })
     }
 
-    /// Stop a running VM by killing the cloud-hypervisor process.
+    /// Stop a running VM by terminating systemd service and verifying process cleanup.
+    /// Note: This method assumes the caller (api.rs) has already killed tracked child
+    /// processes from AppState. This method handles only metadata-based or pattern-matched
+    /// process cleanup for cases where processes weren't tracked in state.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
         let unit = format!("microvm@{}.service", service_id);
         match Command::new("systemctl")
@@ -592,50 +601,165 @@ exec /bin/sh
             }
             _ => {}
         }
-        match Command::new("pkill")
-            .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}", service_id)])
-            .output()
-            .await
-        {
-            Ok(out) if !out.status.success() => {
-                tracing::warn!(service_id = %service_id, "pkill cloud-hypervisor failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+
+        // Read metadata to verify/validate PIDs before attempting cleanup
+        let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
+        let mut verified_kills = Vec::new();
+        if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+                // Verify and kill each PID only if it still belongs to the expected process
+                if let Some(vm_pid) = metadata.get("vm_pid").and_then(|v| v.as_u64()) {
+                    if Self::verify_process_ownership(vm_pid as u32, service_id) {
+                        if let Ok(out) = Command::new("kill").arg(vm_pid.to_string()).output().await {
+                            if out.status.success() {
+                                verified_kills.push(("vm", vm_pid));
+                            }
+                        }
+                    }
+                }
+                if let Some(virtiofsd_pid) = metadata.get("virtiofsd_pid").and_then(|v| v.as_u64()) {
+                    if Self::verify_process_ownership(virtiofsd_pid as u32, service_id) {
+                        if let Ok(out) = Command::new("kill").arg(virtiofsd_pid.to_string()).output().await {
+                            if out.status.success() {
+                                verified_kills.push(("virtiofsd", virtiofsd_pid));
+                            }
+                        }
+                    }
+                }
+                if let Some(socat_pid) = metadata.get("socat_pid").and_then(|v| v.as_u64()) {
+                    if Self::verify_process_ownership(socat_pid as u32, service_id) {
+                        if let Ok(out) = Command::new("kill").arg(socat_pid.to_string()).output().await {
+                            if out.status.success() {
+                                verified_kills.push(("socat", socat_pid));
+                            }
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!(service_id = %service_id, error = %e, "failed to run pkill");
-            }
-            _ => {}
         }
+
+        // Fallback: use pattern-based pkill only if no metadata-based kills succeeded
+        if verified_kills.is_empty() {
+            let escaped_id = escape_regex(service_id);
+            let mut pkill_results = Vec::new();
+
+            // Kill cloud-hypervisor
+            if let Ok(out) = Command::new("pkill")
+                .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}(,|$)", escaped_id)])
+                .output()
+                .await
+            {
+                pkill_results.push(("cloud-hypervisor", out.status.success()));
+            }
+
+            // Kill virtiofsd
+            if let Ok(out) = Command::new("pkill")
+                .args(["-f", &format!("virtiofsd.*russel/{}/", escaped_id)])
+                .output()
+                .await
+            {
+                pkill_results.push(("virtiofsd", out.status.success()));
+            }
+
+            // Kill socat
+            if let Ok(out) = Command::new("pkill")
+                .args(["-f", &format!("socat-russel-{}", escaped_id)])
+                .output()
+                .await
+            {
+                pkill_results.push(("socat", out.status.success()));
+            }
+
+            tracing::debug!(service_id, ?pkill_results, "fallback pkill cleanup results");
+        } else {
+            tracing::debug!(service_id, ?verified_kills, "metadata-based process cleanup completed");
+        }
+
         Ok(())
+    }
+
+    /// Verify that a PID belongs to a process associated with the given service_id.
+    /// This is a best-effort check to avoid killing unrelated processes.
+    fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+            // Check if the command line contains the service_id
+            // For cloud-hypervisor: check for tap=vm-{service_id}
+            // For virtiofsd: check for russel/{service_id}/
+            // For socat: check for socat-russel-{service_id}
+            cmdline.contains(service_id)
+        } else {
+            false
+        }
     }
 
     /// Destroy all state for a microVM.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
-        if let Err(e) = self.stop(service_id).await {
-            tracing::warn!(service_id = %service_id, error = %e, "stop during destroy failed");
-        }
+        // Validate service_id before using it in any paths
+        Self::validate_service_id(service_id)?;
+
+        let alloc = crate::network::subnet_for(service_id);
+
+        self.stop(service_id).await?;
+
+        // Teardown the TAP device
+        crate::network::TapForwarder::teardown(&alloc).await?;
+
+        // Release port and subnet
+        crate::network::PortAllocator::release(service_id);
+        crate::network::release_subnet(service_id);
+
         for dir in &[
             format!("/var/lib/microvms/{}", service_id),
             format!("/var/lib/russel/{}", service_id),
         ] {
-            if let Err(e) = Command::new("rm")
-                .args(["-rf", dir])
-                .output()
-                .await
-            {
-                tracing::warn!(dir = %dir, error = %e, "failed to rm dir during destroy");
+            let path = std::path::Path::new(dir);
+            if path.exists() {
+                let out = Command::new("rm")
+                    .args(["-rf", dir])
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    anyhow::bail!("failed to remove directory {}: {}", dir, String::from_utf8_lossy(&out.stderr).trim());
+                }
             }
         }
         for file in &[
             format!("/nix/var/nix/gcroots/microvm/{}", service_id),
             format!("/nix/var/nix/gcroots/microvm/booted-{}", service_id),
         ] {
-            if let Err(e) = Command::new("rm")
-                .args(["-f", file])
-                .output()
-                .await
-            {
-                tracing::warn!(file = %file, error = %e, "failed to rm gcroot during destroy");
+            let path = std::path::Path::new(file);
+            if path.exists() {
+                let out = Command::new("rm")
+                    .args(["-f", file])
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    anyhow::bail!("failed to remove gcroot {}: {}", file, String::from_utf8_lossy(&out.stderr).trim());
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Validate service_id to prevent path traversal and ensure it's a safe identifier.
+    pub fn validate_service_id(service_id: &str) -> anyhow::Result<()> {
+        if service_id.is_empty() {
+            anyhow::bail!("service_id cannot be empty");
+        }
+        if service_id.len() > 128 {
+            anyhow::bail!("service_id too long (max 128 characters)");
+        }
+        // Check for path separators and traversal components
+        if service_id.contains('/') || service_id.contains('\\') {
+            anyhow::bail!("service_id cannot contain path separators");
+        }
+        if service_id.contains("..") || service_id == "." {
+            anyhow::bail!("service_id cannot contain path traversal components");
+        }
+        // Ensure it only contains safe characters (alphanumeric, dash, underscore)
+        if !service_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            anyhow::bail!("service_id can only contain alphanumeric characters, dashes, and underscores");
         }
         Ok(())
     }
@@ -663,4 +787,15 @@ exec /bin/sh
 pub struct BootOutput {
     pub vm_child: tokio::process::Child,
     pub virtiofsd_child: tokio::process::Child,
+}
+
+fn escape_regex(s: &str) -> String {
+    let mut escaped = String::new();
+    for c in s.chars() {
+        if ".+*?^$()[]{}|\\".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
