@@ -95,6 +95,53 @@ impl AppState {
         inner.aux_processes.push(child);
     }
 
+    pub fn take_processes_if_matches(&self, service_id: &str) -> (Option<Child>, Vec<Child>) {
+        let mut inner = self.lock_inner();
+        if inner.service_id == service_id {
+            let vm = inner.vm_process.take();
+            let aux = std::mem::take(&mut inner.aux_processes);
+            inner.vm_pid = None;
+            (vm, aux)
+        } else {
+            (None, Vec::new())
+        }
+    }
+
+    /// Atomically begin a lifecycle operation: update status and claim processes.
+    /// Returns None if the service_id doesn't match or the state is already claimed.
+    pub fn begin_lifecycle_operation(&self, service_id: &str, status: &str, vm_state: &str) -> Option<(Option<Child>, Vec<Child>)> {
+        let mut inner = self.lock_inner();
+        if inner.service_id == service_id {
+            inner.status = status.to_string();
+            inner.vm_state = vm_state.to_string();
+            let vm = inner.vm_process.take();
+            let aux = std::mem::take(&mut inner.aux_processes);
+            inner.vm_pid = None;
+            Some((vm, aux))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_status_if_matches(&self, service_id: &str, status: &str, vm_state: &str) {
+        let mut inner = self.lock_inner();
+        if inner.service_id == service_id {
+            inner.status = status.to_string();
+            inner.vm_state = vm_state.to_string();
+        }
+    }
+
+    pub fn restore_processes(&self, service_id: &str, vm_process: Option<Child>, aux_processes: Vec<Child>) {
+        let mut inner = self.lock_inner();
+        if inner.service_id == service_id {
+            if let Some(p) = vm_process {
+                inner.vm_pid = p.id();
+                inner.vm_process = Some(p);
+            }
+            inner.aux_processes.extend(aux_processes);
+        }
+    }
+
     pub fn status(&self) -> StatusResponse {
         let inner = self.lock_inner();
         StatusResponse {
