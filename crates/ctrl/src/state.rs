@@ -171,10 +171,13 @@ impl AppState {
     /// endpoints (status, stop, destroy) can find them.
     pub fn ensure_service(&self, service_id: &str) {
         let mut inner = self.lock_inner();
-        inner.services.entry(service_id.to_string()).or_insert_with(|| ServiceState {
-            status: "stopped".to_string(),
-            ..Default::default()
-        });
+        inner
+            .services
+            .entry(service_id.to_string())
+            .or_insert_with(|| ServiceState {
+                status: "stopped".to_string(),
+                ..Default::default()
+            });
     }
 
     pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
@@ -187,8 +190,6 @@ impl AppState {
         ));
         s.flake_path = Some(flake_path);
     }
-
-
 
     /// Take processes for a service. Returns None if the service doesn't exist.
     /// Clears the prebuild snapshot since the old VM is committed for replacement.

@@ -659,9 +659,10 @@ exec /bin/sh
             ),
         ] {
             if let Some(pid) = pid
-                && terminate_owned_process(pid, service_id).await? {
-                    continue;
-                }
+                && terminate_owned_process(pid, service_id).await?
+            {
+                continue;
+            }
             self.pkill_service_process(service_id, kind, &pattern)
                 .await?;
         }

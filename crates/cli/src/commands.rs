@@ -5,10 +5,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use russel_core::api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse};
+use russel_core::api::{
+    DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse,
+};
 
 #[derive(Debug, Parser)]
-#[command(name = "russel", about = "Deploy Nix-built services into microVMs")]
+#[command(
+    name = "russel",
+    about = "Deploy Nix-built services into microVMs/containers"
+)]
 pub struct Cli {
     #[arg(
         long,
@@ -73,7 +78,14 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         step("vm-id", &format!("\x1b[1m{vm_id}\x1b[0m"), "");
     }
     if let Some(p) = &port {
-        step("publish", &format!("localhost:\x1b[1m{}\x1b[0m → guest:\x1b[1m{}\x1b[0m", p.host, p.guest), "");
+        step(
+            "publish",
+            &format!(
+                "localhost:\x1b[1m{}\x1b[0m → guest:\x1b[1m{}\x1b[0m",
+                p.host, p.guest
+            ),
+            "",
+        );
     }
     println!();
 
@@ -101,16 +113,21 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             while let Some(i) = buffer.find('\n') {
                 let line = buffer[..i].to_string();
                 buffer = buffer[i + 1..].to_string();
-                
+
                 if line.trim().is_empty() {
                     continue;
                 }
-                
+
                 let event: russel_core::api::DeployEvent = serde_json::from_str(&line)
-                    .with_context(|| format!("failed to parse event from control plane: {}", line))?;
-                
+                    .with_context(|| {
+                        format!("failed to parse event from control plane: {}", line)
+                    })?;
+
                 match event {
-                    russel_core::api::DeployEvent::Progress { phase: p, description: d } => {
+                    russel_core::api::DeployEvent::Progress {
+                        phase: p,
+                        description: d,
+                    } => {
                         phase(&p, &d);
                     }
                     russel_core::api::DeployEvent::Complete(resp) => {
@@ -132,7 +149,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     })?;
 
     println!();
-    print_deploy_response(response, wall.elapsed());
+    print_deploy_response(*response, wall.elapsed());
 
     Ok(())
 }
@@ -155,21 +172,41 @@ fn ms(v: u128) -> String {
 
 fn print_deploy_response(r: DeployResponse, wall: Duration) {
     let ok = r.status == "deployed";
-    let icon = if ok { "\x1b[1;32m✓\x1b[0m" } else { "\x1b[1;31m✗\x1b[0m" };
+    let icon = if ok {
+        "\x1b[1;32m✓\x1b[0m"
+    } else {
+        "\x1b[1;31m✗\x1b[0m"
+    };
     let label = if ok { "Deployed" } else { "Failed" };
 
-    println!("  {icon} {label} in \x1b[1m{}\x1b[0m  (server: {})", ms(wall.as_millis()), ms(r.elapsed_ms));
+    println!(
+        "  {icon} {label} in \x1b[1m{}\x1b[0m  (server: {})",
+        ms(wall.as_millis()),
+        ms(r.elapsed_ms)
+    );
     println!();
 
-    step("vm-id",   &r.vm_id, "");
-    step("status",  &r.status, "");
+    step("vm-id", &r.vm_id, "");
+    step("status", &r.status, "");
 
     if let Some(p) = &r.port {
-        step("port", &format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, p.guest), "");
+        step(
+            "port",
+            &format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, p.guest),
+            "",
+        );
     }
     if let Some(ip) = &r.vm_ip {
-        let gp = r.port.as_ref().map(|p| p.guest.to_string()).unwrap_or_default();
-        step("vm-ip", &format!("\x1b[2m{ip}\x1b[0m"), &format!("  \x1b[2m(direct: curl {ip}:{gp})\x1b[0m"));
+        let gp = r
+            .port
+            .as_ref()
+            .map(|p| p.guest.to_string())
+            .unwrap_or_default();
+        step(
+            "vm-ip",
+            &format!("\x1b[2m{ip}\x1b[0m"),
+            &format!("  \x1b[2m(direct: curl {ip}:{gp})\x1b[0m"),
+        );
     }
     if let Some(store) = &r.store_path {
         step("store", &format!("\x1b[2m{store}\x1b[0m"), "");
@@ -182,28 +219,45 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     if let Some(t) = &r.timing {
         println!();
         println!("  \x1b[1;2mPhase timing & Docker Comparison:\x1b[0m");
-        timing_row("resolve",  t.resolve_ms,  "repo + Russelfile");
-        
+        timing_row("resolve", t.resolve_ms, "repo + Russelfile");
+
         let docker_build_note = if t.build_ms < 3000 {
             " (Nix cache hit: fast incremental build - Docker equivalent takes 10s-30s)"
         } else {
             " (Nix package build - Docker equivalent takes 20s-60s)"
         };
-        timing_row("build",    t.build_ms,    &format!("nix build (package){}", docker_build_note));
-        
-        timing_row("create",   t.create_ms,   "build minimal initramfs (BusyBox + modules)");
-        timing_row("start",    t.start_ms,    "spawn virtiofsd + boot cloud-hypervisor");
-        timing_row("ready",    t.ready_ms,    "guest app network socket ready (VM is live)");
+        timing_row(
+            "build",
+            t.build_ms,
+            &format!("nix build (package){}", docker_build_note),
+        );
+
+        timing_row(
+            "create",
+            t.create_ms,
+            "build minimal initramfs (BusyBox + modules)",
+        );
+        timing_row(
+            "start",
+            t.start_ms,
+            "spawn virtiofsd + boot cloud-hypervisor",
+        );
+        timing_row(
+            "ready",
+            t.ready_ms,
+            "guest app network socket ready (VM is live)",
+        );
     }
 
     println!();
     println!("  \x1b[2mnote: {}\x1b[0m", r.message);
 
-    if ok {
-        if let Some(p) = &r.port {
-            println!();
-            println!("  \x1b[1mTest:\x1b[0m  curl -I http://127.0.0.1:{}/", p.host);
-        }
+    if ok && let Some(p) = &r.port {
+        println!();
+        println!(
+            "  \x1b[1mTest:\x1b[0m  curl -I http://127.0.0.1:{}/",
+            p.host
+        );
     }
     println!();
 }
@@ -211,8 +265,10 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
 fn timing_row(label: &str, val_ms: u128, desc: &str) {
     let bar_len = ((val_ms / 200).min(30)) as usize;
     let bar = "█".repeat(bar_len);
-    println!("  \x1b[2m{label:>10}\x1b[0m  \x1b[1m{:>6}\x1b[0m  \x1b[32m{bar}\x1b[0m  \x1b[2m{desc}\x1b[0m",
-        ms(val_ms));
+    println!(
+        "  \x1b[2m{label:>10}\x1b[0m  \x1b[1m{:>6}\x1b[0m  \x1b[32m{bar}\x1b[0m  \x1b[2m{desc}\x1b[0m",
+        ms(val_ms)
+    );
 }
 
 fn normalize_repo_arg(repo: &str) -> Result<String> {
@@ -232,14 +288,21 @@ fn parse_port_mapping(value: &str) -> Result<PortMapping> {
         .split_once(':')
         .ok_or_else(|| anyhow!("port mapping must be HOST:GUEST, e.g. 8080:3000"))?;
     Ok(PortMapping {
-        host: host.parse().with_context(|| format!("invalid host port in {value}"))?,
-        guest: guest.parse().with_context(|| format!("invalid guest port in {value}"))?,
+        host: host
+            .parse()
+            .with_context(|| format!("invalid host port in {value}"))?,
+        guest: guest
+            .parse()
+            .with_context(|| format!("invalid guest port in {value}"))?,
     })
 }
 
 pub async fn status(control_plane: &str) -> Result<()> {
     let r = reqwest::get(format!("{control_plane}/status"))
-        .await?.error_for_status()?.json::<StatusResponse>().await?;
+        .await?
+        .error_for_status()?
+        .json::<StatusResponse>()
+        .await?;
     println!("service_id={}", r.service_id);
     println!("status={}", r.status);
     println!("vm_state={}", r.vm_state);
@@ -249,18 +312,26 @@ pub async fn status(control_plane: &str) -> Result<()> {
 
 pub async fn logs(control_plane: &str) -> Result<()> {
     let r = reqwest::get(format!("{control_plane}/logs"))
-        .await?.error_for_status()?.json::<LogsResponse>().await?;
+        .await?
+        .error_for_status()?
+        .json::<LogsResponse>()
+        .await?;
     print!("{}", r.output);
     Ok(())
 }
 
 pub async fn vms(control_plane: &str) -> Result<()> {
     let r = reqwest::get(format!("{control_plane}/vms"))
-        .await?.error_for_status()?.json::<VmsResponse>().await?;
+        .await?
+        .error_for_status()?
+        .json::<VmsResponse>()
+        .await?;
     if r.vms.is_empty() {
         println!("no microVMs registered");
     } else {
-        for vm in r.vms { println!("{}", vm); }
+        for vm in r.vms {
+            println!("{}", vm);
+        }
     }
     Ok(())
 }
@@ -268,7 +339,11 @@ pub async fn vms(control_plane: &str) -> Result<()> {
 pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
     let r = reqwest::Client::new()
         .post(format!("{control_plane}/vm/{id}/stop"))
-        .send().await?.error_for_status()?.json::<String>().await?;
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<String>()
+        .await?;
     println!("{}", r);
     Ok(())
 }
@@ -276,7 +351,11 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
 pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
     let r = reqwest::Client::new()
         .delete(format!("{control_plane}/vm/{id}"))
-        .send().await?.error_for_status()?.json::<String>().await?;
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<String>()
+        .await?;
     println!("{}", r);
     Ok(())
 }

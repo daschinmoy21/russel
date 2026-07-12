@@ -43,7 +43,9 @@ impl PortAllocator {
             let port_u16 = port as u16;
             if !registry.busy_ports.contains(&port_u16) && port_is_available(port_u16) {
                 registry.busy_ports.insert(port_u16);
-                registry.allocations.insert(service_id.to_string(), port_u16);
+                registry
+                    .allocations
+                    .insert(service_id.to_string(), port_u16);
                 return Ok(port_u16);
             }
             port += 1;
@@ -97,9 +99,9 @@ pub struct SubnetAllocation {
 /// Uses full 16-bit hash space (65536 subnets in 10.0.0.0/8).
 /// Collision probability <2% at 50 concurrent services.
 pub fn subnet_for(service_id: &str) -> SubnetAllocation {
-    let hash = service_id
-        .bytes()
-        .fold(2_166_136_261u32, |acc, b| acc.wrapping_mul(16_777_619) ^ b as u32);
+    let hash = service_id.bytes().fold(2_166_136_261u32, |acc, b| {
+        acc.wrapping_mul(16_777_619) ^ b as u32
+    });
     let x = ((hash >> 8) & 0xFF) as u8;
     let y = (hash & 0xFF) as u8;
     SubnetAllocation {
@@ -140,7 +142,13 @@ impl TapForwarder {
 
         let listen = format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", host_port);
         let connect = format!("TCP:{}:{}", vm_ip, guest_port);
-        tracing::info!(tap, host_port, vm_ip, guest_port, "spawning socat: {listen} -> {connect}");
+        tracing::info!(
+            tap,
+            host_port,
+            vm_ip,
+            guest_port,
+            "spawning socat: {listen} -> {connect}"
+        );
 
         let child = Command::new("socat")
             .arg0(format!("socat-russel-{service_id}"))
@@ -148,9 +156,20 @@ impl TapForwarder {
             .arg(&connect)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to spawn socat: {}. Install with: nix-env -iA nixpkgs.socat", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to spawn socat: {}. Install with: nix-env -iA nixpkgs.socat",
+                    e
+                )
+            })?;
 
-        tracing::info!(tap, host_port, vm_ip, guest_port, "port forwarding active: 0.0.0.0:{host_port} -> {vm_ip}:{guest_port}");
+        tracing::info!(
+            tap,
+            host_port,
+            vm_ip,
+            guest_port,
+            "port forwarding active: 0.0.0.0:{host_port} -> {vm_ip}:{guest_port}"
+        );
         Ok(child)
     }
 
@@ -159,7 +178,12 @@ impl TapForwarder {
         tracing::info!(tap, "tearing down tap interface");
         match run_ip(&["link", "del", tap]).await {
             Ok(()) => Ok(()),
-            Err(e) if e.to_string().contains("Cannot find device") || e.to_string().contains("does not exist") => Ok(()),
+            Err(e)
+                if e.to_string().contains("Cannot find device")
+                    || e.to_string().contains("does not exist") =>
+            {
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
@@ -180,7 +204,11 @@ impl TapForwarder {
 async fn sysctl(key: &str, val: &str) {
     let kv = format!("{key}={val}");
     match Command::new("sysctl").args(["-w", &kv]).output().await {
-        Ok(out) if !out.status.success() => tracing::warn!("sysctl {kv} exited with status {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()),
+        Ok(out) if !out.status.success() => tracing::warn!(
+            "sysctl {kv} exited with status {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
         Err(e) => tracing::warn!(error = %e, "failed to run sysctl {kv}"),
         _ => {}
     }
@@ -194,7 +222,11 @@ async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
         .output()
         .await?;
     if !out.status.success() {
-        anyhow::bail!("ip {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "ip {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -214,7 +246,10 @@ mod tests {
 
     #[test]
     fn subnet_for_different_services_differ() {
-        assert_ne!(subnet_for("service-a").host_ip, subnet_for("service-b").host_ip);
+        assert_ne!(
+            subnet_for("service-a").host_ip,
+            subnet_for("service-b").host_ip
+        );
     }
 
     #[test]

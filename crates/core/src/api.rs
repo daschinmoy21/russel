@@ -64,7 +64,7 @@ pub struct VmsResponse {
 #[serde(tag = "type", content = "payload")]
 pub enum DeployEvent {
     Progress { phase: String, description: String },
-    Complete(DeployResponse),
+    Complete(Box<DeployResponse>),
     Error(String),
 }
 
@@ -92,20 +92,26 @@ mod tests {
     #[test]
     fn deploy_event_serialization_roundtrip() {
         let events = vec![
-            DeployEvent::Progress { phase: "resolve".into(), description: "cloning".into() },
-            DeployEvent::Complete(DeployResponse {
+            DeployEvent::Progress {
+                phase: "resolve".into(),
+                description: "cloning".into(),
+            },
+            DeployEvent::Complete(Box::new(DeployResponse {
                 service_id: "svc".into(),
                 vm_id: "vm1".into(),
                 status: "deployed".into(),
                 store_path: Some("/nix/store/abc".into()),
                 microvm_config_path: None,
                 runner_path: None,
-                port: Some(PortMapping { host: 8080, guest: 3000 }),
+                port: Some(PortMapping {
+                    host: 8080,
+                    guest: 3000,
+                }),
                 elapsed_ms: 1234,
                 message: "ok".into(),
                 timing: None,
                 vm_ip: Some("10.0.5.2".into()),
-            }),
+            })),
             DeployEvent::Error("build failed".into()),
         ];
 
@@ -121,7 +127,10 @@ mod tests {
             repo_url: "https://github.com/example/repo.git".into(),
             config_path: "Russelfile.toml".into(),
             vm_id: Some("my-id".into()),
-            port: Some(PortMapping { host: 8080, guest: 3000 }),
+            port: Some(PortMapping {
+                host: 8080,
+                guest: 3000,
+            }),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("my-id"));

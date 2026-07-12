@@ -5,7 +5,7 @@ use std::{
 use tokio::process::Command;
 
 use russel_core::{
-    api::{DeployRequest, DeployResponse, DeployEvent, DeployTiming, PortMapping},
+    api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
     config::Russelfile,
 };
 
@@ -18,7 +18,6 @@ use crate::{
     state::AppState,
     traefik::TraefikClient,
 };
-
 
 #[derive(Debug)]
 pub struct DeployPipeline {
@@ -132,7 +131,10 @@ impl DeployPipeline {
                         elapsed_ms: elapsed,
                         timing: None,
                         vm_ip: None,
-                        message: format!("deployment failed but rolled back successfully: {}", original_error),
+                        message: format!(
+                            "deployment failed but rolled back successfully: {}",
+                            original_error
+                        ),
                     }
                 } else {
                     tracing::error!(
@@ -180,8 +182,6 @@ impl DeployPipeline {
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(service_id, service_name = %config.service.name, resolve_ms, "repo resolved");
 
-
-
         // ── 2. Nix build app + ensure kernel + busybox + modules ──────────
         let t = Instant::now();
         let _ = tx
@@ -226,13 +226,17 @@ impl DeployPipeline {
         }
 
         // Take the old processes from state
-        let (old_vm_proc, old_aux_procs) = self.state.take_processes(service_id).unwrap_or((None, Vec::new()));
+        let (old_vm_proc, old_aux_procs) = self
+            .state
+            .take_processes(service_id)
+            .unwrap_or((None, Vec::new()));
 
         // Teardown the old VM (it will stop systemd service, delete old TAP, release ports)
         // Since the directories are renamed to .bak, they are not deleted.
         if let Err(e) = self.runner.destroy(service_id).await {
             // Restore processes first so the lifecycle can be re-attempted
-            self.state.restore_processes(service_id, old_vm_proc, old_aux_procs);
+            self.state
+                .restore_processes(service_id, old_vm_proc, old_aux_procs);
             // Restore backups on teardown failure
             if has_backup {
                 let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
@@ -254,7 +258,8 @@ impl DeployPipeline {
                 None => {
                     let ports = self.ports.clone();
                     let service_id = service_id.to_string();
-                    let host = tokio::task::spawn_blocking(move || ports.next(&service_id)).await??;
+                    let host =
+                        tokio::task::spawn_blocking(move || ports.next(&service_id)).await??;
                     PortMapping {
                         host,
                         guest: config.service.port,
@@ -307,10 +312,14 @@ impl DeployPipeline {
             tracing::info!(service_id, "setting up TAP + socat + booting VM (serial)");
 
             // Step A: create TAP + setup port forwarding (socat)
-            let socat_child = TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
+            let socat_child =
+                TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
 
             // Step B: boot cloud-hypervisor with virtiofsd + minimal initramfs
-            let BootOutput { vm_child, virtiofsd_child } = self
+            let BootOutput {
+                vm_child,
+                virtiofsd_child,
+            } = self
                 .runner
                 .boot(service_id, &kernel, &initramfs_path, &alloc, mem_mb)
                 .await?;
@@ -331,8 +340,9 @@ impl DeployPipeline {
             });
             let content = serde_json::to_string_pretty(&metadata)
                 .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-            std::fs::write(&metadata_path, content)
-                .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", metadata_path, e))?;
+            std::fs::write(&metadata_path, content).map_err(|e| {
+                anyhow::anyhow!("failed to write metadata to {}: {}", metadata_path, e)
+            })?;
 
             let start_ms = t.elapsed().as_millis();
             let network_ms = 0u128; // included in start_ms (serial)
@@ -352,22 +362,42 @@ impl DeployPipeline {
                 guest_port = port.guest,
                 "polling VM readiness"
             );
-            let up = TapForwarder::wait_for_vm_port(
-                &alloc.vm_ip,
-                port.guest,
-                Duration::from_secs(10),
-            )
-            .await;
+            let up =
+                TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10))
+                    .await;
             let ready_ms = t.elapsed().as_millis();
             if !up {
                 anyhow::bail!("VM not reachable in 10s");
             }
             tracing::info!(service_id, ready_ms, "VM service reachable");
 
-            Ok::<_, anyhow::Error>((port, alloc, vm_child, virtiofsd_child, socat_child, initramfs_path, create_ms, start_ms, network_ms, ready_ms))
-        }.await;
+            Ok::<_, anyhow::Error>((
+                port,
+                alloc,
+                vm_child,
+                virtiofsd_child,
+                socat_child,
+                initramfs_path,
+                create_ms,
+                start_ms,
+                network_ms,
+                ready_ms,
+            ))
+        }
+        .await;
 
-        let (port, alloc, vm_child, virtiofsd_child, socat_child, initramfs_path, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
+        let (
+            port,
+            alloc,
+            vm_child,
+            virtiofsd_child,
+            socat_child,
+            initramfs_path,
+            create_ms,
+            start_ms,
+            network_ms,
+            ready_ms,
+        ) = match deploy_result {
             Ok(val) => {
                 // Do NOT delete backups or kill old processes yet - wait until after Traefik registration
                 val
@@ -383,16 +413,42 @@ impl DeployPipeline {
                         let old_metadata_path = format!("{}/metadata.json", russel_dir);
                         let content = std::fs::read_to_string(&old_metadata_path)?;
                         let old_meta: serde_json::Value = serde_json::from_str(&content)?;
-                        let old_host_port = old_meta["host_port"].as_u64().ok_or_else(|| anyhow::anyhow!("missing host_port"))? as u16;
-                        let old_guest_port = old_meta["guest_port"].as_u64().ok_or_else(|| anyhow::anyhow!("missing guest_port"))? as u16;
+                        let old_host_port = old_meta["host_port"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("missing host_port"))?
+                            as u16;
+                        let old_guest_port = old_meta["guest_port"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("missing guest_port"))?
+                            as u16;
                         let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
-                        let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
-                        let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
+                        let old_kernel_path = PathBuf::from(
+                            old_meta["kernel_path"]
+                                .as_str()
+                                .unwrap_or("/nix/store/kernel"),
+                        );
+                        let old_initramfs_path =
+                            PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
                         let old_alloc = subnet_for(service_id);
 
                         PortAllocator::reserve(service_id, old_host_port)?;
-                        let old_socat = TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
-                        let old_boot = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await?;
+                        let old_socat = TapForwarder::setup(
+                            service_id,
+                            &old_alloc,
+                            old_host_port,
+                            old_guest_port,
+                        )
+                        .await?;
+                        let old_boot = self
+                            .runner
+                            .boot(
+                                service_id,
+                                &old_kernel_path,
+                                &old_initramfs_path,
+                                &old_alloc,
+                                old_mem_mb,
+                            )
+                            .await?;
 
                         let old_vm_pid = old_boot.vm_child.id();
                         let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
@@ -419,13 +475,17 @@ impl DeployPipeline {
                             let _ = std::fs::write(old_metadata_path, c);
                         }
                         Ok::<(), anyhow::Error>(())
-                    }.await;
+                    }
+                    .await;
 
                     match rollback_res {
                         Ok(()) => {
                             tracing::info!(service_id, "Rollback to previous VM succeeded");
                             // The old VM is active again, so keep its port reservation.
-                            port_reservation.as_mut().expect("port reservation exists").disarm();
+                            port_reservation
+                                .as_mut()
+                                .expect("port reservation exists")
+                                .disarm();
                             // Return an error that indicates rollback succeeded (caller should NOT mark as failed)
                             return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
                         }
@@ -450,8 +510,14 @@ impl DeployPipeline {
 
         // Only after successful Traefik registration, clean up old resources
         if has_backup {
-            let _ = Command::new("rm").args(["-rf", &format!("{}.bak", russel_dir)]).output().await;
-            let _ = Command::new("rm").args(["-rf", &format!("{}.bak", microvms_dir)]).output().await;
+            let _ = Command::new("rm")
+                .args(["-rf", &format!("{}.bak", russel_dir)])
+                .output()
+                .await;
+            let _ = Command::new("rm")
+                .args(["-rf", &format!("{}.bak", microvms_dir)])
+                .output()
+                .await;
         }
         if let Some(mut p) = old_vm_proc {
             let _ = p.kill().await;
@@ -461,7 +527,10 @@ impl DeployPipeline {
         }
 
         self.state.attach_flake_path(service_id, repo_path.clone());
-        port_reservation.as_mut().expect("port reservation exists").disarm();
+        port_reservation
+            .as_mut()
+            .expect("port reservation exists")
+            .disarm();
 
         Ok(DeployOutput {
             store_path: build.store_path,
@@ -490,7 +559,10 @@ struct PortReservation {
 
 impl PortReservation {
     fn new(service_id: &str) -> Self {
-        Self { service_id: service_id.to_string(), armed: true }
+        Self {
+            service_id: service_id.to_string(),
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {

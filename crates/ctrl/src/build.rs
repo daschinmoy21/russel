@@ -16,7 +16,13 @@ pub async fn current_system() -> String {
         return sys.clone();
     }
     let out = Command::new("nix")
-        .args(["eval", "--impure", "--raw", "--expr", "builtins.currentSystem"])
+        .args([
+            "eval",
+            "--impure",
+            "--raw",
+            "--expr",
+            "builtins.currentSystem",
+        ])
         .output()
         .await;
     let sys = match out {
@@ -49,7 +55,8 @@ impl NixBuilder {
 
         let flake_content = if repo_path.join("Cargo.toml").exists() {
             tracing::info!("Detected Rust project.");
-            format!(r#"{{
+            format!(
+                r#"{{
   description = "Auto-generated Rust flake by Russel";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = {{ self, nixpkgs }}:
@@ -65,10 +72,13 @@ impl NixBuilder {
         }};
       }};
     }};
-}}"#, system = system)
+}}"#,
+                system = system
+            )
         } else if repo_path.join("go.mod").exists() {
             tracing::info!("Detected Go project.");
-            format!(r#"{{
+            format!(
+                r#"{{
   description = "Auto-generated Go flake by Russel";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = {{ self, nixpkgs }}:
@@ -82,10 +92,13 @@ impl NixBuilder {
         vendorHash = null;
       }};
     }};
-}}"#, system = system)
+}}"#,
+                system = system
+            )
         } else {
             tracing::info!("Defaulting to static web server flake.");
-            format!(r#"{{
+            format!(
+                r#"{{
   description = "Auto-generated Static site flake by Russel";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = {{ self, nixpkgs }}:
@@ -97,7 +110,9 @@ impl NixBuilder {
         exec ${{pkgs.python3}}/bin/python3 -m http.server "$PORT"
       '';
     }};
-}}"#, system = system)
+}}"#,
+                system = system
+            )
         };
 
         std::fs::write(&flake_path, flake_content)?;

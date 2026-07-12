@@ -60,7 +60,9 @@ async fn deploy(
             elapsed_ms = elapsed_ms,
             "POST /deploy -> {}", status
         );
-        let _ = deploy_tx.send(DeployEvent::Complete(response)).await;
+        let _ = deploy_tx
+            .send(DeployEvent::Complete(Box::new(response)))
+            .await;
     });
 
     tokio::spawn(async move {
