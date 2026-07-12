@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn test_mutex_poisoning_recovery() {
         let state = AppState::default();
-        
+
         // Poison the lock intentionally in a separate thread/panic
         let inner_clone = state.inner.clone();
         let _ = std::thread::spawn(move || {

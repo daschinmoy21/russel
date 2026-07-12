@@ -224,11 +224,26 @@ impl DeployPipeline {
             anyhow::bail!("failed to teardown old VM: {}", e);
         }
 
+        let mut port_reservation = None;
         let deploy_result = async {
-            let port = request.port.clone().unwrap_or_else(|| PortMapping {
-                host: self.ports.next(),
-                guest: config.service.port,
-            });
+            // Keep the registry reservation alive until the deployment is fully
+            // committed. Any error in this block releases it via Drop.
+            port_reservation = Some(PortReservation::new(service_id));
+            let port = match request.port.clone() {
+                Some(p) => {
+                    PortAllocator::reserve(service_id, p.host)?;
+                    p
+                }
+                None => {
+                    let ports = self.ports.clone();
+                    let service_id = service_id.to_string();
+                    let host = tokio::task::spawn_blocking(move || ports.next(&service_id)).await??;
+                    PortMapping {
+                        host,
+                        guest: config.service.port,
+                    }
+                }
+            };
             let alloc: SubnetAllocation = subnet_for(service_id);
             tracing::info!(
                 service_id,
@@ -358,6 +373,7 @@ impl DeployPipeline {
                         let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
                         let old_alloc = subnet_for(service_id);
 
+                        PortAllocator::reserve(service_id, old_host_port)?;
                         let old_socat = TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
                         let old_boot = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await?;
 
@@ -389,7 +405,8 @@ impl DeployPipeline {
                     match rollback_res {
                         Ok(()) => {
                             tracing::info!(service_id, "Rollback to previous VM succeeded");
-                            // Note: state.mark_deployed was already called inside the rollback closure
+                            // The old VM is active again, so keep its port reservation.
+                            port_reservation.as_mut().expect("port reservation exists").disarm();
                             // Return an error that indicates rollback succeeded (caller should NOT mark as failed)
                             return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
                         }
@@ -402,8 +419,15 @@ impl DeployPipeline {
             }
         };
 
-        // Register with Traefik before committing the deployment
-        self.traefik.register(service_id, port.host).await?;
+        // Register with Traefik before committing the deployment. Release the
+        // reservation if this final fallible step fails.
+        if let Err(error) = self.traefik.register(service_id, port.host).await {
+            if let Err(teardown_error) = TapForwarder::teardown(&alloc).await {
+                tracing::warn!(service_id, error = %teardown_error, "failed to tear down TAP after Traefik registration failure");
+            }
+            PortAllocator::release(service_id);
+            return Err(error);
+        }
 
         // Only after successful Traefik registration, clean up old resources
         if has_backup {
@@ -418,6 +442,7 @@ impl DeployPipeline {
         }
 
         self.state.attach_flake_path(service_id, repo_path.clone());
+        port_reservation.as_mut().expect("port reservation exists").disarm();
 
         Ok(DeployOutput {
             store_path: build.store_path,
@@ -436,6 +461,29 @@ impl DeployPipeline {
                 ready_ms,
             },
         })
+    }
+}
+
+struct PortReservation {
+    service_id: String,
+    armed: bool,
+}
+
+impl PortReservation {
+    fn new(service_id: &str) -> Self {
+        Self { service_id: service_id.to_string(), armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PortReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            PortAllocator::release(&self.service_id);
+        }
     }
 }
 
