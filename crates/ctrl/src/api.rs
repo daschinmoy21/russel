@@ -15,6 +15,8 @@ pub fn router(state: AppState) -> Router {
         .route("/deploy", post(deploy))
         .route("/vm/{service_id}/status", get(vm_status))
         .route("/vm/{service_id}/logs", get(vm_logs))
+        .route("/status", get(status_all))
+        .route("/logs", get(logs_all))
         .route("/vms", get(vms_list))
         .route("/vm/{service_id}/stop", post(vm_stop))
         .route("/vm/{service_id}", delete(vm_destroy))
@@ -119,11 +121,65 @@ async fn vm_logs(
         .ok_or((StatusCode::NOT_FOUND, format!("service {} not found", service_id)))
 }
 
+// Flat endpoints kept for CLI compatibility
+async fn status_all(
+    State(state): State<AppState>,
+) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    let ids = state.list_services();
+    match ids.len() {
+        0 => Err((StatusCode::NOT_FOUND, "no services".to_string())),
+        1 => {
+            let sid = &ids[0];
+            state.status(sid)
+                .map(Json)
+                .ok_or((StatusCode::NOT_FOUND, format!("service {} not found", sid)))
+        }
+        _ => Err((StatusCode::BAD_REQUEST, "multiple services exist; specify a service_id".to_string())),
+    }
+}
+
+async fn logs_all(
+    State(state): State<AppState>,
+) -> Result<Json<LogsResponse>, (StatusCode, String)> {
+    let ids = state.list_services();
+    match ids.len() {
+        0 => Err((StatusCode::NOT_FOUND, "no services".to_string())),
+        1 => {
+            let sid = &ids[0];
+            state.logs(sid)
+                .map(Json)
+                .ok_or((StatusCode::NOT_FOUND, format!("service {} not found", sid)))
+        }
+        _ => Err((StatusCode::BAD_REQUEST, "multiple services exist; specify a service_id".to_string())),
+    }
+}
+
 async fn vms_list(
     State(state): State<AppState>,
 ) -> Json<VmsResponse> {
-    let vms = state.list_services();
-    tracing::debug!(count = vms.len(), "GET /vms -> {} VMs", vms.len());
+    // Start with in-memory inventory
+    let mut vms = state.list_services();
+
+    // Augment with VMs discovered on disk (to handle restarts/rebuilds)
+    // Look in common persistent locations used by the old system.
+    let mut discovered = Vec::new();
+    for base in &["/var/lib/russel".to_string(), "/var/lib/microvms".to_string()] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type()
+                    && file_type.is_dir()
+                        && let Some(name) = entry.file_name().to_str() {
+                            // ignore known in-memory IDs to avoid duplicates
+                            if !vms.contains(&name.to_string()) {
+                                discovered.push(name.to_string());
+                            }
+                        }
+            }
+        }
+    }
+    vms.extend(discovered);
+
+    tracing::debug!(count = vms.len(), "GET /vms -> {} VMs (from disk+memory)", vms.len());
     Json(VmsResponse { vms })
 }
 

@@ -96,7 +96,10 @@ impl AppState {
         }
         let s = inner.services.entry(service_id.to_string()).or_default();
         s.status = "building".to_string();
-        s.vm_state = "pending".to_string();
+        // Do not clobber an in-flight lifecycle operation's vm_state.
+        if s.vm_state == "none" {
+            s.vm_state = "pending".to_string();
+        }
         Ok(())
     }
 
@@ -108,6 +111,24 @@ impl AppState {
         s.started_at = Instant::now();
         s.vm_pid = child.id();
         s.vm_process = Some(child);
+    }
+
+    /// Atomically register the VM and its auxiliary children.
+    /// Replaces separate mark_deployed + store_aux_process calls with one lock acquisition.
+    pub fn mark_deployed_with_aux(
+        &self,
+        service_id: &str,
+        vm_child: Child,
+        aux_children: Vec<Child>,
+    ) {
+        let mut inner = self.lock_inner();
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.status = "deployed".to_string();
+        s.vm_state = "running".to_string();
+        s.started_at = Instant::now();
+        s.vm_pid = vm_child.id();
+        s.vm_process = Some(vm_child);
+        s.aux_processes.extend(aux_children);
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
