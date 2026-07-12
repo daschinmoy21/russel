@@ -59,13 +59,13 @@ pub struct StopArgs {
 
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    #[arg(long, value_name = "ID")]
+    #[arg(value_name = "ID")]
     pub service_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    #[arg(long, value_name = "ID")]
+    #[arg(value_name = "ID")]
     pub service_id: Option<String>,
 }
 
@@ -249,11 +249,7 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
             t.create_ms,
             "build minimal initramfs (BusyBox + modules)",
         );
-        timing_row(
-            "network",
-            t.network_ms,
-            "TAP + socat port forwarding setup",
-        );
+        timing_row("network", t.network_ms, "TAP + socat port forwarding setup");
         timing_row(
             "start",
             t.start_ms,
@@ -446,7 +442,10 @@ mod tests {
         let result = normalize_repo_arg(".").unwrap();
         // Should resolve to an absolute path
         assert!(result.starts_with('/'), "got: {result}");
-        assert!(std::path::Path::new(&result).is_dir(), "path not found: {result}");
+        assert!(
+            std::path::Path::new(&result).is_dir(),
+            "path not found: {result}"
+        );
     }
 
     #[test]

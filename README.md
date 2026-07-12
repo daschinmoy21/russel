@@ -73,8 +73,8 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 
 ```bash
 russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID]
-russel status <service_id>
-russel logs <service_id>
+russel status [<service_id>]
+russel logs [<service_id>]
 russel vms
 russel stop <service_id>
 russel destroy <service_id>
@@ -167,16 +167,41 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 
 | Metric | Value |
 |--------|-------|
-| Clean build (debug) | 14.5s |
-| Release build | 26.4s |
-| Incremental build | 1.0s |
-| Tests | 31 passing, 0.8s |
-| Binary size (cli) | 6.6MB |
+| Clean build (debug) | 12.3s |
+| Release build | 24.4s |
+| Incremental build | 0.8s |
+| Tests | 43 passing, 0.7s |
+| Binary size (cli) | 6.7MB |
 | Binary size (ctrl) | 4.5MB |
-| Rust LOC | 3,562 (16 files) |
+| Rust LOC | 3,994 (16 files) |
 | Direct deps | 332 |
+| Dockerfiles | 3 (examples/basic-http, static-test, filebrowser) |
+
+### Container Boot Comparison (via podman)
+
+| Example | Container ready | Build time |
+|---------|----------------|------------|
+| basic-http | 176ms | 19.1s |
+| static-test | 519ms | 1.2s |
+| filebrowser | 292ms | 8.3s |
+
+Container startup is faster than microVM boot (which includes kernel init,
+initramfs extraction, and module loading), but microVMs provide stronger
+isolation via hardware virtualization. Container resources are capped to
+`--memory=256m` to match the microVM memory limit.
+
+MicroVM boot times require KVM + root and are measured separately via
+`russel-cli deploy` on a host with `/dev/kvm` access.
 
 Run `./bench.sh` to reproduce.
+
+### Known Limitations
+
+- **Subnet collision detection** — 16-bit FNV-1a space, <2% collision at 50 services. Add when scale demands it.
+- **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
+- **Traefik/Database/Health stubs** — documented placeholders, fully functional via direct socat access.
+- **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
+- **microVM boot benchmark** — add `russel deploy` timing to bench.sh once Cloud Hypervisor is present in CI.
 
 ## License
 

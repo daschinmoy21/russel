@@ -538,10 +538,13 @@ exec /bin/sh
             tracing::warn!(file = %api_sock, error = %e, "failed to remove stale Cloud Hypervisor API socket");
         }
 
-        tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store");
+        // ponytail: --readonly ensures the guest cannot write to /nix/store.
+        // Remove if a deployment workflow ever needs guest-side store mutations.
+        tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store (read-only)");
         let virtiofsd_child = Command::new("virtiofsd")
             .arg(format!("--socket-path={}", virtiofs_sock))
             .arg("--shared-dir=/nix/store")
+            .arg("--readonly")
             .arg("--sandbox=none")
             .arg("--cache=always")
             .kill_on_drop(true)
