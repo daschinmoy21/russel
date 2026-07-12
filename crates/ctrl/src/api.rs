@@ -6,7 +6,7 @@ use axum::{
 use russel_core::api::{DeployRequest, DeployEvent, LogsResponse, StatusResponse, VmsResponse};
 use tokio_stream::StreamExt;
 
-use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, state::AppState};
+use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, network::release_subnet, state::AppState};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -49,8 +49,8 @@ async fn deploy(
     });
 
     tokio::spawn(async move {
-        if let Err(e) = deploy_handle.await {
-            if e.is_panic() {
+        if let Err(e) = deploy_handle.await
+            && e.is_panic() {
                 let panic = e.into_panic();
                 let detail = panic
                     .downcast_ref::<&'static str>()
@@ -67,14 +67,13 @@ async fn deploy(
             }
             // Cancelled join errors (runtime shutdown) are intentionally dropped
             // so the client falls back to the generic closed-connection message.
-        }
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
         .map(|msg| {
             let json = serde_json::to_string(&msg).map_err(|e| {
                 tracing::error!(error = %e, "failed to serialize deploy event");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
+                std::io::Error::other(e)
             })?;
             Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
         });
@@ -137,13 +136,12 @@ async fn vm_stop(
     let mut aux_failed = Vec::new();
     let mut has_kill_failure = false;
 
-    if let Some(mut child) = vm_child {
-        if let Err(e) = child.kill().await {
+    if let Some(mut child) = vm_child
+        && let Err(e) = child.kill().await {
             tracing::error!(vm_id = %id, error = %e, "failed to kill VM process");
             vm_failed = Some(child);
             has_kill_failure = true;
         }
-    }
     for mut child in aux_processes {
         if let Err(e) = child.kill().await {
             tracing::error!(vm_id = %id, error = %e, "failed to kill aux process");
@@ -198,13 +196,12 @@ async fn vm_destroy(
     let mut aux_failed = Vec::new();
     let mut has_kill_failure = false;
 
-    if let Some(mut child) = vm_child {
-        if let Err(e) = child.kill().await {
+    if let Some(mut child) = vm_child
+        && let Err(e) = child.kill().await {
             tracing::error!(vm_id = %id, error = %e, "failed to kill VM process during destroy");
             vm_failed = Some(child);
             has_kill_failure = true;
         }
-    }
     for mut child in aux_processes {
         if let Err(e) = child.kill().await {
             tracing::error!(vm_id = %id, error = %e, "failed to kill aux process during destroy");
@@ -226,6 +223,7 @@ async fn vm_destroy(
     let runner = MicrovmRunner::new();
     match runner.destroy(&id).await {
         Ok(_) => {
+            release_subnet(&id);
             tracing::info!(vm_id = %id, "destroyed microvm");
             state.set_status_if_matches(&id, "destroyed", "none");
             Ok(Json(format!("destroyed {}", id)))

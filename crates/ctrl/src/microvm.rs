@@ -146,11 +146,10 @@ impl MicrovmRunner {
 
     fn check_cache(&self, cache: &Mutex<Option<PathBuf>>) -> Option<PathBuf> {
         if let Ok(cache) = cache.lock() {
-            if let Some(ref path) = *cache {
-                if path.exists() {
+            if let Some(ref path) = *cache
+                && path.exists() {
                     return Some(path.clone());
                 }
-            }
         } else {
             tracing::warn!("cache lock poisoned, re-building from scratch");
         }
@@ -179,11 +178,10 @@ impl MicrovmRunner {
         let initramfs_file = deploy_dir.join("initramfs.cpio");
         let work = deploy_dir.join("initramfs.d");
 
-        if let Err(e) = std::fs::remove_dir_all(&work) {
-            if e.kind() != std::io::ErrorKind::NotFound {
+        if let Err(e) = std::fs::remove_dir_all(&work)
+            && e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous initramfs work dir");
             }
-        }
         std::fs::create_dir_all(&work)?;
 
         let needed_modules: &[&str] = &[
@@ -345,11 +343,10 @@ exec /bin/sh
         std::fs::create_dir_all(&bin_dir)?;
         for name in &["sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat"] {
             let dest = bin_dir.join(name);
-            if let Err(e) = std::fs::remove_file(&dest) {
-                if e.kind() != std::io::ErrorKind::NotFound {
+            if let Err(e) = std::fs::remove_file(&dest)
+                && e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(file = %dest.display(), error = %e, "failed to remove previous symlink");
                 }
-            }
             std::os::unix::fs::symlink(bb_bin, &dest)?;
         }
         Ok(())
@@ -389,11 +386,10 @@ exec /bin/sh
         let mods_dir = modules_path.join("lib/modules");
         for entry in std::fs::read_dir(&mods_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str() {
                     return Ok(name.to_string());
                 }
-            }
         }
         anyhow::bail!("no kernel version directory found in {}", mods_dir.display())
     }
@@ -497,11 +493,10 @@ exec /bin/sh
         let sock_dir = format!("/var/lib/russel/{}", service_id);
         std::fs::create_dir_all(&sock_dir)?;
         let console_log = format!("{}/console.log", sock_dir);
-        if let Err(e) = std::fs::remove_file(&console_log) {
-            if e.kind() != std::io::ErrorKind::NotFound {
+        if let Err(e) = std::fs::remove_file(&console_log)
+            && e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(file = %console_log, error = %e, "failed to remove previous console log");
             }
-        }
         if let Ok(file) = std::fs::File::create(&console_log) {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o666)) {
@@ -510,11 +505,10 @@ exec /bin/sh
         }
 
         let virtiofs_sock = format!("{}/virtiofs.sock", sock_dir);
-        if let Err(e) = std::fs::remove_file(&virtiofs_sock) {
-            if e.kind() != std::io::ErrorKind::NotFound {
+        if let Err(e) = std::fs::remove_file(&virtiofs_sock)
+            && e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(file = %virtiofs_sock, error = %e, "failed to remove stale virtiofs socket");
             }
-        }
 
         tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store");
         let virtiofsd_child = Command::new("virtiofsd")
@@ -605,38 +599,28 @@ exec /bin/sh
         // Read metadata to verify/validate PIDs before attempting cleanup
         let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
         let mut verified_kills = Vec::new();
-        if let Ok(content) = std::fs::read_to_string(&metadata_path) {
-            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Ok(content) = std::fs::read_to_string(&metadata_path)
+            && let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
                 // Verify and kill each PID only if it still belongs to the expected process
-                if let Some(vm_pid) = metadata.get("vm_pid").and_then(|v| v.as_u64()) {
-                    if Self::verify_process_ownership(vm_pid as u32, service_id) {
-                        if let Ok(out) = Command::new("kill").arg(vm_pid.to_string()).output().await {
-                            if out.status.success() {
+                if let Some(vm_pid) = metadata.get("vm_pid").and_then(|v| v.as_u64())
+                    && Self::verify_process_ownership(vm_pid as u32, service_id)
+                        && let Ok(out) = Command::new("kill").arg(vm_pid.to_string()).output().await
+                            && out.status.success() {
                                 verified_kills.push(("vm", vm_pid));
                             }
-                        }
-                    }
-                }
-                if let Some(virtiofsd_pid) = metadata.get("virtiofsd_pid").and_then(|v| v.as_u64()) {
-                    if Self::verify_process_ownership(virtiofsd_pid as u32, service_id) {
-                        if let Ok(out) = Command::new("kill").arg(virtiofsd_pid.to_string()).output().await {
-                            if out.status.success() {
+                if let Some(virtiofsd_pid) = metadata.get("virtiofsd_pid").and_then(|v| v.as_u64())
+                    && Self::verify_process_ownership(virtiofsd_pid as u32, service_id)
+                        && let Ok(out) = Command::new("kill").arg(virtiofsd_pid.to_string()).output().await
+                            && out.status.success() {
                                 verified_kills.push(("virtiofsd", virtiofsd_pid));
                             }
-                        }
-                    }
-                }
-                if let Some(socat_pid) = metadata.get("socat_pid").and_then(|v| v.as_u64()) {
-                    if Self::verify_process_ownership(socat_pid as u32, service_id) {
-                        if let Ok(out) = Command::new("kill").arg(socat_pid.to_string()).output().await {
-                            if out.status.success() {
+                if let Some(socat_pid) = metadata.get("socat_pid").and_then(|v| v.as_u64())
+                    && Self::verify_process_ownership(socat_pid as u32, service_id)
+                        && let Ok(out) = Command::new("kill").arg(socat_pid.to_string()).output().await
+                            && out.status.success() {
                                 verified_kills.push(("socat", socat_pid));
                             }
-                        }
-                    }
-                }
             }
-        }
 
         // Fallback: use pattern-based pkill only if no metadata-based kills succeeded
         if verified_kills.is_empty() {
@@ -698,16 +682,14 @@ exec /bin/sh
         // Validate service_id before using it in any paths
         Self::validate_service_id(service_id)?;
 
-        let alloc = crate::network::subnet_for(service_id);
-
         self.stop(service_id).await?;
 
         // Teardown the TAP device
+        let alloc = crate::network::subnet_for(service_id);
         crate::network::TapForwarder::teardown(&alloc).await?;
 
-        // Release port and subnet
+        // Release port
         crate::network::PortAllocator::release(service_id);
-        crate::network::release_subnet(service_id);
 
         for dir in &[
             format!("/var/lib/microvms/{}", service_id),
@@ -768,17 +750,15 @@ exec /bin/sh
     pub async fn list(&self) -> anyhow::Result<Vec<String>> {
         let mut vms = Vec::new();
         let state_dir = Path::new("/var/lib/microvms");
-        if state_dir.exists() {
-            if let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
+        if state_dir.exists()
+            && let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
-                    if entry.file_type().await?.is_dir() {
-                        if let Some(name) = entry.file_name().to_str() {
+                    if entry.file_type().await?.is_dir()
+                        && let Some(name) = entry.file_name().to_str() {
                             vms.push(name.to_string());
                         }
-                    }
                 }
             }
-        }
         Ok(vms)
     }
 }

@@ -36,12 +36,12 @@ impl DeployPipeline {
     pub fn new(state: AppState) -> Self {
         Self {
             state,
-            git: GitClient::default(),
+            git: GitClient,
             builder: NixBuilder,
             database: DatabaseProvisioner,
             runner: MicrovmRunner::new(),
-            ports: PortAllocator::default(),
-            traefik: TraefikClient::default(),
+            ports: PortAllocator,
+            traefik: TraefikClient,
         }
     }
 

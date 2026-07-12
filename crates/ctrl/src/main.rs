@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::state::AppState;
+use crate::network::release_subnet;
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -64,8 +65,13 @@ async fn cleanup_all_vms() {
                 let runner = runner.clone();
                 tasks.push(tokio::spawn(async move {
                     info!(vm_id = %vm_id, "destroying microVM during shutdown");
-                    if let Err(e) = runner.destroy(&vm_id).await {
-                        tracing::warn!(vm_id = %vm_id, error = %e, "failed to destroy microVM during shutdown");
+                    match runner.destroy(&vm_id).await {
+                        Ok(()) => {
+                            release_subnet(&vm_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(vm_id = %vm_id, error = %e, "failed to destroy microVM during shutdown");
+                        }
                     }
                 }));
             }
@@ -135,14 +141,13 @@ async fn cleanup_stale_resources() {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
-                if line.contains("vm-") {
-                    if let Some(name) = line.split_whitespace().nth(1) {
+                if line.contains("vm-")
+                    && let Some(name) = line.split_whitespace().nth(1) {
                         let name = name.trim_matches(':');
                         if let Err(e) = Command::new("ip").args(["link", "delete", name]).output().await {
                             tracing::warn!(tap = name, error = %e, "failed to delete stale tap interface");
                         }
                     }
-                }
             }
         }
         Err(e) => {
