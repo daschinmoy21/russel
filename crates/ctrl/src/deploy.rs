@@ -1,6 +1,5 @@
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::process::Command;
@@ -15,7 +14,7 @@ use crate::{
     database::DatabaseProvisioner,
     git::GitClient,
     microvm::{BootOutput, MicrovmRunner},
-    network::{PortAllocator, SubnetAllocation, TapForwarder, release_subnet, subnet_for},
+    network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
     state::AppState,
     traefik::TraefikClient,
 };
@@ -31,21 +30,18 @@ pub struct DeployPipeline {
     runner: MicrovmRunner,
     ports: PortAllocator,
     traefik: TraefikClient,
-    /// Whether the current deploy attempt allocated a NEW subnet slot.
-    subnet_acquired: AtomicBool,
 }
 
 impl DeployPipeline {
     pub fn new(state: AppState) -> Self {
         Self {
             state,
-            git: GitClient,
+            git: GitClient::default(),
             builder: NixBuilder,
             database: DatabaseProvisioner,
             runner: MicrovmRunner::new(),
             ports: PortAllocator::default(),
-            traefik: TraefikClient,
-            subnet_acquired: AtomicBool::new(false),
+            traefik: TraefikClient::default(),
         }
     }
 
@@ -76,8 +72,6 @@ impl DeployPipeline {
                     "deploy succeeded"
                 );
                 self.state.mark_deployed(&service_id, output.vm_child);
-                // The subnet is now owned by the deployed service, not this attempt.
-                self.subnet_acquired.store(false, Ordering::Relaxed);
                 self.state.store_aux_process(output.socat_child);
                 self.state.store_aux_process(output.virtiofsd_child);
                 DeployResponse {
@@ -99,7 +93,7 @@ impl DeployPipeline {
             }
             Err(error) => {
                 let elapsed = started.elapsed().as_millis();
-                let mut error_msg = error.to_string();
+                let error_msg = error.to_string();
 
                 // Check if this is a successful rollback case
                 if error_msg.starts_with("ROLLBACK_SUCCESS:") {
@@ -131,28 +125,6 @@ impl DeployPipeline {
                         "deploy failed"
                     );
                     self.state.mark_failed(&service_id, error.to_string());
-                    // ponytail: tear down before releasing the subnet, and only if THIS
-                    // attempt acquired it. If the service was already deployed (re-deploy
-                    // hit a build error), the existing reservation must be left alone.
-                    if self.subnet_acquired.load(Ordering::Relaxed) {
-                        match self.runner.destroy(&service_id).await {
-                            Ok(()) => {
-                                release_subnet(&service_id);
-                                self.subnet_acquired.store(false, Ordering::Relaxed);
-                            }
-                            Err(destroy_error) => {
-                                tracing::error!(
-                                    service_id = %service_id,
-                                    error = %destroy_error,
-                                    "failed to clean up VM after deployment failure"
-                                );
-                                error_msg = format!(
-                                    "{}; cleanup failed: {}",
-                                    error_msg, destroy_error
-                                );
-                            }
-                        }
-                    }
                     DeployResponse {
                         service_id,
                         vm_id,
@@ -164,7 +136,7 @@ impl DeployPipeline {
                         elapsed_ms: elapsed,
                         timing: None,
                         vm_ip: None,
-                        message: error_msg,
+                        message: error.to_string(),
                     }
                 }
             }
@@ -252,14 +224,27 @@ impl DeployPipeline {
             anyhow::bail!("failed to teardown old VM: {}", e);
         }
 
+        let mut port_reservation = None;
         let deploy_result = async {
-            let port = request.port.clone().unwrap_or_else(|| PortMapping {
-                host: self.ports.next(),
-                guest: config.service.port,
-            });
-            // Allocate subnet and track if it's newly allocated
-            let (alloc, newly_allocated) = subnet_for(service_id)?;
-            self.subnet_acquired.store(newly_allocated, Ordering::Relaxed);
+            // Keep the registry reservation alive until the deployment is fully
+            // committed. Any error in this block releases it via Drop.
+            port_reservation = Some(PortReservation::new(service_id));
+            let port = match request.port.clone() {
+                Some(p) => {
+                    PortAllocator::reserve(service_id, p.host)?;
+                    p
+                }
+                None => {
+                    let ports = self.ports.clone();
+                    let service_id = service_id.to_string();
+                    let host = tokio::task::spawn_blocking(move || ports.next(&service_id)).await??;
+                    PortMapping {
+                        host,
+                        guest: config.service.port,
+                    }
+                }
+            };
+            let alloc: SubnetAllocation = subnet_for(service_id);
             tracing::info!(
                 service_id,
                 host = port.host,
@@ -372,10 +357,8 @@ impl DeployPipeline {
             }
             Err(deploy_err) => {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
-                // Always tear down any partially-created VM from the failed deployment.
-                // Note: destroy() does NOT release the subnet (callers own that).
-                let _destroy_result = self.runner.destroy(service_id).await;
-
+                // Always tear down any partially-created VM from the failed deployment
+                let _ = self.runner.destroy(service_id).await;
                 if has_backup {
                     let rollback_res = async {
                         tokio::fs::rename(&russel_bak, &russel_dir).await?;
@@ -388,8 +371,9 @@ impl DeployPipeline {
                         let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
                         let old_kernel_path = PathBuf::from(old_meta["kernel_path"].as_str().unwrap_or("/nix/store/kernel"));
                         let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
-                        let (old_alloc, _) = subnet_for(service_id)?;
+                        let old_alloc = subnet_for(service_id);
 
+                        PortAllocator::reserve(service_id, old_host_port)?;
                         let old_socat = TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
                         let old_boot = self.runner.boot(service_id, &old_kernel_path, &old_initramfs_path, &old_alloc, old_mem_mb).await?;
 
@@ -421,9 +405,9 @@ impl DeployPipeline {
                     match rollback_res {
                         Ok(()) => {
                             tracing::info!(service_id, "Rollback to previous VM succeeded");
-                            // Note: state.mark_deployed was already called inside the rollback closure
+                            // The old VM is active again, so keep its port reservation.
+                            port_reservation.as_mut().expect("port reservation exists").disarm();
                             // Return an error that indicates rollback succeeded (caller should NOT mark as failed)
-                            // Subnet is NOT released — the restored VM needs it.
                             return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
                         }
                         Err(rollback_err) => {
@@ -431,18 +415,19 @@ impl DeployPipeline {
                         }
                     }
                 }
-
-                // Rollback failed or no backup — release subnet if THIS attempt allocated it
-                if self.subnet_acquired.load(Ordering::Relaxed) {
-                    release_subnet(service_id);
-                    self.subnet_acquired.store(false, Ordering::Relaxed);
-                }
                 return Err(deploy_err);
             }
         };
 
-        // Register with Traefik before committing the deployment
-        self.traefik.register(service_id, port.host).await?;
+        // Register with Traefik before committing the deployment. Release the
+        // reservation if this final fallible step fails.
+        if let Err(error) = self.traefik.register(service_id, port.host).await {
+            if let Err(teardown_error) = TapForwarder::teardown(&alloc).await {
+                tracing::warn!(service_id, error = %teardown_error, "failed to tear down TAP after Traefik registration failure");
+            }
+            PortAllocator::release(service_id);
+            return Err(error);
+        }
 
         // Only after successful Traefik registration, clean up old resources
         if has_backup {
@@ -457,6 +442,7 @@ impl DeployPipeline {
         }
 
         self.state.attach_flake_path(service_id, repo_path.clone());
+        port_reservation.as_mut().expect("port reservation exists").disarm();
 
         Ok(DeployOutput {
             store_path: build.store_path,
@@ -475,6 +461,29 @@ impl DeployPipeline {
                 ready_ms,
             },
         })
+    }
+}
+
+struct PortReservation {
+    service_id: String,
+    armed: bool,
+}
+
+impl PortReservation {
+    fn new(service_id: &str) -> Self {
+        Self { service_id: service_id.to_string(), armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PortReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            PortAllocator::release(&self.service_id);
+        }
     }
 }
 
