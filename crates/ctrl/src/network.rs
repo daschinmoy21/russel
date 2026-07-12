@@ -60,7 +60,7 @@ pub struct TapForwarder;
 impl TapForwarder {
     /// Create the TAP interface, bring it up with host-side IP, enable IP
     /// forwarding, then spawn a `socat` TCP forwarder:
-    ///   `0.0.0.0:<host_port>` → `<vm_ip>:<guest_port>`.
+    ///   `127.0.0.1:<host_port>` → `<vm_ip>:<guest_port>`.
     ///
     /// All steps run sequentially — the TAP must exist before the VM boots.
     pub async fn setup(
