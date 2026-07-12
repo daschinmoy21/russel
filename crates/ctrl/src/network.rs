@@ -28,9 +28,16 @@ fn port_is_available(port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
+fn port_registry() -> std::sync::MutexGuard<'static, PortRegistry> {
+    PORT_REGISTRY.lock().unwrap_or_else(|e| {
+        tracing::warn!("PORT_REGISTRY lock poisoned — recovering");
+        e.into_inner()
+    })
+}
+
 impl PortAllocator {
     pub fn next(&self, service_id: &str) -> anyhow::Result<u16> {
-        let mut registry = PORT_REGISTRY.lock().unwrap();
+        let mut registry = port_registry();
         if let Some(old_port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&old_port);
         }
@@ -53,7 +60,7 @@ impl PortAllocator {
     }
 
     pub fn reserve(service_id: &str, port: u16) -> anyhow::Result<()> {
-        let mut registry = PORT_REGISTRY.lock().unwrap();
+        let mut registry = port_registry();
         let existing_port = registry.allocations.get(service_id).copied();
         if existing_port == Some(port) {
             // Do not trust the registry alone: the listener may have disappeared,
@@ -78,7 +85,7 @@ impl PortAllocator {
     }
 
     pub fn release(service_id: &str) {
-        let mut registry = PORT_REGISTRY.lock().unwrap();
+        let mut registry = port_registry();
         if let Some(port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&port);
         }

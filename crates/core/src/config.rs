@@ -3,19 +3,41 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Russelfile {
     pub service: ServiceConfig,
+    /// ponytail: database provisioning is not yet implemented.
+    /// When enabled = true, `load` returns an error telling the user
+    /// databases are not supported yet, rather than silently ignoring
+    /// their config.
+    #[serde(default)]
     pub database: Option<DatabaseConfig>,
 }
 
 impl Russelfile {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents = fs::read_to_string(path)?;
-        Ok(toml::from_str(&contents)?)
+        Self::load_from_str(&contents)
+    }
+
+    /// Parse from a string — shared by `load` and tests.
+    fn load_from_str(contents: &str) -> anyhow::Result<Self> {
+        let config: Self = toml::from_str(contents)?;
+        // Reject database config at parse time — it's not implemented yet.
+        if let Some(ref db) = config.database
+            && (db.postgres.as_ref().is_some_and(|p| p.enabled)
+                || db.redis.as_ref().is_some_and(|r| r.enabled))
+        {
+            anyhow::bail!(
+                "database provisioning is not yet supported (remove [database] from Russelfile)"
+            );
+        }
+        Ok(config)
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
     pub source: String,
@@ -150,7 +172,25 @@ memory = "512gb"
     }
 
     #[test]
-    fn parse_optional_database_config() {
+    fn parse_database_config_disabled_ok() {
+        let toml = r#"
+[service]
+name = "db-app"
+source = "."
+port = 5432
+memory = "512mb"
+
+[database.postgres]
+enabled = false
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        let db = config.database.unwrap();
+        assert!(!db.postgres.unwrap().enabled);
+        assert!(db.redis.is_none());
+    }
+
+    #[test]
+    fn parse_database_enabled_rejected() {
         let toml = r#"
 [service]
 name = "db-app"
@@ -161,9 +201,21 @@ memory = "512mb"
 [database.postgres]
 enabled = true
 "#;
-        let config: Russelfile = toml::from_str(toml).unwrap();
-        let db = config.database.unwrap();
-        assert!(db.postgres.unwrap().enabled);
-        assert!(db.redis.is_none());
+        let err = Russelfile::load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("not yet supported"));
+    }
+
+    #[test]
+    fn deny_unknown_fields() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+typo_field = "oops"
+"#;
+        let err = toml::from_str::<Russelfile>(toml).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 }
