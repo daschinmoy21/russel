@@ -658,11 +658,10 @@ exec /bin/sh
                 format!("socat-russel-{}", escape_regex(service_id)),
             ),
         ] {
-            if let Some(pid) = pid {
-                if terminate_owned_process(pid, service_id).await? {
+            if let Some(pid) = pid
+                && terminate_owned_process(pid, service_id).await? {
                     continue;
                 }
-            }
             self.pkill_service_process(service_id, kind, &pattern)
                 .await?;
         }
@@ -745,7 +744,13 @@ exec /bin/sh
     fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
         let cmdline_path = format!("/proc/{pid}/cmdline");
         std::fs::read_to_string(cmdline_path)
-            .map(|cmdline| cmdline.contains(service_id))
+            .map(|cmdline| {
+                cmdline.split('\0').any(|arg| {
+                    arg == format!("tap=vm-{service_id}")
+                        || arg.contains(&format!("russel/{service_id}/"))
+                        || arg.contains(&format!("socat-russel-{service_id}"))
+                })
+            })
             .unwrap_or(false)
     }
 

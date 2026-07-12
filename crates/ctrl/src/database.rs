@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 use russel_core::config::DatabaseConfig;
 
 #[derive(Debug, Default)]
