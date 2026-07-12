@@ -71,7 +71,7 @@ pub struct SubnetAllocation {
 /// Returns an error when all 65 536 indices are exhausted.
 /// Second return value is `true` when a NEW allocation was made (caller should release on error).
 pub fn subnet_for(service_id: &str) -> anyhow::Result<(SubnetAllocation, bool)> {
-    let mut registry = SUBNET_REGISTRY.lock().unwrap();
+    let mut registry = SUBNET_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let (val, newly_allocated) = if let Some(&val) = registry.allocations.get(service_id) {
         (val, false)
     } else {
@@ -206,6 +206,21 @@ impl TapForwarder {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// Clean up TAP interface and network configuration.
+    /// Safe to call even if TAP doesn't exist (best-effort cleanup).
+    pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
+        let tap = &alloc.tap_id;
+        tracing::info!(tap, "tearing down tap interface");
+        
+        // Best-effort TAP deletion (may not exist if setup failed early)
+        let _ = run_ip(&["link", "del", tap]).await;
+        
+        // Note: socat process cleanup is handled by kill_on_drop(true) in Command
+        // Note: IP forwarding sysctl left enabled (system-wide setting)
+        
+        Ok(())
     }
 }
 
