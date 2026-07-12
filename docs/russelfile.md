@@ -153,15 +153,13 @@ YAML can represent the complete Russel model directly:
 
 YAML also has risks. Russel should use a YAML 1.2 parser, reject unknown fields, validate types strictly, and avoid surprising implicit values such as `yes`, `no`, or numeric-looking strings. A single canonical filename such as `Russelfile.yaml` is preferable to silently searching many formats.
 
-Manifest format contract and precedence
+A practical compatibility plan would be:
 
-- Russelfile.yaml takes precedence over Russelfile.toml when both exist.
-- If both exist, Russelfile.yaml is used for all generation and runtime behavior.
-- Russelfile.toml remains supported for backwards-compatibility and is used only if YAML is not present.
-- russel init reads Russelfile.yaml when present; if YAML is missing, it reads Russelfile.toml; when both exist, YAML wins.
-- For core commands (russel build, russel deploy, russel check), the same precedence applies: YAML if present, otherwise TOML.
-- In managed mode, custom-flake metadata, and dependency handling, Russelfile.yaml governs the behavior; TOML is only used if YAML is absent.
-- TOML compatibility is maintained: existing TOML inputs should continue to work with legacy flows.
+- support the current `Russelfile.toml` during the MVP;
+- make `Russelfile.yaml` the preferred structured format for the richer model;
+- allow `russel init` to generate YAML by default;
+- keep TOML as a backwards-compatible input format;
+- support Dockerfile import or a constrained Dockerfile frontend separately.
 
 ## Dockerfile Compatibility
 

@@ -1,6 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::StatusCode,
     routing::{delete, get, post},
 };
 use russel_core::api::{DeployRequest, DeployEvent, LogsResponse, StatusResponse, VmsResponse};
@@ -11,11 +12,11 @@ use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, network::release_sub
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/deploy", post(deploy))
-        .route("/status", get(status))
-        .route("/logs", get(logs))
+        .route("/vm/{service_id}/status", get(vm_status))
+        .route("/vm/{service_id}/logs", get(vm_logs))
         .route("/vms", get(vms_list))
-        .route("/vm/{id}/stop", post(vm_stop))
-        .route("/vm/{id}", delete(vm_destroy))
+        .route("/vm/{service_id}/stop", post(vm_stop))
+        .route("/vm/{service_id}", delete(vm_destroy))
         .with_state(state)
 }
 
@@ -23,17 +24,20 @@ async fn deploy(
     State(state): State<AppState>,
     Json(request): Json<DeployRequest>,
 ) -> axum::response::Response {
+    let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
+
     tracing::info!(
         repo = %request.repo_url,
-        vm_id = ?request.vm_id,
+        service_id = %service_id,
         port = ?request.port.as_ref().map(|p| format!("{}:{}", p.host, p.guest)),
         "POST /deploy"
     );
-    
+
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
     let monitor_state = state.clone();
-    let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
+    let sid = service_id.clone();
+    let sid2 = service_id.clone();
 
     let deploy_handle = tokio::spawn(async move {
         let pipeline = DeployPipeline::new(state);
@@ -41,6 +45,7 @@ async fn deploy(
         let status = response.status.clone();
         let elapsed_ms = response.elapsed_ms;
         tracing::info!(
+            service_id = %sid,
             status = %status,
             elapsed_ms = elapsed_ms,
             "POST /deploy -> {}", status
@@ -58,11 +63,11 @@ async fn deploy(
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "deploy task panicked".to_string());
                 tracing::error!(
-                    service_id = %service_id,
+                    service_id = %sid2,
                     panic = %detail,
                     "deploy task panicked"
                 );
-                monitor_state.mark_failed(&service_id, detail);
+                monitor_state.mark_failed(&sid2, detail);
                 let _ = tx.send(DeployEvent::Error("deploy task failed".to_string())).await;
             }
             // Cancelled join errors (runtime shutdown) are intentionally dropped
@@ -93,41 +98,47 @@ async fn deploy(
         })
 }
 
-async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let s = state.status();
-    tracing::debug!(service_id = %s.service_id, status = %s.status, "GET /status");
-    Json(s)
+async fn vm_status(
+    State(state): State<AppState>,
+    Path(service_id): Path<String>,
+) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    tracing::debug!(service_id = %service_id, "GET /vm/{}/status", service_id);
+    state.status(&service_id)
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("service {} not found", service_id)))
 }
 
-async fn logs(State(state): State<AppState>) -> Json<LogsResponse> {
-    tracing::debug!("GET /logs");
-    Json(state.logs())
+async fn vm_logs(
+    State(state): State<AppState>,
+    Path(service_id): Path<String>,
+) -> Result<Json<LogsResponse>, (StatusCode, String)> {
+    tracing::debug!(service_id = %service_id, "GET /vm/{}/logs", service_id);
+    state.logs(&service_id)
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("service {} not found", service_id)))
 }
 
-async fn vms_list() -> Result<Json<VmsResponse>, (axum::http::StatusCode, String)> {
-    tracing::debug!("GET /vms");
-    let runner = MicrovmRunner::new();
-    let vms = runner.list().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to list VMs");
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("failed to list VMs: {}", e))
-    })?;
+async fn vms_list(
+    State(state): State<AppState>,
+) -> Json<VmsResponse> {
+    let vms = state.list_services();
     tracing::debug!(count = vms.len(), "GET /vms -> {} VMs", vms.len());
-    Ok(Json(VmsResponse { vms }))
+    Json(VmsResponse { vms })
 }
 
 async fn vm_stop(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<String>, (axum::http::StatusCode, String)> {
-    tracing::info!(vm_id = %id, "POST /vm/{}/stop", id);
+    Path(service_id): Path<String>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
     // Atomically claim the service for this lifecycle operation
-    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&id, "stopping", "pending") {
+    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&service_id, "stopping", "pending") {
         Some(processes) => processes,
         None => {
             return Err((
-                axum::http::StatusCode::CONFLICT,
-                format!("service {} not found or already in use", id),
+                StatusCode::CONFLICT,
+                format!("service {} not found or already in a lifecycle operation", service_id),
             ));
         }
     };
@@ -138,56 +149,56 @@ async fn vm_stop(
 
     if let Some(mut child) = vm_child
         && let Err(e) = child.kill().await {
-            tracing::error!(vm_id = %id, error = %e, "failed to kill VM process");
+            tracing::error!(service_id = %service_id, error = %e, "failed to kill VM process");
             vm_failed = Some(child);
             has_kill_failure = true;
         }
     for mut child in aux_processes {
         if let Err(e) = child.kill().await {
-            tracing::error!(vm_id = %id, error = %e, "failed to kill aux process");
+            tracing::error!(service_id = %service_id, error = %e, "failed to kill aux process");
             aux_failed.push(child);
             has_kill_failure = true;
         }
     }
 
     if has_kill_failure {
-        state.restore_processes(&id, vm_failed, aux_failed);
-        state.set_status_if_matches(&id, "failed", "failed");
+        state.restore_processes(&service_id, vm_failed, aux_failed);
+        state.set_status(&service_id, "failed", "failed");
         return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "failed to kill child processes".to_string(),
         ));
     }
 
     // Runner's stop method now only does cleanup that doesn't duplicate child process killing
     let runner = MicrovmRunner::new();
-    match runner.stop(&id).await {
+    match runner.stop(&service_id).await {
         Ok(_) => {
-            tracing::info!(vm_id = %id, "stopped microvm");
-            state.set_status_if_matches(&id, "stopped", "none");
-            Ok(Json(format!("stopped {}", id)))
+            tracing::info!(service_id = %service_id, "stopped microvm");
+            state.set_status(&service_id, "stopped", "none");
+            Ok(Json(format!("stopped {}", service_id)))
         }
         Err(e) => {
-            tracing::error!(vm_id = %id, error = %e, "failed to stop microvm");
-            state.set_status_if_matches(&id, "failed", "failed");
-            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
+            tracing::error!(service_id = %service_id, error = %e, "failed to stop microvm");
+            state.set_status(&service_id, "failed", "failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
 }
 
 async fn vm_destroy(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<String>, (axum::http::StatusCode, String)> {
-    tracing::info!(vm_id = %id, "DELETE /vm/{}", id);
+    Path(service_id): Path<String>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
     // Atomically claim the service for this lifecycle operation
-    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&id, "destroying", "pending") {
+    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&service_id, "destroying", "pending") {
         Some(processes) => processes,
         None => {
             return Err((
-                axum::http::StatusCode::CONFLICT,
-                format!("service {} not found or already in use", id),
+                StatusCode::CONFLICT,
+                format!("service {} not found or already in a lifecycle operation", service_id),
             ));
         }
     };
@@ -198,40 +209,40 @@ async fn vm_destroy(
 
     if let Some(mut child) = vm_child
         && let Err(e) = child.kill().await {
-            tracing::error!(vm_id = %id, error = %e, "failed to kill VM process during destroy");
+            tracing::error!(service_id = %service_id, error = %e, "failed to kill VM process during destroy");
             vm_failed = Some(child);
             has_kill_failure = true;
         }
     for mut child in aux_processes {
         if let Err(e) = child.kill().await {
-            tracing::error!(vm_id = %id, error = %e, "failed to kill aux process during destroy");
+            tracing::error!(service_id = %service_id, error = %e, "failed to kill aux process during destroy");
             aux_failed.push(child);
             has_kill_failure = true;
         }
     }
 
     if has_kill_failure {
-        state.restore_processes(&id, vm_failed, aux_failed);
-        state.set_status_if_matches(&id, "failed", "failed");
+        state.restore_processes(&service_id, vm_failed, aux_failed);
+        state.set_status(&service_id, "failed", "failed");
         return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "failed to kill child processes during destroy".to_string(),
         ));
     }
 
     // Runner's destroy method now only does cleanup that doesn't duplicate child process killing
     let runner = MicrovmRunner::new();
-    match runner.destroy(&id).await {
+    match runner.destroy(&service_id).await {
         Ok(_) => {
-            release_subnet(&id);
-            tracing::info!(vm_id = %id, "destroyed microvm");
-            state.set_status_if_matches(&id, "destroyed", "none");
-            Ok(Json(format!("destroyed {}", id)))
+            release_subnet(&service_id);
+            tracing::info!(service_id = %service_id, "destroyed microvm");
+            state.remove_service(&service_id);
+            Ok(Json(format!("destroyed {}", service_id)))
         }
         Err(e) => {
-            tracing::error!(vm_id = %id, error = %e, "failed to destroy microvm");
-            state.set_status_if_matches(&id, "failed", "failed");
-            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
+            tracing::error!(service_id = %service_id, error = %e, "failed to destroy microvm");
+            state.set_status(&service_id, "failed", "failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
 }
