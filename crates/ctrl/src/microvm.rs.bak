@@ -1,14 +1,9 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
-    process::Command,
-};
+use tokio::process::Command;
 
 use crate::network::SubnetAllocation;
 
@@ -50,9 +45,7 @@ impl MicrovmRunner {
                 "--print-out-paths",
                 "-f",
                 "<nixpkgs>",
-                "--argstr",
-                "system",
-                &system,
+                "--argstr", "system", &system,
                 "linux",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -90,9 +83,7 @@ impl MicrovmRunner {
                 "--print-out-paths",
                 "-f",
                 "<nixpkgs>",
-                "--argstr",
-                "system",
-                &system,
+                "--argstr", "system", &system,
                 "busybox",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -124,10 +115,7 @@ impl MicrovmRunner {
 
         let system = crate::build::current_system().await;
         tracing::info!(system = %system, "resolving kernel modules from nixpkgs");
-        let expr = format!(
-            "let pkgs = import <nixpkgs> {{ system = \"{}\"; }}; in pkgs.linux.modules",
-            system
-        );
+        let expr = format!("let pkgs = import <nixpkgs> {{ system = \"{}\"; }}; in pkgs.linux.modules", system);
         let output = Command::new("nix")
             .args([
                 "build",
@@ -159,10 +147,9 @@ impl MicrovmRunner {
     fn check_cache(&self, cache: &Mutex<Option<PathBuf>>) -> Option<PathBuf> {
         if let Ok(cache) = cache.lock() {
             if let Some(ref path) = *cache
-                && path.exists()
-            {
-                return Some(path.clone());
-            }
+                && path.exists() {
+                    return Some(path.clone());
+                }
         } else {
             tracing::warn!("cache lock poisoned, re-building from scratch");
         }
@@ -192,10 +179,9 @@ impl MicrovmRunner {
         let work = deploy_dir.join("initramfs.d");
 
         if let Err(e) = std::fs::remove_dir_all(&work)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous initramfs work dir");
-        }
+            && e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous initramfs work dir");
+            }
         std::fs::create_dir_all(&work)?;
 
         let needed_modules: &[&str] = &[
@@ -213,8 +199,7 @@ impl MicrovmRunner {
         self.copy_kernel_modules(kernel_modules_path, &work, needed_modules)?;
 
         let bb_bin = format!("{}/bin/busybox", busybox_path.display());
-        let init =
-            self.generate_init_script(alloc, guest_port, app_store_path, bin_name, needed_modules);
+        let init = self.generate_init_script(alloc, guest_port, app_store_path, bin_name, needed_modules);
         use std::os::unix::fs::PermissionsExt;
         let init_path = work.join("init");
         std::fs::write(&init_path, &init)?;
@@ -359,10 +344,9 @@ exec /bin/sh
         for name in &["sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat"] {
             let dest = bin_dir.join(name);
             if let Err(e) = std::fs::remove_file(&dest)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(file = %dest.display(), error = %e, "failed to remove previous symlink");
-            }
+                && e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(file = %dest.display(), error = %e, "failed to remove previous symlink");
+                }
             std::os::unix::fs::symlink(bb_bin, &dest)?;
         }
         Ok(())
@@ -403,22 +387,22 @@ exec /bin/sh
         for entry in std::fs::read_dir(&mods_dir)? {
             let entry = entry?;
             if entry.file_type()?.is_dir()
-                && let Some(name) = entry.file_name().to_str()
-            {
-                return Ok(name.to_string());
-            }
+                && let Some(name) = entry.file_name().to_str() {
+                    return Ok(name.to_string());
+                }
         }
-        anyhow::bail!(
-            "no kernel version directory found in {}",
-            mods_dir.display()
-        )
+        anyhow::bail!("no kernel version directory found in {}", mods_dir.display())
     }
 
     /// Copy a Nix store path and all its runtime dependencies into `dest_root`
     /// using hard-links for files (instant, no data copy).
     async fn copy_closure_to(&self, store_path: &Path, dest_root: &Path) -> anyhow::Result<()> {
         let output = Command::new("nix")
-            .args(["path-info", "-r", &store_path.display().to_string()])
+            .args([
+                "path-info",
+                "-r",
+                &store_path.display().to_string(),
+            ])
             .output()
             .await?;
 
@@ -510,10 +494,9 @@ exec /bin/sh
         std::fs::create_dir_all(&sock_dir)?;
         let console_log = format!("{}/console.log", sock_dir);
         if let Err(e) = std::fs::remove_file(&console_log)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(file = %console_log, error = %e, "failed to remove previous console log");
-        }
+            && e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(file = %console_log, error = %e, "failed to remove previous console log");
+            }
         if let Ok(file) = std::fs::File::create(&console_log) {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o666)) {
@@ -523,20 +506,9 @@ exec /bin/sh
 
         let virtiofs_sock = format!("{}/virtiofs.sock", sock_dir);
         if let Err(e) = std::fs::remove_file(&virtiofs_sock)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(file = %virtiofs_sock, error = %e, "failed to remove stale virtiofs socket");
-        }
-
-        // Cloud Hypervisor owns the VM lifecycle. Keep its API socket alongside
-        // the other per-service state so stop/destroy do not need process-wide
-        // process matching in the normal case.
-        let api_sock = format!("{}/cloud-hypervisor.sock", sock_dir);
-        if let Err(e) = std::fs::remove_file(&api_sock)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(file = %api_sock, error = %e, "failed to remove stale Cloud Hypervisor API socket");
-        }
+            && e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(file = %virtiofs_sock, error = %e, "failed to remove stale virtiofs socket");
+            }
 
         tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store");
         let virtiofsd_child = Command::new("virtiofsd")
@@ -584,8 +556,6 @@ exec /bin/sh
             ))
             .arg("--console")
             .arg("null")
-            .arg("--api-socket")
-            .arg(format!("path={}", api_sock))
             .arg("--serial")
             .arg(format!("file=/var/lib/russel/{}/console.log", service_id))
             .kill_on_drop(true)
@@ -606,147 +576,66 @@ exec /bin/sh
         })
     }
 
-    /// Gracefully stop a VM through Cloud Hypervisor's REST API.
-    ///
-    /// The VMM is deliberately not killed on the normal path. `vm.shutdown`
-    /// asks the guest to power off and `vmm.shutdown` then asks Cloud Hypervisor
-    /// itself to exit. If the API is unavailable or the process does not exit in
-    /// time, cleanup falls back to a service-scoped `pkill`.
+    /// Stop a running VM by terminating systemd service and verifying process cleanup.
+    /// Note: This method assumes the caller (api.rs) has already killed tracked child
+    /// processes from AppState. This method handles only metadata-based or pattern-matched
+    /// process cleanup for cases where processes weren't tracked in state.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
-        Self::validate_service_id(service_id)?;
 
-        let metadata = read_metadata(service_id);
-        let vm_pid = metadata.as_ref().and_then(|m| m.vm_pid);
-        let api_result = self.shutdown_via_api(service_id).await;
+        //using cloud-hypervisor cli is a better choice than directly killing processes/using systemd
+        // refer to docs/cloud-hypervisor
+        let _ = Command::new("cloud-hypervisor")
+            .args(["vm", "stop", "--tap", &format!("vm-{}", service_id)])
+            .output()
+            .await;
 
-        let vm_stopped = if api_result.is_ok() {
-            match vm_pid {
-                Some(pid) => wait_for_process_exit(pid, Duration::from_secs(5)).await,
-                None => true,
-            }
-        } else {
-            if let Err(error) = api_result {
-                tracing::warn!(service_id, error = %error, "Cloud Hypervisor shutdown failed; using process fallback");
-            }
-            false
-        };
+        // Fallback: use pattern-based pkill only if cloud-hypervisor stop fails
+        let escaped_id = escape_regex(service_id);
+        let mut pkill_results = Vec::new();
 
-        if !vm_stopped {
-            self.pkill_service_process(
-                service_id,
-                "cloud-hypervisor",
-                &format!("cloud-hypervisor.*tap=vm-{}(,|$)", escape_regex(service_id)),
-            )
-            .await?;
-            if let Some(pid) = vm_pid {
-                let _ = wait_for_process_exit(pid, Duration::from_secs(2)).await;
-            }
-        }
-
-        // Cloud Hypervisor does not own these helper processes. Prefer the PIDs
-        // recorded at boot, and only use the scoped pattern fallback if a helper
-        // is still alive or the VM was recovered without metadata.
-        for (pid, kind, pattern) in [
-            (
-                metadata.as_ref().and_then(|m| m.virtiofsd_pid),
-                "virtiofsd",
-                format!("virtiofsd.*russel/{}/", escape_regex(service_id)),
-            ),
-            (
-                metadata.as_ref().and_then(|m| m.socat_pid),
-                "socat",
-                format!("socat-russel-{}", escape_regex(service_id)),
-            ),
-        ] {
-            if let Some(pid) = pid {
-                if terminate_owned_process(pid, service_id).await? {
-                    continue;
-                }
-            }
-            self.pkill_service_process(service_id, kind, &pattern)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn shutdown_via_api(&self, service_id: &str) -> anyhow::Result<()> {
-        self.cloud_hypervisor_api_request(service_id, "vm.shutdown")
-            .await
-            .map_err(|e| anyhow::anyhow!("vm.shutdown: {e}"))?;
-        self.cloud_hypervisor_api_request(service_id, "vmm.shutdown")
-            .await
-            .map_err(|e| anyhow::anyhow!("vmm.shutdown: {e}"))?;
-        Ok(())
-    }
-
-    async fn cloud_hypervisor_api_request(
-        &self,
-        service_id: &str,
-        endpoint: &str,
-    ) -> anyhow::Result<()> {
-        let socket = format!("/var/lib/russel/{service_id}/cloud-hypervisor.sock");
-        let timeout = Duration::from_secs(3);
-        let mut stream = tokio::time::timeout(timeout, UnixStream::connect(&socket))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out connecting to {socket}"))??;
-        let request = format!(
-            "PUT /api/v1/{endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out writing {endpoint}"))??;
-
-        let mut response = Vec::new();
-        tokio::time::timeout(timeout, stream.read_to_end(&mut response))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for {endpoint}"))??;
-        let status_line = String::from_utf8_lossy(&response)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let status = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .ok_or_else(|| anyhow::anyhow!("invalid response from {endpoint}: {status_line}"))?;
-        if !(200..300).contains(&status) {
-            anyhow::bail!("Cloud Hypervisor returned HTTP {status} for {endpoint}");
-        }
-        Ok(())
-    }
-
-    async fn pkill_service_process(
-        &self,
-        service_id: &str,
-        process_kind: &str,
-        pattern: &str,
-    ) -> anyhow::Result<()> {
-        let output = Command::new("pkill")
-            .args(["-TERM", "-f", pattern])
+        // Kill cloud-hypervisor
+        if let Ok(out) = Command::new("pkill")
+            .args(["-f", &format!("cloud-hypervisor.*tap=vm-{}(,|$)", escaped_id)])
             .output()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to run pkill for {process_kind}: {e}"))?;
-        // pkill uses exit code 1 when no process matched, which is a successful
-        // outcome for idempotent stop/destroy operations.
-        if !output.status.success() && output.status.code() != Some(1) {
-            anyhow::bail!(
-                "pkill for {process_kind} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        {
+            pkill_results.push(("cloud-hypervisor", out.status.success()));
         }
-        tracing::debug!(service_id, process_kind, "process fallback completed");
+
+        // Kill virtiofsd
+        if let Ok(out) = Command::new("pkill")
+            .args(["-f", &format!("virtiofsd.*russel/{}/", escaped_id)])
+            .output()
+            .await
+        {
+            pkill_results.push(("virtiofsd", out.status.success()));
+        }
+
+        // Kill socat
+        if let Ok(out) = Command::new("pkill")
+            .args(["-f", &format!("socat-russel-{}", escaped_id)])
+            .output()
+            .await
+        {
+            pkill_results.push(("socat", out.status.success()));
+        }
+
         Ok(())
     }
 
-    /// Verify that a PID still belongs to a process associated with service_id.
-    /// This prevents a reused PID from causing an unrelated process to be killed.
+    /// Verify that a PID belongs to a process associated with the given service_id.
+    /// This is a best-effort check to avoid killing unrelated processes.
     fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        std::fs::read_to_string(cmdline_path)
-            .map(|cmdline| cmdline.contains(service_id))
-            .unwrap_or(false)
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+            // Check if the command line contains the service_id
+            // For cloud-hypervisor: check for tap=vm-{service_id}
+            // For virtiofsd: check for russel/{service_id}/
+            // For socat: check for socat-russel-{service_id}
+            cmdline.contains(service_id)
+        } else {
+            false
+        }
     }
 
     /// Destroy all state for a microVM.
@@ -754,7 +643,7 @@ exec /bin/sh
         // Validate service_id before using it in any paths
         Self::validate_service_id(service_id)?;
 
-        self.stop(service_id).await?;
+        self.stop(service_id).await?;\n\n        // Try to delete VM via Cloud Hypervisor REST API; fallback to local cleanup if API fails\n        let api_deleted = self.delete_vm_via_api().await.is_ok();\n
 
         let alloc = crate::network::subnet_for(service_id);
         crate::network::TapForwarder::teardown(&alloc).await?;
@@ -767,13 +656,12 @@ exec /bin/sh
         ] {
             let path = std::path::Path::new(dir);
             if path.exists() {
-                let out = Command::new("rm").args(["-rf", dir]).output().await?;
+                let out = Command::new("rm")
+                    .args(["-rf", dir])
+                    .output()
+                    .await?;
                 if !out.status.success() {
-                    anyhow::bail!(
-                        "failed to remove directory {}: {}",
-                        dir,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
+                    anyhow::bail!("failed to remove directory {}: {}", dir, String::from_utf8_lossy(&out.stderr).trim());
                 }
             }
         }
@@ -783,13 +671,12 @@ exec /bin/sh
         ] {
             let path = std::path::Path::new(file);
             if path.exists() {
-                let out = Command::new("rm").args(["-f", file]).output().await?;
+                let out = Command::new("rm")
+                    .args(["-f", file])
+                    .output()
+                    .await?;
                 if !out.status.success() {
-                    anyhow::bail!(
-                        "failed to remove gcroot {}: {}",
-                        file,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
+                    anyhow::bail!("failed to remove gcroot {}: {}", file, String::from_utf8_lossy(&out.stderr).trim());
                 }
             }
         }
@@ -812,13 +699,8 @@ exec /bin/sh
             anyhow::bail!("service_id cannot contain path traversal components");
         }
         // Ensure it only contains safe characters (alphanumeric, dash, underscore)
-        if !service_id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            anyhow::bail!(
-                "service_id can only contain alphanumeric characters, dashes, and underscores"
-            );
+        if !service_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            anyhow::bail!("service_id can only contain alphanumeric characters, dashes, and underscores");
         }
         Ok(())
     }
@@ -828,16 +710,14 @@ exec /bin/sh
         let mut vms = Vec::new();
         let state_dir = Path::new("/var/lib/microvms");
         if state_dir.exists()
-            && let Ok(mut entries) = tokio::fs::read_dir(state_dir).await
-        {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry.file_type().await?.is_dir()
-                    && let Some(name) = entry.file_name().to_str()
-                {
-                    vms.push(name.to_string());
+            && let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_type().await?.is_dir()
+                        && let Some(name) = entry.file_name().to_str() {
+                            vms.push(name.to_string());
+                        }
                 }
             }
-        }
         Ok(vms)
     }
 }
@@ -846,69 +726,6 @@ exec /bin/sh
 pub struct BootOutput {
     pub vm_child: tokio::process::Child,
     pub virtiofsd_child: tokio::process::Child,
-}
-
-#[derive(Debug, Default)]
-struct ProcessMetadata {
-    vm_pid: Option<u32>,
-    virtiofsd_pid: Option<u32>,
-    socat_pid: Option<u32>,
-}
-
-fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    Some(ProcessMetadata {
-        vm_pid: value
-            .get("vm_pid")
-            .and_then(|pid| pid.as_u64())
-            .map(|pid| pid as u32),
-        virtiofsd_pid: value
-            .get("virtiofsd_pid")
-            .and_then(|pid| pid.as_u64())
-            .map(|pid| pid as u32),
-        socat_pid: value
-            .get("socat_pid")
-            .and_then(|pid| pid.as_u64())
-            .map(|pid| pid as u32),
-    })
-}
-
-async fn terminate_owned_process(pid: u32, service_id: &str) -> anyhow::Result<bool> {
-    if !MicrovmRunner::verify_process_ownership(pid, service_id) {
-        return Ok(false);
-    }
-    let output = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .output()
-        .await?;
-    if !output.status.success() && process_is_alive(pid) {
-        anyhow::bail!(
-            "failed to terminate process {pid}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(wait_for_process_exit(pid, Duration::from_secs(2)).await)
-}
-
-fn process_is_alive(pid: u32) -> bool {
-    let path = format!("/proc/{pid}/stat");
-    let Ok(stat) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    // The state is the first field after the executable name in /proc/pid/stat.
-    stat.rsplit_once(") ")
-        .and_then(|(_, rest)| rest.chars().next())
-        .is_some_and(|state| state != 'Z')
-}
-
-async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while process_is_alive(pid) && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    !process_is_alive(pid)
 }
 
 fn escape_regex(s: &str) -> String {

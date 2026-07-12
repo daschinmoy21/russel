@@ -1,12 +1,11 @@
+#[allow(dead_code)]
 use russel_core::config::DatabaseConfig;
 
 #[derive(Debug, Default)]
 pub struct DatabaseProvisioner;
 
 impl DatabaseProvisioner {
-    #[allow(dead_code)]
     pub async fn ensure(&self, _config: &DatabaseConfig) -> anyhow::Result<()> {
-        tracing::warn!("database provisioning is not yet implemented");
-        Ok(())
+        todo!("Impl database support!");
     }
 }
