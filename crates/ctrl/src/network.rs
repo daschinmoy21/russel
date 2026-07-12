@@ -184,7 +184,12 @@ async fn sysctl(key: &str, val: &str) {
 }
 
 async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
-    let out = Command::new("ip").args(args).output().await?;
+    let out = Command::new("ip")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success() {
         anyhow::bail!("ip {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }

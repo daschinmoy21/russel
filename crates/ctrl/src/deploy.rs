@@ -228,17 +228,22 @@ impl DeployPipeline {
         let deploy_result = async {
             // Keep the registry reservation alive until the deployment is fully
             // committed. Any error in this block releases it via Drop.
+            port_reservation = Some(PortReservation::new(service_id));
             let port = match request.port.clone() {
                 Some(p) => {
                     PortAllocator::reserve(service_id, p.host)?;
                     p
                 }
-                None => PortMapping {
-                    host: self.ports.next(service_id)?,
-                    guest: config.service.port,
-                },
+                None => {
+                    let ports = self.ports.clone();
+                    let service_id = service_id.to_string();
+                    let host = tokio::task::spawn_blocking(move || ports.next(&service_id)).await??;
+                    PortMapping {
+                        host,
+                        guest: config.service.port,
+                    }
+                }
             };
-            port_reservation = Some(PortReservation::new(service_id));
             let alloc: SubnetAllocation = subnet_for(service_id);
             tracing::info!(
                 service_id,
@@ -417,6 +422,9 @@ impl DeployPipeline {
         // Register with Traefik before committing the deployment. Release the
         // reservation if this final fallible step fails.
         if let Err(error) = self.traefik.register(service_id, port.host).await {
+            if let Err(teardown_error) = TapForwarder::teardown(&alloc).await {
+                tracing::warn!(service_id, error = %teardown_error, "failed to tear down TAP after Traefik registration failure");
+            }
             PortAllocator::release(service_id);
             return Err(error);
         }
