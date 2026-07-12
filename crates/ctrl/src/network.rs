@@ -5,6 +5,11 @@ use std::{
 
 use tokio::process::Command;
 
+// Helper: construct socat listen string bound to loopback (127.0.0.1)
+fn socat_listen(host_port: u16) -> String {
+    format!("TCP-LISTEN:{},fork,reuseaddr,bind=127.0.0.1", host_port)
+}
+
 // ── Port allocator ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -81,7 +86,7 @@ impl TapForwarder {
         sysctl("net.ipv4.ip_forward", "1").await;
 
         // 4. Spawn socat: listens on 127.0.0.1:<host_port>, forwards to VM.
-        let listen = format!("TCP-LISTEN:{},fork,reuseaddr,bind=127.0.0.1", host_port);
+        		let listen = socat_listen(host_port);
         let connect = format!("TCP:{}:{}", vm_ip, guest_port);
 
         tracing::info!(
@@ -207,4 +212,10 @@ mod tests {
         assert_eq!(p2, 3101);
         assert_eq!(p3, 3102);
     }
+
+	#[test]
+	fn socat_listen_uses_loopback() {
+		let port = 54321;
+		assert_eq!(socat_listen(port), "TCP-LISTEN:54321,fork,reuseaddr,bind=127.0.0.1");
+	}
 }
