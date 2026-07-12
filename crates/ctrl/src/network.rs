@@ -177,16 +177,15 @@ impl TapForwarder {
     }
 
     /// Delete the TAP interface when the VM is destroyed.
-    pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
-        let tap = &alloc.tap_id;
-        tracing::info!(tap, "tearing down tap interface");
-        match run_ip(&["link", "del", tap]).await {
+    pub async fn teardown(tap_id: &str) -> anyhow::Result<()> {
+        tracing::info!(tap_id, "tearing down tap interface");
+        match run_ip(&["link", "del", tap_id]).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 let err_msg = e.to_string();
                 // Treat "not found" or "does not exist" as success
                 if err_msg.contains("Cannot find device") || err_msg.contains("does not exist") {
-                    tracing::debug!(tap, "tap interface already removed");
+                    tracing::debug!(tap_id, "tap interface already removed");
                     Ok(())
                 } else {
                     Err(e)
@@ -206,21 +205,6 @@ impl TapForwarder {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
-    }
-
-    /// Clean up TAP interface and network configuration.
-    /// Safe to call even if TAP doesn't exist (best-effort cleanup).
-    pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
-        let tap = &alloc.tap_id;
-        tracing::info!(tap, "tearing down tap interface");
-        
-        // Best-effort TAP deletion (may not exist if setup failed early)
-        let _ = run_ip(&["link", "del", tap]).await;
-        
-        // Note: socat process cleanup is handled by kill_on_drop(true) in Command
-        // Note: IP forwarding sysctl left enabled (system-wide setting)
-        
-        Ok(())
     }
 }
 

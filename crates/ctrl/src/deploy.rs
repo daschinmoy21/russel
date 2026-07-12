@@ -39,12 +39,12 @@ impl DeployPipeline {
     pub fn new(state: AppState) -> Self {
         Self {
             state,
-            git: GitClient::default(),
+            git: GitClient,
             builder: NixBuilder,
             database: DatabaseProvisioner,
             runner: MicrovmRunner::new(),
             ports: PortAllocator::default(),
-            traefik: TraefikClient::default(),
+            traefik: TraefikClient,
             subnet_acquired: AtomicBool::new(false),
         }
     }
@@ -99,7 +99,7 @@ impl DeployPipeline {
             }
             Err(error) => {
                 let elapsed = started.elapsed().as_millis();
-                let error_msg = error.to_string();
+                let mut error_msg = error.to_string();
 
                 // Check if this is a successful rollback case
                 if error_msg.starts_with("ROLLBACK_SUCCESS:") {
@@ -164,7 +164,7 @@ impl DeployPipeline {
                         elapsed_ms: elapsed,
                         timing: None,
                         vm_ip: None,
-                        message: error.to_string(),
+                        message: error_msg,
                     }
                 }
             }
@@ -373,29 +373,8 @@ impl DeployPipeline {
             Err(deploy_err) => {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
                 // Always tear down any partially-created VM from the failed deployment.
-                let deploy_err = match self.runner.destroy(service_id).await {
-                    Ok(()) => {
-                        // Release subnet only if THIS attempt allocated it, and only after
-                        // the VM teardown completed successfully.
-                        if self.subnet_acquired.load(Ordering::Relaxed) {
-                            release_subnet(service_id);
-                            self.subnet_acquired.store(false, Ordering::Relaxed);
-                        }
-                        deploy_err
-                    }
-                    Err(destroy_err) => {
-                        tracing::error!(
-                            service_id,
-                            error = %destroy_err,
-                            "failed to tear down VM after deployment failure"
-                        );
-                        anyhow::anyhow!(
-                            "{}; cleanup failed: {}",
-                            deploy_err,
-                            destroy_err
-                        )
-                    }
-                };
+                // Note: destroy() does NOT release the subnet (callers own that).
+                let _destroy_result = self.runner.destroy(service_id).await;
 
                 if has_backup {
                     let rollback_res = async {
@@ -444,12 +423,19 @@ impl DeployPipeline {
                             tracing::info!(service_id, "Rollback to previous VM succeeded");
                             // Note: state.mark_deployed was already called inside the rollback closure
                             // Return an error that indicates rollback succeeded (caller should NOT mark as failed)
+                            // Subnet is NOT released — the restored VM needs it.
                             return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
                         }
                         Err(rollback_err) => {
                             tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
                         }
                     }
+                }
+
+                // Rollback failed or no backup — release subnet if THIS attempt allocated it
+                if self.subnet_acquired.load(Ordering::Relaxed) {
+                    release_subnet(service_id);
+                    self.subnet_acquired.store(false, Ordering::Relaxed);
                 }
                 return Err(deploy_err);
             }
