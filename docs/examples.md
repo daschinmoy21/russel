@@ -7,7 +7,7 @@ Go binaries and Nix-wrapped third-party packages.
 
 These examples use Russel's current Linux microVM backend. Before deploying any example:
 
-1. Install Nix with flakes enabled, then enter the repository development environment. The shell provides Rust, Cloud Hypervisor, `virtiofsd`, `socat`, `iproute2`, `iptables`, and `git:
+1. Install Nix with flakes enabled, then enter the repository development environment. The shell provides Rust, Cloud Hypervisor, `virtiofsd`, `socat`, `iproute2`, `iptables`, and `git`:
 
    ```bash
    nix develop
@@ -21,6 +21,7 @@ These examples use Russel's current Linux microVM backend. Before deploying any 
    ```bash
    cargo build
    ```
+
 5. Start the control plane in the first terminal. It listens on `127.0.0.1:7878` by default:
 
    ```bash

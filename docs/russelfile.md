@@ -712,10 +712,10 @@ For a simple Rust project, Russel could generate a flake conceptually like this:
 
     devShells = {
       "x86_64-linux"."default" = nixpkgs.legacyPackages."x86_64-linux".mkShell {
-        packages = [ nixpkgs.legacyPackages."x86_64-linux".rustAnalyzer ];
+        packages = [ nixpkgs.legacyPackages."x86_64-linux".rust-analyzer ];
       };
       "aarch64-linux"."default" = nixpkgs.legacyPackages."aarch64-linux".mkShell {
-        packages = [ nixpkgs.legacyPackages."aarch64-linux".rustAnalyzer ];
+        packages = [ nixpkgs.legacyPackages."aarch64-linux".rust-analyzer ];
       };
     };
 

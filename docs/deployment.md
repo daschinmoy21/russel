@@ -142,7 +142,7 @@ If your app is already distributed as a precompiled binary in Nixpkgs (e.g., Pyt
 
 ## 3. Readiness Check
 
-Russel verifies deployment readiness by TCP-connecting to the guest port for up to 10 seconds. If the port doesn't respond, the deployment is rolled back to the previous working VM.
+Russel verifies deployment readiness by TCP-connecting to the guest port for up to 10 seconds. If the port doesn't respond, Russel attempts rollback to the previous working VM (only when a prior VM backup exists). For an initial deployment with no backup, readiness failure cleans up the attempted VM and returns failure without restoring a prior VM.
 
 **Recommended convention**: Expose a `GET /health` endpoint on your app's `PORT`. While Russel doesn't currently check HTTP status, this endpoint will be used by future Traefik health checks and is a good practice for any service.
 
