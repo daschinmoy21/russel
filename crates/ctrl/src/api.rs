@@ -5,9 +5,10 @@ use axum::{
     routing::{delete, get, post},
 };
 use russel_core::api::{DeployRequest, DeployEvent, LogsResponse, StatusResponse, VmsResponse};
+use tokio::process::Child;
 use tokio_stream::StreamExt;
 
-use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, network::release_subnet, state::AppState};
+use crate::{deploy::DeployPipeline, microvm::MicrovmRunner, network::release_subnet, state::{AppState, LifecycleClaim}};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -132,46 +133,8 @@ async fn vm_stop(
 ) -> Result<Json<String>, (StatusCode, String)> {
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
-    // Atomically claim the service for this lifecycle operation
-    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&service_id, "stopping", "pending") {
-        Some(processes) => processes,
-        None => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("service {} not found or already in a lifecycle operation", service_id),
-            ));
-        }
-    };
+    let (runner, _, _) = claim_and_kill(&state, &service_id, "stopping", "stop").await?;
 
-    let mut vm_failed = None;
-    let mut aux_failed = Vec::new();
-    let mut has_kill_failure = false;
-
-    if let Some(mut child) = vm_child
-        && let Err(e) = child.kill().await {
-            tracing::error!(service_id = %service_id, error = %e, "failed to kill VM process");
-            vm_failed = Some(child);
-            has_kill_failure = true;
-        }
-    for mut child in aux_processes {
-        if let Err(e) = child.kill().await {
-            tracing::error!(service_id = %service_id, error = %e, "failed to kill aux process");
-            aux_failed.push(child);
-            has_kill_failure = true;
-        }
-    }
-
-    if has_kill_failure {
-        state.restore_processes(&service_id, vm_failed, aux_failed);
-        state.set_status(&service_id, "failed", "failed");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to kill child processes".to_string(),
-        ));
-    }
-
-    // Runner's stop method now only does cleanup that doesn't duplicate child process killing
-    let runner = MicrovmRunner::new();
     match runner.stop(&service_id).await {
         Ok(_) => {
             tracing::info!(service_id = %service_id, "stopped microvm");
@@ -192,46 +155,8 @@ async fn vm_destroy(
 ) -> Result<Json<String>, (StatusCode, String)> {
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
-    // Atomically claim the service for this lifecycle operation
-    let (vm_child, aux_processes) = match state.begin_lifecycle_operation(&service_id, "destroying", "pending") {
-        Some(processes) => processes,
-        None => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("service {} not found or already in a lifecycle operation", service_id),
-            ));
-        }
-    };
+    let (runner, _, _) = claim_and_kill(&state, &service_id, "destroying", "destroy").await?;
 
-    let mut vm_failed = None;
-    let mut aux_failed = Vec::new();
-    let mut has_kill_failure = false;
-
-    if let Some(mut child) = vm_child
-        && let Err(e) = child.kill().await {
-            tracing::error!(service_id = %service_id, error = %e, "failed to kill VM process during destroy");
-            vm_failed = Some(child);
-            has_kill_failure = true;
-        }
-    for mut child in aux_processes {
-        if let Err(e) = child.kill().await {
-            tracing::error!(service_id = %service_id, error = %e, "failed to kill aux process during destroy");
-            aux_failed.push(child);
-            has_kill_failure = true;
-        }
-    }
-
-    if has_kill_failure {
-        state.restore_processes(&service_id, vm_failed, aux_failed);
-        state.set_status(&service_id, "failed", "failed");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to kill child processes during destroy".to_string(),
-        ));
-    }
-
-    // Runner's destroy method now only does cleanup that doesn't duplicate child process killing
-    let runner = MicrovmRunner::new();
     match runner.destroy(&service_id).await {
         Ok(_) => {
             release_subnet(&service_id);
@@ -245,4 +170,80 @@ async fn vm_destroy(
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
+}
+
+/// Claim a service for a lifecycle op and kill its VM + aux children.
+///
+/// Returns the runner (and consumed child placeholders) for the caller to
+/// perform the post-kill cleanup (`runner.stop()` / `runner.destroy()` and
+/// final status). Maps `NotFound` -> 404 and `Busy` -> 409. On kill failure the
+/// processes are restored and the service is marked failed.
+// ponytail: children are killed here; returned Option/Vec are empty placeholders
+// kept only to match the agreed helper signature.
+async fn claim_and_kill(
+    state: &AppState,
+    service_id: &str,
+    target_status: &str,
+    op_label: &str,
+) -> Result<(MicrovmRunner, Option<Child>, Vec<Child>), (StatusCode, String)> {
+    let (vm_child, aux_processes) = match state
+        .begin_lifecycle_operation(service_id, target_status, "pending")
+    {
+        LifecycleClaim::Claimed(vm, aux) => (vm, aux),
+        LifecycleClaim::NotFound => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("service {} not found", service_id),
+            ));
+        }
+        LifecycleClaim::Busy => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "service {} is already in a lifecycle operation",
+                    service_id
+                ),
+            ));
+        }
+    };
+
+    let mut vm_failed = None;
+    let mut aux_failed = Vec::new();
+    let mut has_kill_failure = false;
+
+    if let Some(mut child) = vm_child
+        && let Err(e) = child.kill().await
+    {
+        tracing::error!(
+            service_id = %service_id,
+            op = %op_label,
+            error = %e,
+            "failed to kill VM process"
+        );
+        vm_failed = Some(child);
+        has_kill_failure = true;
+    }
+    for mut child in aux_processes {
+        if let Err(e) = child.kill().await {
+            tracing::error!(
+                service_id = %service_id,
+                op = %op_label,
+                error = %e,
+                "failed to kill aux process"
+            );
+            aux_failed.push(child);
+            has_kill_failure = true;
+        }
+    }
+
+    if has_kill_failure {
+        state.restore_processes(service_id, vm_failed, aux_failed);
+        state.set_status(service_id, "failed", "failed");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to kill child processes during {}", op_label),
+        ));
+    }
+
+    Ok((MicrovmRunner::new(), None, Vec::new()))
 }

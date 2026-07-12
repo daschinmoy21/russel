@@ -7,6 +7,16 @@ use std::{
 use russel_core::api::{LogsResponse, StatusResponse};
 use tokio::process::Child;
 
+/// Outcome of attempting to claim a service for a lifecycle operation.
+pub enum LifecycleClaim {
+    /// Service was claimed; processes are handed off to the caller.
+    Claimed(Option<Child>, Vec<Child>),
+    /// No such service in state.
+    NotFound,
+    /// Service exists but is already in a conflicting lifecycle op.
+    Busy,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<Mutex<StateInner>>,
@@ -70,11 +80,24 @@ impl AppState {
         ids
     }
 
-    pub fn mark_building(&self, service_id: &str) {
+    /// Mark a service as building. Rejects if the service already exists in a
+    /// conflicting lifecycle state (building/stopping/destroying). Creates a
+    /// new entry if the service does not yet exist.
+    pub fn mark_building(&self, service_id: &str) -> anyhow::Result<()> {
         let mut inner = self.lock_inner();
+        if let Some(s) = inner.services.get(service_id)
+            && (s.status == "building" || s.status == "stopping" || s.status == "destroying")
+        {
+            anyhow::bail!(
+                "service {} is already in lifecycle state '{}'",
+                service_id,
+                s.status
+            );
+        }
         let s = inner.services.entry(service_id.to_string()).or_default();
         s.status = "building".to_string();
         s.vm_state = "pending".to_string();
+        Ok(())
     }
 
     pub fn mark_deployed(&self, service_id: &str, child: Child) {
@@ -113,6 +136,11 @@ impl AppState {
         let mut inner = self.lock_inner();
         if let Some(s) = inner.services.get_mut(service_id) {
             s.aux_processes.push(child);
+        } else {
+            tracing::warn!(
+                service_id = %service_id,
+                "store_aux_process called for unknown service"
+            );
         }
     }
 
@@ -127,25 +155,28 @@ impl AppState {
     }
 
     /// Atomically begin a lifecycle operation: claim processes and update status.
-    /// Returns None if the service doesn't exist or is already in a lifecycle op.
+    /// Distinguishes between NotFound (no such service) and Busy (already in a
+    /// conflicting lifecycle op).
     pub fn begin_lifecycle_operation(
         &self,
         service_id: &str,
         status: &str,
         vm_state: &str,
-    ) -> Option<(Option<Child>, Vec<Child>)> {
+    ) -> LifecycleClaim {
         let mut inner = self.lock_inner();
-        let s = inner.services.get_mut(service_id)?;
+        let Some(s) = inner.services.get_mut(service_id) else {
+            return LifecycleClaim::NotFound;
+        };
         // Prevent concurrent lifecycle ops on the same service
         if s.status == "stopping" || s.status == "destroying" || s.status == "building" {
-            return None;
+            return LifecycleClaim::Busy;
         }
         s.status = status.to_string();
         s.vm_state = vm_state.to_string();
         let vm = s.vm_process.take();
         let aux = std::mem::take(&mut s.aux_processes);
         s.vm_pid = None;
-        Some((vm, aux))
+        LifecycleClaim::Claimed(vm, aux)
     }
 
     pub fn set_status(&self, service_id: &str, status: &str, vm_state: &str) {
@@ -169,6 +200,11 @@ impl AppState {
                 s.vm_process = Some(p);
             }
             s.aux_processes.extend(aux_processes);
+        } else {
+            tracing::warn!(
+                service_id = %service_id,
+                "restore_processes called for unknown service"
+            );
         }
     }
 
@@ -227,7 +263,7 @@ mod tests {
     #[test]
     fn test_mark_and_status() {
         let state = AppState::default();
-        state.mark_building("svc-1");
+        state.mark_building("svc-1").unwrap();
         let status = state.status("svc-1").unwrap();
         assert_eq!(status.status, "building");
         assert_eq!(status.vm_state, "pending");
@@ -237,9 +273,29 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_building_rejects_conflicting_lifecycle() {
+        let state = AppState::default();
+        // New entry succeeds.
+        state.mark_building("svc-1").unwrap();
+        // Already building -> rejected.
+        let err = state.mark_building("svc-1").unwrap_err();
+        assert!(err.to_string().contains("already in lifecycle state"));
+
+        // stopping / destroying also rejected.
+        state.set_status("svc-1", "stopping", "pending");
+        assert!(state.mark_building("svc-1").is_err());
+        state.set_status("svc-1", "destroying", "pending");
+        assert!(state.mark_building("svc-1").is_err());
+
+        // A fresh service still works alongside the conflicting one.
+        state.mark_building("svc-2").unwrap();
+        assert_eq!(state.status("svc-2").unwrap().status, "building");
+    }
+
+    #[test]
     fn test_mark_deployed_then_logs_and_status() {
         let state = AppState::default();
-        state.mark_building("svc-a");
+        state.mark_building("svc-a").unwrap();
         // We can't create a real Child in tests, so mark_failed is the easier path
         state.mark_failed("svc-a", "test error".into());
         let status = state.status("svc-a").unwrap();
@@ -251,8 +307,8 @@ mod tests {
     #[test]
     fn test_services_are_independent() {
         let state = AppState::default();
-        state.mark_building("alpha");
-        state.mark_building("beta");
+        state.mark_building("alpha").unwrap();
+        state.mark_building("beta").unwrap();
         state.mark_failed("beta", "beta error".into());
 
         let alpha = state.status("alpha").unwrap();
@@ -264,17 +320,23 @@ mod tests {
     #[test]
     fn test_begin_lifecycle_operation() {
         let state = AppState::default();
-        state.mark_building("svc-1");
-        // begin_lifecycle_operation should be None while status is "building"
-        assert!(state
-            .begin_lifecycle_operation("svc-1", "stopping", "pending")
-            .is_none());
+        state.mark_building("svc-1").unwrap();
+        // While status is "building" the claim is Busy (not NotFound).
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Busy
+        ));
+        // Unknown service is NotFound, distinct from Busy.
+        assert!(matches!(
+            state.begin_lifecycle_operation("nope", "stopping", "pending"),
+            LifecycleClaim::NotFound
+        ));
     }
 
     #[test]
     fn test_remove_service() {
         let state = AppState::default();
-        state.mark_building("svc-1");
+        state.mark_building("svc-1").unwrap();
         assert!(state.status("svc-1").is_some());
         state.remove_service("svc-1");
         assert!(state.status("svc-1").is_none());
@@ -283,9 +345,9 @@ mod tests {
     #[test]
     fn test_list_services() {
         let state = AppState::default();
-        state.mark_building("z");
-        state.mark_building("a");
-        state.mark_building("m");
+        state.mark_building("z").unwrap();
+        state.mark_building("a").unwrap();
+        state.mark_building("m").unwrap();
         let ids = state.list_services();
         assert_eq!(ids, vec!["a", "m", "z"]);
     }

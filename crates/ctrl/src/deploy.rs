@@ -55,7 +55,22 @@ impl DeployPipeline {
         let vm_id = service_id.clone();
 
         tracing::info!(service_id = %service_id, repo = %request.repo_url, "deploy started");
-        self.state.mark_building(&service_id);
+        if let Err(e) = self.state.mark_building(&service_id) {
+            tracing::error!(service_id = %service_id, error = %e, "deploy rejected: service busy");
+            return DeployResponse {
+                service_id,
+                vm_id,
+                status: "failed".to_string(),
+                store_path: None,
+                microvm_config_path: None,
+                runner_path: None,
+                port: None,
+                elapsed_ms: started.elapsed().as_millis(),
+                timing: None,
+                vm_ip: None,
+                message: e.to_string(),
+            };
+        }
 
         let result = self.deploy_inner(&service_id, request, tx).await;
 
