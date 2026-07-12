@@ -94,15 +94,18 @@ pub struct SubnetAllocation {
 }
 
 /// Deterministic /30 subnet for a service_id via FNV-1a hash.
+/// Uses full 16-bit hash space (65536 subnets in 10.0.0.0/8).
+/// Collision probability <2% at 50 concurrent services.
 pub fn subnet_for(service_id: &str) -> SubnetAllocation {
     let hash = service_id
         .bytes()
         .fold(2_166_136_261u32, |acc, b| acc.wrapping_mul(16_777_619) ^ b as u32);
-    let idx = (hash % 200) as u8;
+    let x = ((hash >> 8) & 0xFF) as u8;
+    let y = (hash & 0xFF) as u8;
     SubnetAllocation {
-        host_ip: format!("10.0.{idx}.1"),
-        vm_ip: format!("10.0.{idx}.2"),
-        mac: format!("02:00:00:00:{idx:02x}:01"),
+        host_ip: format!("10.{x}.{y}.1"),
+        vm_ip: format!("10.{x}.{y}.2"),
+        mac: format!("02:00:00:00:{x:02x}:{y:02x}"),
         tap_id: format!("vm-{service_id}"),
     }
 }
@@ -231,8 +234,14 @@ mod tests {
     fn subnet_index_bounded() {
         for s in &["a", "b", "long-service-name-123", "edge", "max"] {
             let allocation = subnet_for(s);
-            let idx = allocation.host_ip.trim_start_matches("10.0.").trim_end_matches(".1");
-            assert!(idx.parse::<u8>().unwrap() < 200);
+            let parts: Vec<&str> = allocation.host_ip.split('.').collect();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], "10");
+            assert_eq!(parts[3], "1");
+            let x: u8 = parts[1].parse().unwrap();
+            let y: u8 = parts[2].parse().unwrap();
+            // Both octets are valid (full 16-bit space)
+            let _ = (x, y);
         }
     }
 

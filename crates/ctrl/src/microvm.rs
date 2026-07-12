@@ -684,15 +684,12 @@ exec /bin/sh
 
         self.stop(service_id).await?;
 
-        // Teardown the TAP device (tap_id is deterministic: vm-{service_id})
-        let tap_id = format!("vm-{service_id}");
-        crate::network::TapForwarder::teardown(&tap_id).await?;
+        // Teardown the TAP device
+        let alloc = crate::network::subnet_for(service_id);
+        crate::network::TapForwarder::teardown(&alloc).await?;
 
         // Release port
         crate::network::PortAllocator::release(service_id);
-
-        // Note: subnet release is the caller's responsibility (deploy tracks subnet_acquired;
-        // api.rs vm_destroy and main.rs shutdown release explicitly)
 
         for dir in &[
             format!("/var/lib/microvms/{}", service_id),
