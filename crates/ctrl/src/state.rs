@@ -103,16 +103,6 @@ impl AppState {
         Ok(())
     }
 
-    pub fn mark_deployed(&self, service_id: &str, child: Child) {
-        let mut inner = self.lock_inner();
-        let s = inner.services.entry(service_id.to_string()).or_default();
-        s.status = "deployed".to_string();
-        s.vm_state = "running".to_string();
-        s.started_at = Instant::now();
-        s.vm_pid = child.id();
-        s.vm_process = Some(child);
-    }
-
     /// Atomically register the VM and its auxiliary children.
     /// Replaces separate mark_deployed + store_aux_process calls with one lock acquisition.
     pub fn mark_deployed_with_aux(
@@ -152,18 +142,7 @@ impl AppState {
         s.flake_path = Some(flake_path);
     }
 
-    /// Park a child process (e.g. socat) so it stays alive as long as the service exists.
-    pub fn store_aux_process(&self, service_id: &str, child: Child) {
-        let mut inner = self.lock_inner();
-        if let Some(s) = inner.services.get_mut(service_id) {
-            s.aux_processes.push(child);
-        } else {
-            tracing::warn!(
-                service_id = %service_id,
-                "store_aux_process called for unknown service"
-            );
-        }
-    }
+
 
     /// Take processes for a service. Returns None if the service doesn't exist.
     pub fn take_processes(&self, service_id: &str) -> Option<(Option<Child>, Vec<Child>)> {
