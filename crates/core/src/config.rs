@@ -120,7 +120,6 @@ memory = "256mb"
         assert_eq!(config.service.bin_name(), "my-app");
         assert_eq!(config.service.memory.as_mebibytes(), 256);
     }
-
     #[test]
     fn custom_bin_name_takes_priority() {
         let toml = r#"
@@ -218,4 +217,16 @@ typo_field = "oops"
         let err = toml::from_str::<Russelfile>(toml).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
+}
+#[test]
+fn deny_empty_fields() {
+    let toml = r#"
+[service]
+name = ""
+source = "."
+port = 
+memory = ""
+"#;
+    let err = toml::from_str::<Russelfile>(toml).unwrap_err();
+    assert!(err.to_string().contains("cannot have empty fields!!!"));
 }
