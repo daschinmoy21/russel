@@ -106,12 +106,15 @@ cleanup() {
 			mv "$MICROVMS_STATE_BAK" /var/lib/microvms
 		fi
 	fi
-	# Remove temp state dir
+	# Remove temp files
 	if [ -n "${RUSSEL_STATE_DIR:-}" ] && [ -d "$RUSSEL_STATE_DIR" ]; then
 		rm -rf "$RUSSEL_STATE_DIR"
 	fi
 	if [ -n "$BENCH_CARGO_TARGET" ] && [ -d "$BENCH_CARGO_TARGET" ]; then
 		rm -rf "$BENCH_CARGO_TARGET"
+	fi
+	if [ -n "${RUSSEL_LOG:-}" ] && [ -f "$RUSSEL_LOG" ]; then
+		rm -f "$RUSSEL_LOG"
 	fi
 }
 trap cleanup EXIT
@@ -202,7 +205,8 @@ for bin in russel-cli russel-ctrl; do
 	if [ -f "$path" ]; then
 		size=$(stat --printf="%s" "$path")
 		size_kb=$((size / 1024))
-		stripped_size=$(strip "$path" -o /dev/null 2>/dev/null && stat --printf="%s" "$path" 2>/dev/null || echo "$size")
+		stripped_size=$(strip "$path" -o "$path.stripped" 2>/dev/null && stat --printf="%s" "$path.stripped" 2>/dev/null || echo "$size")
+		rm -f "$path.stripped"
 		stripped_kb=$((stripped_size / 1024))
 		pass "${bin}: ${size_kb}KB (stripped: ${stripped_kb}KB)"
 	else
@@ -335,7 +339,7 @@ else
 		# Start control plane in background
 		info "starting russel-ctrl (pid in background)..."
 		RUSSEL_LOG=$(mktemp /tmp/russel-ctrl-log-XXXXXX)
-		russel-ctrl &
+		russel-ctrl &>"$RUSSEL_LOG" &
 		CTRL_PID=$!
 
 		# Wait for control plane to be listening (max 30s)

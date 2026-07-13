@@ -540,12 +540,12 @@ exec /bin/sh
         // virtiofsd normally creates its socket immediately.  Do not add a
         // fixed boot delay here: wait only until it is actually ready and fail
         // clearly if it never comes up.
-        let socket_deadline = Instant::now() + Duration::from_millis(200);
+        let socket_deadline = Instant::now() + Duration::from_millis(2000);
         while !std::path::Path::new(&virtiofs_sock).exists() && Instant::now() < socket_deadline {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         if !std::path::Path::new(&virtiofs_sock).exists() {
-            anyhow::bail!("virtiofsd did not create socket {virtiofs_sock} within 200ms");
+            anyhow::bail!("virtiofsd did not create socket {virtiofs_sock} within 2s");
         }
 
         // ── 2. Boot cloud-hypervisor ─────────────────────────────────────

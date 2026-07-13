@@ -63,6 +63,8 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/deploy` | Deploy or re-deploy a service (returns NDJSON stream) |
+| `GET`  | `/status` | Get deployment status for all services (when `service_id` omitted) |
+| `GET`  | `/logs`   | Get logs for all services (when `service_id` omitted) |
 | `GET`  | `/vm/{service_id}/status` | Get deployment status for a service |
 | `GET`  | `/vm/{service_id}/logs`   | Get logs for a service |
 | `GET`  | `/vms`                     | List registered services |
@@ -183,10 +185,6 @@ The benchmark races Russel (microVM via cloud-hypervisor) against the detected
 container runtime (podman or docker) for each example application — end to end:
 build → spawn → first HTTP response. The table reports end-to-end times.
 A second "Spawn-to-Ready" table (excluding build time) is printed below it.
-
-Run `./bench.sh` to reproduce. Requires Rust toolchain, nix, and optionally
-podman/docker for the comparison. Default is `--warm` (images and nix caches
-persist). Use `--cold` to force cold builds on both platforms.
 
 | Example | Russel (deploy+curl) | Docker/Podman (build+run+curl) | Winner |
 |---------|---------------------|--------------------------------|--------|
