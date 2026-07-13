@@ -28,9 +28,16 @@ fn port_is_available(port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
+fn port_registry() -> std::sync::MutexGuard<'static, PortRegistry> {
+    PORT_REGISTRY.lock().unwrap_or_else(|e| {
+        tracing::warn!("PORT_REGISTRY lock poisoned — recovering");
+        e.into_inner()
+    })
+}
+
 impl PortAllocator {
     pub fn next(&self, service_id: &str) -> anyhow::Result<u16> {
-        let mut registry = PORT_REGISTRY.lock().unwrap();
+        let mut registry = port_registry();
         if let Some(old_port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&old_port);
         }
@@ -53,7 +60,7 @@ impl PortAllocator {
     }
 
     pub fn reserve(service_id: &str, port: u16) -> anyhow::Result<()> {
-        let mut registry = PORT_REGISTRY.lock().unwrap();
+        let mut registry = port_registry();
         let existing_port = registry.allocations.get(service_id).copied();
         if existing_port == Some(port) {
             // Do not trust the registry alone: the listener may have disappeared,
@@ -78,7 +85,7 @@ impl PortAllocator {
     }
 
     pub fn release(service_id: &str) {
-        let mut registry = PORT_REGISTRY.lock().unwrap();
+        let mut registry = port_registry();
         if let Some(port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&port);
         }
@@ -108,7 +115,11 @@ pub fn subnet_for(service_id: &str) -> SubnetAllocation {
         host_ip: format!("10.{x}.{y}.1"),
         vm_ip: format!("10.{x}.{y}.2"),
         mac: format!("02:00:00:00:{x:02x}:{y:02x}"),
-        tap_id: format!("vm-{service_id}"),
+        // Linux limits interface names to IFNAMSIZ - 1 (15) bytes.  Service
+        // IDs may be up to 128 bytes, so putting the ID in the TAP name makes
+        // perfectly valid deployments fail at `ip tuntap add`.  A stable hash
+        // keeps the name short while still allowing cleanup to rederive it.
+        tap_id: format!("rsl-{hash:08x}"),
     }
 }
 
@@ -133,7 +144,9 @@ impl TapForwarder {
 
         tracing::info!(tap, "creating tap interface");
         let _ = run_ip(&["link", "del", tap]).await;
-        let _ = run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await;
+        run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"])
+            .await
+            .map_err(|e| anyhow::anyhow!("create TAP interface {tap}: {e}"))?;
         run_ip(&["link", "set", tap, "up"]).await?;
         run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
         tracing::info!(tap, host_ip, "tap configured");
@@ -254,9 +267,14 @@ mod tests {
 
     #[test]
     fn subnet_for_produces_valid_tap_id() {
-        let a = subnet_for("foo");
-        assert!(a.tap_id.starts_with("vm-"));
-        assert!(a.tap_id.contains("foo"));
+        let a = subnet_for("a-service-id-that-is-much-longer-than-a-linux-interface-name");
+        assert!(a.tap_id.starts_with("rsl-"));
+        assert!(a.tap_id.len() <= 15);
+        assert!(a.tap_id.bytes().all(|byte| byte.is_ascii_hexdigit()
+            || byte == b'-'
+            || byte == b'r'
+            || byte == b's'
+            || byte == b'l'));
     }
 
     #[test]

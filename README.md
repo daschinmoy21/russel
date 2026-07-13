@@ -63,6 +63,8 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/deploy` | Deploy or re-deploy a service (returns NDJSON stream) |
+| `GET`  | `/status` | Get deployment status for all services (when `service_id` omitted) |
+| `GET`  | `/logs`   | Get logs for all services (when `service_id` omitted) |
 | `GET`  | `/vm/{service_id}/status` | Get deployment status for a service |
 | `GET`  | `/vm/{service_id}/logs`   | Get logs for a service |
 | `GET`  | `/vms`                     | List registered services |
@@ -73,8 +75,8 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 
 ```bash
 russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID]
-russel status <service_id>
-russel logs <service_id>
+russel status [<service_id>]
+russel logs [<service_id>]
 russel vms
 russel stop <service_id>
 russel destroy <service_id>
@@ -167,16 +169,64 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 
 | Metric | Value |
 |--------|-------|
-| Clean build (debug) | 14.5s |
-| Release build | 26.4s |
-| Incremental build | 1.0s |
-| Tests | 31 passing, 0.8s |
-| Binary size (cli) | 6.6MB |
+| Clean build (debug) | 12.3s |
+| Release build | 24.4s |
+| Incremental build | 0.8s |
+| Tests | 43 passing, 0.7s |
+| Binary size (cli) | 6.7MB |
 | Binary size (ctrl) | 4.5MB |
-| Rust LOC | 3,562 (16 files) |
+| Rust LOC | 3,994 (16 files) |
 | Direct deps | 332 |
+| Dockerfiles | 3 (examples/basic-http, static-test, filebrowser) |
 
-Run `./bench.sh` to reproduce.
+### Russel vs Container: Application Boot Race
+
+The benchmark races Russel (microVM via cloud-hypervisor) against the detected
+container runtime (podman or docker) for each example application — end to end:
+build → spawn → first HTTP response. The table reports end-to-end times.
+A second "Spawn-to-Ready" table (excluding build time) is printed below it.
+
+| Example | Russel (deploy+curl) | Docker/Podman (build+run+curl) | Winner |
+|---------|---------------------|--------------------------------|--------|
+| basic-http | 3.9s | 8.6s | Russel |
+| static-test | 1.7s | 2.7s | Russel |
+| filebrowser | 1.9s | 10.1s | Russel |
+
+Times are end-to-end: build + spawn + first HTTP 200. The runtime label
+(podman/docker) is auto-detected. Russel phase breakdown
+(resolve, nix build, initramfs, network, boot, ready) is printed after the
+race by `./bench.sh`.
+
+Run `./bench.sh [--cold|--warm]` to reproduce. Requires Rust toolchain, nix,
+and optionally podman/docker for the comparison.
+
+### Container Boot Comparison (legacy, for reference)
+
+| Example | Container ready | Build time |
+|---------|----------------|------------|
+| basic-http | 176ms | 19.1s |
+| static-test | 519ms | 1.2s |
+| filebrowser | 292ms | 8.3s |
+
+Container startup (spawn→ready) is faster than microVM boot (which includes
+kernel init, initramfs extraction, and module loading), but microVMs provide
+stronger isolation via hardware virtualization. Container resources are capped
+to `--memory=256m` to match the microVM memory limit. Container run time
+includes port-resolution polling (`sleep 0.5` up to 5×) while Russel's port is
+pre-allocated.
+
+> **Fair comparison note:** The main End-to-End table conflates build and spawn
+> into one number, which favors Russel (its Nix cache persists; Docker images
+> were previously destroyed each run via `rmi`). The Spawn-to-Ready table
+> (printed by `./bench.sh`) strips build time. `--warm` (default) now keeps both
+> caches warm; `--cold` forces cold builds on both sides.
+
+### Known Limitations
+
+- **Subnet collision detection** — 16-bit FNV-1a space, <2% collision at 50 services. Add when scale demands it.
+- **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
+- **Traefik/Database/Health stubs** — documented placeholders, fully functional via direct socat access.
+- **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 
 ## License
 

@@ -29,8 +29,8 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Deploy(DeployArgs),
-    Status,
-    Logs,
+    Status(StatusArgs),
+    Logs(LogsArgs),
     Vms,
     Stop(StopArgs),
     Destroy(DestroyArgs),
@@ -55,6 +55,18 @@ pub struct DeployArgs {
 pub struct StopArgs {
     #[arg(value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    #[arg(value_name = "ID")]
+    pub service_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    #[arg(value_name = "ID")]
+    pub service_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -237,6 +249,7 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
             t.create_ms,
             "build minimal initramfs (BusyBox + modules)",
         );
+        timing_row("network", t.network_ms, "TAP + socat port forwarding setup");
         timing_row(
             "start",
             t.start_ms,
@@ -271,6 +284,8 @@ fn timing_row(label: &str, val_ms: u128, desc: &str) {
     );
 }
 
+// ponytail: tests inline, no test framework ceremony for pure functions
+
 fn normalize_repo_arg(repo: &str) -> Result<String> {
     let path = PathBuf::from(repo);
     if path.exists() {
@@ -287,18 +302,27 @@ fn parse_port_mapping(value: &str) -> Result<PortMapping> {
     let (host, guest) = value
         .split_once(':')
         .ok_or_else(|| anyhow!("port mapping must be HOST:GUEST, e.g. 8080:3000"))?;
-    Ok(PortMapping {
-        host: host
-            .parse()
-            .with_context(|| format!("invalid host port in {value}"))?,
-        guest: guest
-            .parse()
-            .with_context(|| format!("invalid guest port in {value}"))?,
-    })
+    let host: u16 = host
+        .parse()
+        .with_context(|| format!("invalid host port in {value}"))?;
+    if host == 0 {
+        anyhow::bail!("host port must not be 0 in {value}");
+    }
+    let guest: u16 = guest
+        .parse()
+        .with_context(|| format!("invalid guest port in {value}"))?;
+    Ok(PortMapping { host, guest })
 }
 
-pub async fn status(control_plane: &str) -> Result<()> {
-    let r = reqwest::get(format!("{control_plane}/status"))
+// ponytail: only status/logs/vms/stop/destroy use HTTP — tested via unit tests
+// on pure functions below.
+
+pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
+    let url = match args.service_id {
+        Some(id) => format!("{control_plane}/vm/{id}/status"),
+        None => format!("{control_plane}/status"),
+    };
+    let r = reqwest::get(&url)
         .await?
         .error_for_status()?
         .json::<StatusResponse>()
@@ -310,8 +334,12 @@ pub async fn status(control_plane: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn logs(control_plane: &str) -> Result<()> {
-    let r = reqwest::get(format!("{control_plane}/logs"))
+pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
+    let url = match args.service_id {
+        Some(id) => format!("{control_plane}/vm/{id}/logs"),
+        None => format!("{control_plane}/logs"),
+    };
+    let r = reqwest::get(&url)
         .await?
         .error_for_status()?
         .json::<LogsResponse>()
@@ -358,4 +386,78 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
         .await?;
     println!("{}", r);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_port_mapping_valid() {
+        let pm = parse_port_mapping("8080:3000").unwrap();
+        assert_eq!(pm.host, 8080);
+        assert_eq!(pm.guest, 3000);
+    }
+
+    #[test]
+    fn parse_port_mapping_invalid_format() {
+        assert!(parse_port_mapping("8080").is_err());
+        assert!(parse_port_mapping("").is_err());
+    }
+
+    #[test]
+    fn parse_port_mapping_host_zero_rejected() {
+        let err = parse_port_mapping("0:3000").unwrap_err();
+        assert!(err.to_string().contains("must not be 0"));
+    }
+
+    #[test]
+    fn parse_port_mapping_non_numeric() {
+        assert!(parse_port_mapping("abc:3000").is_err());
+        assert!(parse_port_mapping("8080:xyz").is_err());
+    }
+
+    #[test]
+    fn ms_under_second() {
+        assert_eq!(ms(500), "500ms");
+        assert_eq!(ms(0), "0ms");
+        assert_eq!(ms(999), "999ms");
+    }
+
+    #[test]
+    fn ms_over_second() {
+        assert_eq!(ms(1000), "1.0s");
+        assert_eq!(ms(1500), "1.5s");
+        assert_eq!(ms(12345), "12.3s");
+    }
+
+    #[test]
+    fn normalize_repo_arg_is_identity_for_remote() {
+        let url = "https://github.com/user/repo.git";
+        assert_eq!(normalize_repo_arg(url).unwrap(), url);
+    }
+
+    #[test]
+    fn normalize_repo_arg_resolves_local_path() {
+        let result = normalize_repo_arg(".").unwrap();
+        // Should resolve to an absolute path
+        assert!(result.starts_with('/'), "got: {result}");
+        assert!(
+            std::path::Path::new(&result).is_dir(),
+            "path not found: {result}"
+        );
+    }
+
+    #[test]
+    fn normalize_repo_arg_nonexistent_returns_asis() {
+        let name = "some-nonexistent-repo-name";
+        assert_eq!(normalize_repo_arg(name).unwrap(), name);
+    }
+
+    #[test]
+    fn ms_edge_cases() {
+        assert_eq!(ms(1000), "1.0s");
+        assert_eq!(ms(999), "999ms");
+        assert_eq!(ms(0), "0ms");
+    }
 }

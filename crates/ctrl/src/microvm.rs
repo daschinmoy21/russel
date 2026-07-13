@@ -288,8 +288,7 @@ impl MicrovmRunner {
                     .unwrap_or(m);
                 let ko_name = xz_name.trim_end_matches(".xz");
                 format!(
-                    "echo \"Loading module {ko_name}...\"\n\
-                     /bin/xzcat /modules/{xz_name} > /tmp/{ko_name} && /bin/insmod /tmp/{ko_name} || echo \"FAILED to load {ko_name}\""
+                    "if [ -f /modules/{xz_name} ]; then /bin/xzcat /modules/{xz_name} > /tmp/{ko_name} && /bin/insmod /tmp/{ko_name} || exit 1; fi"
                 )
             })
             .collect::<Vec<_>>()
@@ -297,16 +296,15 @@ impl MicrovmRunner {
 
         format!(
             r#"#!/bin/sh
-echo "=== RUSSEL INIT STARTING ==="
 /bin/mkdir -p /proc /sys /dev /nix/store /tmp
 /bin/mount -t proc proc /proc
 /bin/mount -t sysfs sysfs /sys
 /bin/mount -t devtmpfs devtmpfs /dev
 
-# Load virtio kernel modules
+# Load the small set of virtio modules needed by this guest.
 {insmod_cmds}
 
-echo "=== Mounting /nix/store via virtiofs ==="
+# Mount the host Nix store before configuring the network.
 /bin/mount -t virtiofs nixstore /nix/store
 if [ $? -ne 0 ]; then
   echo "ERROR: Failed to mount /nix/store via virtiofs"
@@ -330,13 +328,6 @@ if [ $? -ne 0 ]; then
   echo "ERROR: Failed to set default gateway {host_ip}"
 fi
 
-# Print interface details
-echo "=== Network Interfaces ==="
-/bin/ip addr show
-echo "=== Routes ==="
-/bin/ip route show
-
-echo "=== Launching application ==="
 export PORT={port}
 cd /
 echo "exec {app}/bin/{bin}"
@@ -508,18 +499,6 @@ exec /bin/sh
         // ── 1. Spawn virtiofsd to serve /nix/store via a per-VM socket ───
         let sock_dir = format!("/var/lib/russel/{}", service_id);
         std::fs::create_dir_all(&sock_dir)?;
-        let console_log = format!("{}/console.log", sock_dir);
-        if let Err(e) = std::fs::remove_file(&console_log)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(file = %console_log, error = %e, "failed to remove previous console log");
-        }
-        if let Ok(file) = std::fs::File::create(&console_log) {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o666)) {
-                tracing::warn!(file = %console_log, error = %e, "failed to set permissions on console log");
-            }
-        }
 
         let virtiofs_sock = format!("{}/virtiofs.sock", sock_dir);
         if let Err(e) = std::fs::remove_file(&virtiofs_sock)
@@ -538,10 +517,13 @@ exec /bin/sh
             tracing::warn!(file = %api_sock, error = %e, "failed to remove stale Cloud Hypervisor API socket");
         }
 
-        tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store");
+        // ponytail: --readonly ensures the guest cannot write to /nix/store.
+        // Remove if a deployment workflow ever needs guest-side store mutations.
+        tracing::info!(socket = %virtiofs_sock, "spawning virtiofsd for /nix/store (read-only)");
         let virtiofsd_child = Command::new("virtiofsd")
             .arg(format!("--socket-path={}", virtiofs_sock))
             .arg("--shared-dir=/nix/store")
+            .arg("--readonly")
             .arg("--sandbox=none")
             .arg("--cache=always")
             .kill_on_drop(true)
@@ -555,12 +537,15 @@ exec /bin/sh
             })?;
         tracing::info!(pid = virtiofsd_child.id(), "virtiofsd started");
 
-        // Give virtiofsd a moment to create the socket
-        for _ in 0..20 {
-            if std::path::Path::new(&virtiofs_sock).exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // virtiofsd normally creates its socket immediately.  Do not add a
+        // fixed boot delay here: wait only until it is actually ready and fail
+        // clearly if it never comes up.
+        let socket_deadline = Instant::now() + Duration::from_millis(2000);
+        while !std::path::Path::new(&virtiofs_sock).exists() && Instant::now() < socket_deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if !std::path::Path::new(&virtiofs_sock).exists() {
+            anyhow::bail!("virtiofsd did not create socket {virtiofs_sock} within 2s");
         }
 
         // ── 2. Boot cloud-hypervisor ─────────────────────────────────────
@@ -570,7 +555,9 @@ exec /bin/sh
             .arg("--initramfs")
             .arg(initramfs_path)
             .arg("--cmdline")
-            .arg("console=ttyS0 panic=-1 random.trust_cpu=on")
+            // No serial console: kernel output is not part of readiness and
+            // writing it to a per-VM file adds avoidable boot I/O.
+            .arg("panic=-1 random.trust_cpu=on")
             .arg("--cpus")
             .arg("boot=1")
             .arg("--memory")
@@ -586,8 +573,6 @@ exec /bin/sh
             .arg("null")
             .arg("--api-socket")
             .arg(format!("path={}", api_sock))
-            .arg("--serial")
-            .arg(format!("file=/var/lib/russel/{}/console.log", service_id))
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
@@ -616,6 +601,13 @@ exec /bin/sh
         Self::validate_service_id(service_id)?;
 
         let metadata = read_metadata(service_id);
+        let api_socket = format!("/var/lib/russel/{service_id}/cloud-hypervisor.sock");
+        // `destroy` is intentionally idempotent. A first cleanup attempt for a
+        // benchmark VM normally has neither metadata nor a VMM socket; do not
+        // turn that expected case into a shutdown warning or process scan.
+        if metadata.is_none() && !Path::new(&api_socket).exists() {
+            return Ok(());
+        }
         let vm_pid = metadata.as_ref().and_then(|m| m.vm_pid);
         let api_result = self.shutdown_via_api(service_id).await;
 
@@ -632,10 +624,11 @@ exec /bin/sh
         };
 
         if !vm_stopped {
+            let tap = crate::network::subnet_for(service_id).tap_id;
             self.pkill_service_process(
                 service_id,
                 "cloud-hypervisor",
-                &format!("cloud-hypervisor.*tap=vm-{}(,|$)", escape_regex(service_id)),
+                &format!("cloud-hypervisor.*tap={}(,|$)", escape_regex(&tap)),
             )
             .await?;
             if let Some(pid) = vm_pid {
@@ -697,10 +690,30 @@ exec /bin/sh
             .await
             .map_err(|_| anyhow::anyhow!("timed out writing {endpoint}"))??;
 
-        let mut response = Vec::new();
-        tokio::time::timeout(timeout, stream.read_to_end(&mut response))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for {endpoint}"))??;
+        // Cloud Hypervisor may keep the API connection open after sending a
+        // shutdown response. Waiting for EOF here makes every shutdown pay the
+        // full timeout even though the request succeeded. The status and headers
+        // are enough for these action endpoints, so stop at the end of headers.
+        let mut response = Vec::with_capacity(1024);
+        tokio::time::timeout(timeout, async {
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 {
+                    break;
+                }
+                response.extend_from_slice(&chunk[..read]);
+                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                if response.len() > 64 * 1024 {
+                    anyhow::bail!("response headers from {endpoint} are too large");
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for {endpoint}"))??;
         let status_line = String::from_utf8_lossy(&response)
             .lines()
             .next()
@@ -744,10 +757,16 @@ exec /bin/sh
     /// This prevents a reused PID from causing an unrelated process to be killed.
     fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
         let cmdline_path = format!("/proc/{pid}/cmdline");
-        std::fs::read_to_string(cmdline_path)
+        let tap_arg = format!("tap={}", crate::network::subnet_for(service_id).tap_id);
+        // `/proc/<pid>/cmdline` is NUL-separated bytes, not a text file. Read
+        // bytes directly so an unexpected non-UTF-8 argument cannot make an
+        // owned helper look unrelated and trigger a broad process fallback.
+        std::fs::read(cmdline_path)
             .map(|cmdline| {
-                cmdline.split('\0').any(|arg| {
-                    arg == format!("tap=vm-{service_id}")
+                cmdline.split(|byte| *byte == 0).any(|arg| {
+                    let arg = String::from_utf8_lossy(arg);
+                    arg == tap_arg
+                        || arg.starts_with(&format!("{tap_arg},"))
                         || arg.contains(&format!("russel/{service_id}/"))
                         || arg.contains(&format!("socat-russel-{service_id}"))
                 })
