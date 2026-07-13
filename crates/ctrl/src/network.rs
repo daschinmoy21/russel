@@ -115,7 +115,11 @@ pub fn subnet_for(service_id: &str) -> SubnetAllocation {
         host_ip: format!("10.{x}.{y}.1"),
         vm_ip: format!("10.{x}.{y}.2"),
         mac: format!("02:00:00:00:{x:02x}:{y:02x}"),
-        tap_id: format!("vm-{service_id}"),
+        // Linux limits interface names to IFNAMSIZ - 1 (15) bytes.  Service
+        // IDs may be up to 128 bytes, so putting the ID in the TAP name makes
+        // perfectly valid deployments fail at `ip tuntap add`.  A stable hash
+        // keeps the name short while still allowing cleanup to rederive it.
+        tap_id: format!("rsl-{hash:08x}"),
     }
 }
 
@@ -140,7 +144,9 @@ impl TapForwarder {
 
         tracing::info!(tap, "creating tap interface");
         let _ = run_ip(&["link", "del", tap]).await;
-        let _ = run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await;
+        run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"])
+            .await
+            .map_err(|e| anyhow::anyhow!("create TAP interface {tap}: {e}"))?;
         run_ip(&["link", "set", tap, "up"]).await?;
         run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
         tracing::info!(tap, host_ip, "tap configured");
@@ -261,9 +267,14 @@ mod tests {
 
     #[test]
     fn subnet_for_produces_valid_tap_id() {
-        let a = subnet_for("foo");
-        assert!(a.tap_id.starts_with("vm-"));
-        assert!(a.tap_id.contains("foo"));
+        let a = subnet_for("a-service-id-that-is-much-longer-than-a-linux-interface-name");
+        assert!(a.tap_id.starts_with("rsl-"));
+        assert!(a.tap_id.len() <= 15);
+        assert!(a.tap_id.bytes().all(|byte| byte.is_ascii_hexdigit()
+            || byte == b'-'
+            || byte == b'r'
+            || byte == b's'
+            || byte == b'l'));
     }
 
     #[test]

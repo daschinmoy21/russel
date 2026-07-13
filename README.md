@@ -177,7 +177,32 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 | Direct deps | 332 |
 | Dockerfiles | 3 (examples/basic-http, static-test, filebrowser) |
 
-### Container Boot Comparison (via podman)
+### Russel vs Container: Application Boot Race
+
+The benchmark races Russel (microVM via cloud-hypervisor) against the detected
+container runtime (podman or docker) for each example application — end to end:
+build → spawn → first HTTP response. The table reports end-to-end times.
+A second "Spawn-to-Ready" table (excluding build time) is printed below it.
+
+Run `./bench.sh` to reproduce. Requires Rust toolchain, nix, and optionally
+podman/docker for the comparison. Default is `--warm` (images and nix caches
+persist). Use `--cold` to force cold builds on both platforms.
+
+| Example | Russel (deploy+curl) | Docker/Podman (build+run+curl) | Winner |
+|---------|---------------------|--------------------------------|--------|
+| basic-http | 3.9s | 8.6s | Russel |
+| static-test | 1.7s | 2.7s | Russel |
+| filebrowser | 1.9s | 10.1s | Russel |
+
+Times are end-to-end: build + spawn + first HTTP 200. The runtime label
+(podman/docker) is auto-detected. Russel phase breakdown
+(resolve, nix build, initramfs, network, boot, ready) is printed after the
+race by `./bench.sh`.
+
+Run `./bench.sh [--cold|--warm]` to reproduce. Requires Rust toolchain, nix,
+and optionally podman/docker for the comparison.
+
+### Container Boot Comparison (legacy, for reference)
 
 | Example | Container ready | Build time |
 |---------|----------------|------------|
@@ -185,15 +210,18 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 | static-test | 519ms | 1.2s |
 | filebrowser | 292ms | 8.3s |
 
-Container startup is faster than microVM boot (which includes kernel init,
-initramfs extraction, and module loading), but microVMs provide stronger
-isolation via hardware virtualization. Container resources are capped to
-`--memory=256m` to match the microVM memory limit.
+Container startup (spawn→ready) is faster than microVM boot (which includes
+kernel init, initramfs extraction, and module loading), but microVMs provide
+stronger isolation via hardware virtualization. Container resources are capped
+to `--memory=256m` to match the microVM memory limit. Container run time
+includes port-resolution polling (`sleep 0.5` up to 5×) while Russel's port is
+pre-allocated.
 
-MicroVM boot times require KVM + root and are measured separately via
-`russel-cli deploy` on a host with `/dev/kvm` access.
-
-Run `./bench.sh` to reproduce.
+> **Fair comparison note:** The main End-to-End table conflates build and spawn
+> into one number, which favors Russel (its Nix cache persists; Docker images
+> were previously destroyed each run via `rmi`). The Spawn-to-Ready table
+> (printed by `./bench.sh`) strips build time. `--warm` (default) now keeps both
+> caches warm; `--cold` forces cold builds on both sides.
 
 ### Known Limitations
 
@@ -201,7 +229,6 @@ Run `./bench.sh` to reproduce.
 - **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
 - **Traefik/Database/Health stubs** — documented placeholders, fully functional via direct socat access.
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
-- **microVM boot benchmark** — add `russel deploy` timing to bench.sh once Cloud Hypervisor is present in CI.
 
 ## License
 

@@ -2,7 +2,10 @@
 # ponytail: matches go.mod (1.22) so the binary is the same toolchain as Nix build.
 FROM docker.io/library/golang:1.22-alpine AS build
 WORKDIR /app
-COPY go.mod main.go ./
+# ponytail: separate go mod download for layer caching — go.mod rarely changes
+COPY go.mod ./
+RUN go mod download
+COPY main.go ./
 COPY static ./static
 RUN CGO_ENABLED=0 go build -o basic-http .
 

@@ -38,7 +38,11 @@ impl DeployPipeline {
             git: GitClient,
             builder: NixBuilder,
             database: DatabaseProvisioner,
-            runner: MicrovmRunner::new(),
+            // DeployPipeline is constructed per request.  Keep the expensive
+            // kernel/busybox/module resolution cache alive across requests so
+            // the benchmark's later VMs measure VM work rather than repeated
+            // `nix build --no-link` evaluations.
+            runner: shared_runner(),
             ports: PortAllocator,
             traefik: TraefikClient,
         }
@@ -301,7 +305,7 @@ impl DeployPipeline {
             let create_ms = t.elapsed().as_millis();
             tracing::info!(service_id, create_ms, "initramfs ready");
 
-            // ── 5. TAP + socat + boot VM (serial, as user requested) ──────────
+            // ── 5. TAP + socat + boot VM ─────────────────────────────────────
             let _ = tx
                 .send(DeployEvent::Progress {
                     phase: "start".into(),
@@ -557,6 +561,12 @@ impl DeployPipeline {
             },
         })
     }
+}
+
+fn shared_runner() -> MicrovmRunner {
+    static RUNNER: std::sync::LazyLock<MicrovmRunner> =
+        std::sync::LazyLock::new(MicrovmRunner::new);
+    RUNNER.clone()
 }
 
 struct PortReservation {
