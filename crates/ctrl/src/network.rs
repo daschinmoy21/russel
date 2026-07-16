@@ -90,6 +90,30 @@ impl PortAllocator {
             registry.busy_ports.remove(&port);
         }
     }
+
+    /// Register a port that is already bound by a live container (e.g. after ctrl
+    /// restart). Does NOT check port_is_available — the port is already in use.
+    pub fn claim_existing(service_id: &str, port: u16) -> anyhow::Result<()> {
+        let mut registry = port_registry();
+        // Reject if a different service already owns this port.
+        if let Some(other_id) = registry
+            .allocations
+            .iter()
+            .find_map(|(id, &p)| if p == port && id != service_id { Some(id.clone()) } else { None })
+        {
+            anyhow::bail!("port {port} already claimed by service '{other_id}'");
+        }
+        // If this service already has a different port, release it first.
+        if let Some(&old_port) = registry.allocations.get(service_id) {
+            if old_port == port {
+                return Ok(());
+            }
+            registry.busy_ports.remove(&old_port);
+        }
+        registry.busy_ports.insert(port);
+        registry.allocations.insert(service_id.to_string(), port);
+        Ok(())
+    }
 }
 
 // ── Subnet allocation (deterministic per service_id) ─────────────────────────
@@ -202,16 +226,24 @@ impl TapForwarder {
     }
 
     pub async fn wait_for_vm_port(vm_ip: &str, guest_port: u16, timeout: Duration) -> bool {
-        let addr = format!("{vm_ip}:{guest_port}");
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        false
+        wait_for_tcp_addr(&format!("{vm_ip}:{guest_port}"), timeout).await
     }
+
+    /// Poll until a TCP connect to `127.0.0.1:host_port` succeeds (container port publish).
+    pub async fn wait_for_host_port(host_port: u16, timeout: Duration) -> bool {
+        wait_for_tcp_addr(&format!("127.0.0.1:{host_port}"), timeout).await
+    }
+}
+
+async fn wait_for_tcp_addr(addr: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
 }
 
 async fn sysctl(key: &str, val: &str) {
@@ -317,5 +349,22 @@ mod tests {
         PortAllocator::release("custom-service");
         PortAllocator::reserve("another-service", 4000).unwrap();
         PortAllocator::release("another-service");
+    }
+
+    #[test]
+    fn port_allocator_claim_existing_registers_port() {
+        PortAllocator::release("claimed-svc");
+        PortAllocator::claim_existing("claimed-svc", 9000).unwrap();
+        // Same service, same port is idempotent.
+        PortAllocator::claim_existing("claimed-svc", 9000).unwrap();
+        // Different service claiming same port is rejected.
+        let err = PortAllocator::claim_existing("other-svc", 9000).unwrap_err();
+        assert!(err.to_string().contains("already claimed"));
+        // Same service with a different port moves the claim.
+        PortAllocator::claim_existing("claimed-svc", 9001).unwrap();
+        // Old port should now be available for another service.
+        PortAllocator::release("claimed-svc");
+        PortAllocator::claim_existing("other-svc", 9000).unwrap();
+        PortAllocator::release("other-svc");
     }
 }

@@ -6,14 +6,19 @@ use axum::{
     http::StatusCode,
     routing::{delete, get, post},
 };
-use russel_core::api::{DeployEvent, DeployRequest, LogsResponse, StatusResponse, VmsResponse};
-use tokio::process::Child;
+use russel_core::api::{
+    DeployEvent, DeployRequest, LogsResponse, ServiceSummary, StatusResponse, VmsResponse,
+};
+use russel_core::config::RuntimeKind;
+use tokio::process::{Child, Command};
 use tokio_stream::StreamExt;
 
 use crate::{
+    container::{ContainerRunner, container_log_path},
     deploy::DeployPipeline,
+    metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
-    network::release_subnet,
+    network::{PortAllocator, release_subnet},
     state::{AppState, LifecycleClaim},
 };
 
@@ -132,10 +137,43 @@ async fn vm_logs(
     Path(service_id): Path<String>,
 ) -> Result<Json<LogsResponse>, (StatusCode, String)> {
     tracing::debug!(service_id = %service_id, "GET /vm/{}/logs", service_id);
-    state.logs(&service_id).map(Json).ok_or((
+    let mut resp = state.logs(&service_id).ok_or((
         StatusCode::NOT_FOUND,
         format!("service {} not found", service_id),
-    ))
+    ))?;
+
+    let runtime = resolve_lifecycle_runtime(state.runtime_for_service(&service_id), &service_id);
+    if runtime == RuntimeKind::Container {
+        append_podman_logs(&service_id, &mut resp.output).await;
+    }
+
+    Ok(Json(resp))
+}
+
+async fn append_podman_logs(service_id: &str, output: &mut String) {
+    let name = ContainerRunner::container_name(service_id);
+    let log_path = container_log_path(service_id);
+    if log_path.exists() {
+        return;
+    }
+
+    let result = Command::new("podman")
+        .args(["logs", "--tail", "200", &name])
+        .output()
+        .await;
+
+    if let Ok(out) = result
+        && out.status.success()
+    {
+        let logs = String::from_utf8_lossy(&out.stdout);
+        if !logs.trim().is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("--- podman logs ---\n");
+            output.push_str(&logs);
+        }
+    }
 }
 
 // Flat endpoints kept for CLI compatibility
@@ -167,10 +205,7 @@ async fn logs_all(
         0 => Err((StatusCode::NOT_FOUND, "no services".to_string())),
         1 => {
             let sid = &ids[0];
-            state
-                .logs(sid)
-                .map(Json)
-                .ok_or((StatusCode::NOT_FOUND, format!("service {} not found", sid)))
+            vm_logs(State(state), Path(sid.clone())).await
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -180,12 +215,9 @@ async fn logs_all(
 }
 
 async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
-    // Start with in-memory inventory
     let mut vms = state.list_services();
     let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
-    // Augment with VMs discovered on disk (to handle restarts/rebuilds).
-    // Rehydrate the state so lifecycle endpoints can find them.
     for base in &["/var/lib/russel", "/var/lib/microvms"] {
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
@@ -193,11 +225,9 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
                     && file_type.is_dir()
                     && let Some(name) = entry.file_name().to_str()
                 {
-                    // Exclude .bak backup directories
                     if name.ends_with(".bak") {
                         continue;
                     }
-                    // De-duplicate across both disk roots and in-memory services
                     if seen.insert(name.to_string()) {
                         state.ensure_service(name);
                         vms.push(name.to_string());
@@ -207,12 +237,77 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
         }
     }
 
+    discover_podman_containers(&state, &mut vms, &mut seen).await;
+
+    vms.sort();
+
+    let services: Vec<ServiceSummary> = vms
+        .iter()
+        .map(|id| {
+            let status = state
+                .status(id)
+                .map(|s| s.status)
+                .unwrap_or_else(|| "stopped".to_string());
+            let runtime = state
+                .status(id)
+                .and_then(|s| s.runtime)
+                .or_else(|| Some(prior_runtime_from_disk(id)));
+            ServiceSummary {
+                service_id: id.clone(),
+                runtime,
+                status,
+            }
+        })
+        .collect();
+
     tracing::debug!(
         count = vms.len(),
-        "GET /vms -> {} VMs (from disk+memory)",
+        "GET /vms -> {} services (from disk+memory+podman)",
         vms.len()
     );
-    Json(VmsResponse { vms })
+    Json(VmsResponse { vms, services })
+}
+
+async fn discover_podman_containers(
+    state: &AppState,
+    vms: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let output = Command::new("podman")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=russel.runtime=container",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await;
+
+    let Ok(out) = output else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = line.trim();
+        if let Some(service_id) = name.strip_prefix("russel-")
+            && seen.insert(service_id.to_string())
+        {
+            state.ensure_service(service_id);
+            if let Some(meta) = load_metadata_from_disk(service_id) {
+                if let Some(host_port) = meta.host_port {
+                    if let Err(e) = PortAllocator::claim_existing(service_id, host_port) {
+                        tracing::warn!(service_id = %service_id, host_port, error = %e, "failed to claim existing container port");
+                    }
+                }
+            }
+            vms.push(service_id.to_string());
+        }
+    }
 }
 
 async fn vm_stop(
@@ -221,19 +316,30 @@ async fn vm_stop(
 ) -> Result<Json<String>, (StatusCode, String)> {
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
-    let (runner, vm_child, aux_processes) =
-        claim_lifecycle_operation(&state, &service_id, "stopping")?;
-    let result = runner.stop(&service_id).await;
-    reap_children(vm_child, aux_processes).await;
+    let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
+    let result = match claim {
+        LifecycleClaimKind::Microvm {
+            runner,
+            vm_child,
+            aux_processes,
+        } => {
+            let result = runner.stop(&service_id).await;
+            reap_children(vm_child, aux_processes).await;
+            result
+        }
+        LifecycleClaimKind::Container { runner } => runner.stop(&service_id).await,
+    };
+
+    let label = runtime_label(runtime);
 
     match result {
         Ok(_) => {
-            tracing::info!(service_id = %service_id, "stopped microvm");
+            tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
             state.set_status(&service_id, "stopped", "none");
-            Ok(Json(format!("stopped {}", service_id)))
+            Ok(Json(format!("stopped {label} {service_id}")))
         }
         Err(e) => {
-            tracing::error!(service_id = %service_id, error = %e, "failed to stop microvm");
+            tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to stop service");
             state.set_status(&service_id, "failed", "failed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
@@ -246,37 +352,74 @@ async fn vm_destroy(
 ) -> Result<Json<String>, (StatusCode, String)> {
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
-    let (runner, vm_child, aux_processes) =
-        claim_lifecycle_operation(&state, &service_id, "destroying")?;
-    let result = runner.destroy(&service_id).await;
-    reap_children(vm_child, aux_processes).await;
+    let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
+    let result = match claim {
+        LifecycleClaimKind::Microvm {
+            runner,
+            vm_child,
+            aux_processes,
+        } => {
+            let result = runner.destroy(&service_id).await;
+            reap_children(vm_child, aux_processes).await;
+            result
+        }
+        LifecycleClaimKind::Container { runner } => {
+            let result = runner.destroy(&service_id).await;
+            if result.is_ok() {
+                PortAllocator::release(&service_id);
+                let base = crate::container::default_base_dir(&service_id);
+                if base.exists() {
+                    let _ = tokio::fs::remove_dir_all(&base).await;
+                }
+            }
+            result
+        }
+    };
+
+    let label = runtime_label(runtime);
 
     match result {
         Ok(_) => {
-            release_subnet(&service_id);
-            tracing::info!(service_id = %service_id, "destroyed microvm");
+            if runtime == RuntimeKind::Microvm {
+                release_subnet(&service_id);
+            }
+            tracing::info!(service_id = %service_id, runtime = %label, "destroyed service");
             state.remove_service(&service_id);
-            Ok(Json(format!("destroyed {}", service_id)))
+            Ok(Json(format!("destroyed {label} {service_id}")))
         }
         Err(e) => {
-            tracing::error!(service_id = %service_id, error = %e, "failed to destroy microvm");
+            tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
             state.set_status(&service_id, "failed", "failed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
 }
 
-/// Claim a service for a lifecycle operation without killing its processes.
-///
-/// Cloud Hypervisor must receive the graceful shutdown request while its child
-/// is still alive. The handles are returned so the caller can reap them after
-/// `MicrovmRunner::stop`/`destroy` has completed. Maps `NotFound` -> 404 and
-/// `Busy` -> 409.
+enum LifecycleClaimKind {
+    Microvm {
+        runner: MicrovmRunner,
+        vm_child: Option<Child>,
+        aux_processes: Vec<Child>,
+    },
+    Container {
+        runner: ContainerRunner,
+    },
+}
+
+fn runtime_label(runtime: RuntimeKind) -> &'static str {
+    match runtime {
+        RuntimeKind::Microvm => "microvm",
+        RuntimeKind::Container => "container",
+    }
+}
+
 fn claim_lifecycle_operation(
     state: &AppState,
     service_id: &str,
     target_status: &str,
-) -> Result<(MicrovmRunner, Option<Child>, Vec<Child>), (StatusCode, String)> {
+) -> Result<(RuntimeKind, LifecycleClaimKind), (StatusCode, String)> {
+    let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
+
     let (vm_child, aux_processes) =
         match state.begin_lifecycle_operation(service_id, target_status, "pending") {
             LifecycleClaim::Claimed(vm, aux) => (vm, aux),
@@ -294,7 +437,18 @@ fn claim_lifecycle_operation(
             }
         };
 
-    Ok((MicrovmRunner::new(), vm_child, aux_processes))
+    let claim = match runtime {
+        RuntimeKind::Microvm => LifecycleClaimKind::Microvm {
+            runner: MicrovmRunner::new(),
+            vm_child,
+            aux_processes,
+        },
+        RuntimeKind::Container => LifecycleClaimKind::Container {
+            runner: ContainerRunner::new(),
+        },
+    };
+
+    Ok((runtime, claim))
 }
 
 async fn reap_children(vm_child: Option<Child>, aux_processes: Vec<Child>) {
@@ -311,5 +465,28 @@ async fn reap_child(mut child: Child) {
     if !matches!(wait, Ok(Ok(_))) {
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_lifecycle_runtime_uses_state_over_disk_default() {
+        assert_eq!(
+            resolve_lifecycle_runtime(Some(RuntimeKind::Container), "missing"),
+            RuntimeKind::Container
+        );
+        assert_eq!(
+            resolve_lifecycle_runtime(None, "missing"),
+            RuntimeKind::Microvm
+        );
+    }
+
+    #[test]
+    fn runtime_label_matches_kind() {
+        assert_eq!(runtime_label(RuntimeKind::Microvm), "microvm");
+        assert_eq!(runtime_label(RuntimeKind::Container), "container");
     }
 }

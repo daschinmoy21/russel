@@ -8,6 +8,7 @@ use std::{
 };
 
 use russel_core::api::{LogsResponse, StatusResponse};
+use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 use tokio::sync::Notify;
 
@@ -61,6 +62,8 @@ struct ServiceState {
     flake_path: Option<std::path::PathBuf>,
     vm_pid: Option<u32>,
     vm_process: Option<Child>,
+    container_id: Option<String>,
+    runtime: Option<RuntimeKind>,
     /// Auxiliary child processes (socat forwarders, etc.) that must stay alive.
     aux_processes: Vec<Child>,
     /// Prior state captured when mark_building is called, for restoring the
@@ -81,6 +84,8 @@ impl Default for ServiceState {
             flake_path: None,
             vm_pid: None,
             vm_process: None,
+            container_id: None,
+            runtime: None,
             aux_processes: Vec::new(),
             prebuild_status: None,
             prebuild_vm_state: None,
@@ -176,6 +181,8 @@ impl AppState {
             s.started_at = Instant::now();
             s.vm_pid = vm_child.id();
             s.vm_process = Some(vm_child);
+            s.container_id = None;
+            s.runtime = Some(RuntimeKind::Microvm);
             s.aux_processes = aux_children;
             // Deploy succeeded — clear prebuild snapshot.
             s.prebuild_status = None;
@@ -300,6 +307,24 @@ impl AppState {
         }
     }
 
+    /// Mark a container deployment as running (no VM child processes).
+    pub fn mark_deployed_container(&self, service_id: &str, container_id: &str) {
+        let mut inner = self.lock_inner();
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.status = "deployed".to_string();
+        s.vm_state = "running".to_string();
+        s.started_at = Instant::now();
+        s.vm_pid = None;
+        s.vm_process = None;
+        s.container_id = Some(container_id.to_string());
+        s.runtime = Some(RuntimeKind::Container);
+        s.aux_processes.clear();
+        s.logs
+            .push_str(&format!("container running (id: {container_id})\n"));
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
+    }
+
     pub fn mark_failed(&self, service_id: &str, error: String) {
         let needs_supervisor = {
             let mut inner = self.lock_inner();
@@ -347,10 +372,24 @@ impl AppState {
         inner
             .services
             .entry(service_id.to_string())
-            .or_insert_with(|| ServiceState {
-                status: "stopped".to_string(),
-                ..Default::default()
+            .or_insert_with(|| {
+                let mut s = ServiceState {
+                    status: "stopped".to_string(),
+                    ..Default::default()
+                };
+                if let Some(meta) = crate::metadata::load_metadata_from_disk(service_id) {
+                    s.runtime = meta.runtime;
+                    if let Some(id) = meta.container_id {
+                        s.container_id = Some(id);
+                    }
+                }
+                s
             });
+    }
+
+    pub fn runtime_for_service(&self, service_id: &str) -> Option<RuntimeKind> {
+        let inner = self.lock_inner();
+        inner.services.get(service_id).and_then(|s| s.runtime)
     }
 
     pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
@@ -495,20 +534,54 @@ impl AppState {
     pub fn status(&self, service_id: &str) -> Option<StatusResponse> {
         let inner = self.lock_inner();
         let s = inner.services.get(service_id)?;
+        let disk = crate::metadata::load_metadata_from_disk(service_id);
         Some(StatusResponse {
             service_id: service_id.to_string(),
             status: s.status.clone(),
             vm_state: s.vm_state.clone(),
             uptime_seconds: s.started_at.elapsed().as_secs(),
+            runtime: s
+                .runtime
+                .or_else(|| disk.as_ref().and_then(|m| m.runtime)),
+            host_port: disk.as_ref().and_then(|m| m.host_port),
+            guest_port: disk.as_ref().and_then(|m| m.guest_port),
         })
     }
 
     pub fn logs(&self, service_id: &str) -> Option<LogsResponse> {
         let inner = self.lock_inner();
         let s = inner.services.get(service_id)?;
-        Some(LogsResponse {
-            output: s.logs.clone(),
-        })
+        let mut output = s.logs.clone();
+        let runtime = s
+            .runtime
+            .unwrap_or_else(|| crate::metadata::prior_runtime_from_disk(service_id));
+        match runtime {
+            RuntimeKind::Microvm => {
+                let console_path = format!("/var/lib/russel/{service_id}/console.log");
+                if let Ok(console) = std::fs::read_to_string(&console_path)
+                    && !console.is_empty()
+                {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str("--- console.log ---\n");
+                    output.push_str(&console);
+                }
+            }
+            RuntimeKind::Container => {
+                let log_path = crate::container::container_log_path(service_id);
+                if let Ok(container_log) = std::fs::read_to_string(&log_path)
+                    && !container_log.is_empty()
+                {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str("--- container.log ---\n");
+                    output.push_str(&container_log);
+                }
+            }
+        }
+        Some(LogsResponse { output })
     }
 
     /// Check if the state inner is healthy (not poisoned).
