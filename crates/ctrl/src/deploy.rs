@@ -393,6 +393,19 @@ impl DeployPipeline {
                     .await;
             let ready_ms = t.elapsed().as_millis();
             if !up {
+                let console_log = format!("{russel_dir}/console.log");
+                if let Ok(raw) = std::fs::read_to_string(&console_log) {
+                    let lines: Vec<&str> = raw.lines().collect();
+                    let start = lines.len().saturating_sub(40);
+                    let tail: String = if start < lines.len() {
+                        lines[start..].join("\n")
+                    } else {
+                        raw
+                    };
+                    anyhow::bail!(
+                        "VM not reachable in 10s\n--- guest console tail (last 40 lines) ---\n{tail}\n--- end console ---"
+                    );
+                }
                 anyhow::bail!("VM not reachable in 10s");
             }
             tracing::info!(service_id, ready_ms, "VM service reachable");

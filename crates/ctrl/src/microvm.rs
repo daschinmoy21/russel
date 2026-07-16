@@ -138,18 +138,35 @@ impl MicrovmRunner {
     }
 
     async fn build_microvm_kernel(&self) -> anyhow::Result<PathBuf> {
-        let microvm_nix = Path::new("nix/microvm-kernel.nix");
+        let microvm_nix = {
+            // Prefer compile-time path from ctrl crate.
+            let compile_time = PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../nix/microvm-kernel.nix"
+            ));
+            if compile_time.exists() {
+                compile_time
+            } else if let Ok(env_path) = std::env::var("RUSSEL_MICROVM_KERNEL_NIX") {
+                let p = PathBuf::from(&env_path);
+                if !p.exists() {
+                    anyhow::bail!("RUSSEL_MICROVM_KERNEL_NIX={env_path} does not exist");
+                }
+                p
+            } else {
+                PathBuf::from("nix/microvm-kernel.nix")
+            }
+        };
         if !microvm_nix.exists() {
-            anyhow::bail!("nix/microvm-kernel.nix not found");
+            anyhow::bail!("nix/microvm-kernel.nix not found at {}", microvm_nix.display());
         }
-        tracing::info!("building microvm kernel from nix/microvm-kernel.nix");
+        tracing::info!("building microvm kernel from {}", microvm_nix.display());
         let output = Command::new("nix")
             .args([
                 "build",
                 "--no-link",
                 "--print-out-paths",
                 "-f",
-                "nix/microvm-kernel.nix",
+                &microvm_nix.display().to_string(),
             ])
             .stderr(std::process::Stdio::inherit())
             .output()
@@ -337,6 +354,7 @@ impl MicrovmRunner {
         }
 
         let busybox_path = self.ensure_busybox().await?;
+        let kernel_modules_path = self.ensure_kernel_modules().await?;
         let pool_dir = PathBuf::from("/var/lib/russel/_pool");
         std::fs::create_dir_all(&pool_dir)?;
 
@@ -349,6 +367,24 @@ impl MicrovmRunner {
             tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous agent initramfs work dir");
         }
         std::fs::create_dir_all(&work)?;
+
+        // Copy kernel modules when using stock kernel (drivers not built-in).
+        // ponytail: same virtio/fuse list as legacy per-service initramfs.
+        if let Some(ref mod_path) = kernel_modules_path {
+            let mods: &[&str] = &[
+                "drivers/virtio/virtio_ring.ko.xz",
+                "drivers/virtio/virtio.ko.xz",
+                "drivers/virtio/virtio_pci_modern_dev.ko.xz",
+                "drivers/virtio/virtio_pci_legacy_dev.ko.xz",
+                "drivers/virtio/virtio_pci.ko.xz",
+                "net/core/failover.ko.xz",
+                "drivers/net/net_failover.ko.xz",
+                "drivers/net/virtio_net.ko.xz",
+                "fs/fuse/fuse.ko.xz",
+                "fs/fuse/virtiofs.ko.xz",
+            ];
+            self.copy_kernel_modules(mod_path, &work, mods)?;
+        }
 
         let bb_bin = format!("{}/bin/busybox", busybox_path.display());
         let init = AGENT_INIT_SCRIPT;
@@ -756,6 +792,11 @@ exec /bin/sh
                     fs.socket.display()
                 ));
             }
+
+            // Serial console for guest diagnosis on cold boot.
+            let serial_path = sock_dir.join("console.log");
+            cmd.arg("--serial")
+                .arg(format!("file={}", serial_path.display()));
         }
 
         cmd.kill_on_drop(true);
@@ -805,7 +846,7 @@ exec /bin/sh
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
             initramfs: initramfs_path.to_path_buf(),
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on".into(),
+            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()
@@ -1100,7 +1141,28 @@ const AGENT_INIT_SCRIPT: &str = r#"#!/bin/sh
 /bin/mount -t sysfs sysfs /sys
 /bin/mount -t devtmpfs devtmpfs /dev
 
-# Mount host store (read-only) — drivers are built-in, no insmod needed.
+# Load virtio/fuse modules if present (stock kernel fallback).
+# ponytail: ordered list matches legacy per-service init, xzcat+insmod.
+if [ -d /modules ] && ls /modules/*.ko.xz >/dev/null 2>&1; then
+  echo "Loading kernel modules from /modules..."
+  for mod in /modules/virtio_ring.ko.xz /modules/virtio.ko.xz \
+             /modules/virtio_pci_modern_dev.ko.xz /modules/virtio_pci_legacy_dev.ko.xz \
+             /modules/virtio_pci.ko.xz \
+             /modules/failover.ko.xz /modules/net_failover.ko.xz \
+             /modules/virtio_net.ko.xz \
+             /modules/fuse.ko.xz /modules/virtiofs.ko.xz; do
+    [ -f "$mod" ] || continue
+    ko="/tmp/${mod##*/}"
+    ko="${ko%.xz}"
+    if /bin/xzcat "$mod" > "$ko" 2>/dev/null && /bin/insmod "$ko" 2>/dev/null; then
+      true
+    else
+      echo "WARN: failed to load ${mod##*/}"
+    fi
+  done
+fi
+
+# Mount host store (read-only).
 echo "Mounting /nix/store via virtiofs..."
 /bin/mount -t virtiofs nixstore /nix/store
 if [ $? -ne 0 ]; then
@@ -1128,9 +1190,21 @@ done
 # Source deployment config.
 . /config/deploy.env
 
-echo "Configuring eth0: ip=$VM_IP gw=$HOST_IP port=$PORT"
-/bin/ip addr add $VM_IP/30 dev eth0
-/bin/ip link set eth0 up
+# Find network interface (net.ifnames=0 friendly).
+IFACE="eth0"
+if ! /bin/ip link show eth0 >/dev/null 2>&1; then
+  for iface in /sys/class/net/*; do
+    ifname="${iface##*/}"
+    if [ "$ifname" != "lo" ]; then
+      IFACE="$ifname"
+      break
+    fi
+  done
+fi
+
+echo "Configuring $IFACE: ip=$VM_IP gw=$HOST_IP port=$PORT"
+/bin/ip addr add $VM_IP/30 dev $IFACE
+/bin/ip link set $IFACE up
 /bin/ip route add default via $HOST_IP
 
 export PORT

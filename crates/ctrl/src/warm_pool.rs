@@ -147,7 +147,7 @@ impl WarmPool {
         let spec = VmSpec {
             kernel: kernel_info.path.clone(),
             initramfs: agent_initramfs,
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on".into(),
+            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()
@@ -351,7 +351,7 @@ impl WarmPool {
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
             initramfs: initramfs_path.to_path_buf(),
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on".into(),
+            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()

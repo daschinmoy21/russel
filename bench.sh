@@ -266,6 +266,17 @@ has_ip=0
 [ -c /dev/kvm ] 2>/dev/null && has_kvm=1
 [ "$EUID" -eq 0 ] 2>/dev/null && has_root=1
 command -v nix &>/dev/null && has_nix=1
+
+# Inject flake devShell PATH so cloud-hypervisor/virtiofsd/socat are found
+# without a global install. Works under sudo when run from the repo root.
+# ponytail: one-shot inject; run `sudo nix develop -c ./bench.sh` alternative.
+if [ "$has_nix" -eq 1 ] && ! command -v cloud-hypervisor >/dev/null 2>&1; then
+	FLAKE_PATH=$(nix develop -c sh -c 'printf %s "$PATH"' 2>/dev/null || echo "")
+	if [ -n "$FLAKE_PATH" ]; then
+		export PATH="$FLAKE_PATH:$PATH"
+	fi
+fi
+
 command -v cloud-hypervisor &>/dev/null && has_ch=1
 command -v socat &>/dev/null && has_socat=1
 command -v ip &>/dev/null && has_ip=1
