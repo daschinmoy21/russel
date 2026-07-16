@@ -161,9 +161,23 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     })?;
 
     println!();
+    let status = response.status.clone();
+    let message = response.message.clone();
     print_deploy_response(*response, wall.elapsed());
 
+    if !deploy_status_is_success(&status) {
+        anyhow::bail!("deploy failed (status={status}): {message}");
+    }
+
     Ok(())
+}
+
+/// Control-plane success status for a completed deploy stream.
+///
+/// Anything other than exact `"deployed"` is treated as failure so CI/scripts
+/// get a non-zero process exit code (see issue #68).
+fn deploy_status_is_success(status: &str) -> bool {
+    status == "deployed"
 }
 
 fn step(label: &str, value: &str, suffix: &str) {
@@ -391,6 +405,15 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deploy_status_success_only_deployed() {
+        assert!(deploy_status_is_success("deployed"));
+        assert!(!deploy_status_is_success("failed"));
+        assert!(!deploy_status_is_success("building"));
+        assert!(!deploy_status_is_success(""));
+        assert!(!deploy_status_is_success("Deployed")); // case-sensitive
+    }
 
     #[test]
     fn parse_port_mapping_valid() {
