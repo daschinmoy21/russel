@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn port_allocator_increments() {
-        let alloc = PortAllocator::default();
+        let alloc = PortAllocator;
         let p1 = alloc.next("service-1").unwrap();
         let p2 = alloc.next("service-2").unwrap();
         let p3 = alloc.next("service-3").unwrap();

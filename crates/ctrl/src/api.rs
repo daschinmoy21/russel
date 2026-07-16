@@ -54,7 +54,11 @@ async fn deploy(
     let sid = service_id.clone();
     let sid2 = service_id.clone();
 
+    // Track in-flight deploy so shutdown can wait before detaching processes
+    let deploy_guard = state.begin_deploy();
+
     let deploy_handle = tokio::spawn(async move {
+        let _guard = deploy_guard;
         let pipeline = DeployPipeline::new(state);
         let response = pipeline.deploy(request, deploy_tx.clone()).await;
         let status = response.status.clone();
