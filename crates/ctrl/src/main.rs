@@ -24,7 +24,6 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::network::release_subnet;
 use crate::state::AppState;
 
 #[cfg(unix)]
@@ -49,8 +48,11 @@ async fn main() -> Result<()> {
     // Flush stale iptables NAT rules and tap interfaces from previous sessions.
     cleanup_stale_resources().await;
 
+    // Keep a clone so we can detach workload children after Axum drops the
+    // router state. Child handles are spawned with kill_on_drop(true); without
+    // an explicit detach, dropping AppState would SIGKILL every VM on exit.
     let state = AppState::default();
-    let app: Router = api::router(state);
+    let app: Router = api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let listener = TcpListener::bind(&bind_addr).await?;
 
@@ -62,42 +64,16 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    info!("shutting down: cleaning up all running microVMs...");
-    cleanup_all_vms().await;
+    // Workload teardown is an explicit admin action (`russel destroy` /
+    // DELETE /vm/{id}). Controller restart must not take the fleet down.
+    let detached = state.detach_all_processes();
+    info!(
+        detached,
+        "control plane stopped; left workloads running \
+         (use `russel vms` / `russel destroy <id>` to manage them)"
+    );
 
     Ok(())
-}
-
-async fn cleanup_all_vms() {
-    let runner = crate::microvm::MicrovmRunner::new();
-    match runner.list().await {
-        Ok(vms) => {
-            let mut tasks = Vec::new();
-            for vm_id in vms {
-                let runner = runner.clone();
-                tasks.push(tokio::spawn(async move {
-                    info!(vm_id = %vm_id, "destroying microVM during shutdown");
-                    match runner.destroy(&vm_id).await {
-                        Ok(()) => {
-                            release_subnet(&vm_id);
-                        }
-                        Err(e) => {
-                            tracing::warn!(vm_id = %vm_id, error = %e, "failed to destroy microVM during shutdown");
-                        }
-                    }
-                }));
-            }
-            for task in tasks {
-                if let Err(e) = task.await {
-                    tracing::warn!(error = %e, "shutdown cleanup task panicked");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to list VMs during shutdown cleanup");
-        }
-    }
-    cleanup_stale_resources().await;
 }
 
 async fn shutdown_signal() {

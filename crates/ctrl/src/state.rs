@@ -266,6 +266,46 @@ impl AppState {
         inner.services.remove(service_id);
     }
 
+    /// Release ownership of all tracked child processes without killing them.
+    ///
+    /// Used on control-plane shutdown so `kill_on_drop` Child destructors do
+    /// not tear down live Cloud Hypervisor / virtiofsd / socat workloads.
+    /// Processes are intentionally leaked from the Rust side; the OS continues
+    /// to run them until an operator destroys the service or reaps them.
+    ///
+    /// Returns the number of services that had process handles detached.
+    pub fn detach_all_processes(&self) -> usize {
+        let mut inner = self.lock_inner();
+        let mut detached = 0usize;
+        for (service_id, s) in inner.services.iter_mut() {
+            let mut had = false;
+            if let Some(child) = s.vm_process.take() {
+                std::mem::forget(child);
+                had = true;
+            }
+            for child in std::mem::take(&mut s.aux_processes) {
+                std::mem::forget(child);
+                had = true;
+            }
+            if had {
+                // Handles are gone but the VM may still be running on disk.
+                // Keep the service id so a future reconciler can re-adopt it;
+                // status reflects that this controller no longer owns the PIDs.
+                s.vm_pid = None;
+                if s.status == "deployed" || s.vm_state == "running" {
+                    s.status = "detached".to_string();
+                    s.vm_state = "orphaned".to_string();
+                }
+                tracing::info!(
+                    service_id = %service_id,
+                    "detached workload processes for control-plane shutdown"
+                );
+                detached += 1;
+            }
+        }
+        detached
+    }
+
     pub fn status(&self, service_id: &str) -> Option<StatusResponse> {
         let inner = self.lock_inner();
         let s = inner.services.get(service_id)?;
@@ -295,6 +335,12 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detach_all_processes_empty() {
+        let state = AppState::default();
+        assert_eq!(state.detach_all_processes(), 0);
+    }
 
     #[test]
     fn test_mutex_poisoning_recovery() {
