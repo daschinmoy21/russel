@@ -5,8 +5,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use russel_core::api::{
-    DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse,
+use russel_core::{
+    RuntimeKind,
+    api::{
+        DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse,
+    },
+    config::{Russelfile, resolve_runtime},
 };
 
 #[derive(Debug, Parser)]
@@ -49,6 +53,10 @@ pub struct DeployArgs {
 
     #[arg(long, default_value = "Russelfile.toml")]
     pub config: String,
+
+    /// Runtime kind (`microvm` or `container`). Must match Russelfile `service.type` for local repos.
+    #[arg(long, value_name = "RUNTIME")]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -78,6 +86,7 @@ pub struct DestroyArgs {
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     let wall = Instant::now();
     let repo_url = normalize_repo_arg(&args.repo)?;
+    let runtime = resolve_deploy_runtime(&args.repo, &args.config, args.runtime.as_deref())?;
     let port = args.port.as_deref().map(parse_port_mapping).transpose()?;
 
     // ── Pre-flight banner ──────────────────────────────────────────────────
@@ -99,6 +108,9 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             "",
         );
     }
+    if let Some(runtime) = runtime {
+        step("runtime", &runtime.to_string(), "");
+    }
     println!();
 
     // ── Send deploy request ────────────────────────────────────────────────
@@ -111,6 +123,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             config_path: args.config,
             vm_id: args.vm_id,
             port,
+            runtime,
         })
         .send()
         .await?
@@ -285,6 +298,28 @@ fn timing_row(label: &str, val_ms: u128, desc: &str) {
 }
 
 // ponytail: tests inline, no test framework ceremony for pure functions
+
+fn resolve_deploy_runtime(
+    repo: &str,
+    config_path: &str,
+    cli_runtime: Option<&str>,
+) -> Result<Option<RuntimeKind>> {
+    let cli = cli_runtime
+        .map(|value| value.parse::<RuntimeKind>())
+        .transpose()?;
+    let path = PathBuf::from(repo);
+    if path.exists() {
+        let repo_root = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize local repo path {repo}"))?;
+        let russelfile_path = repo_root.join(config_path);
+        let config = Russelfile::load(&russelfile_path)
+            .with_context(|| format!("failed to load {}", russelfile_path.display()))?;
+        let resolved = resolve_runtime(config.service.runtime, cli)?;
+        return Ok(Some(resolved));
+    }
+    Ok(cli)
+}
 
 fn normalize_repo_arg(repo: &str) -> Result<String> {
     let path = PathBuf::from(repo);

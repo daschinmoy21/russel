@@ -6,7 +6,7 @@ use tokio::process::Command;
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::Russelfile,
+    config::{Russelfile, resolve_runtime},
 };
 
 use crate::{
@@ -71,10 +71,12 @@ impl DeployPipeline {
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
                 vm_ip: None,
+                runtime: request.runtime,
                 message: e.to_string(),
             };
         }
 
+        let request_runtime = request.runtime;
         let result = self.deploy_inner(&service_id, request, tx).await;
 
         match result {
@@ -105,6 +107,7 @@ impl DeployPipeline {
                     elapsed_ms: elapsed,
                     timing: Some(output.timing),
                     vm_ip: Some(output.alloc.vm_ip.clone()),
+                    runtime: output.runtime,
                     message: format!(
                         "microVM running. localhost:{host_port} -> {}:{guest_port}",
                         output.alloc.vm_ip
@@ -135,6 +138,7 @@ impl DeployPipeline {
                         elapsed_ms: elapsed,
                         timing: None,
                         vm_ip: None,
+                        runtime: request_runtime,
                         message: format!(
                             "deployment failed but rolled back successfully: {}",
                             original_error
@@ -159,6 +163,7 @@ impl DeployPipeline {
                         elapsed_ms: elapsed,
                         timing: None,
                         vm_ip: None,
+                        runtime: request_runtime,
                         message: error.to_string(),
                     }
                 }
@@ -186,6 +191,7 @@ impl DeployPipeline {
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
         let config_path = repo_path.join(PathBuf::from(&request.config_path));
         let config = Russelfile::load(&config_path)?;
+        resolve_runtime(config.service.runtime, request.runtime)?;
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(service_id, service_name = %config.service.name, resolve_ms, "repo resolved");
 
@@ -551,6 +557,7 @@ impl DeployPipeline {
             virtiofsd_child,
             socat_child,
             port,
+            runtime: Some(config.service.runtime),
             timing: DeployTiming {
                 resolve_ms,
                 build_ms,
@@ -603,5 +610,6 @@ struct DeployOutput {
     virtiofsd_child: tokio::process::Child,
     socat_child: tokio::process::Child,
     port: PortMapping,
+    runtime: Option<russel_core::config::RuntimeKind>,
     timing: DeployTiming,
 }
