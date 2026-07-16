@@ -42,6 +42,13 @@ in
     SERIAL_8250         = yes;
     SERIAL_8250_CONSOLE = yes;
 
+    # ── ACPI + hotplug (future CPU/memory/IO resize) ──────────────
+    ACPI              = yes;
+    ACPI_HOTPLUG_CPU  = yes;
+    HOTPLUG_PCI       = yes;
+    HOTPLUG_CPU       = yes;
+    MEMORY_HOTPLUG    = yes;
+
     # ── initramfs support ─────────────────────────────────────────────
     BLK_DEV_INITRD    = yes;
 
@@ -59,4 +66,4 @@ in
     MEDIA_SUPPORT     = lib.mkForce no;
     STAGING           = lib.mkForce no;
   };
-}).dev
+})

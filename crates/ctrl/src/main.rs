@@ -5,6 +5,7 @@
 
 mod api;
 mod build;
+mod ch_api;
 mod database;
 mod deploy;
 mod git;
@@ -13,6 +14,7 @@ mod microvm;
 mod network;
 mod state;
 mod traefik;
+mod warm_pool;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
@@ -48,6 +50,19 @@ async fn main() -> Result<()> {
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
+
+    // Start warm pool prepare in the background so the first deploy after
+    // ctrl restart can restore from a paused snapshot instead of cold booting.
+    // Failures are logged but never block the control plane from serving.
+    tokio::spawn(async move {
+        let pool = crate::warm_pool::shared_warm_pool();
+        if let Err(e) = pool.prepare().await {
+            tracing::warn!(
+                error = %e,
+                "warm pool prepare failed — cold boot will be used for deploys"
+            );
+        }
+    });
 
     // Keep a clone so we can detach workload children after Axum drops the
     // router state. Child handles are spawned with kill_on_drop(true); without
