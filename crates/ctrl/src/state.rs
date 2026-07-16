@@ -1,11 +1,15 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use russel_core::api::{LogsResponse, StatusResponse};
 use tokio::process::Child;
+use tokio::sync::Notify;
 
 /// Outcome of attempting to claim a service for a lifecycle operation.
 pub enum LifecycleClaim {
@@ -20,6 +24,27 @@ pub enum LifecycleClaim {
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<Mutex<StateInner>>,
+    deploy_count: Arc<AtomicUsize>,
+    deploy_notify: Arc<Notify>,
+}
+
+/// Guard that decrements the in-flight deploy counter on drop.
+///
+/// Move into a spawned deploy task so the counter is decremented when the
+/// task completes (success, error, or panic). If the spawn itself fails,
+/// the guard drops in the caller, still decrementing correctly.
+#[derive(Debug)]
+pub struct DeployGuard {
+    state: AppState,
+}
+
+impl Drop for DeployGuard {
+    fn drop(&mut self) {
+        let prev = self.state.deploy_count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.state.deploy_notify.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -81,6 +106,8 @@ impl Default for AppState {
             inner: Arc::new(Mutex::new(StateInner {
                 services: HashMap::new(),
             })),
+            deploy_count: Arc::new(AtomicUsize::new(0)),
+            deploy_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -425,6 +452,46 @@ impl AppState {
         inner.services.remove(service_id);
     }
 
+    /// Release ownership of all tracked child processes without killing them.
+    ///
+    /// Used on control-plane shutdown so `kill_on_drop` Child destructors do
+    /// not tear down live Cloud Hypervisor / virtiofsd / socat workloads.
+    /// Processes are intentionally leaked from the Rust side; the OS continues
+    /// to run them until an operator destroys the service or reaps them.
+    ///
+    /// Returns the number of services that had process handles detached.
+    pub fn detach_all_processes(&self) -> usize {
+        let mut inner = self.lock_inner();
+        let mut detached = 0usize;
+        for (service_id, s) in inner.services.iter_mut() {
+            let mut had = false;
+            if let Some(child) = s.vm_process.take() {
+                std::mem::forget(child);
+                had = true;
+            }
+            for child in std::mem::take(&mut s.aux_processes) {
+                std::mem::forget(child);
+                had = true;
+            }
+            if had {
+                // Handles are gone but the VM may still be running on disk.
+                // Keep the service id so a future reconciler can re-adopt it;
+                // status reflects that this controller no longer owns the PIDs.
+                s.vm_pid = None;
+                if s.status == "deployed" || s.vm_state == "running" {
+                    s.status = "detached".to_string();
+                    s.vm_state = "orphaned".to_string();
+                }
+                tracing::info!(
+                    service_id = %service_id,
+                    "detached workload processes for control-plane shutdown"
+                );
+                detached += 1;
+            }
+        }
+        detached
+    }
+
     pub fn status(&self, service_id: &str) -> Option<StatusResponse> {
         let inner = self.lock_inner();
         let s = inner.services.get(service_id)?;
@@ -449,11 +516,86 @@ impl AppState {
     pub fn is_healthy(&self) -> bool {
         self.inner.try_lock().is_ok()
     }
+
+    /// Increment the in-flight deploy counter and return a guard.
+    ///
+    /// The guard must be moved into the spawned deploy task so the counter
+    /// is decremented when the task completes. Call this BEFORE spawning to
+    /// ensure the counter is accurate even if the spawn is slow.
+    pub fn begin_deploy(&self) -> DeployGuard {
+        self.deploy_count.fetch_add(1, Ordering::SeqCst);
+        DeployGuard {
+            state: self.clone(),
+        }
+    }
+
+    /// Wait until all in-flight deploy tasks have completed.
+    ///
+    /// Called during shutdown after `axum::serve` returns, to ensure no
+    /// deploy task is still creating VMs when we detach processes.
+    pub async fn wait_for_deploys(&self) {
+        loop {
+            let notified = self.deploy_notify.notified();
+            tokio::pin!(notified);
+            if self.deploy_count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.as_mut().await;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detach_all_processes_empty() {
+        let state = AppState::default();
+        assert_eq!(state.detach_all_processes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_detach_all_processes_nonempty() {
+        use tokio::process::Command;
+
+        let state = AppState::default();
+        // Create a service with VM and auxiliary processes
+        let vm_child = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let aux1 = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let aux2 = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("failed to spawn sleep");
+
+        let _vm_pid = vm_child.id();
+        state.mark_deployed_with_aux("test-svc", vm_child, vec![aux1, aux2]);
+
+        // Verify initial state
+        let status = state.status("test-svc").unwrap();
+        assert_eq!(status.status, "deployed");
+        assert_eq!(status.vm_state, "running");
+        assert!(state.lock_inner().services.get("test-svc").unwrap().vm_pid.is_some());
+
+        // Detach all processes
+        let detached = state.detach_all_processes();
+        assert_eq!(detached, 1);
+
+        // Verify handles are removed and state updated
+        let inner = state.lock_inner();
+        let svc = inner.services.get("test-svc").unwrap();
+        assert!(svc.vm_process.is_none(), "vm_process should be None");
+        assert!(svc.aux_processes.is_empty(), "aux_processes should be empty");
+        assert!(svc.vm_pid.is_none(), "vm_pid should be None");
+        assert_eq!(svc.status, "detached");
+        assert_eq!(svc.vm_state, "orphaned");
+    }
 
     #[test]
     fn test_mutex_poisoning_recovery() {
@@ -732,5 +874,72 @@ mod tests {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+    }
+
+    // ── deploy tracking tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_begin_deploy_increments_counter() {
+        let state = AppState::default();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        let _guard1 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        let _guard2 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_deploy_guard_drop_decrements_counter() {
+        let state = AppState::default();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        let guard1 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        let guard2 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 2);
+
+        drop(guard1);
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        drop(guard2);
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_deploys_returns_immediately_when_zero() {
+        let state = AppState::default();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        // Should return immediately without blocking
+        state.wait_for_deploys().await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_deploys_waits_for_guards() {
+        let state = AppState::default();
+        let guard = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        let state_clone = state.clone();
+        let handle = tokio::spawn(async move {
+            state_clone.wait_for_deploys().await;
+        });
+
+        // Give the task time to start waiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        assert!(!handle.is_finished(), "wait_for_deploys should still be waiting");
+
+        // Drop the guard to decrement counter
+        drop(guard);
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        // Now the task should complete
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), handle)
+            .await
+            .expect("wait_for_deploys should complete after counter reaches 0")
+            .expect("task should not panic");
     }
 }

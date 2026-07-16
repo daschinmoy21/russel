@@ -21,7 +21,7 @@ impl Russelfile {
     }
 
     /// Parse from a string — shared by `load` and tests.
-    fn load_from_str(contents: &str) -> anyhow::Result<Self> {
+    pub fn load_from_str(contents: &str) -> anyhow::Result<Self> {
         let config: Self = toml::from_str(contents)?;
         // Reject database config at parse time — it's not implemented yet.
         if let Some(ref db) = config.database
