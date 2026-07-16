@@ -842,12 +842,18 @@ exec /bin/sh
                 .arg("--initramfs")
                 .arg(&spec.initramfs);
 
-            for fs in &spec.fs {
-                cmd.arg("--fs").arg(format!(
-                    "tag={},socket={},num_queues=1,queue_size=512",
-                    fs.tag,
-                    fs.socket.display()
-                ));
+            // Cloud Hypervisor (clap) takes one `--fs` with multiple values:
+            //   --fs tag=a,socket=… tag=b,socket=…
+            // Repeating `--fs` fails with "cannot be used multiple times".
+            if !spec.fs.is_empty() {
+                cmd.arg("--fs");
+                for fs in &spec.fs {
+                    cmd.arg(format!(
+                        "tag={},socket={},num_queues=1,queue_size=512",
+                        fs.tag,
+                        fs.socket.display()
+                    ));
+                }
             }
 
             // Serial console for guest diagnosis on cold boot.
@@ -858,13 +864,26 @@ exec /bin/sh
 
         cmd.kill_on_drop(true);
 
-        let vm_child = cmd.spawn().map_err(|e| {
+        let mut vm_child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
                 "failed to spawn cloud-hypervisor: {e}. \
                  Install with: nix-env -iA nixpkgs.cloud-hypervisor \
                  (or add to your devShell)"
             )
         })?;
+
+        // Fail fast if CH rejects argv (e.g. bad --fs) and exits immediately.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match vm_child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::bail!(
+                    "cloud-hypervisor exited immediately with {status} \
+                     (check --fs/--kernel/--initramfs args; multi-fs must be one --fs with multiple values)"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "could not poll cloud-hypervisor status"),
+        }
 
         tracing::info!(pid = vm_child.id(), "cloud-hypervisor started");
 
