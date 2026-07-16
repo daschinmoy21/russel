@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::process::Command;
@@ -574,6 +574,224 @@ fn shared_runner() -> MicrovmRunner {
     static RUNNER: std::sync::LazyLock<MicrovmRunner> =
         std::sync::LazyLock::new(MicrovmRunner::new);
     RUNNER.clone()
+}
+
+/// Maximum accepted size for a Russelfile (prevents huge-file DoS via config_path).
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Resolve `config_path` strictly under `repo_path`.
+///
+/// Rejects absolute paths, `..` components, symlink escapes outside the repo
+/// root, non-files, and oversized files. Addresses issue #23.
+fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<PathBuf> {
+    if config_path.is_empty() {
+        anyhow::bail!("config_path must not be empty");
+    }
+
+    let cfg = Path::new(config_path);
+    if cfg.is_absolute() {
+        anyhow::bail!("config_path must be relative to the repository root (got absolute path)");
+    }
+
+    for component in cfg.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("config_path must not contain '..' path components");
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("config_path must be relative to the repository root");
+            }
+        }
+    }
+
+    let repo_canon = repo_path.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "cannot resolve repository path {}: {e}",
+            repo_path.display()
+        )
+    })?;
+
+    let joined = repo_canon.join(cfg);
+    let config_canon = joined.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "config_path '{}' not found under repository: {e}",
+            config_path
+        )
+    })?;
+
+    if !config_canon.starts_with(&repo_canon) {
+        anyhow::bail!("config_path escapes repository root");
+    }
+
+    let meta = std::fs::metadata(&config_canon).map_err(|e| {
+        anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display())
+    })?;
+    if !meta.is_file() {
+        anyhow::bail!("config_path must be a regular file");
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        anyhow::bail!(
+            "config_path exceeds maximum size of {} bytes",
+            MAX_CONFIG_BYTES
+        );
+    }
+
+    Ok(config_canon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "russel-config-path-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_config(dir: &Path, rel: &str, body: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn resolve_config_path_accepts_relative_file() {
+        let repo = TempRepo::new();
+        write_config(
+            repo.path(),
+            "Russelfile.toml",
+            r#"[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+"#,
+        );
+        let resolved = resolve_config_path(repo.path(), "Russelfile.toml").unwrap();
+        assert!(resolved.ends_with("Russelfile.toml"));
+        assert!(resolved.starts_with(repo.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn resolve_config_path_accepts_nested_relative() {
+        let repo = TempRepo::new();
+        write_config(
+            repo.path(),
+            "deploy/Russelfile.toml",
+            r#"[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+"#,
+        );
+        let resolved = resolve_config_path(repo.path(), "deploy/Russelfile.toml").unwrap();
+        assert!(resolved.ends_with("deploy/Russelfile.toml"));
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_absolute() {
+        let repo = TempRepo::new();
+        let err = resolve_config_path(repo.path(), "/etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relative"), "{err}");
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_parent_dir() {
+        let repo = TempRepo::new();
+        let err = resolve_config_path(repo.path(), "../outside.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".."), "{err}");
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_missing() {
+        let repo = TempRepo::new();
+        let err = resolve_config_path(repo.path(), "missing.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_directory() {
+        let repo = TempRepo::new();
+        std::fs::create_dir(repo.path().join("subdir")).unwrap();
+        let err = resolve_config_path(repo.path(), "subdir")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("regular file"), "{err}");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn resolve_config_path_rejects_symlink_escape() {
+        let repo = TempRepo::new();
+        let outside = std::env::temp_dir().join(format!(
+            "russel-config-path-outside-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.toml");
+        std::fs::write(&outside_file, b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside_file, repo.path().join("escape.toml")).unwrap();
+        let err = resolve_config_path(repo.path(), "escape.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes repository root"), "{err}");
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_oversized() {
+        let repo = TempRepo::new();
+        let path = repo.path().join("huge.toml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"[service]\n").unwrap();
+            // pad to exceed MAX_CONFIG_BYTES
+            let pad = vec![b'#'; MAX_CONFIG_BYTES as usize + 1];
+            f.write_all(&pad).unwrap();
+        }
+        let err = resolve_config_path(repo.path(), "huge.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds maximum size"), "{err}");
+    }
 }
 
 struct PortReservation {
