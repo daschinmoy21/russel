@@ -33,6 +33,7 @@ pub struct AppState {
 /// Move into a spawned deploy task so the counter is decremented when the
 /// task completes (success, error, or panic). If the spawn itself fails,
 /// the guard drops in the caller, still decrementing correctly.
+#[derive(Debug)]
 pub struct DeployGuard {
     state: AppState,
 }
@@ -616,5 +617,72 @@ mod tests {
         let status = state.status("svc-1").unwrap();
         assert_eq!(status.status, "deployed");
         assert_eq!(status.vm_state, "running");
+    }
+
+    // ── deploy tracking tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_begin_deploy_increments_counter() {
+        let state = AppState::default();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        let _guard1 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        let _guard2 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_deploy_guard_drop_decrements_counter() {
+        let state = AppState::default();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        let guard1 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        let guard2 = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 2);
+
+        drop(guard1);
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        drop(guard2);
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_deploys_returns_immediately_when_zero() {
+        let state = AppState::default();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        // Should return immediately without blocking
+        state.wait_for_deploys().await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_deploys_waits_for_guards() {
+        let state = AppState::default();
+        let guard = state.begin_deploy();
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+        let state_clone = state.clone();
+        let handle = tokio::spawn(async move {
+            state_clone.wait_for_deploys().await;
+        });
+
+        // Give the task time to start waiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        assert!(!handle.is_finished(), "wait_for_deploys should still be waiting");
+
+        // Drop the guard to decrement counter
+        drop(guard);
+        assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+
+        // Now the task should complete
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), handle)
+            .await
+            .expect("wait_for_deploys should complete after counter reaches 0")
+            .expect("task should not panic");
     }
 }
