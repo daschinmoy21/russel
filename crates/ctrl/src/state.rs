@@ -396,6 +396,48 @@ mod tests {
         assert_eq!(state.detach_all_processes(), 0);
     }
 
+    #[tokio::test]
+    async fn test_detach_all_processes_nonempty() {
+        use tokio::process::Command;
+
+        let state = AppState::default();
+        // Create a service with VM and auxiliary processes
+        let vm_child = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let aux1 = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let aux2 = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("failed to spawn sleep");
+
+        let vm_pid = vm_child.id();
+        state.mark_deployed_with_aux("test-svc", vm_child, vec![aux1, aux2]);
+
+        // Verify initial state
+        let status = state.status("test-svc").unwrap();
+        assert_eq!(status.status, "deployed");
+        assert_eq!(status.vm_state, "running");
+        assert!(state.lock_inner().services.get("test-svc").unwrap().vm_pid.is_some());
+
+        // Detach all processes
+        let detached = state.detach_all_processes();
+        assert_eq!(detached, 1);
+
+        // Verify handles are removed and state updated
+        let inner = state.lock_inner();
+        let svc = inner.services.get("test-svc").unwrap();
+        assert!(svc.vm_process.is_none(), "vm_process should be None");
+        assert!(svc.aux_processes.is_empty(), "aux_processes should be empty");
+        assert!(svc.vm_pid.is_none(), "vm_pid should be None");
+        assert_eq!(svc.status, "detached");
+        assert_eq!(svc.vm_state, "orphaned");
+    }
+
     #[test]
     fn test_mutex_poisoning_recovery() {
         let state = AppState::default();
