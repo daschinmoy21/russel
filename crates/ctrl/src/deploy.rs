@@ -159,14 +159,23 @@ impl DeployPipeline {
                 let elapsed = started.elapsed().as_millis();
                 let error_msg = error.to_string();
 
-                // Check if this is a successful rollback case
-                if error_msg.starts_with("ROLLBACK_SUCCESS:") {
+                // Successful rollback encodes prior runtime so the response
+                // reports what is actually running (not the failed request).
+                // Format: ROLLBACK_SUCCESS:<runtime>:<original error>
+                if let Some(rest) = error_msg.strip_prefix("ROLLBACK_SUCCESS:") {
+                    let (restored_runtime, original_error) = match rest.split_once(':') {
+                        Some((rt, msg)) => (
+                            rt.parse::<RuntimeKind>().ok().or(request_runtime),
+                            msg.trim(),
+                        ),
+                        None => (request_runtime, rest.trim()),
+                    };
                     tracing::info!(
                         service_id = %service_id,
                         elapsed_ms = elapsed,
-                        "deploy failed but successfully rolled back to previous VM"
+                        runtime = ?restored_runtime,
+                        "deploy failed but successfully rolled back"
                     );
-                    let original_error = error_msg.trim_start_matches("ROLLBACK_SUCCESS:").trim();
                     DeployResponse {
                         service_id,
                         vm_id,
@@ -178,10 +187,9 @@ impl DeployPipeline {
                         elapsed_ms: elapsed,
                         timing: None,
                         vm_ip: None,
-                        runtime: request_runtime,
+                        runtime: restored_runtime,
                         message: format!(
-                            "deployment failed but rolled back successfully: {}",
-                            original_error
+                            "deployment failed but rolled back successfully: {original_error}"
                         ),
                     }
                 } else {
@@ -402,7 +410,9 @@ impl DeployPipeline {
                                 .as_mut()
                                 .expect("port reservation exists")
                                 .disarm();
-                            return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
+                            return Err(anyhow::anyhow!(
+                                "ROLLBACK_SUCCESS:{prior_runtime}:{deploy_err}"
+                            ));
                         }
                         Err(rollback_err) => {
                             tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
@@ -425,7 +435,9 @@ impl DeployPipeline {
                                 .as_mut()
                                 .expect("port reservation exists")
                                 .disarm();
-                            return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
+                            return Err(anyhow::anyhow!(
+                                "ROLLBACK_SUCCESS:{prior_runtime}:{deploy_err}"
+                            ));
                         }
                         Err(rollback_err) => {
                             tracing::error!(service_id, error = %rollback_err, "CRITICAL: Container rollback failed. Old container could not be restored.");
@@ -953,6 +965,24 @@ async fn attempt_container_rollback(
         extra_args: old_podman_args.clone(),
     };
     let running = containers.start(&start_spec).await?;
+
+    // Do not mark deployed until the restored container is reachable.
+    let ready =
+        TapForwarder::wait_for_host_port(old_host_port, Duration::from_secs(10)).await;
+    if !ready {
+        if let Err(e) = containers.destroy(service_id).await {
+            tracing::warn!(
+                service_id,
+                error = %e,
+                "failed to destroy unready rolled-back container"
+            );
+        }
+        PortAllocator::release(service_id);
+        anyhow::bail!(
+            "rolled-back container not reachable on host port {old_host_port} within 10s"
+        );
+    }
+
     state.mark_deployed_container(service_id, &running.container_id);
 
     let old_store_path = old_meta["store_path"]

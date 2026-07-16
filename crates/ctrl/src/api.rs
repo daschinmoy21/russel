@@ -273,6 +273,7 @@ async fn discover_podman_containers(
     vms: &mut Vec<String>,
     seen: &mut std::collections::HashSet<String>,
 ) {
+    // Format: "name\tstate" so we can claim ports only for running containers.
     let output = Command::new("podman")
         .args([
             "ps",
@@ -280,7 +281,7 @@ async fn discover_podman_containers(
             "--filter",
             "label=russel.runtime=container",
             "--format",
-            "{{.Names}}",
+            "{{.Names}}\t{{.State}}",
         ])
         .output()
         .await;
@@ -293,18 +294,38 @@ async fn discover_podman_containers(
     }
 
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = line.trim();
-        if let Some(service_id) = name.strip_prefix("russel-")
-            && seen.insert(service_id.to_string())
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, container_state) = match line.split_once('\t') {
+            Some((n, s)) => (n.trim(), s.trim().to_ascii_lowercase()),
+            None => (line, String::new()),
+        };
+        let Some(service_id) = name.strip_prefix("russel-") else {
+            continue;
+        };
+
+        // Always re-init known services so ports can be reclaimed after ctrl restart.
+        state.ensure_service(service_id);
+        if let Some(meta) = load_metadata_from_disk(service_id)
+            && let Some(host_port) = meta.host_port
         {
-            state.ensure_service(service_id);
-            if let Some(meta) = load_metadata_from_disk(service_id) {
-                if let Some(host_port) = meta.host_port {
-                    if let Err(e) = PortAllocator::claim_existing(service_id, host_port) {
-                        tracing::warn!(service_id = %service_id, host_port, error = %e, "failed to claim existing container port");
-                    }
-                }
+            // Only bind allocator to ports of *running* containers.
+            if container_state == "running"
+                && let Err(e) = PortAllocator::claim_existing(service_id, host_port)
+            {
+                tracing::warn!(
+                    service_id = %service_id,
+                    host_port,
+                    error = %e,
+                    "failed to claim existing container port"
+                );
             }
+        }
+
+        // De-dupe inventory listing only.
+        if seen.insert(service_id.to_string()) {
             vms.push(service_id.to_string());
         }
     }

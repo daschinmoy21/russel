@@ -252,23 +252,37 @@ fn validate_shebang(store_path: &Path, bin_path: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("empty shebang in {}", bin_path.display()))?;
 
     if interpreter == "/usr/bin/env" || interpreter == "/bin/env" {
-        // Issue #4: require a non-empty program name; reject path traversal.
-        let program = shebang.split_whitespace().nth(1);
-        match program {
-            None | Some("") => {
-                anyhow::bail!(
-                    "shebang uses {} without a program name in {}",
-                    interpreter,
-                    bin_path.display()
-                );
-            }
-            Some(prog) if prog.contains('/') || prog.contains("..") => {
-                anyhow::bail!(
-                    "shebang program name must not contain path separators or traversal: {prog}"
-                );
-            }
-            _ => return Ok(()),
+        // Rootfs installs a minimal `env` wrapper that is `exec "$@"`.
+        // Only the staged form `#!/usr/bin/env <program>` is supported —
+        // reject options (`env -S …`), extra args, and pathy program names.
+        let parts: Vec<&str> = shebang.split_whitespace().collect();
+        if parts.len() < 2 {
+            anyhow::bail!(
+                "shebang uses {interpreter} without a program name in {}",
+                bin_path.display()
+            );
         }
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "shebang env form must be exactly `#!{interpreter} <program>` \
+                 (no options or extra arguments) in {}",
+                bin_path.display()
+            );
+        }
+        let prog = parts[1];
+        if prog.is_empty() {
+            anyhow::bail!(
+                "shebang uses {interpreter} without a program name in {}",
+                bin_path.display()
+            );
+        }
+        if prog.starts_with('-') || prog.contains('/') || prog.contains("..") {
+            anyhow::bail!(
+                "shebang program name must be a simple basename without options, \
+                 path separators, or traversal: {prog}"
+            );
+        }
+        return Ok(());
     }
 
     validate_interpreter_path(store_path, Path::new(interpreter), "shebang interpreter")
@@ -795,14 +809,14 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
         }
 
         // PORT env override (Issue #2): deny any arg that sets PORT variable
-        if arg == "-e" || arg == "--env" {
-            if let Some(val) = next {
-                if val.starts_with("PORT=") {
-                    anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT=...)");
-                }
-                if val == "PORT" {
-                    anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT)");
-                }
+        if (arg == "-e" || arg == "--env")
+            && let Some(val) = next
+        {
+            if val.starts_with("PORT=") {
+                anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT=...)");
+            }
+            if val == "PORT" {
+                anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT)");
             }
         }
         if arg.starts_with("-ePORT=") || arg.starts_with("--env=PORT=") {
@@ -826,12 +840,11 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
         }
 
         // --network/--net/-net with host
-        if arg == "--network" || arg == "--net" || arg == "-net" {
-            if let Some(val) = next
-                && val == "host"
-            {
-                anyhow::bail!("podman passthrough arg denied for security: {arg} host");
-            }
+        if (arg == "--network" || arg == "--net" || arg == "-net")
+            && let Some(val) = next
+            && val == "host"
+        {
+            anyhow::bail!("podman passthrough arg denied for security: {arg} host");
         }
         if arg == "--network=host" || arg == "--net=host" {
             anyhow::bail!("podman passthrough arg denied for security: {arg}");
@@ -839,12 +852,11 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
 
         // --ipc/--uts/--cgroupns/--userns with host
         for flag in &["--ipc", "--uts", "--cgroupns", "--userns"] {
-            if arg == *flag {
-                if let Some(val) = next
-                    && val == "host"
-                {
-                    anyhow::bail!("podman passthrough arg denied for security: {flag} host");
-                }
+            if arg == *flag
+                && let Some(val) = next
+                && val == "host"
+            {
+                anyhow::bail!("podman passthrough arg denied for security: {flag} host");
             }
             if arg.starts_with(&format!("{}={}", flag, "host")) {
                 anyhow::bail!("podman passthrough arg denied for security: {arg}");
@@ -1651,43 +1663,67 @@ mod tests {
     }
 
     // ── RUSSEL_PODMAN_USER tests (Issue #278598) ────────────────────────
+    // Serialize env mutations: cargo runs tests in parallel by default.
+
+    static PODMAN_USER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_russel_podman_user_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = PODMAN_USER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("RUSSEL_PODMAN_USER").ok();
+        // SAFETY: exclusive lock held for the duration of the mutation + assertion.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("RUSSEL_PODMAN_USER", v),
+                None => std::env::remove_var("RUSSEL_PODMAN_USER"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("RUSSEL_PODMAN_USER", v),
+                None => std::env::remove_var("RUSSEL_PODMAN_USER"),
+            }
+        }
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
 
     #[test]
     fn configured_podman_user_empty_when_not_set() {
-        // SAFETY: test isolation; no other threads touch this var
-        unsafe { std::env::remove_var("RUSSEL_PODMAN_USER"); }
-        assert_eq!(configured_podman_user(), None);
+        with_russel_podman_user_env(None, || {
+            assert_eq!(configured_podman_user(), None);
+        });
     }
 
     #[test]
     fn configured_podman_user_filters_empty() {
-        unsafe { std::env::set_var("RUSSEL_PODMAN_USER", ""); }
-        let result = configured_podman_user();
-        unsafe { std::env::remove_var("RUSSEL_PODMAN_USER"); }
-        assert_eq!(result, None);
+        with_russel_podman_user_env(Some(""), || {
+            assert_eq!(configured_podman_user(), None);
+        });
     }
 
     #[test]
     fn configured_podman_user_filters_root() {
-        unsafe { std::env::set_var("RUSSEL_PODMAN_USER", "root"); }
-        let result = configured_podman_user();
-        unsafe { std::env::remove_var("RUSSEL_PODMAN_USER"); }
-        assert_eq!(result, None);
+        with_russel_podman_user_env(Some("root"), || {
+            assert_eq!(configured_podman_user(), None);
+        });
     }
 
     #[test]
     fn configured_podman_user_accepts_valid() {
-        unsafe { std::env::set_var("RUSSEL_PODMAN_USER", "myuser"); }
-        let result = configured_podman_user();
-        unsafe { std::env::remove_var("RUSSEL_PODMAN_USER"); }
-        assert_eq!(result, Some("myuser".to_string()));
+        with_russel_podman_user_env(Some("myuser"), || {
+            assert_eq!(configured_podman_user(), Some("myuser".to_string()));
+        });
     }
 
     #[test]
     fn configured_podman_user_trims_whitespace() {
-        unsafe { std::env::set_var("RUSSEL_PODMAN_USER", "  myuser  "); }
-        let result = configured_podman_user();
-        unsafe { std::env::remove_var("RUSSEL_PODMAN_USER"); }
-        assert_eq!(result, Some("myuser".to_string()));
+        with_russel_podman_user_env(Some("  myuser  "), || {
+            assert_eq!(configured_podman_user(), Some("myuser".to_string()));
+        });
     }
 }
