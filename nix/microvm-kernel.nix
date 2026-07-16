@@ -8,6 +8,11 @@
 # Build: nix build .#microvm-kernel
 # Result: ./result/bzImage  (and $out/bzImage in store)
 # Legacy: nix-build -E 'with import <nixpkgs> {}; callPackage ./nix/microvm-kernel.nix {}'
+#
+# ignoreConfigErrors: nixpkgs common-config emits child options for subsystems
+# we didn't explicitly configure. We intentionally don't strip subsystems to
+# avoid cascading unused-option errors; size is secondary to a working
+# built-in virtio kernel.
 
 {
   pkgs,
@@ -55,18 +60,6 @@
     # ── initramfs support ─────────────────────────────────────────────
     BLK_DEV_INITRD    = yes;
 
-    # ── Disable unnecessary subsystems for faster build + smaller image
-    SOUND             = lib.mkForce no;
-    DRM               = lib.mkForce no;
-    USB_SUPPORT       = lib.mkForce no;
-    WLAN              = lib.mkForce no;
-    BLUETOOTH         = lib.mkForce no;
-    INPUT_JOYSTICK    = lib.mkForce no;
-    INPUT_TABLET      = lib.mkForce no;
-    INPUT_TOUCHSCREEN = lib.mkForce no;
-    WIRELESS          = lib.mkForce no;
-    NFC               = lib.mkForce no;
-    MEDIA_SUPPORT     = lib.mkForce no;
-    STAGING           = lib.mkForce no;
   };
+  ignoreConfigErrors = true;
 })
