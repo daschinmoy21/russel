@@ -145,7 +145,7 @@ async fn cleanup_stale_resources() {
         .output()
         .await
     {
-        Ok(out) => {
+        Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 let Some(raw) = line.split_whitespace().nth(1) else {
@@ -182,6 +182,13 @@ async fn cleanup_stale_resources() {
                 }
             }
         }
+        Ok(out) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "ip link show failed with status {}",
+                out.status,
+            );
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to list network interfaces during cleanup");
         }
@@ -195,7 +202,10 @@ fn is_russel_tap(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix("rsl-") else {
         return false;
     };
-    suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit())
+    suffix.len() == 8
+        && suffix
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 #[cfg(test)]
@@ -210,6 +220,7 @@ mod tests {
         assert!(!is_russel_tap("rsl-a1b2c3d4e")); // too long
         assert!(!is_russel_tap("vm-api"));
         assert!(!is_russel_tap("docker0"));
+        assert!(!is_russel_tap("rsl-A1B2C3D4")); // uppercase not lowercase hex
         assert!(!is_russel_tap("rsl-gggggggg")); // not hex
     }
 }
