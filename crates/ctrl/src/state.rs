@@ -5,6 +5,7 @@ use std::{
 };
 
 use russel_core::api::{LogsResponse, StatusResponse};
+use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 
 /// Outcome of attempting to claim a service for a lifecycle operation.
@@ -36,6 +37,8 @@ struct ServiceState {
     flake_path: Option<std::path::PathBuf>,
     vm_pid: Option<u32>,
     vm_process: Option<Child>,
+    container_id: Option<String>,
+    runtime: Option<RuntimeKind>,
     /// Auxiliary child processes (socat forwarders, etc.) that must stay alive.
     aux_processes: Vec<Child>,
     /// Prior state captured when mark_building is called, for restoring the
@@ -54,6 +57,8 @@ impl Default for ServiceState {
             flake_path: None,
             vm_pid: None,
             vm_process: None,
+            container_id: None,
+            runtime: None,
             aux_processes: Vec::new(),
             prebuild_status: None,
             prebuild_vm_state: None,
@@ -131,8 +136,28 @@ impl AppState {
         s.started_at = Instant::now();
         s.vm_pid = vm_child.id();
         s.vm_process = Some(vm_child);
+        s.container_id = None;
+        s.runtime = Some(RuntimeKind::Microvm);
         s.aux_processes.extend(aux_children);
         // Deploy succeeded — clear prebuild snapshot.
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
+    }
+
+    /// Mark a container deployment as running (no VM child processes).
+    pub fn mark_deployed_container(&self, service_id: &str, container_id: &str) {
+        let mut inner = self.lock_inner();
+        let s = inner.services.entry(service_id.to_string()).or_default();
+        s.status = "deployed".to_string();
+        s.vm_state = "running".to_string();
+        s.started_at = Instant::now();
+        s.vm_pid = None;
+        s.vm_process = None;
+        s.container_id = Some(container_id.to_string());
+        s.runtime = Some(RuntimeKind::Container);
+        s.aux_processes.clear();
+        s.logs
+            .push_str(&format!("container running (id: {container_id})\n"));
         s.prebuild_status = None;
         s.prebuild_vm_state = None;
     }

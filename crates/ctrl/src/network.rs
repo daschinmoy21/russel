@@ -202,16 +202,24 @@ impl TapForwarder {
     }
 
     pub async fn wait_for_vm_port(vm_ip: &str, guest_port: u16, timeout: Duration) -> bool {
-        let addr = format!("{vm_ip}:{guest_port}");
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        false
+        wait_for_tcp_addr(&format!("{vm_ip}:{guest_port}"), timeout).await
     }
+
+    /// Poll until a TCP connect to `127.0.0.1:host_port` succeeds (container port publish).
+    pub async fn wait_for_host_port(host_port: u16, timeout: Duration) -> bool {
+        wait_for_tcp_addr(&format!("127.0.0.1:{host_port}"), timeout).await
+    }
+}
+
+async fn wait_for_tcp_addr(addr: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 async fn sysctl(key: &str, val: &str) {

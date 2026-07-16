@@ -1,16 +1,19 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::process::Command;
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::{Russelfile, resolve_runtime},
+    config::{RuntimeKind, Russelfile, resolve_runtime},
 };
 
 use crate::{
     build::NixBuilder,
+    container::{
+        ContainerRunner, ContainerStartSpec, RootfsSpec, default_base_dir,
+    },
     database::DatabaseProvisioner,
     git::GitClient,
     microvm::{BootOutput, MicrovmRunner},
@@ -27,6 +30,7 @@ pub struct DeployPipeline {
     #[allow(dead_code)]
     database: DatabaseProvisioner,
     runner: MicrovmRunner,
+    containers: ContainerRunner,
     ports: PortAllocator,
     traefik: TraefikClient,
 }
@@ -43,6 +47,7 @@ impl DeployPipeline {
             // the benchmark's later VMs measure VM work rather than repeated
             // `nix build --no-link` evaluations.
             runner: shared_runner(),
+            containers: ContainerRunner::new(),
             ports: PortAllocator,
             traefik: TraefikClient,
         }
@@ -89,29 +94,61 @@ impl DeployPipeline {
                     elapsed_ms = elapsed,
                     host_port,
                     guest_port,
+                    runtime = %output.runtime,
                     "deploy succeeded"
                 );
-                self.state.mark_deployed_with_aux(
-                    &service_id,
-                    output.vm_child,
-                    vec![output.socat_child, output.virtiofsd_child],
-                );
+                let (message, vm_ip, microvm_config_path) = match output.workload {
+                    DeployWorkload::Microvm {
+                        alloc,
+                        initramfs_path,
+                        vm_child,
+                        virtiofsd_child,
+                        socat_child,
+                        ..
+                    } => {
+                        self.state.mark_deployed_with_aux(
+                            &service_id,
+                            *vm_child,
+                            vec![*socat_child, *virtiofsd_child],
+                        );
+                        (
+                            format!(
+                                "microVM running. localhost:{host_port} -> {}:{guest_port}",
+                                alloc.vm_ip
+                            ),
+                            Some(alloc.vm_ip),
+                            Some(initramfs_path.display().to_string()),
+                        )
+                    }
+                    DeployWorkload::Container {
+                        container_id,
+                        rootfs_path,
+                        ..
+                    } => {
+                        self.state
+                            .mark_deployed_container(&service_id, &container_id);
+                        (
+                            format!(
+                                "container running. localhost:{host_port} -> guest:{guest_port}"
+                            ),
+                            None,
+                            Some(rootfs_path.display().to_string()),
+                        )
+                    }
+                };
                 DeployResponse {
                     service_id,
                     vm_id,
                     status: "deployed".to_string(),
                     store_path: Some(output.store_path.display().to_string()),
-                    microvm_config_path: Some(output.initramfs_path.display().to_string()),
+                    microvm_config_path,
                     runner_path: None,
                     port: Some(output.port),
                     elapsed_ms: elapsed,
                     timing: Some(output.timing),
-                    vm_ip: Some(output.alloc.vm_ip.clone()),
-                    runtime: output.runtime,
-                    message: format!(
-                        "microVM running. localhost:{host_port} -> {}:{guest_port}",
-                        output.alloc.vm_ip
-                    ),
+                    vm_ip,
+                    runtime: Some(output.runtime),
+                    message,
                 }
             }
             Err(error) => {
@@ -125,7 +162,6 @@ impl DeployPipeline {
                         elapsed_ms = elapsed,
                         "deploy failed but successfully rolled back to previous VM"
                     );
-                    // Do NOT mark as failed - the old VM was restored and is running
                     let original_error = error_msg.trim_start_matches("ROLLBACK_SUCCESS:").trim();
                     DeployResponse {
                         service_id,
@@ -177,7 +213,6 @@ impl DeployPipeline {
         request: DeployRequest,
         tx: tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<DeployOutput> {
-        // Validate service_id early, before any expensive operations
         MicrovmRunner::validate_service_id(service_id)?;
 
         // ── 1. Resolve repo ──────────────────────────────────────────────────
@@ -191,74 +226,106 @@ impl DeployPipeline {
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
         let config_path = repo_path.join(PathBuf::from(&request.config_path));
         let config = Russelfile::load(&config_path)?;
-        resolve_runtime(config.service.runtime, request.runtime)?;
+        let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         let resolve_ms = t.elapsed().as_millis();
-        tracing::info!(service_id, service_name = %config.service.name, resolve_ms, "repo resolved");
+        tracing::info!(
+            service_id,
+            service_name = %config.service.name,
+            runtime = %runtime,
+            resolve_ms,
+            "repo resolved"
+        );
 
-        // ── 2. Nix build app + ensure kernel + busybox + modules ──────────
+        // ── 2. Nix build (+ kernel stack only for microVM) ───────────────────
         let t = Instant::now();
+        let build_description = if runtime == RuntimeKind::Microvm {
+            "Building Nix package + ensuring kernel/busybox/modules"
+        } else {
+            "Building Nix package"
+        };
         let _ = tx
             .send(DeployEvent::Progress {
                 phase: "build".into(),
-                description: "Building Nix package + ensuring kernel/busybox/modules".into(),
+                description: build_description.into(),
             })
             .await;
         let build = self.builder.build(&repo_path).await?;
-        let kernel = self.runner.ensure_kernel().await?;
-        let busybox = self.runner.ensure_busybox().await?;
-        let kernel_modules = self.runner.ensure_kernel_modules().await?;
+        let kernel = if runtime == RuntimeKind::Microvm {
+            Some(self.runner.ensure_kernel().await?)
+        } else {
+            None
+        };
+        let busybox = if runtime == RuntimeKind::Microvm {
+            Some(self.runner.ensure_busybox().await?)
+        } else {
+            None
+        };
+        let kernel_modules = if runtime == RuntimeKind::Microvm {
+            Some(self.runner.ensure_kernel_modules().await?)
+        } else {
+            None
+        };
         let build_ms = t.elapsed().as_millis();
-        tracing::info!(
-            service_id,
-            store = %build.store_path.display(),
-            kernel = %kernel.display(),
-            modules = %kernel_modules.display(),
-            build_ms,
-            "build complete (kernel + busybox + modules cached)"
-        );
+        if runtime == RuntimeKind::Microvm {
+            tracing::info!(
+                service_id,
+                store = %build.store_path.display(),
+                kernel = %kernel.as_ref().unwrap().display(),
+                modules = %kernel_modules.as_ref().unwrap().display(),
+                build_ms,
+                "build complete (kernel + busybox + modules cached)"
+            );
+        } else {
+            tracing::info!(
+                service_id,
+                store = %build.store_path.display(),
+                build_ms,
+                "build complete"
+            );
+        }
 
-        // Now that the build has succeeded, we can prepare the backup and rollback path
+        let prior_runtime = prior_runtime_from_disk(service_id);
+
         let russel_dir = format!("/var/lib/russel/{}", service_id);
         let microvms_dir = format!("/var/lib/microvms/{}", service_id);
         let russel_bak = format!("{}.bak", russel_dir);
         let microvms_bak = format!("{}.bak", microvms_dir);
-        let has_backup = std::path::Path::new(&russel_dir).exists();
-        if has_backup {
-            // Perform transactional backup: propagate errors and restore on failure
+        let has_russel_backup = Path::new(&russel_dir).exists();
+        let has_microvms_backup = Path::new(&microvms_dir).exists();
+        let has_backup = has_russel_backup;
+        if has_russel_backup {
             if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
                 anyhow::bail!("failed to backup russel directory: {}", e);
             }
-            if let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await {
-                // Restore the first rename on failure
+            if has_microvms_backup
+                && let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await
+            {
                 let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
                 anyhow::bail!("failed to backup microvms directory: {}", e);
             }
         }
 
-        // Take the old processes from state
         let (old_vm_proc, old_aux_procs) = self
             .state
             .take_processes(service_id)
             .unwrap_or((None, Vec::new()));
 
-        // Teardown the old VM (it will stop systemd service, delete old TAP, release ports)
-        // Since the directories are renamed to .bak, they are not deleted.
-        if let Err(e) = self.runner.destroy(service_id).await {
-            // Restore processes first so the lifecycle can be re-attempted
+        if let Err(e) =
+            destroy_prior_runtime(prior_runtime, service_id, &self.runner, &self.containers).await
+        {
             self.state
                 .restore_processes(service_id, old_vm_proc, old_aux_procs);
-            // Restore backups on teardown failure
             if has_backup {
                 let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
-                let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+                if has_microvms_backup {
+                    let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+                }
             }
-            anyhow::bail!("failed to teardown old VM: {}", e);
+            anyhow::bail!("failed to teardown prior {}: {}", prior_runtime, e);
         }
 
         let mut port_reservation = None;
         let deploy_result = async {
-            // Keep the registry reservation alive until the deployment is fully
-            // committed. Any error in this block releases it via Drop.
             port_reservation = Some(PortReservation::new(service_id));
             let port = match request.port.clone() {
                 Some(p) => {
@@ -276,265 +343,97 @@ impl DeployPipeline {
                     }
                 }
             };
-            let alloc: SubnetAllocation = subnet_for(service_id);
-            tracing::info!(
-                service_id,
-                host = port.host,
-                guest = port.guest,
-                vm_ip = %alloc.vm_ip,
-                "allocated"
-            );
 
-            // ── 4. Create initramfs (minimal rootfs with app + init) ───────────
-            let t = Instant::now();
-            let _ = tx
-                .send(DeployEvent::Progress {
-                    phase: "create".into(),
-                    description: "Building minimal initramfs".into(),
-                })
-                .await;
-            let bin_name = config.service.bin_name().to_string();
-            let mem_mb = config.service.memory.as_mebibytes();
-
-            let initramfs_path = self
-                .runner
-                .build_initramfs(
-                    service_id,
-                    &alloc,
-                    port.guest,
-                    &build.store_path,
-                    &bin_name,
-                    &busybox,
-                    &kernel_modules,
-                )
-                .await?;
-            let create_ms = t.elapsed().as_millis();
-            tracing::info!(service_id, create_ms, "initramfs ready");
-
-            // ── 5. TAP + socat + boot VM ─────────────────────────────────────
-            let _ = tx
-                .send(DeployEvent::Progress {
-                    phase: "start".into(),
-                    description: "Setting up network + booting VM".into(),
-                })
-                .await;
-            tracing::info!(service_id, "setting up TAP + socat + booting VM");
-
-            // Step A: create TAP + setup port forwarding (socat)
-            let t_net = Instant::now();
-            let socat_child =
-                TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
-            let network_ms = t_net.elapsed().as_millis();
-
-            // Step B: boot cloud-hypervisor with virtiofsd + minimal initramfs
-            let t_start = Instant::now();
-            let BootOutput {
-                vm_child,
-                virtiofsd_child,
-            } = self
-                .runner
-                .boot(service_id, &kernel, &initramfs_path, &alloc, mem_mb)
-                .await?;
-
-            // Write metadata.json for precise and secure cleanup
-            // This must succeed for deployment to be considered successful
-            let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
-            let metadata = serde_json::json!({
-                "service_id": service_id,
-                "host_port": port.host,
-                "guest_port": port.guest,
-                "vm_ip": alloc.vm_ip,
-                "vm_pid": vm_child.id(),
-                "virtiofsd_pid": virtiofsd_child.id(),
-                "socat_pid": socat_child.id(),
-                "kernel_path": kernel.to_string_lossy(),
-                "mem_mb": mem_mb,
-            });
-            let content = serde_json::to_string_pretty(&metadata)
-                .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-            std::fs::write(&metadata_path, content).map_err(|e| {
-                anyhow::anyhow!("failed to write metadata to {}: {}", metadata_path, e)
-            })?;
-
-            // Create marker directory for MicrovmRunner::list() discovery
-            let microvms_marker = format!("/var/lib/microvms/{}", service_id);
-            std::fs::create_dir_all(&microvms_marker).map_err(|e| {
-                anyhow::anyhow!("failed to create marker dir {}: {}", microvms_marker, e)
-            })?;
-
-            let start_ms = t_start.elapsed().as_millis();
-            tracing::info!(service_id, network_ms, start_ms, "network + VM booted");
-
-            // ── 6. Wait for VM service to be reachable ───────────────────────────
-            let t = Instant::now();
-            let _ = tx
-                .send(DeployEvent::Progress {
-                    phase: "ready".into(),
-                    description: "Waiting for VM service to be reachable".into(),
-                })
-                .await;
-            tracing::info!(
-                service_id,
-                vm_ip = %alloc.vm_ip,
-                guest_port = port.guest,
-                "polling VM readiness"
-            );
-            let up =
-                TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10))
-                    .await;
-            let ready_ms = t.elapsed().as_millis();
-            if !up {
-                anyhow::bail!("VM not reachable in 10s");
+            match runtime {
+                RuntimeKind::Microvm => {
+                    self.deploy_microvm(
+                        service_id,
+                        &config,
+                        &build.store_path,
+                        &port,
+                        kernel.as_ref().unwrap(),
+                        busybox.as_ref().unwrap(),
+                        kernel_modules.as_ref().unwrap(),
+                        &tx,
+                    )
+                    .await
+                }
+                RuntimeKind::Container => {
+                    self.deploy_container(
+                        service_id,
+                        &config,
+                        &build.store_path,
+                        &port,
+                        &tx,
+                    )
+                    .await
+                }
             }
-            tracing::info!(service_id, ready_ms, "VM service reachable");
-
-            Ok::<_, anyhow::Error>((
-                port,
-                alloc,
-                vm_child,
-                virtiofsd_child,
-                socat_child,
-                initramfs_path,
-                create_ms,
-                start_ms,
-                network_ms,
-                ready_ms,
-            ))
         }
         .await;
 
-        let (
-            port,
-            alloc,
-            vm_child,
-            virtiofsd_child,
-            socat_child,
-            initramfs_path,
-            create_ms,
-            start_ms,
-            network_ms,
-            ready_ms,
-        ) = match deploy_result {
-            Ok(val) => {
-                // Do NOT delete backups or kill old processes yet - wait until after Traefik registration
-                val
-            }
+        let (workload, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
+            Ok(val) => val,
             Err(deploy_err) => {
                 tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
-                // Always tear down any partially-created VM from the failed deployment
-                let _ = self.runner.destroy(service_id).await;
-                if has_backup {
-                    let rollback_res = async {
-                        tokio::fs::rename(&russel_bak, &russel_dir).await?;
-                        tokio::fs::rename(&microvms_bak, &microvms_dir).await?;
-                        let old_metadata_path = format!("{}/metadata.json", russel_dir);
-                        let content = std::fs::read_to_string(&old_metadata_path)?;
-                        let old_meta: serde_json::Value = serde_json::from_str(&content)?;
-                        let old_host_port = old_meta["host_port"]
-                            .as_u64()
-                            .ok_or_else(|| anyhow::anyhow!("missing host_port"))?
-                            as u16;
-                        let old_guest_port = old_meta["guest_port"]
-                            .as_u64()
-                            .ok_or_else(|| anyhow::anyhow!("missing guest_port"))?
-                            as u16;
-                        let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
-                        let old_kernel_path = PathBuf::from(
-                            old_meta["kernel_path"]
-                                .as_str()
-                                .unwrap_or("/nix/store/kernel"),
-                        );
-                        let old_initramfs_path =
-                            PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
-                        let old_alloc = subnet_for(service_id);
-
-                        PortAllocator::reserve(service_id, old_host_port)?;
-                        let old_socat = TapForwarder::setup(
-                            service_id,
-                            &old_alloc,
-                            old_host_port,
-                            old_guest_port,
-                        )
-                        .await?;
-                        let old_boot = self
-                            .runner
-                            .boot(
-                                service_id,
-                                &old_kernel_path,
-                                &old_initramfs_path,
-                                &old_alloc,
-                                old_mem_mb,
-                            )
-                            .await?;
-
-                        let old_vm_pid = old_boot.vm_child.id();
-                        let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
-                        let old_socat_pid = old_socat.id();
-
-                        self.state.mark_deployed_with_aux(
-                            service_id,
-                            old_boot.vm_child,
-                            vec![old_socat, old_boot.virtiofsd_child],
-                        );
-
-                        let new_metadata = serde_json::json!({
-                            "service_id": service_id,
-                            "host_port": old_host_port,
-                            "guest_port": old_guest_port,
-                            "vm_ip": old_meta["vm_ip"],
-                            "vm_pid": old_vm_pid,
-                            "virtiofsd_pid": old_virtiofsd_pid,
-                            "socat_pid": old_socat_pid,
-                            "kernel_path": old_kernel_path.to_string_lossy(),
-                            "mem_mb": old_mem_mb,
-                        });
-                        if let Ok(c) = serde_json::to_string_pretty(&new_metadata) {
-                            let _ = std::fs::write(old_metadata_path, c);
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    }
+                cleanup_failed_deploy(runtime, service_id, &self.runner, &self.containers).await;
+                if has_backup && runtime == RuntimeKind::Microvm {
+                    let rollback_res = attempt_microvm_rollback(
+                        service_id,
+                        &russel_dir,
+                        &microvms_dir,
+                        &russel_bak,
+                        &microvms_bak,
+                        has_microvms_backup,
+                        &self.runner,
+                        &self.state,
+                    )
                     .await;
 
                     match rollback_res {
                         Ok(()) => {
                             tracing::info!(service_id, "Rollback to previous VM succeeded");
-                            // The old VM is active again, so keep its port reservation.
                             port_reservation
                                 .as_mut()
                                 .expect("port reservation exists")
                                 .disarm();
-                            // Return an error that indicates rollback succeeded (caller should NOT mark as failed)
                             return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
                         }
                         Err(rollback_err) => {
                             tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
                         }
                     }
+                } else if has_backup {
+                    restore_backup_dirs(
+                        &russel_dir,
+                        &microvms_dir,
+                        &russel_bak,
+                        &microvms_bak,
+                        has_microvms_backup,
+                    )
+                    .await;
                 }
                 return Err(deploy_err);
             }
         };
 
-        // Register with Traefik before committing the deployment. Release the
-        // reservation if this final fallible step fails.
-        if let Err(error) = self.traefik.register(service_id, port.host).await {
-            if let Err(teardown_error) = TapForwarder::teardown(&alloc).await {
-                tracing::warn!(service_id, error = %teardown_error, "failed to tear down TAP after Traefik registration failure");
-            }
+        if let Err(error) = self.traefik.register(service_id, workload.port().host).await {
+            workload.teardown_network().await;
             PortAllocator::release(service_id);
             return Err(error);
         }
 
-        // Only after successful Traefik registration, clean up old resources
         if has_backup {
             let _ = Command::new("rm")
                 .args(["-rf", &format!("{}.bak", russel_dir)])
                 .output()
                 .await;
-            let _ = Command::new("rm")
-                .args(["-rf", &format!("{}.bak", microvms_dir)])
-                .output()
-                .await;
+            if has_microvms_backup {
+                let _ = Command::new("rm")
+                    .args(["-rf", &format!("{}.bak", microvms_dir)])
+                    .output()
+                    .await;
+            }
         }
         if let Some(mut p) = old_vm_proc {
             let _ = p.kill().await;
@@ -551,13 +450,8 @@ impl DeployPipeline {
 
         Ok(DeployOutput {
             store_path: build.store_path,
-            initramfs_path,
-            alloc,
-            vm_child,
-            virtiofsd_child,
-            socat_child,
-            port,
-            runtime: Some(config.service.runtime),
+            port: workload.port().clone(),
+            runtime,
             timing: DeployTiming {
                 resolve_ms,
                 build_ms,
@@ -566,8 +460,396 @@ impl DeployPipeline {
                 network_ms,
                 ready_ms,
             },
+            workload,
         })
     }
+
+    async fn deploy_microvm(
+        &self,
+        service_id: &str,
+        config: &Russelfile,
+        store_path: &Path,
+        port: &PortMapping,
+        kernel: &Path,
+        busybox: &Path,
+        kernel_modules: &Path,
+        tx: &tokio::sync::mpsc::Sender<DeployEvent>,
+    ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
+        let alloc: SubnetAllocation = subnet_for(service_id);
+        tracing::info!(
+            service_id,
+            host = port.host,
+            guest = port.guest,
+            vm_ip = %alloc.vm_ip,
+            "allocated"
+        );
+
+        let t = Instant::now();
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "create".into(),
+                description: "Building minimal initramfs".into(),
+            })
+            .await;
+        let bin_name = config.service.bin_name().to_string();
+        let mem_mb = config.service.memory.as_mebibytes();
+
+        let initramfs_path = self
+            .runner
+            .build_initramfs(
+                service_id,
+                &alloc,
+                port.guest,
+                store_path,
+                &bin_name,
+                busybox,
+                kernel_modules,
+            )
+            .await?;
+        let create_ms = t.elapsed().as_millis();
+        tracing::info!(service_id, create_ms, "initramfs ready");
+
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "start".into(),
+                description: "Setting up network + booting VM".into(),
+            })
+            .await;
+        tracing::info!(service_id, "setting up TAP + socat + booting VM");
+
+        let t_net = Instant::now();
+        let socat_child =
+            TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
+        let network_ms = t_net.elapsed().as_millis();
+
+        let t_start = Instant::now();
+        let BootOutput {
+            vm_child,
+            virtiofsd_child,
+        } = self
+            .runner
+            .boot(service_id, kernel, &initramfs_path, &alloc, mem_mb)
+            .await?;
+
+        let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
+        let metadata = serde_json::json!({
+            "service_id": service_id,
+            "runtime": "microvm",
+            "host_port": port.host,
+            "guest_port": port.guest,
+            "vm_ip": alloc.vm_ip,
+            "vm_pid": vm_child.id(),
+            "virtiofsd_pid": virtiofsd_child.id(),
+            "socat_pid": socat_child.id(),
+            "kernel_path": kernel.to_string_lossy(),
+            "store_path": store_path.to_string_lossy(),
+            "mem_mb": mem_mb,
+        });
+        write_metadata(&metadata_path, &metadata)?;
+
+        let microvms_marker = format!("/var/lib/microvms/{}", service_id);
+        std::fs::create_dir_all(&microvms_marker).map_err(|e| {
+            anyhow::anyhow!("failed to create marker dir {}: {}", microvms_marker, e)
+        })?;
+
+        let start_ms = t_start.elapsed().as_millis();
+        tracing::info!(service_id, network_ms, start_ms, "network + VM booted");
+
+        let t = Instant::now();
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "ready".into(),
+                description: "Waiting for VM service to be reachable".into(),
+            })
+            .await;
+        tracing::info!(
+            service_id,
+            vm_ip = %alloc.vm_ip,
+            guest_port = port.guest,
+            "polling VM readiness"
+        );
+        let up =
+            TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10))
+                .await;
+        let ready_ms = t.elapsed().as_millis();
+        if !up {
+            anyhow::bail!("VM not reachable in 10s");
+        }
+        tracing::info!(service_id, ready_ms, "VM service reachable");
+
+        Ok((
+            DeployWorkload::Microvm {
+                alloc,
+                vm_child: Box::new(vm_child),
+                virtiofsd_child: Box::new(virtiofsd_child),
+                socat_child: Box::new(socat_child),
+                initramfs_path,
+                port: port.clone(),
+            },
+            create_ms,
+            start_ms,
+            network_ms,
+            ready_ms,
+        ))
+    }
+
+    async fn deploy_container(
+        &self,
+        service_id: &str,
+        config: &Russelfile,
+        store_path: &Path,
+        port: &PortMapping,
+        tx: &tokio::sync::mpsc::Sender<DeployEvent>,
+    ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
+        tracing::info!(
+            service_id,
+            host = port.host,
+            guest = port.guest,
+            "allocated container port"
+        );
+
+        let bin_name = config.service.bin_name().to_string();
+        let mem_mb = config.service.memory.as_mebibytes();
+        let base_dir = default_base_dir(service_id);
+
+        let t = Instant::now();
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "create".into(),
+                description: "Preparing container rootfs".into(),
+            })
+            .await;
+        let rootfs_spec = RootfsSpec {
+            service_id: service_id.to_string(),
+            store_path: store_path.to_path_buf(),
+            bin_name,
+            base_dir: base_dir.clone(),
+            bash_store: None,
+            curl_store: None,
+        };
+        let prepared = self.containers.prepare(&rootfs_spec).await?;
+        let create_ms = t.elapsed().as_millis();
+        tracing::info!(service_id, create_ms, "container rootfs ready");
+
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "start".into(),
+                description: "Starting rootless Podman container".into(),
+            })
+            .await;
+        let t_start = Instant::now();
+        let start_spec = ContainerStartSpec {
+            service_id: service_id.to_string(),
+            rootfs: prepared.clone(),
+            host_port: port.host,
+            guest_port: port.guest,
+            memory_mb: mem_mb,
+            env: vec![("PORT".to_string(), port.guest.to_string())],
+        };
+        let running = self.containers.start(&start_spec).await?;
+        let start_ms = t_start.elapsed().as_millis();
+        let network_ms = 0u128;
+        tracing::info!(service_id, start_ms, "container started");
+
+        let metadata_path = base_dir.join("metadata.json");
+        let metadata = serde_json::json!({
+            "service_id": service_id,
+            "runtime": "container",
+            "host_port": port.host,
+            "guest_port": port.guest,
+            "store_path": store_path.to_string_lossy(),
+            "container_id": running.container_id,
+            "container_name": running.container_name,
+            "rootfs_path": running.rootfs_path.to_string_lossy(),
+            "mem_mb": mem_mb,
+        });
+        write_metadata(&metadata_path.display().to_string(), &metadata)?;
+
+        let t = Instant::now();
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "ready".into(),
+                description: "Waiting for container service to be reachable".into(),
+            })
+            .await;
+        tracing::info!(
+            service_id,
+            host_port = port.host,
+            "polling container readiness"
+        );
+        let up =
+            TapForwarder::wait_for_host_port(port.host, Duration::from_secs(10)).await;
+        let ready_ms = t.elapsed().as_millis();
+        if !up {
+            anyhow::bail!("container not reachable on 127.0.0.1:{} in 10s", port.host);
+        }
+        tracing::info!(service_id, ready_ms, "container service reachable");
+
+        Ok((
+            DeployWorkload::Container {
+                container_id: running.container_id,
+                container_name: running.container_name,
+                rootfs_path: running.rootfs_path,
+                port: port.clone(),
+            },
+            create_ms,
+            start_ms,
+            network_ms,
+            ready_ms,
+        ))
+    }
+}
+
+/// Parse `runtime` from on-disk metadata JSON; legacy entries without the field
+/// default to microVM.
+pub fn prior_runtime_from_metadata(content: &str) -> RuntimeKind {
+    let value: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return RuntimeKind::Microvm,
+    };
+    value
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(RuntimeKind::Microvm)
+}
+
+pub fn prior_runtime_from_disk(service_id: &str) -> RuntimeKind {
+    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return RuntimeKind::Microvm;
+    };
+    prior_runtime_from_metadata(&content)
+}
+
+async fn destroy_prior_runtime(
+    prior: RuntimeKind,
+    service_id: &str,
+    microvm_runner: &MicrovmRunner,
+    container_runner: &ContainerRunner,
+) -> anyhow::Result<()> {
+    match prior {
+        RuntimeKind::Microvm => microvm_runner.destroy(service_id).await,
+        RuntimeKind::Container => {
+            container_runner.destroy(service_id).await?;
+            PortAllocator::release(service_id);
+            Ok(())
+        }
+    }
+}
+
+async fn cleanup_failed_deploy(
+    runtime: RuntimeKind,
+    service_id: &str,
+    microvm_runner: &MicrovmRunner,
+    container_runner: &ContainerRunner,
+) {
+    let _ = match runtime {
+        RuntimeKind::Microvm => microvm_runner.destroy(service_id).await,
+        RuntimeKind::Container => {
+            let result = container_runner.destroy(service_id).await;
+            PortAllocator::release(service_id);
+            result
+        }
+    };
+}
+
+async fn restore_backup_dirs(
+    russel_dir: &str,
+    microvms_dir: &str,
+    russel_bak: &str,
+    microvms_bak: &str,
+    has_microvms_backup: bool,
+) {
+    let _ = tokio::fs::rename(russel_bak, russel_dir).await;
+    if has_microvms_backup {
+        let _ = tokio::fs::rename(microvms_bak, microvms_dir).await;
+    }
+}
+
+async fn attempt_microvm_rollback(
+    service_id: &str,
+    russel_dir: &str,
+    microvms_dir: &str,
+    russel_bak: &str,
+    microvms_bak: &str,
+    has_microvms_backup: bool,
+    runner: &MicrovmRunner,
+    state: &AppState,
+) -> anyhow::Result<()> {
+    tokio::fs::rename(russel_bak, russel_dir).await?;
+    if has_microvms_backup {
+        tokio::fs::rename(microvms_bak, microvms_dir).await?;
+    }
+    let old_metadata_path = format!("{}/metadata.json", russel_dir);
+    let content = std::fs::read_to_string(&old_metadata_path)?;
+    let old_meta: serde_json::Value = serde_json::from_str(&content)?;
+    let old_host_port = old_meta["host_port"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("missing host_port"))? as u16;
+    let old_guest_port = old_meta["guest_port"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("missing guest_port"))? as u16;
+    let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
+    let old_kernel_path = PathBuf::from(
+        old_meta["kernel_path"]
+            .as_str()
+            .unwrap_or("/nix/store/kernel"),
+    );
+    let old_initramfs_path = PathBuf::from(format!("{}/initramfs.cpio", russel_dir));
+    let old_alloc = subnet_for(service_id);
+
+    PortAllocator::reserve(service_id, old_host_port)?;
+    let old_socat =
+        TapForwarder::setup(service_id, &old_alloc, old_host_port, old_guest_port).await?;
+    let old_boot = runner
+        .boot(
+            service_id,
+            &old_kernel_path,
+            &old_initramfs_path,
+            &old_alloc,
+            old_mem_mb,
+        )
+        .await?;
+
+    let old_vm_pid = old_boot.vm_child.id();
+    let old_virtiofsd_pid = old_boot.virtiofsd_child.id();
+    let old_socat_pid = old_socat.id();
+
+    state.mark_deployed_with_aux(
+        service_id,
+        old_boot.vm_child,
+        vec![old_socat, old_boot.virtiofsd_child],
+    );
+
+    let new_metadata = serde_json::json!({
+        "service_id": service_id,
+        "runtime": "microvm",
+        "host_port": old_host_port,
+        "guest_port": old_guest_port,
+        "vm_ip": old_meta["vm_ip"],
+        "vm_pid": old_vm_pid,
+        "virtiofsd_pid": old_virtiofsd_pid,
+        "socat_pid": old_socat_pid,
+        "kernel_path": old_kernel_path.to_string_lossy(),
+        "mem_mb": old_mem_mb,
+    });
+    if let Ok(c) = serde_json::to_string_pretty(&new_metadata) {
+        let _ = std::fs::write(old_metadata_path, c);
+    }
+    Ok(())
+}
+
+fn write_metadata(path: &str, metadata: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create metadata parent {}: {}", parent.display(), e)
+        })?;
+    }
+    let content = serde_json::to_string_pretty(metadata)
+        .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
+    std::fs::write(path, content)
+        .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", path, e))
 }
 
 fn shared_runner() -> MicrovmRunner {
@@ -602,14 +884,71 @@ impl Drop for PortReservation {
     }
 }
 
+enum DeployWorkload {
+    Microvm {
+        alloc: SubnetAllocation,
+        vm_child: Box<tokio::process::Child>,
+        virtiofsd_child: Box<tokio::process::Child>,
+        socat_child: Box<tokio::process::Child>,
+        initramfs_path: PathBuf,
+        port: PortMapping,
+    },
+    Container {
+        container_id: String,
+        container_name: String,
+        rootfs_path: PathBuf,
+        port: PortMapping,
+    },
+}
+
+impl DeployWorkload {
+    fn port(&self) -> &PortMapping {
+        match self {
+            Self::Microvm { port, .. } | Self::Container { port, .. } => port,
+        }
+    }
+
+    async fn teardown_network(&self) {
+        if let Self::Microvm { alloc, .. } = self
+            && let Err(teardown_error) = TapForwarder::teardown(alloc).await
+        {
+            tracing::warn!(error = %teardown_error, "failed to tear down TAP after Traefik registration failure");
+        }
+    }
+}
+
 struct DeployOutput {
     store_path: PathBuf,
-    initramfs_path: PathBuf,
-    alloc: SubnetAllocation,
-    vm_child: tokio::process::Child,
-    virtiofsd_child: tokio::process::Child,
-    socat_child: tokio::process::Child,
     port: PortMapping,
-    runtime: Option<russel_core::config::RuntimeKind>,
+    runtime: RuntimeKind,
     timing: DeployTiming,
+    workload: DeployWorkload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prior_runtime_defaults_to_microvm_when_missing() {
+        let json = r#"{"service_id":"api","host_port":3100}"#;
+        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Microvm);
+    }
+
+    #[test]
+    fn prior_runtime_reads_container_field() {
+        let json = r#"{"runtime":"container","service_id":"api"}"#;
+        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Container);
+    }
+
+    #[test]
+    fn prior_runtime_reads_microvm_field() {
+        let json = r#"{"runtime":"microvm","service_id":"api"}"#;
+        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Microvm);
+    }
+
+    #[test]
+    fn prior_runtime_invalid_json_defaults_microvm() {
+        assert_eq!(prior_runtime_from_metadata("not json"), RuntimeKind::Microvm);
+    }
 }
