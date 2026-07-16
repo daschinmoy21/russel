@@ -415,7 +415,7 @@ mod tests {
             .spawn()
             .expect("failed to spawn sleep");
 
-        let vm_pid = vm_child.id();
+        let _vm_pid = vm_child.id();
         state.mark_deployed_with_aux("test-svc", vm_child, vec![aux1, aux2]);
 
         // Verify initial state
