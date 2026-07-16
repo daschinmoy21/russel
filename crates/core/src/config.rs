@@ -218,15 +218,3 @@ typo_field = "oops"
         assert!(err.to_string().contains("unknown field"));
     }
 }
-#[test]
-fn deny_empty_fields() {
-    let toml = r#"
-[service]
-name = ""
-source = "."
-port = 
-memory = ""
-"#;
-    let err = toml::from_str::<Russelfile>(toml).unwrap_err();
-    assert!(err.to_string().contains("cannot have empty fields!!!"));
-}

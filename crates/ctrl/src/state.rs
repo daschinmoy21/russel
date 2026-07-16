@@ -160,6 +160,11 @@ impl AppState {
     }
 
     fn spawn_process_supervisor(&self, service_id: String, generation: u64) {
+        // ponytail: skip supervisor when no tokio runtime is active (e.g.
+        // sync unit tests). The test process is the only observer.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let state = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -269,32 +274,42 @@ impl AppState {
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
-        let mut inner = self.lock_inner();
-        let s = inner.services.entry(service_id.to_string()).or_default();
+        let needs_supervisor = {
+            let mut inner = self.lock_inner();
+            let s = inner.services.entry(service_id.to_string()).or_default();
 
-        // If the prior service had a running VM and processes haven't been
-        // taken yet (prebuild snapshot is still set), the build failed before
-        // take_processes — restore the previous deployment state.
-        if s.prebuild_vm_state.as_deref() == Some("running") {
-            let prev_status = s.prebuild_status.take().unwrap_or_default();
-            let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
-            s.status = prev_status;
-            s.vm_state = prev_vm_state;
-            s.logs.push_str(&format!(
-                "BUILD FAILED (previous deployment preserved): {}\n",
-                error
-            ));
-            return;
+            // If the prior service had a running VM and processes haven't been
+            // taken yet (prebuild snapshot is still set), the build failed before
+            // take_processes — restore the previous deployment state.
+            if s.prebuild_vm_state.as_deref() == Some("running") {
+                let prev_status = s.prebuild_status.take().unwrap_or_default();
+                let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
+                s.status = prev_status;
+                s.vm_state = prev_vm_state;
+                // Bump generation to restart supervision on the restored deployment.
+                s.process_generation = s.process_generation.wrapping_add(1);
+                let g = s.process_generation;
+                s.logs.push_str(&format!(
+                    "BUILD FAILED (previous deployment preserved): {}\n",
+                    error
+                ));
+                Some(g)
+            } else {
+                // No prior VM to restore — standard failure.
+                s.prebuild_status = None;
+                s.prebuild_vm_state = None;
+                s.status = "failed".to_string();
+                s.vm_state = "failed".to_string();
+                s.vm_pid = None;
+                s.logs.push_str(&error);
+                s.logs.push('\n');
+                None
+            }
+        };
+
+        if let Some(g) = needs_supervisor {
+            self.spawn_process_supervisor(service_id.to_string(), g);
         }
-
-        // No prior VM to restore — standard failure.
-        s.prebuild_status = None;
-        s.prebuild_vm_state = None;
-        s.status = "failed".to_string();
-        s.vm_state = "failed".to_string();
-        s.vm_pid = None;
-        s.logs.push_str(&error);
-        s.logs.push('\n');
     }
 
     /// Ensure a service entry exists with minimal state.
@@ -381,19 +396,28 @@ impl AppState {
         vm_process: Option<Child>,
         aux_processes: Vec<Child>,
     ) {
-        let mut inner = self.lock_inner();
-        if let Some(s) = inner.services.get_mut(service_id) {
-            if let Some(p) = vm_process {
-                s.vm_pid = p.id();
-                s.vm_process = Some(p);
+        let generation = {
+            let mut inner = self.lock_inner();
+            if let Some(s) = inner.services.get_mut(service_id) {
+                if let Some(p) = vm_process {
+                    s.vm_pid = p.id();
+                    s.vm_process = Some(p);
+                }
+                s.aux_processes.extend(aux_processes);
+                // ponytail: bump generation and spawn a supervisor so the restored
+                // children are monitored (issue #32). If status is not "deployed" the
+                // supervisor exits harmlessly; the next deployment will spawn its own.
+                s.process_generation = s.process_generation.wrapping_add(1);
+                s.process_generation
+            } else {
+                tracing::warn!(
+                    service_id = %service_id,
+                    "restore_processes called for unknown service"
+                );
+                return;
             }
-            s.aux_processes.extend(aux_processes);
-        } else {
-            tracing::warn!(
-                service_id = %service_id,
-                "restore_processes called for unknown service"
-            );
-        }
+        };
+        self.spawn_process_supervisor(service_id.to_string(), generation);
     }
 
     pub fn remove_service(&self, service_id: &str) {
