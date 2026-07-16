@@ -314,6 +314,12 @@ else
 	if [ "$RUSSEL_CAPABLE" -eq 1 ]; then
 		info "Russel prerequisites met (KVM ✓ root ✓ nix ✓ cloud-hypervisor ✓)"
 
+		# Prewarm the flake microvm kernel so first deploy doesn't build it.
+		if [ "$has_nix" -eq 1 ] && [ -f "flake.nix" ]; then
+			info "prewarming microvm kernel (nix build .#microvm-kernel)..."
+			nix build .#microvm-kernel --no-link || warn "kernel prewarm failed; ctrl will fall back"
+		fi
+
 		# Build release binaries if missing
 		if [ ! -f "$RELEASE_DIR/russel-ctrl" ] || [ ! -f "$RELEASE_DIR/russel-cli" ]; then
 			info "building russel (release) for deploy comparison..."

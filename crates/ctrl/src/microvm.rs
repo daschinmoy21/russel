@@ -99,81 +99,135 @@ impl MicrovmRunner {
 
     /// Get or build the microVM-optimised kernel (virtio/fuse built-in).
     ///
-    /// Tries `nix build -f nix/microvm-kernel.nix` first.
-    /// Falls back to stock `nixpkgs.linux` if the custom kernel build fails.
+    /// Resolution order:
+    ///   1. In-memory cache
+    ///   2. `RUSSEL_KERNEL_PATH` env var → drivers_builtin=true
+    ///   3. `nix build .#microvm-kernel` (flake attr, detected via flake.nix)
+    ///   4. `./result/bzImage` relative file (user ran nix build without --no-link)
+    ///   5. Stock nixpkgs.linux fallback (drivers =m)
+    ///
     /// Result is cached in-memory for the lifetime of the runner.
     pub async fn ensure_kernel(&self) -> anyhow::Result<KernelInfo> {
+        // 1. In-memory cache
         if let Some(info) = self.check_kernel_cache() {
             return Ok(info);
         }
 
-        // Try microvm kernel first (built-in drivers).
-        match self.build_microvm_kernel().await {
-            Ok(path) => {
+        // 2. RUSSEL_KERNEL_PATH env var
+        if let Ok(env_path) = std::env::var("RUSSEL_KERNEL_PATH") {
+            let p = PathBuf::from(&env_path);
+            if p.exists() {
                 let info = KernelInfo {
-                    path,
+                    path: p,
                     drivers_builtin: true,
                 };
                 self.store_kernel_cache(info.clone());
-                tracing::info!(kernel = %info.path.display(), "microvm kernel cached (drivers built-in)");
+                tracing::info!(
+                    kernel = %info.path.display(),
+                    source = "RUSSEL_KERNEL_PATH",
+                    "kernel cached (drivers built-in)"
+                );
                 return Ok(info);
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "microvm kernel build failed; falling back to stock nixpkgs kernel (modules =m)"
-                );
+            tracing::warn!("RUSSEL_KERNEL_PATH={env_path} does not exist, continuing");
+        }
+
+        // 3. Flake package: nix build .#microvm-kernel
+        if let Some(repo_root) = self.find_repo_root() {
+            if repo_root.join("flake.nix").exists() {
+                match self.build_flake_kernel(&repo_root).await {
+                    Ok(path) => {
+                        let info = KernelInfo {
+                            path,
+                            drivers_builtin: true,
+                        };
+                        self.store_kernel_cache(info.clone());
+                        tracing::info!(
+                            kernel = %info.path.display(),
+                            source = "flake",
+                            "microvm kernel cached (drivers built-in)"
+                        );
+                        return Ok(info);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "flake kernel build failed; trying next source"
+                        );
+                    }
+                }
             }
         }
 
-        // Fallback: stock kernel (drivers as modules).
+        // 4. Relative result/bzImage (user ran nix build without --no-link)
+        let result_bzimage = PathBuf::from("result/bzImage");
+        if result_bzimage.exists() {
+            let abs = std::fs::canonicalize(&result_bzimage)
+                .unwrap_or_else(|_| result_bzimage.clone());
+            let info = KernelInfo {
+                path: abs,
+                drivers_builtin: true,
+            };
+            self.store_kernel_cache(info.clone());
+            tracing::info!(
+                kernel = %info.path.display(),
+                source = "result/bzImage",
+                "microvm kernel cached (drivers built-in)"
+            );
+            return Ok(info);
+        }
+
+        // 5. Stock kernel fallback (drivers as modules)
         let path = self.build_stock_kernel().await?;
         let info = KernelInfo {
             path,
             drivers_builtin: false,
         };
         self.store_kernel_cache(info.clone());
-        tracing::info!(kernel = %info.path.display(), "stock kernel cached (drivers =m)");
+        tracing::info!(
+            kernel = %info.path.display(),
+            source = "stock",
+            "stock kernel cached (drivers =m)"
+        );
         Ok(info)
     }
 
-    async fn build_microvm_kernel(&self) -> anyhow::Result<PathBuf> {
-        let microvm_nix = {
-            // Prefer compile-time path from ctrl crate.
-            let compile_time = PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../nix/microvm-kernel.nix"
-            ));
-            if compile_time.exists() {
-                compile_time
-            } else if let Ok(env_path) = std::env::var("RUSSEL_MICROVM_KERNEL_NIX") {
-                let p = PathBuf::from(&env_path);
-                if !p.exists() {
-                    anyhow::bail!("RUSSEL_MICROVM_KERNEL_NIX={env_path} does not exist");
-                }
-                p
-            } else {
-                PathBuf::from("nix/microvm-kernel.nix")
-            }
-        };
-        if !microvm_nix.exists() {
-            anyhow::bail!("nix/microvm-kernel.nix not found at {}", microvm_nix.display());
+    /// Find the repo root by looking for flake.nix upward from
+    /// CARGO_MANIFEST_DIR (compile-time) or cwd (runtime).
+    fn find_repo_root(&self) -> Option<PathBuf> {
+        // Compile-time: CARGO_MANIFEST_DIR is crates/ctrl → ../../ is repo root
+        let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if compile_time.join("flake.nix").exists() {
+            return Some(std::fs::canonicalize(&compile_time).unwrap_or(compile_time));
         }
-        tracing::info!("building microvm kernel from {}", microvm_nix.display());
+        // Runtime: try cwd
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join("flake.nix").exists() {
+                return Some(cwd);
+            }
+        }
+        None
+    }
+
+    async fn build_flake_kernel(&self, repo_root: &Path) -> anyhow::Result<PathBuf> {
+        tracing::info!(
+            repo = %repo_root.display(),
+            "building microvm kernel via flake"
+        );
         let output = Command::new("nix")
             .args([
                 "build",
                 "--no-link",
                 "--print-out-paths",
-                "-f",
-                &microvm_nix.display().to_string(),
+                ".#microvm-kernel",
             ])
+            .current_dir(repo_root)
             .stderr(std::process::Stdio::inherit())
             .output()
             .await?;
 
         if !output.status.success() {
-            anyhow::bail!("nix build -f nix/microvm-kernel.nix failed");
+            anyhow::bail!("nix build .#microvm-kernel failed");
         }
 
         let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();

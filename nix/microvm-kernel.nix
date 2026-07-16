@@ -5,13 +5,16 @@
 # This expression overrides the kernel config to build the critical
 # virtio/networking/filesystem drivers directly into the kernel (=y).
 #
-# Build with:  nix-build nix/microvm-kernel.nix
-# Result:      ./result/bzImage
+# Build: nix build .#microvm-kernel
+# Result: ./result/bzImage  (and $out/bzImage in store)
+# Legacy: nix-build -E 'with import <nixpkgs> {}; callPackage ./nix/microvm-kernel.nix {}'
 
-let
-  pkgs = import <nixpkgs> {};
-  lib  = pkgs.lib;
-in
+{
+  pkgs,
+  lib ? pkgs.lib,
+}:
+
+
 (pkgs.linuxPackages_latest.kernel.override {
   structuredExtraConfig = with lib.kernel; {
     # ── Virtio transport (must be built-in for PCI device discovery) ───
@@ -53,14 +56,14 @@ in
     BLK_DEV_INITRD    = yes;
 
     # ── Disable unnecessary subsystems for faster build + smaller image
-    SOUND             = no;
-    DRM               = no;
+    SOUND             = lib.mkForce no;
+    DRM               = lib.mkForce no;
     USB_SUPPORT       = lib.mkForce no;
     WLAN              = lib.mkForce no;
     BLUETOOTH         = lib.mkForce no;
-    INPUT_JOYSTICK    = no;
-    INPUT_TABLET      = no;
-    INPUT_TOUCHSCREEN = no;
+    INPUT_JOYSTICK    = lib.mkForce no;
+    INPUT_TABLET      = lib.mkForce no;
+    INPUT_TOUCHSCREEN = lib.mkForce no;
     WIRELESS          = lib.mkForce no;
     NFC               = lib.mkForce no;
     MEDIA_SUPPORT     = lib.mkForce no;
