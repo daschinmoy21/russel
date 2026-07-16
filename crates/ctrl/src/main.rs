@@ -60,9 +60,14 @@ async fn main() -> Result<()> {
         "russel control plane listening on {}",
         listener.local_addr()?
     );
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+
+    // Wait for in-flight deploy tasks to complete before detaching.
+    // Deploy tasks may still be creating VMs; if we detach now, they'd
+    // register handles after detach and get SIGKILLed on drop.
+    state.wait_for_deploys().await;
 
     // Workload teardown is an explicit admin action (`russel destroy` /
     // DELETE /vm/{id}). Controller restart must not take the fleet down.
@@ -73,6 +78,7 @@ async fn main() -> Result<()> {
          (use `russel vms` / `russel destroy <id>` to manage them)"
     );
 
+    serve_result?;
     Ok(())
 }
 

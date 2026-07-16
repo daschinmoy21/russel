@@ -1,11 +1,15 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
 use russel_core::api::{LogsResponse, StatusResponse};
 use tokio::process::Child;
+use tokio::sync::Notify;
 
 /// Outcome of attempting to claim a service for a lifecycle operation.
 pub enum LifecycleClaim {
@@ -20,6 +24,26 @@ pub enum LifecycleClaim {
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<Mutex<StateInner>>,
+    deploy_count: Arc<AtomicUsize>,
+    deploy_notify: Arc<Notify>,
+}
+
+/// Guard that decrements the in-flight deploy counter on drop.
+///
+/// Move into a spawned deploy task so the counter is decremented when the
+/// task completes (success, error, or panic). If the spawn itself fails,
+/// the guard drops in the caller, still decrementing correctly.
+pub struct DeployGuard {
+    state: AppState,
+}
+
+impl Drop for DeployGuard {
+    fn drop(&mut self) {
+        let prev = self.state.deploy_count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.state.deploy_notify.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +91,8 @@ impl Default for AppState {
             inner: Arc::new(Mutex::new(StateInner {
                 services: HashMap::new(),
             })),
+            deploy_count: Arc::new(AtomicUsize::new(0)),
+            deploy_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -329,6 +355,33 @@ impl AppState {
     #[allow(dead_code)]
     pub fn is_healthy(&self) -> bool {
         self.inner.try_lock().is_ok()
+    }
+
+    /// Increment the in-flight deploy counter and return a guard.
+    ///
+    /// The guard must be moved into the spawned deploy task so the counter
+    /// is decremented when the task completes. Call this BEFORE spawning to
+    /// ensure the counter is accurate even if the spawn is slow.
+    pub fn begin_deploy(&self) -> DeployGuard {
+        self.deploy_count.fetch_add(1, Ordering::SeqCst);
+        DeployGuard {
+            state: self.clone(),
+        }
+    }
+
+    /// Wait until all in-flight deploy tasks have completed.
+    ///
+    /// Called during shutdown after `axum::serve` returns, to ensure no
+    /// deploy task is still creating VMs when we detach processes.
+    pub async fn wait_for_deploys(&self) {
+        loop {
+            let notified = self.deploy_notify.notified();
+            tokio::pin!(notified);
+            if self.deploy_count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.as_mut().await;
+        }
     }
 }
 
