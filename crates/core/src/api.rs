@@ -1,11 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+use crate::config::RuntimeKind;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeployRequest {
     pub repo_url: String,
     pub config_path: String,
     pub vm_id: Option<String>,
     pub port: Option<PortMapping>,
+    #[serde(default)]
+    pub runtime: Option<RuntimeKind>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,6 +27,8 @@ pub struct DeployResponse {
     pub timing: Option<DeployTiming>,
     /// Direct VM IP for diagnostics (e.g. `curl 10.0.x.2:3000`).
     pub vm_ip: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<RuntimeKind>,
 }
 
 /// Millisecond breakdown of each deploy phase, included in every successful response.
@@ -111,6 +117,7 @@ mod tests {
                 message: "ok".into(),
                 timing: None,
                 vm_ip: Some("10.0.5.2".into()),
+                runtime: Some(RuntimeKind::Microvm),
             })),
             DeployEvent::Error("build failed".into()),
         ];
@@ -131,10 +138,32 @@ mod tests {
                 host: 8080,
                 guest: 3000,
             }),
+            runtime: Some(RuntimeKind::Container),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("my-id"));
         assert!(json.contains("8080"));
+        assert!(json.contains("\"runtime\":\"container\""));
+    }
+
+    #[test]
+    fn deploy_request_deserializes_without_runtime() {
+        let json = r#"{"repo_url":"https://example.com/repo.git","config_path":"Russelfile.toml"}"#;
+        let req: DeployRequest = serde_json::from_str(json).unwrap();
+        assert!(req.runtime.is_none());
+    }
+
+    #[test]
+    fn deploy_response_deserializes_without_runtime() {
+        let json = r#"{
+            "service_id":"svc",
+            "vm_id":"vm1",
+            "status":"deployed",
+            "elapsed_ms":100,
+            "message":"ok"
+        }"#;
+        let resp: DeployResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.runtime.is_none());
     }
 
     #[test]

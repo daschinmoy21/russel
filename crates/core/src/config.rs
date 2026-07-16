@@ -1,6 +1,6 @@
-use std::{fs, path::Path};
+use std::{fmt, fs, path::Path, str::FromStr};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +36,54 @@ impl Russelfile {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeKind {
+    #[default]
+    Microvm,
+    Container,
+}
+
+impl fmt::Display for RuntimeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Microvm => write!(f, "microvm"),
+            Self::Container => write!(f, "container"),
+        }
+    }
+}
+
+impl FromStr for RuntimeKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "microvm" => Ok(Self::Microvm),
+            "container" => Ok(Self::Container),
+            other => anyhow::bail!(
+                "unknown runtime {other:?}, expected \"microvm\" or \"container\""
+            ),
+        }
+    }
+}
+
+/// Resolve effective runtime: Russelfile `service.type` is source of truth.
+/// CLI `--runtime` must match when provided; otherwise the file value is used.
+pub fn resolve_runtime(
+    file: RuntimeKind,
+    cli: Option<RuntimeKind>,
+) -> anyhow::Result<RuntimeKind> {
+    match cli {
+        None => Ok(file),
+        Some(cli_kind) if cli_kind == file => Ok(file),
+        Some(cli_kind) => anyhow::bail!(
+            "CLI --runtime {cli_kind} does not match Russelfile service.type ({file})"
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
@@ -43,6 +91,9 @@ pub struct ServiceConfig {
     pub source: String,
     pub port: u16,
     pub memory: Memory,
+    /// Runtime kind (`microvm` or `container`). TOML field is `type`.
+    #[serde(default, rename = "type")]
+    pub runtime: RuntimeKind,
     /// Name of the binary produced by the build.
     /// Defaults to `name` if not specified.
     pub bin: Option<String>,
@@ -216,5 +267,67 @@ typo_field = "oops"
 "#;
         let err = toml::from_str::<Russelfile>(toml).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn runtime_defaults_to_microvm_when_omitted() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.runtime, RuntimeKind::Microvm);
+    }
+
+    #[test]
+    fn runtime_parses_container() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+type = "container"
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.runtime, RuntimeKind::Container);
+    }
+
+    #[test]
+    fn runtime_rejects_unknown_value() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+type = "kubernetes"
+"#;
+        let err = toml::from_str::<Russelfile>(toml).unwrap_err();
+        assert!(err.to_string().contains("kubernetes"));
+    }
+
+    #[test]
+    fn resolve_runtime_match_ok() {
+        let resolved =
+            resolve_runtime(RuntimeKind::Container, Some(RuntimeKind::Container)).unwrap();
+        assert_eq!(resolved, RuntimeKind::Container);
+    }
+
+    #[test]
+    fn resolve_runtime_mismatch_errors() {
+        let err = resolve_runtime(RuntimeKind::Microvm, Some(RuntimeKind::Container)).unwrap_err();
+        assert!(err.to_string().contains("does not match"));
+        assert!(err.to_string().contains("container"));
+        assert!(err.to_string().contains("microvm"));
+    }
+
+    #[test]
+    fn resolve_runtime_cli_omitted_uses_file() {
+        let resolved = resolve_runtime(RuntimeKind::Container, None).unwrap();
+        assert_eq!(resolved, RuntimeKind::Container);
     }
 }
