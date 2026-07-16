@@ -10,6 +10,9 @@ pub struct DeployRequest {
     pub port: Option<PortMapping>,
     #[serde(default)]
     pub runtime: Option<RuntimeKind>,
+    /// Extra `podman run` arguments (container runtime only).
+    #[serde(default)]
+    pub podman_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -155,11 +158,39 @@ mod tests {
                 guest: 3000,
             }),
             runtime: Some(RuntimeKind::Container),
+            podman_args: vec!["-v".into(), "/data:/data:ro".into()],
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("my-id"));
         assert!(json.contains("8080"));
         assert!(json.contains("\"runtime\":\"container\""));
+        assert!(json.contains("\"podman_args\""));
+        assert!(json.contains("/data:/data:ro"));
+    }
+
+    #[test]
+    fn deploy_request_deserializes_podman_args_default_empty() {
+        let json = r#"{"repo_url":"https://example.com/repo.git","config_path":"Russelfile.toml"}"#;
+        let req: DeployRequest = serde_json::from_str(json).unwrap();
+        assert!(req.podman_args.is_empty());
+    }
+
+    #[test]
+    fn deploy_request_podman_args_roundtrip() {
+        let req = DeployRequest {
+            repo_url: "https://example.com/repo.git".into(),
+            config_path: "Russelfile.toml".into(),
+            vm_id: None,
+            port: None,
+            runtime: Some(RuntimeKind::Container),
+            podman_args: vec![
+                "--mount".into(),
+                "type=bind,source=/tmp/x,destination=/data".into(),
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DeployRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.podman_args, req.podman_args);
     }
 
     #[test]

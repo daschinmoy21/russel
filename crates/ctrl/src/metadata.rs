@@ -125,6 +125,7 @@ pub fn build_container_metadata(
     rootfs_path: &str,
     mem_mb: u16,
     bin_name: Option<&str>,
+    podman_args: &[String],
 ) -> serde_json::Value {
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -141,6 +142,9 @@ pub fn build_container_metadata(
     });
     if let Some(name) = bin_name {
         meta["bin_name"] = serde_json::json!(name);
+    }
+    if !podman_args.is_empty() {
+        meta["podman_args"] = serde_json::json!(podman_args);
     }
     meta
 }
@@ -225,6 +229,7 @@ mod tests {
             "/var/lib/russel/api/rootfs",
             512,
             Some("myapp"),
+            &[],
         );
         assert_eq!(container["schema_version"], SCHEMA_VERSION);
         assert_eq!(container["runtime"], "container");
@@ -262,6 +267,43 @@ mod tests {
     }
 
     #[test]
+    fn container_metadata_includes_podman_args_when_non_empty() {
+        let meta = build_container_metadata(
+            "api",
+            3100,
+            3000,
+            "/nix/store/app",
+            "abc",
+            "russel-api",
+            "/var/lib/russel/api/rootfs",
+            512,
+            None,
+            &["-v".into(), "/data:/data:ro".into()],
+        );
+        assert_eq!(
+            meta["podman_args"],
+            serde_json::json!(["-v", "/data:/data:ro"])
+        );
+    }
+
+    #[test]
+    fn container_metadata_omits_podman_args_when_empty() {
+        let meta = build_container_metadata(
+            "api",
+            3100,
+            3000,
+            "/nix/store/app",
+            "abc",
+            "russel-api",
+            "/var/lib/russel/api/rootfs",
+            512,
+            None,
+            &[],
+        );
+        assert!(meta.get("podman_args").is_none());
+    }
+
+    #[test]
     fn load_metadata_parses_container_fields() {
         let json = serde_json::to_string(&build_container_metadata(
             "api",
@@ -273,6 +315,7 @@ mod tests {
             "/var/lib/russel/api/rootfs",
             512,
             None,
+            &[],
         ))
         .unwrap();
         assert_eq!(prior_runtime_from_metadata(&json), RuntimeKind::Container);

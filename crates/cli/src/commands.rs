@@ -57,6 +57,17 @@ pub struct DeployArgs {
     /// Runtime kind (`microvm` or `container`). Must match Russelfile `service.type` for local repos.
     #[arg(long, value_name = "RUNTIME")]
     pub runtime: Option<String>,
+
+    /// Extra `podman run` arguments (container runtime only). Use `--` before flags if needed.
+    #[arg(
+        long_help = "Extra arguments forwarded to `podman run` when using container runtime. \
+                     Russel sets detach, name, rootfs, port publish, memory, and entrypoint. \
+                     Use `--` before flags if needed (e.g. `-- -v /data:/data:ro`).",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 0..
+    )]
+    pub podman_args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -87,6 +98,19 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     let wall = Instant::now();
     let repo_url = normalize_repo_arg(&args.repo)?;
     let runtime = resolve_deploy_runtime(&args.repo, &args.config, args.runtime.as_deref())?;
+    match runtime {
+        Some(RuntimeKind::Microvm) if !args.podman_args.is_empty() => {
+            anyhow::bail!(
+                "podman passthrough args require container runtime (effective runtime is microvm)"
+            );
+        }
+        None if !args.podman_args.is_empty() => {
+            anyhow::bail!(
+                "podman passthrough args require --runtime container (or a local Russelfile with type = \"container\")"
+            );
+        }
+        _ => {}
+    }
     let port = args.port.as_deref().map(parse_port_mapping).transpose()?;
 
     // ── Pre-flight banner ──────────────────────────────────────────────────
@@ -111,6 +135,9 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     if let Some(runtime) = runtime {
         step("runtime", &runtime.to_string(), "");
     }
+    if !args.podman_args.is_empty() {
+        step("podman-args", &args.podman_args.join(" "), "");
+    }
     println!();
 
     // ── Send deploy request ────────────────────────────────────────────────
@@ -124,6 +151,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             vm_id: args.vm_id,
             port,
             runtime,
+            podman_args: args.podman_args,
         })
         .send()
         .await?
@@ -447,6 +475,7 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn parse_port_mapping_valid() {
@@ -515,5 +544,50 @@ mod tests {
         assert_eq!(ms(1000), "1.0s");
         assert_eq!(ms(999), "999ms");
         assert_eq!(ms(0), "0ms");
+    }
+
+    #[test]
+    fn deploy_parses_trailing_podman_args_after_double_dash() {
+        let cli = Cli::try_parse_from([
+            "russel",
+            "deploy",
+            ".",
+            "--runtime",
+            "container",
+            "--",
+            "-v",
+            "/a:/b",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Deploy(args) => {
+                assert_eq!(args.podman_args, vec!["-v", "/a:/b"]);
+            }
+            _ => panic!("expected deploy subcommand"),
+        }
+    }
+
+    #[test]
+    fn deploy_parses_mount_style_podman_args() {
+        let cli = Cli::try_parse_from([
+            "russel",
+            "deploy",
+            ".",
+            "--runtime",
+            "container",
+            "--",
+            "--mount",
+            "type=bind,source=/tmp/x,destination=/data",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Deploy(args) => {
+                assert_eq!(
+                    args.podman_args,
+                    vec!["--mount", "type=bind,source=/tmp/x,destination=/data"]
+                );
+            }
+            _ => panic!("expected deploy subcommand"),
+        }
     }
 }

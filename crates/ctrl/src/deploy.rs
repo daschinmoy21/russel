@@ -13,6 +13,7 @@ use crate::{
     build::NixBuilder,
     container::{
         ContainerRunner, ContainerStartSpec, RootfsSpec, default_base_dir,
+        validate_podman_args_for_runtime,
     },
     database::DatabaseProvisioner,
     git::GitClient,
@@ -230,6 +231,7 @@ impl DeployPipeline {
         let config_path = repo_path.join(PathBuf::from(&request.config_path));
         let config = Russelfile::load(&config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
+        validate_podman_args_for_runtime(runtime, &request.podman_args)?;
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
             service_id,
@@ -367,6 +369,7 @@ impl DeployPipeline {
                         &config,
                         &build.store_path,
                         &port,
+                        &request.podman_args,
                         &tx,
                     )
                     .await
@@ -603,6 +606,7 @@ impl DeployPipeline {
         config: &Russelfile,
         store_path: &Path,
         port: &PortMapping,
+        podman_args: &[String],
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
@@ -649,6 +653,7 @@ impl DeployPipeline {
             guest_port: port.guest,
             memory_mb: mem_mb,
             env: vec![("PORT".to_string(), port.guest.to_string())],
+            extra_args: podman_args.to_vec(),
         };
         let running = self.containers.start(&start_spec).await?;
         let start_ms = t_start.elapsed().as_millis();
@@ -666,6 +671,7 @@ impl DeployPipeline {
             &running.rootfs_path.to_string_lossy(),
             mem_mb,
             Some(&bin_name),
+            podman_args,
         );
         write_metadata(&metadata_path, &metadata)?;
 
@@ -898,5 +904,30 @@ struct DeployOutput {
     runtime: RuntimeKind,
     timing: DeployTiming,
     workload: DeployWorkload,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::container::validate_podman_args_for_runtime;
+    use russel_core::config::RuntimeKind;
+
+    #[test]
+    fn podman_args_rejected_for_microvm_runtime() {
+        let err = validate_podman_args_for_runtime(
+            RuntimeKind::Microvm,
+            &["-v".into(), "/a:/b".into()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("microvm"));
+    }
+
+    #[test]
+    fn podman_args_allowed_for_container_runtime() {
+        validate_podman_args_for_runtime(
+            RuntimeKind::Container,
+            &["--network".into(), "bridge".into()],
+        )
+        .unwrap();
+    }
 }
 

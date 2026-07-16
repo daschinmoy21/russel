@@ -74,7 +74,7 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 ## CLI Commands
 
 ```bash
-russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container]
+russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container] [-- <podman-run-args...>]
 russel status [<service_id>]
 russel logs [<service_id>]
 russel vms
@@ -115,6 +115,10 @@ type = "microvm"  # optional: "microvm" (default) or "container"
 # Container — Russelfile must have type = "container", and --runtime must match if passed
 ./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id api \
   --runtime container
+
+# Container with extra podman run flags (after --)
+./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --runtime container \
+  -- -v /data:/data:ro --network bridge
 ```
 
 Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring (planned for Traefik integration), expose a `/health` endpoint on `PORT` as a convention.

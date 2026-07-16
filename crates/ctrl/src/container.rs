@@ -379,6 +379,8 @@ pub struct ContainerStartSpec {
     pub guest_port: u16,
     pub memory_mb: u16,
     pub env: Vec<(String, String)>,
+    /// Validated extra `podman run` arguments (inserted before entrypoint).
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,6 +565,44 @@ pub fn parse_podman_rootless(info_json: &str) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("podman info missing .host.security.rootless"))
 }
 
+/// Reject podman passthrough args that Russel owns (name, detach, rootfs, etc.).
+pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
+    for arg in args {
+        if arg == "--rootfs" || arg.starts_with("--rootfs=") {
+            anyhow::bail!("podman passthrough arg reserved by Russel: --rootfs");
+        }
+        if arg == "--name" || arg.starts_with("--name=") {
+            anyhow::bail!("podman passthrough arg reserved by Russel: --name");
+        }
+        if arg == "--replace" || arg.starts_with("--replace=") {
+            anyhow::bail!("podman passthrough arg reserved by Russel: --replace");
+        }
+        if arg == "-d" || arg == "--detach" || arg.starts_with("--detach=") {
+            anyhow::bail!("podman passthrough arg reserved by Russel: detach (-d/--detach)");
+        }
+        if arg == "-n" {
+            anyhow::bail!("podman passthrough arg reserved by Russel: -n");
+        }
+    }
+    Ok(())
+}
+
+/// Ensure podman passthrough args are only used with the container runtime.
+pub fn validate_podman_args_for_runtime(
+    runtime: russel_core::config::RuntimeKind,
+    args: &[String],
+) -> anyhow::Result<()> {
+    if runtime == russel_core::config::RuntimeKind::Microvm && !args.is_empty() {
+        anyhow::bail!(
+            "podman passthrough args require container runtime (effective runtime is microvm)"
+        );
+    }
+    if !args.is_empty() {
+        validate_podman_passthrough_args(args)?;
+    }
+    Ok(())
+}
+
 /// Build `podman run` arguments for unit testing and runtime use.
 pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Result<Vec<String>> {
     crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
@@ -601,6 +641,11 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     for (key, value) in &spec.env {
         args.push("-e".to_string());
         args.push(format!("{key}={value}"));
+    }
+
+    if !spec.extra_args.is_empty() {
+        validate_podman_passthrough_args(&spec.extra_args)?;
+        args.extend(spec.extra_args.clone());
     }
 
     args.push(spec.rootfs.entrypoint.display().to_string());
@@ -818,6 +863,7 @@ mod tests {
             guest_port: 3000,
             memory_mb: 256,
             env: vec![],
+            extra_args: vec![],
         };
         let err = build_run_args(&spec, &container_log_path("evil")).unwrap_err();
         assert!(err.to_string().contains("path separators"));
@@ -835,6 +881,7 @@ mod tests {
             guest_port: 3000,
             memory_mb: 512,
             env: vec![("PORT".into(), "3000".into()), ("RUSSEL".into(), "1".into())],
+            extra_args: vec![],
         };
         let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
         let args = build_run_args(&spec, &log_path).unwrap();
@@ -890,6 +937,96 @@ mod tests {
     }
 
     #[test]
+    fn validate_podman_passthrough_rejects_reserved_flags() {
+        for arg in [
+            "--rootfs",
+            "--rootfs=/tmp",
+            "--name",
+            "--name=evil",
+            "-n",
+            "--replace",
+            "--replace=true",
+            "-d",
+            "--detach",
+            "--detach=true",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved by Russel"),
+                "expected rejection for {arg}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_podman_passthrough_accepts_common_flags() {
+        let args = vec![
+            "-v".into(),
+            "/data:/data:ro".into(),
+            "--mount".into(),
+            "type=bind,source=/tmp/x,destination=/data".into(),
+            "--network".into(),
+            "bridge".into(),
+            "--device".into(),
+            "/dev/fuse".into(),
+            "--cap-add".into(),
+            "NET_ADMIN".into(),
+            "--env".into(),
+            "FOO=bar".into(),
+        ];
+        validate_podman_passthrough_args(&args).unwrap();
+    }
+
+    #[test]
+    fn validate_podman_args_for_runtime_rejects_microvm() {
+        let err = validate_podman_args_for_runtime(
+            russel_core::config::RuntimeKind::Microvm,
+            &["-v".into(), "/a:/b".into()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("microvm"));
+    }
+
+    #[test]
+    fn validate_podman_args_for_runtime_validates_reserved_on_container() {
+        let err = validate_podman_args_for_runtime(
+            russel_core::config::RuntimeKind::Container,
+            &["--rootfs".into(), "/tmp".into()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--rootfs"));
+    }
+
+    #[test]
+    fn build_run_args_inserts_passthrough_before_entrypoint() {
+        let spec = ContainerStartSpec {
+            service_id: "api-1".into(),
+            rootfs: PreparedRootfs {
+                rootfs_path: PathBuf::from("/var/lib/russel/api-1/rootfs"),
+                entrypoint: PathBuf::from("/bin/api"),
+            },
+            host_port: 8080,
+            guest_port: 3000,
+            memory_mb: 512,
+            env: vec![("PORT".into(), "3000".into())],
+            extra_args: vec![
+                "-v".into(),
+                "/data:/data:ro".into(),
+                "--network".into(),
+                "bridge".into(),
+            ],
+        };
+        let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
+        let args = build_run_args(&spec, &log_path).unwrap();
+        let entry_idx = args.iter().position(|a| a == "/bin/api").unwrap();
+        let vol_idx = args.iter().position(|a| a == "-v").unwrap();
+        let network_idx = args.iter().position(|a| a == "--network").unwrap();
+        assert!(vol_idx < entry_idx);
+        assert!(network_idx < entry_idx);
+        assert_eq!(args.last().unwrap(), "/bin/api");
+    }
+
+    #[test]
     fn container_log_path_is_under_service_base_dir() {
         assert_eq!(
             container_log_path("demo"),
@@ -930,6 +1067,7 @@ mod tests {
             guest_port: 8080,
             memory_mb: 128,
             env: vec![("PORT".into(), "8080".into())],
+            extra_args: vec![],
         };
 
         let running = runner.start(&start_spec).await.unwrap();
