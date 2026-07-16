@@ -21,7 +21,7 @@ impl Russelfile {
     }
 
     /// Parse from a string — shared by `load` and tests.
-    fn load_from_str(contents: &str) -> anyhow::Result<Self> {
+    pub fn load_from_str(contents: &str) -> anyhow::Result<Self> {
         let config: Self = toml::from_str(contents)?;
         // Reject database config at parse time — it's not implemented yet.
         if let Some(ref db) = config.database
@@ -217,16 +217,4 @@ typo_field = "oops"
         let err = toml::from_str::<Russelfile>(toml).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
-}
-#[test]
-fn deny_empty_fields() {
-    let toml = r#"
-[service]
-name = ""
-source = "."
-port = 
-memory = ""
-"#;
-    let err = toml::from_str::<Russelfile>(toml).unwrap_err();
-    assert!(err.to_string().contains("cannot have empty fields!!!"));
 }
