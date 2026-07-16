@@ -185,7 +185,10 @@ impl DeployPipeline {
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
         let config_path = resolve_config_path(&repo_path, &request.config_path)?;
-        let config = Russelfile::load(&config_path)?;
+        let config = {
+            let contents = std::fs::read_to_string(&config_path)?;
+            Russelfile::load_from_str(&contents)?
+        };
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(service_id, service_name = %config.service.name, resolve_ms, "repo resolved");
 
@@ -747,6 +750,43 @@ memory = "256mb"
             .unwrap_err()
             .to_string();
         assert!(err.contains("regular file"), "{err}");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn resolve_config_path_rejects_symlink_escape() {
+        let repo = TempRepo::new();
+        let outside = std::env::temp_dir().join(format!(
+            "russel-config-path-outside-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.toml");
+        std::fs::write(&outside_file, b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside_file, repo.path().join("escape.toml")).unwrap();
+        let err = resolve_config_path(repo.path(), "escape.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes repository root"), "{err}");
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_oversized() {
+        let repo = TempRepo::new();
+        let path = repo.path().join("huge.toml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"[service]\n").unwrap();
+            // pad to exceed MAX_CONFIG_BYTES
+            let pad = vec![b'#'; MAX_CONFIG_BYTES as usize + 1];
+            f.write_all(&pad).unwrap();
+        }
+        let err = resolve_config_path(repo.path(), "huge.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds maximum size"), "{err}");
     }
 }
 
