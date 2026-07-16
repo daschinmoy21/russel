@@ -6,10 +6,12 @@
 mod api;
 mod build;
 mod ch_api;
+mod container;
 mod database;
 mod deploy;
 mod git;
 mod health;
+mod metadata;
 mod microvm;
 mod network;
 mod state;

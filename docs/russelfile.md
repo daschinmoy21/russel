@@ -330,6 +330,9 @@ source = "."
 port = 3000
 memory = "256mb"
 bin = "api"
+# Optional: "microvm" (default) or "container". Source of truth for runtime.
+# CLI --runtime must match this value if provided.
+type = "microvm"
 
 [dependencies]
 build = ["pkg-config", "openssl"]
@@ -342,8 +345,10 @@ The resulting workflow is:
 ```bash
 russel develop
 russel build
-russel deploy .
+russel deploy .                    # microVM by default
+russel deploy . --runtime container  # requires type = "container" in Russelfile
 ```
+
 
 The user does not need to run `nix develop` or `nix build` directly.
 

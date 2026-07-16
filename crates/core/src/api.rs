@@ -10,6 +10,9 @@ pub struct DeployRequest {
     pub port: Option<PortMapping>,
     #[serde(default)]
     pub runtime: Option<RuntimeKind>,
+    /// Extra `podman run` arguments (container runtime only).
+    #[serde(default)]
+    pub podman_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,6 +57,12 @@ pub struct StatusResponse {
     pub status: String,
     pub vm_state: String,
     pub uptime_seconds: u64,
+    #[serde(default)]
+    pub runtime: Option<RuntimeKind>,
+    #[serde(default)]
+    pub host_port: Option<u16>,
+    #[serde(default)]
+    pub guest_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,8 +71,18 @@ pub struct LogsResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServiceSummary {
+    pub service_id: String,
+    #[serde(default)]
+    pub runtime: Option<RuntimeKind>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VmsResponse {
     pub vms: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<ServiceSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -139,11 +158,39 @@ mod tests {
                 guest: 3000,
             }),
             runtime: Some(RuntimeKind::Container),
+            podman_args: vec!["-v".into(), "/data:/data:ro".into()],
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("my-id"));
         assert!(json.contains("8080"));
         assert!(json.contains("\"runtime\":\"container\""));
+        assert!(json.contains("\"podman_args\""));
+        assert!(json.contains("/data:/data:ro"));
+    }
+
+    #[test]
+    fn deploy_request_deserializes_podman_args_default_empty() {
+        let json = r#"{"repo_url":"https://example.com/repo.git","config_path":"Russelfile.toml"}"#;
+        let req: DeployRequest = serde_json::from_str(json).unwrap();
+        assert!(req.podman_args.is_empty());
+    }
+
+    #[test]
+    fn deploy_request_podman_args_roundtrip() {
+        let req = DeployRequest {
+            repo_url: "https://example.com/repo.git".into(),
+            config_path: "Russelfile.toml".into(),
+            vm_id: None,
+            port: None,
+            runtime: Some(RuntimeKind::Container),
+            podman_args: vec![
+                "--mount".into(),
+                "type=bind,source=/tmp/x,destination=/data".into(),
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DeployRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.podman_args, req.podman_args);
     }
 
     #[test]
@@ -173,9 +220,55 @@ mod tests {
             status: "idle".into(),
             vm_state: "none".into(),
             uptime_seconds: 0,
+            runtime: None,
+            host_port: None,
+            guest_port: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, "idle");
+        assert!(parsed.runtime.is_none());
+    }
+
+    #[test]
+    fn status_response_serializes_runtime_and_ports() {
+        let resp = StatusResponse {
+            service_id: "api".into(),
+            status: "deployed".into(),
+            vm_state: "running".into(),
+            uptime_seconds: 42,
+            runtime: Some(RuntimeKind::Container),
+            host_port: Some(3100),
+            guest_port: Some(3000),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"runtime\":\"container\""));
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.runtime, Some(RuntimeKind::Container));
+        assert_eq!(parsed.host_port, Some(3100));
+    }
+
+    #[test]
+    fn vms_response_deserializes_without_services() {
+        let json = r#"{"vms":["api","demo"]}"#;
+        let resp: VmsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.vms, vec!["api", "demo"]);
+        assert!(resp.services.is_empty());
+    }
+
+    #[test]
+    fn vms_response_serializes_service_summaries() {
+        let resp = VmsResponse {
+            vms: vec!["api".into()],
+            services: vec![ServiceSummary {
+                service_id: "api".into(),
+                runtime: Some(RuntimeKind::Microvm),
+                status: "deployed".into(),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"services\""));
+        let parsed: VmsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.services[0].runtime, Some(RuntimeKind::Microvm));
     }
 }
