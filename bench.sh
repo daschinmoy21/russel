@@ -266,6 +266,17 @@ has_ip=0
 [ -c /dev/kvm ] 2>/dev/null && has_kvm=1
 [ "$EUID" -eq 0 ] 2>/dev/null && has_root=1
 command -v nix &>/dev/null && has_nix=1
+
+# Inject flake devShell PATH so cloud-hypervisor/virtiofsd/socat are found
+# without a global install. Works under sudo when run from the repo root.
+# ponytail: one-shot inject; run `sudo nix develop -c ./bench.sh` alternative.
+if [ "$has_nix" -eq 1 ] && ! command -v cloud-hypervisor >/dev/null 2>&1; then
+	FLAKE_PATH=$(nix develop -c sh -c 'printf %s "$PATH"' 2>/dev/null || echo "")
+	if [ -n "$FLAKE_PATH" ]; then
+		export PATH="$FLAKE_PATH:$PATH"
+	fi
+fi
+
 command -v cloud-hypervisor &>/dev/null && has_ch=1
 command -v socat &>/dev/null && has_socat=1
 command -v ip &>/dev/null && has_ip=1
@@ -302,6 +313,12 @@ else
 	RUSSEL_SKIPPED=0
 	if [ "$RUSSEL_CAPABLE" -eq 1 ]; then
 		info "Russel prerequisites met (KVM ✓ root ✓ nix ✓ cloud-hypervisor ✓)"
+
+		# Prewarm the flake microvm kernel so first deploy doesn't build it.
+		if [ "$has_nix" -eq 1 ] && [ -f "flake.nix" ]; then
+			info "prewarming microvm kernel (nix build .#microvm-kernel)..."
+			nix build .#microvm-kernel --no-link || warn "kernel prewarm failed; ctrl will fall back"
+		fi
 
 		# Build release binaries if missing
 		if [ ! -f "$RELEASE_DIR/russel-ctrl" ] || [ ! -f "$RELEASE_DIR/russel-cli" ]; then
@@ -467,6 +484,19 @@ else
 				RUSSEL_CURL_MS+=("failed")
 				RUSSEL_SPAWN_MS+=("failed")
 				fail "russel: deploy failed (${err_msg})"
+				# Surface guest/ctrl diagnostics when deploy fails (JSON may truncate).
+				if [ -n "${RUSSEL_LOG:-}" ] && [ -f "$RUSSEL_LOG" ]; then
+					warn "last 60 lines of russel-ctrl log ($RUSSEL_LOG):"
+					tail -60 "$RUSSEL_LOG" 2>/dev/null | while IFS= read -r line; do info "  $line"; done || true
+				fi
+				# Prefer the most recent console.log under the redirected state dir.
+				if [ -n "${RUSSEL_STATE_DIR:-}" ]; then
+					clog=$(find "$RUSSEL_STATE_DIR" -name console.log 2>/dev/null | head -1 || true)
+					if [ -n "$clog" ] && [ -f "$clog" ]; then
+						warn "guest console tail ($clog):"
+						tail -40 "$clog" 2>/dev/null | while IFS= read -r line; do info "  $line"; done || true
+					fi
+				fi
 			fi
 			set -euo pipefail
 		else

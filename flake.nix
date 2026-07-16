@@ -33,6 +33,13 @@
         );
     in
     {
+      packages = forEachSupportedSystem (
+        { pkgs }:
+        pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          microvm-kernel = pkgs.callPackage ./nix/microvm-kernel.nix { };
+        }
+      );
+
       devShells = forEachSupportedSystem (
         { pkgs }: {
           default = pkgs.mkShell {

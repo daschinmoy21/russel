@@ -208,7 +208,7 @@ impl TapForwarder {
             if tokio::net::TcpStream::connect(&addr).await.is_ok() {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
     }
