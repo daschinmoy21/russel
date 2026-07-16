@@ -54,6 +54,12 @@ pub struct StatusResponse {
     pub status: String,
     pub vm_state: String,
     pub uptime_seconds: u64,
+    #[serde(default)]
+    pub runtime: Option<RuntimeKind>,
+    #[serde(default)]
+    pub host_port: Option<u16>,
+    #[serde(default)]
+    pub guest_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,8 +68,18 @@ pub struct LogsResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServiceSummary {
+    pub service_id: String,
+    #[serde(default)]
+    pub runtime: Option<RuntimeKind>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VmsResponse {
     pub vms: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<ServiceSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,9 +189,55 @@ mod tests {
             status: "idle".into(),
             vm_state: "none".into(),
             uptime_seconds: 0,
+            runtime: None,
+            host_port: None,
+            guest_port: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, "idle");
+        assert!(parsed.runtime.is_none());
+    }
+
+    #[test]
+    fn status_response_serializes_runtime_and_ports() {
+        let resp = StatusResponse {
+            service_id: "api".into(),
+            status: "deployed".into(),
+            vm_state: "running".into(),
+            uptime_seconds: 42,
+            runtime: Some(RuntimeKind::Container),
+            host_port: Some(3100),
+            guest_port: Some(3000),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"runtime\":\"container\""));
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.runtime, Some(RuntimeKind::Container));
+        assert_eq!(parsed.host_port, Some(3100));
+    }
+
+    #[test]
+    fn vms_response_deserializes_without_services() {
+        let json = r#"{"vms":["api","demo"]}"#;
+        let resp: VmsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.vms, vec!["api", "demo"]);
+        assert!(resp.services.is_empty());
+    }
+
+    #[test]
+    fn vms_response_serializes_service_summaries() {
+        let resp = VmsResponse {
+            vms: vec!["api".into()],
+            services: vec![ServiceSummary {
+                service_id: "api".into(),
+                runtime: Some(RuntimeKind::Microvm),
+                status: "deployed".into(),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"services\""));
+        let parsed: VmsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.services[0].runtime, Some(RuntimeKind::Microvm));
     }
 }

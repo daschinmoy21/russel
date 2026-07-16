@@ -366,6 +366,15 @@ pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
     println!("status={}", r.status);
     println!("vm_state={}", r.vm_state);
     println!("uptime_seconds={}", r.uptime_seconds);
+    if let Some(runtime) = r.runtime {
+        println!("runtime={runtime}");
+    }
+    if let Some(host_port) = r.host_port {
+        println!("host_port={host_port}");
+    }
+    if let Some(guest_port) = r.guest_port {
+        println!("guest_port={guest_port}");
+    }
     Ok(())
 }
 
@@ -390,10 +399,22 @@ pub async fn vms(control_plane: &str) -> Result<()> {
         .json::<VmsResponse>()
         .await?;
     if r.vms.is_empty() {
-        println!("no microVMs registered");
+        println!("no services registered");
+        return Ok(());
+    }
+
+    if !r.services.is_empty() {
+        for svc in &r.services {
+            let runtime = svc
+                .runtime
+                .as_ref()
+                .map(|r| format!("{r}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("{} runtime={runtime} status={}", svc.service_id, svc.status);
+        }
     } else {
         for vm in r.vms {
-            println!("{}", vm);
+            println!("{vm}");
         }
     }
     Ok(())

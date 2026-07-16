@@ -16,11 +16,14 @@ use crate::{
     },
     database::DatabaseProvisioner,
     git::GitClient,
+    metadata::{build_container_metadata, build_microvm_metadata, write_metadata},
     microvm::{BootOutput, MicrovmRunner},
     network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
     state::AppState,
     traefik::TraefikClient,
 };
+
+pub use crate::metadata::prior_runtime_from_disk;
 
 #[derive(Debug)]
 pub struct DeployPipeline {
@@ -532,19 +535,20 @@ impl DeployPipeline {
             .await?;
 
         let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
-        let metadata = serde_json::json!({
-            "service_id": service_id,
-            "runtime": "microvm",
-            "host_port": port.host,
-            "guest_port": port.guest,
-            "vm_ip": alloc.vm_ip,
-            "vm_pid": vm_child.id(),
-            "virtiofsd_pid": virtiofsd_child.id(),
-            "socat_pid": socat_child.id(),
-            "kernel_path": kernel.to_string_lossy(),
-            "store_path": store_path.to_string_lossy(),
-            "mem_mb": mem_mb,
-        });
+        let metadata = build_microvm_metadata(
+            service_id,
+            port.host,
+            port.guest,
+            &alloc.vm_ip,
+            vm_child.id(),
+            virtiofsd_child.id(),
+            socat_child.id(),
+            &kernel.to_string_lossy(),
+            &store_path.to_string_lossy(),
+            mem_mb,
+            Some(&bin_name),
+            Some(&initramfs_path.to_string_lossy()),
+        );
         write_metadata(&metadata_path, &metadata)?;
 
         let microvms_marker = format!("/var/lib/microvms/{}", service_id);
@@ -622,7 +626,7 @@ impl DeployPipeline {
         let rootfs_spec = RootfsSpec {
             service_id: service_id.to_string(),
             store_path: store_path.to_path_buf(),
-            bin_name,
+            bin_name: bin_name.clone(),
             base_dir: base_dir.clone(),
             bash_store: None,
             curl_store: None,
@@ -652,18 +656,18 @@ impl DeployPipeline {
         tracing::info!(service_id, start_ms, "container started");
 
         let metadata_path = base_dir.join("metadata.json");
-        let metadata = serde_json::json!({
-            "service_id": service_id,
-            "runtime": "container",
-            "host_port": port.host,
-            "guest_port": port.guest,
-            "store_path": store_path.to_string_lossy(),
-            "container_id": running.container_id,
-            "container_name": running.container_name,
-            "rootfs_path": running.rootfs_path.to_string_lossy(),
-            "mem_mb": mem_mb,
-        });
-        write_metadata(&metadata_path.display().to_string(), &metadata)?;
+        let metadata = build_container_metadata(
+            service_id,
+            port.host,
+            port.guest,
+            &store_path.to_string_lossy(),
+            &running.container_id,
+            &running.container_name,
+            &running.rootfs_path.to_string_lossy(),
+            mem_mb,
+            Some(&bin_name),
+        );
+        write_metadata(&metadata_path, &metadata)?;
 
         let t = Instant::now();
         let _ = tx
@@ -698,28 +702,6 @@ impl DeployPipeline {
             ready_ms,
         ))
     }
-}
-
-/// Parse `runtime` from on-disk metadata JSON; legacy entries without the field
-/// default to microVM.
-pub fn prior_runtime_from_metadata(content: &str) -> RuntimeKind {
-    let value: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return RuntimeKind::Microvm,
-    };
-    value
-        .get("runtime")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(RuntimeKind::Microvm)
-}
-
-pub fn prior_runtime_from_disk(service_id: &str) -> RuntimeKind {
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return RuntimeKind::Microvm;
-    };
-    prior_runtime_from_metadata(&content)
 }
 
 async fn destroy_prior_runtime(
@@ -822,34 +804,27 @@ async fn attempt_microvm_rollback(
         vec![old_socat, old_boot.virtiofsd_child],
     );
 
-    let new_metadata = serde_json::json!({
-        "service_id": service_id,
-        "runtime": "microvm",
-        "host_port": old_host_port,
-        "guest_port": old_guest_port,
-        "vm_ip": old_meta["vm_ip"],
-        "vm_pid": old_vm_pid,
-        "virtiofsd_pid": old_virtiofsd_pid,
-        "socat_pid": old_socat_pid,
-        "kernel_path": old_kernel_path.to_string_lossy(),
-        "mem_mb": old_mem_mb,
-    });
-    if let Ok(c) = serde_json::to_string_pretty(&new_metadata) {
-        let _ = std::fs::write(old_metadata_path, c);
-    }
+    let vm_ip = old_meta["vm_ip"].as_str().unwrap_or("10.0.0.2");
+    let store_path = old_meta["store_path"]
+        .as_str()
+        .unwrap_or("/nix/store/unknown");
+    let bin_name = old_meta["bin_name"].as_str();
+    let new_metadata = build_microvm_metadata(
+        service_id,
+        old_host_port,
+        old_guest_port,
+        vm_ip,
+        old_vm_pid,
+        old_virtiofsd_pid,
+        old_socat_pid,
+        &old_kernel_path.to_string_lossy(),
+        store_path,
+        old_mem_mb,
+        bin_name,
+        Some(&old_initramfs_path.to_string_lossy()),
+    );
+    let _ = write_metadata(&old_metadata_path, &new_metadata);
     Ok(())
-}
-
-fn write_metadata(path: &str, metadata: &serde_json::Value) -> anyhow::Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!("failed to create metadata parent {}: {}", parent.display(), e)
-        })?;
-    }
-    let content = serde_json::to_string_pretty(metadata)
-        .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-    std::fs::write(path, content)
-        .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", path, e))
 }
 
 fn shared_runner() -> MicrovmRunner {
@@ -925,30 +900,3 @@ struct DeployOutput {
     workload: DeployWorkload,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prior_runtime_defaults_to_microvm_when_missing() {
-        let json = r#"{"service_id":"api","host_port":3100}"#;
-        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Microvm);
-    }
-
-    #[test]
-    fn prior_runtime_reads_container_field() {
-        let json = r#"{"runtime":"container","service_id":"api"}"#;
-        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Container);
-    }
-
-    #[test]
-    fn prior_runtime_reads_microvm_field() {
-        let json = r#"{"runtime":"microvm","service_id":"api"}"#;
-        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Microvm);
-    }
-
-    #[test]
-    fn prior_runtime_invalid_json_defaults_microvm() {
-        assert_eq!(prior_runtime_from_metadata("not json"), RuntimeKind::Microvm);
-    }
-}

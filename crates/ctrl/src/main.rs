@@ -10,6 +10,7 @@ mod database;
 mod deploy;
 mod git;
 mod health;
+mod metadata;
 mod microvm;
 mod network;
 mod state;
@@ -169,7 +170,7 @@ async fn cleanup_stale_resources() {
         .output()
         .await
     {
-        Ok(out) => {
+        Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 if line.contains("vm-")
@@ -185,6 +186,13 @@ async fn cleanup_stale_resources() {
                     }
                 }
             }
+        }
+        Ok(out) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "ip link show failed with status {}",
+                out.status,
+            );
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to list network interfaces during cleanup");
