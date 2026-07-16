@@ -5,6 +5,7 @@
 
 mod api;
 mod build;
+mod container;
 mod database;
 mod deploy;
 mod git;
