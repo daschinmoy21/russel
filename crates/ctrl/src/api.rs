@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 use crate::{
     container::{ContainerRunner, container_log_path},
     deploy::DeployPipeline,
-    metadata::{prior_runtime_from_disk, resolve_lifecycle_runtime},
+    metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     state::{AppState, LifecycleClaim},
@@ -298,6 +298,13 @@ async fn discover_podman_containers(
             && seen.insert(service_id.to_string())
         {
             state.ensure_service(service_id);
+            if let Some(meta) = load_metadata_from_disk(service_id) {
+                if let Some(host_port) = meta.host_port {
+                    if let Err(e) = PortAllocator::claim_existing(service_id, host_port) {
+                        tracing::warn!(service_id = %service_id, host_port, error = %e, "failed to claim existing container port");
+                    }
+                }
+            }
             vms.push(service_id.to_string());
         }
     }

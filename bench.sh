@@ -124,6 +124,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Podman identity helper (Issue #278598) ────────────────────────────────────
+# When root via sudo, check SUDO_USER's rootless podman (not root's rootful).
+podman_as_deploy_user() {
+	if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+		local uid home
+		uid=$(id -u "$SUDO_USER" 2>/dev/null) || return 1
+		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+		[ -n "$home" ] || home="/home/$SUDO_USER"
+		# XDG_RUNTIME_DIR required for rootless
+		sudo -u "$SUDO_USER" -H env \
+			"HOME=$home" \
+			"XDG_RUNTIME_DIR=/run/user/$uid" \
+			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+			podman "$@"
+	else
+		podman "$@"
+	fi
+}
+
 # ponytail: results arrays — indexed by example order
 declare -a EXAMPLES=()
 declare -a RUSSEL_MICROVM_DEPLOY_MS=()
@@ -154,12 +173,22 @@ fi
 
 # Rootless Podman is required for Russel containers (not docker, not rootful).
 HAS_ROOTLESS_PODMAN=0
+RUSSEL_PODMAN_USER=""
 if command -v podman &>/dev/null; then
-	if podman info --format json 2>/dev/null | grep -q '"rootless"[[:space:]]*:[[:space:]]*true'; then
+	rootless_val=$(podman_as_deploy_user info --format '{{.Host.Security.Rootless}}' 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+	if [ "$rootless_val" = "true" ]; then
 		HAS_ROOTLESS_PODMAN=1
-		pass "rootless podman: yes (Russel containers)"
+		if [ "${EUID:-0}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+			RUSSEL_PODMAN_USER="$SUDO_USER"
+			pass "rootless podman: yes (user=$RUSSEL_PODMAN_USER; Russel containers)"
+		else
+			pass "rootless podman: yes (Russel containers)"
+		fi
 	else
 		warn "podman present but not rootless — Russel container path will be skipped"
+		if [ "${EUID:-0}" -eq 0 ]; then
+			info "hint: root's podman is rootful; run via sudo from a user with rootless podman (SUDO_USER) or without sudo if only testing containers"
+		fi
 	fi
 else
 	warn "podman missing — Russel container path will be skipped"
@@ -442,10 +471,17 @@ else
 
 		export PATH="$RELEASE_DIR:$PATH"
 
+		# Pass podman user identity to russel-ctrl (Issue #278598)
+		export RUSSEL_PODMAN_USER
+
 		RUSSEL_STATE_DIR=$(mktemp -d /tmp/russel-bench-XXXXXX)
 		export RUSSEL_CTRL_ADDR="127.0.0.1:7878"
 
 		mkdir -p "$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
+		# mktemp is 0700 root-owned; rootless podman (SUDO_USER) must traverse
+		# /var/lib/russel → this tree to faccessat the prepared rootfs.
+		chmod 755 "$RUSSEL_STATE_DIR" "$RUSSEL_STATE_DIR/lib" \
+			"$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
 		# ponytail: redirect /var/lib/{russel,microvms} to temp dir (requires root)
 		VAR_LIB_REDIRECTED=1
 		if [ -e /var/lib/russel ] || [ -L /var/lib/russel ]; then
@@ -453,13 +489,13 @@ else
 			rm -f "$RUSSEL_STATE_BAK"
 			mv /var/lib/russel "$RUSSEL_STATE_BAK"
 		fi
-		ln -s "$RUSSEL_STATE_DIR/lib/russel" /var/lib/russel
+		ln -sfn "$RUSSEL_STATE_DIR/lib/russel" /var/lib/russel
 		if [ -e /var/lib/microvms ] || [ -L /var/lib/microvms ]; then
 			MICROVMS_STATE_BAK=$(mktemp /tmp/russel-var-lib-bak-XXXXXX)
 			rm -f "$MICROVMS_STATE_BAK"
 			mv /var/lib/microvms "$MICROVMS_STATE_BAK"
 		fi
-		ln -s "$RUSSEL_STATE_DIR/lib/microvms" /var/lib/microvms
+		ln -sfn "$RUSSEL_STATE_DIR/lib/microvms" /var/lib/microvms
 
 		info "starting russel-ctrl (pid in background)..."
 		RUSSEL_LOG=$(mktemp /tmp/russel-ctrl-log-XXXXXX)
@@ -659,12 +695,18 @@ else
 							if [ "${RUSSEL_MICROVM_DEPLOY_MS[-1]}" != "skipped" ] && [ "${RUSSEL_MICROVM_DEPLOY_MS[-1]}" != "failed" ] &&
 								[ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "timeout" ] && [ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "failed" ]; then
 								t=$((RUSSEL_MICROVM_DEPLOY_MS[-1] + RUSSEL_MICROVM_CURL_MS[-1]))
-								if [ "$t" -lt "$best_ms" ]; then best_ms=$t; best_name="Russel-mVM"; fi
+								if [ "$t" -lt "$best_ms" ]; then
+									best_ms=$t
+									best_name="Russel-mVM"
+								fi
 							fi
 							if [ "${RUSSEL_CONTAINER_DEPLOY_MS[-1]}" != "skipped" ] && [ "${RUSSEL_CONTAINER_DEPLOY_MS[-1]}" != "failed" ] &&
 								[ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "timeout" ] && [ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "failed" ]; then
 								t=$((RUSSEL_CONTAINER_DEPLOY_MS[-1] + RUSSEL_CONTAINER_CURL_MS[-1]))
-								if [ "$t" -lt "$best_ms" ]; then best_ms=$t; best_name="Russel-ctr"; fi
+								if [ "$t" -lt "$best_ms" ]; then
+									best_ms=$t
+									best_name="Russel-ctr"
+								fi
 							fi
 							d_total=$((build_ms + docker_boot_ms))
 							if [ "$d_total" -lt "$best_ms" ]; then
@@ -699,18 +741,25 @@ else
 
 	fmt_e2e() {
 		local d="$1" c="$2"
-		if [ "$d" = "skipped" ]; then echo "skipped"
-		elif [ "$d" = "failed" ]; then echo "failed"
-		elif [ "$c" = "timeout" ]; then echo "timeout (${d}+?)"
-		elif [ "$c" = "failed" ]; then echo "failed"
-		else echo "$((d + c))ms (${d}+${c})"
+		if [ "$d" = "skipped" ]; then
+			echo "skipped"
+		elif [ "$d" = "failed" ]; then
+			echo "failed"
+		elif [ "$c" = "timeout" ]; then
+			echo "timeout (${d}+?)"
+		elif [ "$c" = "failed" ]; then
+			echo "failed"
+		else
+			echo "$((d + c))ms (${d}+${c})"
 		fi
 	}
 
 	fmt_spawn() {
 		local s="$1"
-		if [ "$s" = "skipped" ] || [ "$s" = "failed" ] || [ "$s" = "timeout" ]; then echo "$s"
-		else echo "${s}ms"
+		if [ "$s" = "skipped" ] || [ "$s" = "failed" ] || [ "$s" = "timeout" ]; then
+			echo "$s"
+		else
+			echo "${s}ms"
 		fi
 	}
 
@@ -730,10 +779,14 @@ else
 			ctr_col=$(fmt_e2e "${RUSSEL_CONTAINER_DEPLOY_MS[$i]}" "${RUSSEL_CONTAINER_CURL_MS[$i]}")
 			dc_b="${DOCKER_BUILD_MS[$i]}"
 			dc_r="${DOCKER_BOOT_MS[$i]}"
-			if [ "$dc_b" = "skipped" ]; then dc_col="skipped"
-			elif [ "$dc_b" = "failed" ] || [ "$dc_r" = "failed" ]; then dc_col="failed"
-			elif [ "$dc_r" = "timeout" ]; then dc_col="timeout"
-			else dc_col="$((dc_b + dc_r))ms (${dc_b}+${dc_r})"
+			if [ "$dc_b" = "skipped" ]; then
+				dc_col="skipped"
+			elif [ "$dc_b" = "failed" ] || [ "$dc_r" = "failed" ]; then
+				dc_col="failed"
+			elif [ "$dc_r" = "timeout" ]; then
+				dc_col="timeout"
+			else
+				dc_col="$((dc_b + dc_r))ms (${dc_b}+${dc_r})"
 			fi
 			winner="${WINNER[$i]:-—}"
 			printf "  ${DIM}│${NC} %-12s ${DIM}│${NC} %-16s ${DIM}│${NC} %-16s ${DIM}│${NC} %-16s ${DIM}│${NC} %-10s ${DIM}│${NC}\n" \

@@ -90,6 +90,30 @@ impl PortAllocator {
             registry.busy_ports.remove(&port);
         }
     }
+
+    /// Register a port that is already bound by a live container (e.g. after ctrl
+    /// restart). Does NOT check port_is_available — the port is already in use.
+    pub fn claim_existing(service_id: &str, port: u16) -> anyhow::Result<()> {
+        let mut registry = port_registry();
+        // Reject if a different service already owns this port.
+        if let Some(other_id) = registry
+            .allocations
+            .iter()
+            .find_map(|(id, &p)| if p == port && id != service_id { Some(id.clone()) } else { None })
+        {
+            anyhow::bail!("port {port} already claimed by service '{other_id}'");
+        }
+        // If this service already has a different port, release it first.
+        if let Some(&old_port) = registry.allocations.get(service_id) {
+            if old_port == port {
+                return Ok(());
+            }
+            registry.busy_ports.remove(&old_port);
+        }
+        registry.busy_ports.insert(port);
+        registry.allocations.insert(service_id.to_string(), port);
+        Ok(())
+    }
 }
 
 // ── Subnet allocation (deterministic per service_id) ─────────────────────────
@@ -325,5 +349,22 @@ mod tests {
         PortAllocator::release("custom-service");
         PortAllocator::reserve("another-service", 4000).unwrap();
         PortAllocator::release("another-service");
+    }
+
+    #[test]
+    fn port_allocator_claim_existing_registers_port() {
+        PortAllocator::release("claimed-svc");
+        PortAllocator::claim_existing("claimed-svc", 9000).unwrap();
+        // Same service, same port is idempotent.
+        PortAllocator::claim_existing("claimed-svc", 9000).unwrap();
+        // Different service claiming same port is rejected.
+        let err = PortAllocator::claim_existing("other-svc", 9000).unwrap_err();
+        assert!(err.to_string().contains("already claimed"));
+        // Same service with a different port moves the claim.
+        PortAllocator::claim_existing("claimed-svc", 9001).unwrap();
+        // Old port should now be available for another service.
+        PortAllocator::release("claimed-svc");
+        PortAllocator::claim_existing("other-svc", 9000).unwrap();
+        PortAllocator::release("other-svc");
     }
 }

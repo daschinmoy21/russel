@@ -12,8 +12,8 @@ use russel_core::{
 use crate::{
     build::NixBuilder,
     container::{
-        ContainerRunner, ContainerStartSpec, RootfsSpec, default_base_dir,
-        validate_podman_args_for_runtime,
+        ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec,
+        default_base_dir, validate_podman_args_for_runtime,
     },
     database::DatabaseProvisioner,
     git::GitClient,
@@ -381,9 +381,9 @@ impl DeployPipeline {
         let (workload, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
             Ok(val) => val,
             Err(deploy_err) => {
-                tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback");
+                tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback (prior runtime was {prior_runtime})");
                 cleanup_failed_deploy(runtime, service_id, &self.runner, &self.containers).await;
-                if has_backup && runtime == RuntimeKind::Microvm {
+                if has_backup && prior_runtime == RuntimeKind::Microvm {
                     let rollback_res = attempt_microvm_rollback(
                         service_id,
                         &russel_dir,
@@ -407,6 +407,29 @@ impl DeployPipeline {
                         }
                         Err(rollback_err) => {
                             tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
+                        }
+                    }
+                } else if has_backup && prior_runtime == RuntimeKind::Container {
+                    let rollback_res = attempt_container_rollback(
+                        service_id,
+                        &russel_dir,
+                        &russel_bak,
+                        &self.containers,
+                        &self.state,
+                    )
+                    .await;
+
+                    match rollback_res {
+                        Ok(()) => {
+                            tracing::info!(service_id, "Rollback to previous container succeeded");
+                            port_reservation
+                                .as_mut()
+                                .expect("port reservation exists")
+                                .disarm();
+                            return Err(anyhow::anyhow!("ROLLBACK_SUCCESS: {}", deploy_err));
+                        }
+                        Err(rollback_err) => {
+                            tracing::error!(service_id, error = %rollback_err, "CRITICAL: Container rollback failed. Old container could not be restored.");
                         }
                     }
                 } else if has_backup {
@@ -833,6 +856,70 @@ async fn attempt_microvm_rollback(
     Ok(())
 }
 
+async fn attempt_container_rollback(
+    service_id: &str,
+    russel_dir: &str,
+    russel_bak: &str,
+    containers: &ContainerRunner,
+    state: &AppState,
+) -> anyhow::Result<()> {
+    tokio::fs::rename(russel_bak, russel_dir).await?;
+    let old_metadata_path = format!("{}/metadata.json", russel_dir);
+    let content = std::fs::read_to_string(&old_metadata_path)?;
+    let old_meta: serde_json::Value = serde_json::from_str(&content)?;
+    let old_host_port = old_meta["host_port"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))? as u16;
+    let old_guest_port = old_meta["guest_port"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))? as u16;
+    let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
+    let old_bin_name = old_meta["bin_name"].as_str().unwrap_or("app");
+    let old_rootfs_path = old_meta["rootfs_path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing rootfs_path in container metadata"))?;
+    let old_podman_args: Vec<String> = old_meta
+        .get("podman_args")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|a| a.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+
+    PortAllocator::reserve(service_id, old_host_port)?;
+
+    let start_spec = ContainerStartSpec {
+        service_id: service_id.to_string(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from(old_rootfs_path),
+            entrypoint: PathBuf::from(format!("/bin/{}", old_bin_name)),
+        },
+        host_port: old_host_port,
+        guest_port: old_guest_port,
+        memory_mb: old_mem_mb,
+        env: vec![("PORT".to_string(), old_guest_port.to_string())],
+        extra_args: old_podman_args.clone(),
+    };
+    let running = containers.start(&start_spec).await?;
+    state.mark_deployed_container(service_id, &running.container_id);
+
+    let old_store_path = old_meta["store_path"]
+        .as_str()
+        .unwrap_or("/nix/store/unknown");
+    let new_metadata = build_container_metadata(
+        service_id,
+        old_host_port,
+        old_guest_port,
+        old_store_path,
+        &running.container_id,
+        &running.container_name,
+        &running.rootfs_path.to_string_lossy(),
+        old_mem_mb,
+        Some(old_bin_name),
+        &old_podman_args,
+    );
+    write_metadata(&old_metadata_path, &new_metadata)?;
+    Ok(())
+}
+
 fn shared_runner() -> MicrovmRunner {
     static RUNNER: std::sync::LazyLock<MicrovmRunner> =
         std::sync::LazyLock::new(MicrovmRunner::new);
@@ -1125,7 +1212,7 @@ struct DeployOutput {
 }
 
 #[cfg(test)]
-mod tests {
+mod deploy_tests {
     use crate::container::validate_podman_args_for_runtime;
     use russel_core::config::RuntimeKind;
 
