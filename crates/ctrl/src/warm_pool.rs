@@ -16,7 +16,9 @@
 //!   - Pool ready → restore from golden snapshot with service config injected
 //!   - Restore fails → cold boot fallback
 //!
-//! Env: `RUSSEL_WARM_POOL=0` disables prepare + restore path.
+//! Env: `RUSSEL_WARM_POOL=1` enables prepare + restore (experimental).
+//! Default is **off**: snapshot-after-virtiofs leaves stale guest FUSE state on
+//! restore, which presents as "VM not reachable in 10s".
 
 use std::{
     path::{Path, PathBuf},
@@ -89,8 +91,11 @@ impl WarmPool {
             return Ok(());
         }
 
-        if std::env::var("RUSSEL_WARM_POOL").as_deref() == Ok("0") {
-            tracing::info!("RUSSEL_WARM_POOL=0 — warm pool disabled");
+        // Opt-in only: restore after virtiofs mount is not safe yet.
+        if std::env::var("RUSSEL_WARM_POOL").as_deref() != Ok("1") {
+            tracing::info!(
+                "warm pool disabled (set RUSSEL_WARM_POOL=1 for experimental snapshot restore)"
+            );
             self.prepare_done.notify_waiters();
             return Ok(());
         }
@@ -147,7 +152,7 @@ impl WarmPool {
         let spec = VmSpec {
             kernel: kernel_info.path.clone(),
             initramfs: agent_initramfs,
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
+            cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()
@@ -351,7 +356,7 @@ impl WarmPool {
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
             initramfs: initramfs_path.to_path_buf(),
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
+            cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()
@@ -447,7 +452,7 @@ impl WarmPool {
         let spec = VmSpec {
             kernel: PathBuf::from("/dev/null"),  // not used when restoring
             initramfs: PathBuf::from("/dev/null"),
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on".into(),
+            cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()

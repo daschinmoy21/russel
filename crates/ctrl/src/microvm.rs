@@ -412,7 +412,8 @@ impl MicrovmRunner {
         let pool_dir = PathBuf::from("/var/lib/russel/_pool");
         std::fs::create_dir_all(&pool_dir)?;
 
-        let initramfs_file = pool_dir.join("agent-initramfs.cpio");
+        // Bump filename when AGENT_INIT_SCRIPT changes so disk cache cannot serve a stale CPIO.
+        let initramfs_file = pool_dir.join("agent-initramfs-v2.cpio");
         let work = pool_dir.join("agent-initramfs.d");
 
         if let Err(e) = std::fs::remove_dir_all(&work)
@@ -655,7 +656,9 @@ exec /bin/sh
         let bin_dir = work.join("bin");
         std::fs::create_dir_all(&bin_dir)?;
         // Agent init needs `cat` + `sleep` in addition to basic tools.
-        for name in &["sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat", "sleep"] {
+        for name in &[
+            "sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat", "sleep", "usleep", "ls",
+        ] {
             let dest = bin_dir.join(name);
             if let Err(e) = std::fs::remove_file(&dest)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -900,7 +903,7 @@ exec /bin/sh
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
             initramfs: initramfs_path.to_path_buf(),
-            cmdline: "quiet loglevel=0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
+            cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: std::env::var("RUSSEL_CPU_MAX")
                 .ok()
@@ -1216,19 +1219,40 @@ if [ -d /modules ] && ls /modules/*.ko.xz >/dev/null 2>&1; then
   done
 fi
 
-# Mount host store (read-only).
+# Mount host store (read-only). Virtio devices can lag a few hundred ms.
 echo "Mounting /nix/store via virtiofs..."
-/bin/mount -t virtiofs nixstore /nix/store
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to mount /nix/store via virtiofs"
+i=0
+mounted=0
+while [ $i -lt 30 ]; do
+  if /bin/mount -t virtiofs nixstore /nix/store; then
+    echo "nixstore mounted"
+    mounted=1
+    break
+  fi
+  i=$((i + 1))
+  /bin/usleep 100000 2>/dev/null || /bin/sleep 1
+done
+if [ "$mounted" -ne 1 ]; then
+  echo "ERROR: Failed to mount /nix/store via virtiofs after retries"
+  /bin/ls -l /sys/bus/virtio/devices 2>/dev/null || true
   exec /bin/sh
 fi
 
 # Mount config (read-write) for deploy.env + readiness marker.
 echo "Mounting /config via virtiofs..."
-/bin/mount -t virtiofs russelcfg /config
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to mount /config via virtiofs"
+i=0
+mounted=0
+while [ $i -lt 30 ]; do
+  if /bin/mount -t virtiofs russelcfg /config; then
+    echo "russelcfg mounted"
+    mounted=1
+    break
+  fi
+  i=$((i + 1))
+  /bin/usleep 100000 2>/dev/null || /bin/sleep 1
+done
+if [ "$mounted" -ne 1 ]; then
+  echo "ERROR: Failed to mount /config via virtiofs after retries"
   exec /bin/sh
 fi
 

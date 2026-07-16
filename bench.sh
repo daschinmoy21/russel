@@ -484,6 +484,19 @@ else
 				RUSSEL_CURL_MS+=("failed")
 				RUSSEL_SPAWN_MS+=("failed")
 				fail "russel: deploy failed (${err_msg})"
+				# Surface guest/ctrl diagnostics when deploy fails (JSON may truncate).
+				if [ -n "${RUSSEL_LOG:-}" ] && [ -f "$RUSSEL_LOG" ]; then
+					warn "last 60 lines of russel-ctrl log ($RUSSEL_LOG):"
+					tail -60 "$RUSSEL_LOG" 2>/dev/null | while IFS= read -r line; do info "  $line"; done || true
+				fi
+				# Prefer the most recent console.log under the redirected state dir.
+				if [ -n "${RUSSEL_STATE_DIR:-}" ]; then
+					clog=$(find "$RUSSEL_STATE_DIR" -name console.log 2>/dev/null | head -1 || true)
+					if [ -n "$clog" ] && [ -f "$clog" ]; then
+						warn "guest console tail ($clog):"
+						tail -40 "$clog" 2>/dev/null | while IFS= read -r line; do info "  $line"; done || true
+					fi
+				fi
 			fi
 			set -euo pipefail
 		else

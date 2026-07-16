@@ -394,19 +394,33 @@ impl DeployPipeline {
             let ready_ms = t.elapsed().as_millis();
             if !up {
                 let console_log = format!("{russel_dir}/console.log");
+                let cfg_env = format!("{russel_dir}/cfg/deploy.env");
+                let mut detail = String::from("VM not reachable in 10s");
+                detail.push_str(&format!(
+                    "\nvm_ip={}:{} deploy.env_exists={} console={}",
+                    alloc.vm_ip,
+                    port.guest,
+                    Path::new(&cfg_env).exists(),
+                    console_log
+                ));
+                detail.push_str(
+                    "\nhint: snapshot warm pool is off unless RUSSEL_WARM_POOL=1 (experimental)",
+                );
                 if let Ok(raw) = std::fs::read_to_string(&console_log) {
                     let lines: Vec<&str> = raw.lines().collect();
-                    let start = lines.len().saturating_sub(40);
-                    let tail: String = if start < lines.len() {
+                    let start = lines.len().saturating_sub(80);
+                    let tail = if start < lines.len() {
                         lines[start..].join("\n")
                     } else {
                         raw
                     };
-                    anyhow::bail!(
-                        "VM not reachable in 10s\n--- guest console tail (last 40 lines) ---\n{tail}\n--- end console ---"
-                    );
+                    detail.push_str("\n--- guest console tail ---\n");
+                    detail.push_str(&tail);
+                    detail.push_str("\n--- end console ---");
+                } else {
+                    detail.push_str("\n(no console.log — guest may have failed before serial)");
                 }
-                anyhow::bail!("VM not reachable in 10s");
+                anyhow::bail!("{detail}");
             }
             tracing::info!(service_id, ready_ms, "VM service reachable");
 
