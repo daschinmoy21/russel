@@ -93,33 +93,38 @@ curl http://localhost:8080/
 ./target/debug/russel-cli destroy basic
 ```
 
-### Container Deploy (Podman)
+### Container Deploy (Russel + rootless Podman)
 
-Once container support lands, the same Nix-built package can run as a container.
-Podman's `--rootfs` flag mounts the Nix store path directly — no image build, no
-layer extraction.
+Set `type = "container"` in `Russelfile.toml` (source of truth). Optionally pass
+`--runtime container` — it must **match** the file or deploy errors.
 
-```bash
-# Build the Nix package
-nix build path:examples/basic-http --no-link --print-out-paths
-# → /nix/store/abc123...-api
+Russel prepares a Docker-like rootfs (with `/tmp`, `/var`, bash, curl) under
+`/var/lib/russel/<id>/rootfs` and starts rootless Podman with `--rootfs` plus a
+read-only bind of host `/nix/store`. **Do not** use a bare package path as rootfs.
 
-# Run with podman --rootfs (NO Dockerfile, NO image pull)
-podman run --rm \
-  --rootfs /nix/store/abc123...-api \
-  --publish 8080:3000 \
-  --env PORT=3000 \
-  /bin/basic-http
+```toml
+# examples/basic-http/Russelfile.toml
+[service]
+name = "api"
+# ...
+type = "container"
 ```
 
 ```bash
+./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id basic \
+  --runtime container
+
 curl http://localhost:8080/health
 # → ok
+
+./target/debug/russel-cli status basic   # shows runtime=container
+./target/debug/russel-cli stop basic
+./target/debug/russel-cli destroy basic
 ```
 
-> **Key insight**: The Nix store path is the artifact. Same `/nix/store/<hash>`
-> can be used as a microVM root (via virtiofs) **and** as a container rootfs
-> (via `podman --rootfs`). No rebuild, no repackaging.
+> **Key insight**: The Nix store path is still the artifact. MicroVM (virtiofs)
+> and container (bind-mounted store into a prepared rootfs) share the same build
+> output — no OCI image rebuild.
 
 ---
 
@@ -147,17 +152,12 @@ curl http://localhost:8081/
 # → Welcome to Russel File Manager inside your MicroVM!
 ```
 
-### Container Deploy (Podman)
+### Container Deploy (Russel)
 
 ```bash
-nix build path:examples/filebrowser --no-link --print-out-paths
-# → /nix/store/def456...-filebrowser
-
-podman run --rm \
-  --rootfs /nix/store/def456...-filebrowser \
-  --publish 8081:8080 \
-  --env PORT=8080 \
-  /bin/filebrowser
+# Russelfile: type = "container"
+./target/debug/russel-cli deploy examples/filebrowser -p 8081:8080 --vm-id files \
+  --runtime container
 ```
 
 ---
@@ -188,17 +188,12 @@ curl http://localhost:8082/
 ./target/debug/russel-cli destroy static
 ```
 
-### Container Deploy (Podman)
+### Container Deploy (Russel)
 
 ```bash
-nix build path:examples/static-test --no-link --print-out-paths
-# → /nix/store/ghi789...-app
-
-podman run --rm \
-  --rootfs /nix/store/ghi789...-app \
-  --publish 8082:8000 \
-  --env PORT=8000 \
-  /bin/app
+# Russelfile: type = "container"
+./target/debug/russel-cli deploy examples/static-test -p 8082:8000 --vm-id static \
+  --runtime container
 ```
 
 ---
@@ -229,10 +224,12 @@ PORT=8000 ./result/bin/app
 | --------------- | -------------------------------------------------- | ------------------------------------- |
 | Build           | `nix build` (same)                                 | `nix build` (same)                    |
 | Isolation       | Hardware-level KVM (separate kernel)               | OS-level namespaces (shared kernel)   |
-| Store sharing   | `virtiofsd` + `virtiofs` mount in guest            | `podman --rootfs` direct mount        |
-| Cold start      | ~1-3s (kernel + initramfs + app)                   | <200ms (no kernel boot)               |
-| Hotplug         | `--api-socket` (planned)                           | N/A                                   |
-| Use case        | Untrusted workloads, strict isolation, multi-tenant | Dev/test, trusted internal services   |
+| Store sharing   | `virtiofsd` + `virtiofs` mount in guest            | Prepared rootfs + `/nix/store:ro` bind |
+| Cold start      | ~1-3s (kernel + initramfs + app)                   | Typically faster (no guest kernel)    |
+| Privilege       | Often privileged ctrl (TAP/KVM)                    | **Rootless** Podman only              |
+| Use case        | Untrusted workloads, strict isolation              | Trusted / lighter isolation           |
 
-Both paths use the **same Nix store path** as the build artifact. The deployment
-mode is a runtime choice — switch between microVM and container without rebuilding.
+Both paths use the **same Nix store path** as the build artifact. Choose runtime with
+`service.type` in Russelfile (`microvm` default, or `container`). Changing type and
+redeploying is supported today with downtime; **zero-downtime swap is planned later**
+(see deferred issues).

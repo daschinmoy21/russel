@@ -1,6 +1,6 @@
 # Russel
 
-A self-hosted platform for deploying services as microVMs using [Cloud Hypervisor](https://www.cloudhypervisor.org/) and Nix for reproducible builds.
+A self-hosted platform for deploying Nix-built services as **microVMs** ([Cloud Hypervisor](https://www.cloudhypervisor.org/)) or **Russel containers** (rootless Podman `--rootfs`).
 
 ## Architecture
 
@@ -10,16 +10,16 @@ Russel is split into three crates:
 |-------|---------|
 | `russel-core` | Shared types: `Russelfile` config, API request/response types |
 | `russel-cli` | CLI client that talks to the control plane over HTTP |
-| `russel-ctrl` | Control plane (Axum HTTP API) that orchestrates builds, microVMs, and networking. Boots Cloud Hypervisor directly (no systemd, no NixOS guest). |
+| `russel-ctrl` | Control plane (Axum HTTP API) that orchestrates builds, **microVMs** and **Russel containers**, and networking. MicroVMs use Cloud Hypervisor; containers use rootless Podman `--rootfs`. |
 
 ### Deployment Flow
 
-1. **Resolve** — Clone (or use local) repo and parse `Russelfile.toml`
-2. **Build** — Auto-generate `flake.nix` if missing (Rust/Go/static detection), then run `nix build` to produce a store path
-3. **Create Initramfs** — Build a minimal CPIO initramfs containing only BusyBox and required VirtIO kernel modules (2-3MB).
-4. **Network + Start VM** — Create the TAP interface, assign a deterministic `/30` subnet (`10.x.y.1` host, `10.x.y.2` guest), spawn `socat` for port forwarding, spawn `virtiofsd` to share `/nix/store` via a UNIX socket, then boot `cloud-hypervisor` directly with the stock kernel and minimal initramfs.
-5. **Kernel Init** — Guest kernel boots. The custom `/init` script decompresses and loads VirtIO modules via `insmod`, mounts `/nix/store` via `virtiofs`, configures the guest IP, and directly executes the application binary (no systemd).
-6. **Ready** — TCP-connects to the guest port until it responds, confirming deployment success.
+1. **Resolve** — Clone (or use local) repo and parse `Russelfile.toml` (including `service.type`).
+2. **Build** — Auto-generate `flake.nix` if missing (Rust/Go/static detection), then run `nix build` to produce a store path.
+3. **Branch on runtime**
+   - **microvm (default):** minimal initramfs → TAP + socat + virtiofsd → Cloud Hypervisor → guest runs app from virtiofs `/nix/store`.
+   - **container:** prepare Docker-like rootfs → rootless Podman `--rootfs` + `/nix/store:ro` bind → publish `-p HOST:GUEST`.
+4. **Ready** — TCP readiness on guest (microVM) or published host port (container); metadata written under `/var/lib/russel/<id>/`.
 
 ## Quick Start
 
@@ -68,19 +68,22 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 | `GET`  | `/vm/{service_id}/status` | Get deployment status for a service |
 | `GET`  | `/vm/{service_id}/logs`   | Get logs for a service |
 | `GET`  | `/vms`                     | List registered services |
-| `POST` | `/vm/{service_id}/stop`    | Stop a microVM |
-| `DELETE`| `/vm/{service_id}`         | Destroy a microVM and clean up resources |
+| `POST` | `/vm/{service_id}/stop`    | Stop a service (microVM or container) |
+| `DELETE`| `/vm/{service_id}`         | Destroy a service and clean up resources |
 
 ## CLI Commands
 
 ```bash
-russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID]
+russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container]
 russel status [<service_id>]
 russel logs [<service_id>]
 russel vms
 russel stop <service_id>
 russel destroy <service_id>
 ```
+
+- **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
+- Ports today: **`-p HOST:GUEST`** (published binds). Traefik later.
 
 ## Project Requirements
 
@@ -93,16 +96,34 @@ source = "."
 port = 3000
 memory = "256mb"
 bin = "api"    # optional — defaults to name
+type = "microvm"  # optional: "microvm" (default) or "container"
 ```
 
-Russel checks readiness by TCP-connecting to the guest port. For application-level health monitoring (planned for Traefik integration), expose a `/health` endpoint on `PORT` as a convention.
+### Runtimes
+
+| `service.type` | Isolation | Host needs |
+|----------------|-----------|------------|
+| `microvm` (default) | KVM / Cloud Hypervisor | KVM, TAP, virtiofsd, socat |
+| `container` | Rootless Podman `--rootfs` | Rootless Podman |
+
+**Russel containers** prepare a Docker-like rootfs under `/var/lib/russel/<id>/rootfs` (with `/tmp`, `/var`, bash, curl for debugging) and bind-mount the host `/nix/store` read-only. Do **not** pass a bare Nix package path as `--rootfs` yourself — use `russel deploy`.
+
+```bash
+# MicroVM (default)
+./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id api
+
+# Container — Russelfile must have type = "container", and --runtime must match if passed
+./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id api \
+  --runtime container
+```
+
+Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring (planned for Traefik integration), expose a `/health` endpoint on `PORT` as a convention.
 
 ## Networking Model
 
-- Each VM gets a deterministic `/30` subnet derived from its `service_id` via FNV-1a hash (e.g. `10.x.y.1` host, `10.x.y.2` guest)
-- Host-side TAP interface (`vm-<id>`) is created and configured by `russel-ctrl` via `ip tuntap`
-- `socat` forwards `0.0.0.0:<host_port>` → `<vm_ip>:<guest_port>`
-- Traefik integration is planned for multi-node ingress (current: placeholder)
+- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `vm-<id>`, `socat` host→guest port forward.
+- **Container:** Rootless Podman publishes `-p HOST:GUEST` (from CLI `-p` / allocator).
+- Traefik integration is planned for multi-node ingress (current: placeholder).
 
 ## Boot & Network Timing Optimization (Under 2s Boot)
 
@@ -120,26 +141,27 @@ Russel currently runs the control plane on **Linux only**. The `russel-ctrl` bin
 | Dependency | Used for | Required when |
 |------------|----------|----------------|
 | Nix with flakes enabled | Building application closures, the kernel, BusyBox, and kernel modules | Always |
-| `cloud-hypervisor` | Booting the microVM | Deploying |
-| `virtiofsd` | Sharing the host `/nix/store` with the guest | Deploying |
-| `socat` | Forwarding the host port to the guest | Deploying |
-| `iproute2` (`ip`) | Creating and configuring TAP interfaces | Starting `russel-ctrl` / deploying |
+| `cloud-hypervisor` | Booting the microVM | MicroVM deploy |
+| `virtiofsd` | Sharing the host `/nix/store` with the guest | MicroVM deploy |
+| `socat` | Forwarding the host port to the guest | MicroVM deploy |
+| `iproute2` (`ip`) | Creating and configuring TAP interfaces | MicroVM / ctrl networking |
 | `iptables` | Cleaning and configuring host NAT/forwarding rules | Starting `russel-ctrl` / deploying |
+| `podman` (rootless) | Russel containers via `--rootfs` | Container deploy |
 | `git` | Cloning remote application repositories | Deploying a remote repository |
 
 The host also needs:
 
-- A working KVM setup with access to `/dev/kvm` (and virtualization enabled in firmware).
-- Permission to create TAP devices and change networking/iptables rules. Run the control plane with the appropriate root privileges, or grant equivalent capabilities to the binary in a controlled environment.
-- A writable `/var/lib/russel` directory for VM state, logs, and cached artifacts.
+- For microVMs: a working KVM setup (`/dev/kvm`), permission to create TAP devices and change networking/iptables rules.
+- For containers: **rootless Podman** configured and working (`podman info` reports rootless). Russel does not use rootful Podman.
+- A writable `/var/lib/russel` directory for service state, logs, rootfs, and metadata.
 
-After Nix is installed, the repository flake provides Rust, `rust-analyzer`, Cloud Hypervisor, and the runtime utilities for development:
+After Nix is installed, the repository flake provides Rust, `rust-analyzer`, Cloud Hypervisor, Podman (Linux), and related tools:
 
 ```bash
 nix develop
 ```
 
-On a non-Nix host, install the equivalent packages with your distribution's package manager. The exact package names vary; on Debian/Ubuntu they are typically `build-essential`, `pkg-config`, `libssl-dev`, `nix`, `cloud-hypervisor`, `virtiofsd`, `socat`, `iproute2`, `iptables`, and `git`.
+On a non-Nix host, install the equivalent packages with your distribution's package manager. The exact package names vary; on Debian/Ubuntu they are typically `build-essential`, `pkg-config`, `libssl-dev`, `nix`, `cloud-hypervisor`, `virtiofsd`, `socat`, `iproute2`, `iptables`, `podman`, and `git`.
 
 ## Repo Layout
 

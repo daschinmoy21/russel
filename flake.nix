@@ -46,7 +46,11 @@
               ]
               # nixpkgs supports cloud-hypervisor only on aarch64-linux and x86_64-linux,
               # so it must be gated to Linux to avoid Darwin evaluation failures.
-              ++ (lib.optional stdenv.isLinux cloud-hypervisor);
+              ++ (lib.optionals stdenv.isLinux [
+                cloud-hypervisor
+                # Rootless Podman for Russel containers (`service.type = "container"`).
+                podman
+              ]);
 
             shellHook = ''
               echo "Rust development environment loaded!"

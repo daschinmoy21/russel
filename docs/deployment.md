@@ -16,7 +16,7 @@ If you are a power user or need custom native dependencies/system libraries, you
 
 ## 1. Russelfile.toml Configuration
 
-The `Russelfile.toml` specifies the runtime requirements of your microVM.
+The `Russelfile.toml` specifies deploy requirements for your service (microVM or container).
 
 ### Template & Reference
 
@@ -30,16 +30,20 @@ name = "my-app"
 # The source directory of the project (reserved for future multi-service repos)
 source = "."
 
-# The internal guest port the application listens on
+# The internal application port the process listens on
 port = 8080
 
-# MicroVM Memory limit. Supports mb or mib suffixes.
+# Memory limit (microVM RAM / container --memory). Supports mb or mib suffixes.
 # Minimum recommended is 256mb for Go/Rust, 512mb-1gb for Java/Node.
 memory = "256mb"
 
 # Optional: The name of the binary to execute inside the build package.
 # Defaults to the value of `service.name` if not specified.
 bin = "my-app"
+
+# Optional: "microvm" (default) or "container" (rootless Podman).
+# This is the source of truth. CLI --runtime must match if provided.
+type = "microvm"
 
 # Optional: Database provisioning (planned — current: placeholder)
 [database.postgres]

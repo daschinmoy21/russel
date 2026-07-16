@@ -1,18 +1,34 @@
 # Control Plane Architecture
 
-The Russel control plane (`russel-ctrl`) orchestrates builds, microVM lifecycles, and host-side networking.
+The Russel control plane (`russel-ctrl`) orchestrates builds, **microVM and container**
+lifecycles, and host-side networking.
 
 ---
 
 ## Deployment Pipeline
 
-The core deployment pipeline follows these steps:
+Shared steps:
 
-1. **Resolve**: Clone or locate the source repository, parse `Russelfile.toml`.
-2. **Build**: Auto-generate a `flake.nix` if none exists, then build the application using Nix to produce a read-only store path.
-3. **Initramfs**: Assemble a minimal CPIO initramfs containing BusyBox and the target kernel modules.
-4. **Network + Boot**: Create the host TAP interface, spawn `socat` for TCP port forwarding, spawn `virtiofsd` to serve the host's `/nix/store`, then directly invoke `cloud-hypervisor` to boot the kernel and application.
-5. **Traefik**: Register the backend with Traefik (placeholder — planned for multi-node routing).
+1. **Resolve**: Clone or locate the source repository, parse `Russelfile.toml` (including `service.type`).
+2. **Build**: Auto-generate a `flake.nix` if none exists, then `nix build` → store path.
+
+Then branch on `RuntimeKind` (`microvm` default, or `container`):
+
+### MicroVM path
+
+3. **Initramfs**: Minimal CPIO with BusyBox + VirtIO kernel modules.
+4. **Network + Boot**: TAP, `socat` host→guest, `virtiofsd` for `/nix/store`, Cloud Hypervisor boot.
+5. **Metadata**: `/var/lib/russel/<id>/metadata.json` (`schema_version`, `runtime: microvm`, ports, PIDs, …).
+
+### Container path (Russel containers)
+
+3. **Rootfs**: Docker-like tree under `/var/lib/russel/<id>/rootfs` (bash/curl, `/tmp`, `/var`, app symlinks).
+4. **Start**: Rootless Podman `--rootfs` + bind-mount host `/nix/store:ro`, publish `-p HOST:GUEST`.
+5. **Metadata**: same directory with `runtime: container`, `container_id`, `rootfs_path`, …
+
+6. **Traefik**: Register backend (placeholder — planned for multi-node routing).
+
+CLI `--runtime` must match Russelfile `type` when provided; the file is source of truth.
 
 ---
 
