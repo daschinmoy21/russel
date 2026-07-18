@@ -157,38 +157,67 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         .await?
         .error_for_status()?;
 
-    let mut buffer = String::new();
+    // Byte buffer so multi-byte UTF-8 never splits across chunk boundaries (#103).
+    const MAX_NDJSON_LINE: usize = 8 * 1024 * 1024;
+    let mut buffer: Vec<u8> = Vec::new();
     let mut final_response = None;
 
     while let Some(chunk) = response.chunk().await? {
-        if let Ok(s) = std::str::from_utf8(&chunk) {
-            buffer.push_str(s);
-            while let Some(i) = buffer.find('\n') {
-                let line = buffer[..i].to_string();
-                buffer = buffer[i + 1..].to_string();
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() > MAX_NDJSON_LINE {
+            anyhow::bail!(
+                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
+            );
+        }
+        while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+            // drop trailing newline
+            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
+            if line_bytes.is_empty() || line_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let line = std::str::from_utf8(line_bytes)
+                .context("control plane sent non-UTF-8 NDJSON line")?;
+            let event: russel_core::api::DeployEvent = serde_json::from_str(line)
+                .with_context(|| format!("failed to parse event from control plane: {}", line))?;
 
-                if line.trim().is_empty() {
-                    continue;
+            match event {
+                russel_core::api::DeployEvent::Progress {
+                    phase: p,
+                    description: d,
+                } => {
+                    phase(&p, &d);
                 }
+                russel_core::api::DeployEvent::Complete(resp) => {
+                    final_response = Some(resp);
+                }
+                russel_core::api::DeployEvent::Error(err) => {
+                    anyhow::bail!("deploy failed: {}", err);
+                }
+            }
+        }
+    }
 
-                let event: russel_core::api::DeployEvent = serde_json::from_str(&line)
-                    .with_context(|| {
-                        format!("failed to parse event from control plane: {}", line)
-                    })?;
-
-                match event {
-                    russel_core::api::DeployEvent::Progress {
-                        phase: p,
-                        description: d,
-                    } => {
-                        phase(&p, &d);
-                    }
-                    russel_core::api::DeployEvent::Complete(resp) => {
-                        final_response = Some(resp);
-                    }
-                    russel_core::api::DeployEvent::Error(err) => {
-                        anyhow::bail!("deploy failed: {}", err);
-                    }
+    // Final record without trailing newline (EOF).
+    if !buffer.is_empty() {
+        let line = std::str::from_utf8(&buffer)
+            .context("control plane sent non-UTF-8 final NDJSON record")?;
+        let line = line.trim();
+        if !line.is_empty() {
+            let event: russel_core::api::DeployEvent = serde_json::from_str(line)
+                .with_context(|| format!("failed to parse final event from control plane: {}", line))?;
+            match event {
+                russel_core::api::DeployEvent::Progress {
+                    phase: p,
+                    description: d,
+                } => {
+                    phase(&p, &d);
+                }
+                russel_core::api::DeployEvent::Complete(resp) => {
+                    final_response = Some(resp);
+                }
+                russel_core::api::DeployEvent::Error(err) => {
+                    anyhow::bail!("deploy failed: {}", err);
                 }
             }
         }
@@ -239,12 +268,21 @@ fn ms(v: u128) -> String {
 
 fn print_deploy_response(r: DeployResponse, wall: Duration) {
     let ok = r.status == "deployed";
+    let rolled_back = r.status == "rolled_back";
     let icon = if ok {
         "\x1b[1;32m✓\x1b[0m"
+    } else if rolled_back {
+        "\x1b[1;33m↩\x1b[0m"
     } else {
         "\x1b[1;31m✗\x1b[0m"
     };
-    let label = if ok { "Deployed" } else { "Failed" };
+    let label = if ok {
+        "Deployed"
+    } else if rolled_back {
+        "Rolled back"
+    } else {
+        "Failed"
+    };
 
     println!(
         "  {icon} {label} in \x1b[1m{}\x1b[0m  (server: {})",
@@ -475,13 +513,16 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
 }
 
 pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
-    let r = reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .delete(format!("{control_plane}/vm/{id}"))
         .send()
-        .await?
-        .error_for_status()?
-        .json::<String>()
         .await?;
+    // ponytail: 404 means already destroyed — treat as success
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("vm not found (already destroyed)");
+        return Ok(());
+    }
+    let r = resp.error_for_status()?.json::<String>().await?;
     println!("{}", r);
     Ok(())
 }
@@ -494,6 +535,7 @@ mod tests {
     #[test]
     fn deploy_status_success_only_deployed() {
         assert!(deploy_status_is_success("deployed"));
+        assert!(!deploy_status_is_success("rolled_back"));
         assert!(!deploy_status_is_success("failed"));
         assert!(!deploy_status_is_success("building"));
         assert!(!deploy_status_is_success(""));
