@@ -29,7 +29,8 @@ pub use crate::metadata::prior_runtime_from_disk;
 
 /// Typed outcome of `deploy_inner` — success, rollback, or hard failure.
 enum DeployInnerResult {
-    Success(DeployOutput),
+    // Box large success payload (clippy large_enum_variant).
+    Success(Box<DeployOutput>),
     RolledBack { runtime: RuntimeKind, error: String },
 }
 
@@ -487,7 +488,7 @@ impl DeployPipeline {
             .expect("port reservation exists")
             .disarm();
 
-        Ok(DeployInnerResult::Success(DeployOutput {
+        Ok(DeployInnerResult::Success(Box::new(DeployOutput {
             store_path: build.store_path,
             port: workload.port().clone(),
             runtime,
@@ -500,7 +501,7 @@ impl DeployPipeline {
                 ready_ms,
             },
             workload,
-        }))
+        })))
     }
 
     async fn deploy_microvm(
@@ -848,7 +849,7 @@ async fn attempt_microvm_rollback(
         tokio::fs::rename(microvms_bak, microvms_dir).await?;
     }
 
-    // 2. Parse metadata fail-closed
+    // 2. Parse metadata fail-closed (no silent defaults for required fields)
     let old_metadata_path = format!("{}/metadata.json", russel_dir);
     let content = std::fs::read_to_string(&old_metadata_path)?;
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
@@ -857,12 +858,14 @@ async fn attempt_microvm_rollback(
         old_meta["host_port"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("missing host_port"))?,
-    )?;
+    )
+    .map_err(|_| anyhow::anyhow!("host_port out of u16 range"))?;
     let guest_port = u16::try_from(
         old_meta["guest_port"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("missing guest_port"))?,
-    )?;
+    )
+    .map_err(|_| anyhow::anyhow!("guest_port out of u16 range"))?;
 
     let kernel_path_str = old_meta["kernel_path"]
         .as_str()
@@ -872,27 +875,28 @@ async fn attempt_microvm_rollback(
         anyhow::bail!("kernel_path does not exist: {}", kernel_path.display());
     }
 
-    let mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
+    let mem_mb = u16::try_from(
+        old_meta["mem_mb"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("missing mem_mb"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("mem_mb out of u16 range"))?;
 
-    let bin_name = old_meta["bin_name"].as_str().unwrap_or("app");
-    let app_path_from_meta = old_meta["app_path"].as_str();
-    let store_path_from_meta = old_meta["store_path"].as_str();
-    let (app_path, store_path) = match (app_path_from_meta, store_path_from_meta) {
-        (Some(app), _) => {
-            // derive store_path from app_path by stripping /bin/<bin_name>
-            let store = store_path_from_meta.map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    app.strip_suffix(&format!("/bin/{bin_name}"))
-                        .unwrap_or(app)
-                        .to_string()
-                });
-            (app.to_string(), store)
-        }
-        (None, Some(store)) => {
-            (format!("{}/bin/{}", store, bin_name), store.to_string())
-        }
-        _ => anyhow::bail!("missing app_path or store_path in metadata"),
-    };
+    let bin_name = old_meta["bin_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing bin_name"))?
+        .to_string();
+    let app_path = old_meta["app_path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing app_path"))?
+        .to_string();
+    let store_path = old_meta["store_path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing store_path"))?
+        .to_string();
+    if !Path::new(&app_path).exists() {
+        anyhow::bail!("app_path does not exist: {app_path}");
+    }
 
     let initramfs_from_meta = old_meta["initramfs"]
         .as_str()
@@ -903,7 +907,7 @@ async fn attempt_microvm_rollback(
         None => runner.build_agent_initramfs().await?,
     };
 
-    // 3. Ensure cfg dir has deploy.env (rebuild from subnet_for + app_path)
+    // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick
     let alloc = subnet_for(service_id);
     let cfg_dir = format!("{}/cfg", russel_dir);
     std::fs::create_dir_all(&cfg_dir)?;
@@ -916,29 +920,68 @@ async fn attempt_microvm_rollback(
     // 4. Reserve port
     PortAllocator::reserve(service_id, host_port)?;
 
-    // 5. TAP + socat setup (mirror deploy_microvm)
-    let socat_child = TapForwarder::setup(service_id, &alloc, host_port, guest_port).await?;
-
-    // 6. Boot via warm_pool (same as deploy_microvm)
+    // 5–6. Network + boot; clean up on any failure after reservation
     let cfg_dir_path = PathBuf::from(&cfg_dir);
-    let pool = shared_warm_pool();
-    let BootOutput {
-        vm_child,
-        virtiofsd_children,
-    } = pool
-        .restore_or_boot(
-            service_id,
-            &kernel_path,
-            &initramfs_path,
-            &alloc,
-            mem_mb,
-            &cfg_dir_path,
-        )
-        .await?;
+    let boot_result: anyhow::Result<(tokio::process::Child, Vec<tokio::process::Child>, tokio::process::Child)> =
+        async {
+            let socat_child =
+                TapForwarder::setup(service_id, &alloc, host_port, guest_port).await?;
+            let pool = shared_warm_pool();
+            let BootOutput {
+                vm_child,
+                virtiofsd_children,
+            } = pool
+                .restore_or_boot(
+                    service_id,
+                    &kernel_path,
+                    &initramfs_path,
+                    &alloc,
+                    mem_mb,
+                    &cfg_dir_path,
+                )
+                .await
+                .map_err(|e| {
+                    // Drop socat via kill_on_drop when we leave this scope on error —
+                    // also tear down TAP so we do not leak the interface.
+                    e
+                })?;
+            Ok((vm_child, virtiofsd_children, socat_child))
+        }
+        .await;
+
+    let (vm_child, virtiofsd_children, socat_child) = match boot_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = TapForwarder::teardown(&alloc).await;
+            PortAllocator::release(service_id);
+            return Err(e.context("microVM rollback boot failed"));
+        }
+    };
 
     let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
 
-    // 7. Write metadata with build_microvm_metadata
+    // 7. Readiness BEFORE marking deployed / writing durable success metadata
+    let ready =
+        TapForwarder::wait_for_vm_port(&alloc.vm_ip, guest_port, Duration::from_secs(10)).await;
+    if !ready {
+        // Tear down partial restore; do not report rolled_back for a dead service.
+        let mut aux = vec![socat_child];
+        aux.extend(virtiofsd_children);
+        // kill children by dropping after explicit destroy attempt
+        drop(vm_child);
+        drop(aux);
+        if let Err(e) = runner.destroy(service_id).await {
+            tracing::warn!(service_id, error = %e, "failed to destroy unready rolled-back microVM");
+        }
+        let _ = TapForwarder::teardown(&alloc).await;
+        PortAllocator::release(service_id);
+        anyhow::bail!(
+            "rolled-back microVM not reachable on {}:{guest_port} within 10s",
+            alloc.vm_ip
+        );
+    }
+
+    // 8. Write metadata + mark deployed only after readiness
     let meta = build_microvm_metadata(
         service_id,
         host_port,
@@ -952,22 +995,14 @@ async fn attempt_microvm_rollback(
         &store_path,
         mem_mb,
         Some(&app_path),
-        Some(bin_name),
+        Some(&bin_name),
         Some(&initramfs_path.display().to_string()),
     );
     write_metadata(&old_metadata_path, &meta)?;
 
-    // 8. Mark deployed
     let mut aux = vec![socat_child];
     aux.extend(virtiofsd_children);
     state.mark_deployed_with_aux(service_id, vm_child, aux);
-
-    // 9. Wait for readiness (best-effort)
-    let ready =
-        TapForwarder::wait_for_vm_port(&alloc.vm_ip, guest_port, Duration::from_secs(10)).await;
-    if !ready {
-        tracing::warn!(service_id, "rolled-back VM not reachable within 10s — continuing");
-    }
 
     Ok(())
 }
