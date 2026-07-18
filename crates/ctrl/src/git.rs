@@ -16,9 +16,14 @@ impl GitClient {
         let checkout_root = PathBuf::from("/tmp/russel/checkouts");
         fs::create_dir_all(&checkout_root).context("failed to create checkout directory")?;
 
+        if repo.starts_with('-') {
+            anyhow::bail!("repository URL cannot start with '-' (looks like a git option)");
+        }
+
         let checkout = checkout_root.join(sanitize_repo_name(repo));
         let output = Command::new("git")
             .arg("clone")
+            .arg("--")
             .arg(repo)
             .arg(&checkout)
             .output()
