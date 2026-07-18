@@ -78,12 +78,14 @@ pub fn build_microvm_metadata(
     host_port: u16,
     guest_port: u16,
     vm_ip: &str,
+    host_ip: &str,
     vm_pid: Option<u32>,
-    virtiofsd_pid: Option<u32>,
+    virtiofsd_pids: &[u32],
     socat_pid: Option<u32>,
     kernel_path: &str,
     store_path: &str,
     mem_mb: u16,
+    app_path: Option<&str>,
     bin_name: Option<&str>,
     initramfs_path: Option<&str>,
 ) -> serde_json::Value {
@@ -94,6 +96,7 @@ pub fn build_microvm_metadata(
         "host_port": host_port,
         "guest_port": guest_port,
         "vm_ip": vm_ip,
+        "host_ip": host_ip,
         "kernel_path": kernel_path,
         "store_path": store_path,
         "mem_mb": mem_mb,
@@ -102,11 +105,14 @@ pub fn build_microvm_metadata(
     if let Some(pid) = vm_pid {
         meta["vm_pid"] = serde_json::json!(pid);
     }
-    if let Some(pid) = virtiofsd_pid {
-        meta["virtiofsd_pid"] = serde_json::json!(pid);
+    if !virtiofsd_pids.is_empty() {
+        meta["virtiofsd_pids"] = serde_json::json!(virtiofsd_pids);
     }
     if let Some(pid) = socat_pid {
         meta["socat_pid"] = serde_json::json!(pid);
+    }
+    if let Some(path) = app_path {
+        meta["app_path"] = serde_json::json!(path);
     }
     if let Some(name) = bin_name {
         meta["bin_name"] = serde_json::json!(name);
@@ -212,12 +218,14 @@ mod tests {
             3100,
             3000,
             "10.0.1.2",
+            "10.0.1.1",
             Some(42),
-            Some(43),
+            &[43u32],
             Some(44),
             "/nix/store/kernel",
             "/nix/store/app",
             512,
+            Some("/nix/store/app/bin/myapp"),
             Some("myapp"),
             Some("/var/lib/russel/api/initramfs.cpio"),
         );
