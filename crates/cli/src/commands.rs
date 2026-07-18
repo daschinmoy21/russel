@@ -7,9 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use russel_core::{
     RuntimeKind,
-    api::{
-        DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse,
-    },
+    api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse},
     config::{Russelfile, resolve_runtime},
 };
 
@@ -164,12 +162,11 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
 
     while let Some(chunk) = response.chunk().await? {
         buffer.extend_from_slice(&chunk);
-        if buffer.len() > MAX_NDJSON_LINE {
-            anyhow::bail!(
-                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
-            );
-        }
         while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+            // Cap per complete record (not the multi-record aggregate buffer).
+            if i > MAX_NDJSON_LINE {
+                anyhow::bail!("control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes");
+            }
             let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
             // drop trailing newline
             let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
@@ -196,16 +193,29 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
                 }
             }
         }
+        // Incomplete trailing line without newline so far.
+        if buffer.len() > MAX_NDJSON_LINE {
+            anyhow::bail!(
+                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
+            );
+        }
     }
 
     // Final record without trailing newline (EOF).
     if !buffer.is_empty() {
+        if buffer.len() > MAX_NDJSON_LINE {
+            anyhow::bail!(
+                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
+            );
+        }
         let line = std::str::from_utf8(&buffer)
             .context("control plane sent non-UTF-8 final NDJSON record")?;
         let line = line.trim();
         if !line.is_empty() {
-            let event: russel_core::api::DeployEvent = serde_json::from_str(line)
-                .with_context(|| format!("failed to parse final event from control plane: {}", line))?;
+            let event: russel_core::api::DeployEvent =
+                serde_json::from_str(line).with_context(|| {
+                    format!("failed to parse final event from control plane: {}", line)
+                })?;
             match event {
                 russel_core::api::DeployEvent::Progress {
                     phase: p,
@@ -517,12 +527,15 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
         .delete(format!("{control_plane}/vm/{id}"))
         .send()
         .await?;
-    // ponytail: 404 means already destroyed — treat as success
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("vm not found (already destroyed)");
-        return Ok(());
+    // Do not treat bare 404 as success: unmatched routes and "not in memory"
+    // can 404 while runtime resources still exist. Server returns 200 with an
+    // "already gone" body when destroy was intentionally idempotent.
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("destroy failed ({status}): {body}");
     }
-    let r = resp.error_for_status()?.json::<String>().await?;
+    let r = resp.json::<String>().await?;
     println!("{}", r);
     Ok(())
 }
