@@ -1,15 +1,17 @@
 // ponytail: scaffold modules have unused items; allowed deliberately for the MVP.
 // Remove these allows once HealthChecker, DatabaseProvisioner, and TraefikClient
 // are integrated into the deploy pipeline.
-#![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 mod api;
 mod build;
 mod ch_api;
 mod container;
+#[allow(dead_code)]
 mod database;
 mod deploy;
 mod git;
+#[allow(dead_code)]
 mod health;
 mod metadata;
 mod microvm;
