@@ -236,6 +236,8 @@ impl DeployPipeline {
             })
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
+        // Security: config_path is constrained under repo_path (no absolute/`..`,
+        // no symlink escape, size-capped). Load uses the validated path.
         let config_path = resolve_config_path(&repo_path, &request.config_path)?;
         let config = Russelfile::load(&config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
@@ -1008,6 +1010,13 @@ async fn attempt_container_rollback(
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Resolve `config_path` strictly under `repo_path`.
+///
+/// Contract (security-sensitive):
+/// - rejects empty, absolute, and `..` components
+/// - requires a regular file after canonicalize
+/// - requires the canonical path to stay under the canonical repo root
+/// - enforces `MAX_CONFIG_BYTES`
+/// Callers must load the returned path without reinterpreting user `config_path`.
 fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<PathBuf> {
     if config_path.is_empty() {
         anyhow::bail!("config_path must not be empty");
