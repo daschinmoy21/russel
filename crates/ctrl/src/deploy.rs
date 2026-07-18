@@ -236,7 +236,7 @@ impl DeployPipeline {
             })
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
-        let config_path = repo_path.join(PathBuf::from(&request.config_path));
+        let config_path = resolve_config_path(&repo_path, &request.config_path)?;
         let config = Russelfile::load(&config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
