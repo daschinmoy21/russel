@@ -41,7 +41,6 @@ use crate::{
 };
 
 pub use crate::metadata::prior_runtime_from_disk;
-
 /// Short random generation id (8 lowercase hex chars).
 fn new_generation_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -346,13 +345,20 @@ impl DeployPipeline {
                 description: "Resolving source & Russelfile".into(),
             })
             .await;
-        let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
+        let (repo_path, checkout_lease) =
+            self.git.clone_or_use_local(&request.repo_url).await?;
+        let _checkout_lease = self.git.hold_checkout(&repo_path);
+        drop(checkout_lease);
         let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
 
         // Merge env: file < request (request wins on key conflict).
+        // Resolve `secret://name` refs from the host secrets store, then
+        // re-validate so expanded values cannot smuggle reserved keys / bad chars.
         let merged_env = merge_env_maps(&config.service.env, &request.env);
+        validate_env_map(&merged_env)?;
+        let merged_env = crate::secrets::resolve_env_secrets(&merged_env)?;
         validate_env_map(&merged_env)?;
 
         let resolve_ms = t.elapsed().as_millis();
@@ -799,6 +805,12 @@ impl DeployPipeline {
         let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
         std::fs::create_dir_all(&cfg_dir)
             .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| anyhow::anyhow!("chmod config dir: {e}"))?;
+        }
         // Shell-quote APP path to prevent injection through deploy.env
         let mut deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
@@ -807,11 +819,12 @@ impl DeployPipeline {
             port.guest,
             shell_quote(&app_path)
         );
-        // Append user env vars, shell-quoted.
+        // Append user env vars, shell-quoted (may include expanded secrets).
         for (key, value) in env {
             deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
         }
-        std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
+        let deploy_env_path = PathBuf::from(format!("{cfg_dir}/deploy.env"));
+        crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes(), "deploy.env")?;
 
         // Agent initramfs is cached after first use — no app baked in.
         let initramfs_path = self.runner.build_agent_initramfs().await?;
@@ -1260,6 +1273,11 @@ async fn attempt_microvm_rollback(
     let alloc = subnet_for(service_id);
     let cfg_dir = format!("{}/cfg", russel_dir);
     std::fs::create_dir_all(&cfg_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let deploy_env = format!(
         "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
         alloc.vm_ip,
@@ -1267,7 +1285,8 @@ async fn attempt_microvm_rollback(
         guest_port,
         shell_quote(&app_path)
     );
-    std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
+    let deploy_env_path = PathBuf::from(format!("{cfg_dir}/deploy.env"));
+    crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes(), "deploy.env")?;
 
     // 4. Reserve port
     PortAllocator::reserve(service_id, host_port)?;

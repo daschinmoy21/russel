@@ -259,6 +259,7 @@ mod tests {
     use super::*;
     use crate::state::AppState;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     /// Write minimal microVM metadata into `{base}/{service_id}/metadata.json`.
@@ -309,24 +310,34 @@ mod tests {
         path
     }
 
-    /// Spawn a long-lived process whose path/argv contain the socat identity
-    /// for `service_id`. Writes a temp shebang script named `socat-russel-{id}`
-    /// (coreutils multi-call sleep rejects a renamed argv0).
-    fn spawn_fake_socat(service_id: &str) -> (tempfile::TempDir, std::process::Child) {
-        let dir = TempDir::new().unwrap();
-        let bin = dir.path().join(format!("socat-russel-{service_id}"));
-        // Do not `exec` — keep the script path in argv0 so identity matching
-        // can see `socat-russel-{id}` in /proc/pid/cmdline.
-        std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+    /// Spawn a long-lived shell whose argv contains the socat identity for
+    /// `service_id`. Using a system shell avoids parallel-test races around
+    /// creating and executing temporary script files.
+    fn spawn_fake_socat(service_id: &str) -> std::process::Child {
+        let mut command = std::process::Command::new("/bin/sh");
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            use std::os::unix::process::CommandExt;
+            command.arg0(format!("socat-russel-{service_id}"));
         }
-        let child = std::process::Command::new(&bin)
+        command
+            .args(["-c", "sleep 30; wait"])
             .spawn()
-            .expect("spawn fake socat");
-        (dir, child)
+            .map(|child| {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !pid_matches(child.id(), &["socat", "socat-russel"], service_id)
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(pid_matches(
+                    child.id(),
+                    &["socat", "socat-russel"],
+                    service_id
+                ));
+                child
+            })
+            .expect("spawn fake socat")
     }
 
     #[test]
@@ -341,7 +352,7 @@ mod tests {
     async fn reconcile_running_microvm_adopted() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let (_dir, mut fake) = spawn_fake_socat("api");
+        let mut fake = spawn_fake_socat("api");
         let pid = fake.id();
 
         write_microvm_metadata(base, "api", None, Some(pid), 3100);
@@ -449,7 +460,7 @@ mod tests {
     async fn reconcile_running_microvm_claims_port() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let (_dir, mut fake) = spawn_fake_socat("port-svc");
+        let mut fake = spawn_fake_socat("port-svc");
         let pid = fake.id();
 
         write_microvm_metadata(base, "port-svc", None, Some(pid), 9000);
@@ -471,7 +482,7 @@ mod tests {
     async fn reconcile_does_not_overwrite_live_handles() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let (_dir, mut fake) = spawn_fake_socat("live-svc");
+        let mut fake = spawn_fake_socat("live-svc");
         let pid = fake.id();
 
         write_microvm_metadata(base, "live-svc", None, Some(pid), 3105);
@@ -531,8 +542,8 @@ mod tests {
     async fn reconcile_multiple_services() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let (_da, mut a) = spawn_fake_socat("live-a");
-        let (_db, mut b) = spawn_fake_socat("live-b");
+        let mut a = spawn_fake_socat("live-a");
+        let mut b = spawn_fake_socat("live-b");
 
         write_microvm_metadata(base, "live-a", None, Some(a.id()), 3110);
         write_microvm_metadata(base, "live-b", None, Some(b.id()), 3111);
@@ -552,7 +563,7 @@ mod tests {
     async fn reconcile_with_socat_or_virtiofsd_pid_alive() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let (_dd, mut fake) = spawn_fake_socat("socat-only");
+        let mut fake = spawn_fake_socat("socat-only");
 
         let dir = base.join("socat-only");
         std::fs::create_dir_all(&dir).unwrap();

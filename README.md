@@ -79,6 +79,9 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/deploy` | Deploy or re-deploy a service (returns NDJSON stream) |
+| `GET` | `/secrets` | List secret names (values never returned) |
+| `POST` | `/secrets/{name}` | Set secret (`{"value":"..."}`); store mode `0600` |
+| `DELETE` | `/secrets/{name}` | Delete a secret |
 | `GET`  | `/status` | Get deployment status for all services (when `service_id` omitted) |
 | `GET`  | `/logs`   | Get logs for all services (when `service_id` omitted) |
 | `GET`  | `/vm/{service_id}/status` | Get deployment status for a service |
@@ -101,6 +104,7 @@ russel destroy <service_id>
 - **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
 - **`--env-file PATH`**: Load `KEY=VALUE` pairs from a file (`#` comments, blank lines skipped). Merged with `[service.env]` and `--env` (later wins).
 - Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
+- **Secrets** (host store, not committed): `printf '%s' "$VAL" | russel secrets set NAME`, `list`, `delete` (value from stdin, never argv). In env maps use `secret://NAME` — the control plane resolves the value at deploy time from `/var/lib/russel/secrets/` (mode `0600`). HTTP: `GET /secrets`, `POST /secrets/{name}`, `DELETE /secrets/{name}` (Bearer auth when configured).
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
