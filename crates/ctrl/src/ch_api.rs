@@ -66,11 +66,7 @@ pub async fn json_put(
 }
 
 impl ChClient {
-    pub async fn json_put(
-        &self,
-        endpoint: &str,
-        body: &serde_json::Value,
-    ) -> anyhow::Result<()> {
+    pub async fn json_put(&self, endpoint: &str, body: &serde_json::Value) -> anyhow::Result<()> {
         put_request(&self.api_socket, endpoint, Some(body)).await
     }
 }

@@ -133,28 +133,28 @@ impl MicrovmRunner {
         }
 
         // 3. Flake package: nix build .#microvm-kernel
-        if let Some(repo_root) = self.find_repo_root() {
-            if repo_root.join("flake.nix").exists() {
-                match self.build_flake_kernel(&repo_root).await {
-                    Ok(path) => {
-                        let info = KernelInfo {
-                            path,
-                            drivers_builtin: true,
-                        };
-                        self.store_kernel_cache(info.clone());
-                        tracing::info!(
-                            kernel = %info.path.display(),
-                            source = "flake",
-                            "microvm kernel cached (drivers built-in)"
-                        );
-                        return Ok(info);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "flake kernel build failed; trying next source"
-                        );
-                    }
+        if let Some(repo_root) = self.find_repo_root()
+            && repo_root.join("flake.nix").exists()
+        {
+            match self.build_flake_kernel(&repo_root).await {
+                Ok(path) => {
+                    let info = KernelInfo {
+                        path,
+                        drivers_builtin: true,
+                    };
+                    self.store_kernel_cache(info.clone());
+                    tracing::info!(
+                        kernel = %info.path.display(),
+                        source = "flake",
+                        "microvm kernel cached (drivers built-in)"
+                    );
+                    return Ok(info);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "flake kernel build failed; trying next source"
+                    );
                 }
             }
         }
@@ -162,8 +162,8 @@ impl MicrovmRunner {
         // 4. Relative result/bzImage (user ran nix build without --no-link)
         let result_bzimage = PathBuf::from("result/bzImage");
         if result_bzimage.exists() {
-            let abs = std::fs::canonicalize(&result_bzimage)
-                .unwrap_or_else(|_| result_bzimage.clone());
+            let abs =
+                std::fs::canonicalize(&result_bzimage).unwrap_or_else(|_| result_bzimage.clone());
             let info = KernelInfo {
                 path: abs,
                 drivers_builtin: true,
@@ -201,10 +201,10 @@ impl MicrovmRunner {
             return Some(std::fs::canonicalize(&compile_time).unwrap_or(compile_time));
         }
         // Runtime: try cwd
-        if let Ok(cwd) = std::env::current_dir() {
-            if cwd.join("flake.nix").exists() {
-                return Some(cwd);
-            }
+        if let Ok(cwd) = std::env::current_dir()
+            && cwd.join("flake.nix").exists()
+        {
+            return Some(cwd);
         }
         None
     }
@@ -233,7 +233,10 @@ impl MicrovmRunner {
         let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let kernel = PathBuf::from(format!("{}/bzImage", store_path));
         if !kernel.exists() {
-            anyhow::bail!("microvm kernel built but bzImage not found at {}", kernel.display());
+            anyhow::bail!(
+                "microvm kernel built but bzImage not found at {}",
+                kernel.display()
+            );
         }
         Ok(kernel)
     }
@@ -267,12 +270,11 @@ impl MicrovmRunner {
     }
 
     fn check_kernel_cache(&self) -> Option<KernelInfo> {
-        if let Ok(cache) = self.kernel_cache.lock() {
-            if let Some(ref info) = *cache
-                && info.path.exists()
-            {
-                return Some(info.clone());
-            }
+        if let Ok(cache) = self.kernel_cache.lock()
+            && let Some(ref info) = *cache
+            && info.path.exists()
+        {
+            return Some(info.clone());
         }
         None
     }
@@ -517,13 +519,8 @@ impl MicrovmRunner {
         };
 
         let bb_bin = format!("{}/bin/busybox", busybox_path.display());
-        let init = self.generate_init_script(
-            alloc,
-            guest_port,
-            app_store_path,
-            bin_name,
-            needed_modules,
-        );
+        let init =
+            self.generate_init_script(alloc, guest_port, app_store_path, bin_name, needed_modules);
         use std::os::unix::fs::PermissionsExt;
         let init_path = work.join("init");
         std::fs::write(&init_path, &init)?;
@@ -709,7 +706,10 @@ exec /bin/sh
                 return Ok(name.to_string());
             }
         }
-        anyhow::bail!("no kernel version directory found in {}", mods_dir.display())
+        anyhow::bail!(
+            "no kernel version directory found in {}",
+            mods_dir.display()
+        )
     }
 
     async fn copy_closure_to(&self, store_path: &Path, dest_root: &Path) -> anyhow::Result<()> {
@@ -1060,7 +1060,10 @@ exec /bin/sh
         let mut virtiofsd_killed = false;
         if let Some(ref meta) = metadata {
             for &pid in &meta.virtiofsd_pids {
-                if terminate_owned_process(pid, service_id).await.unwrap_or(false) {
+                if terminate_owned_process(pid, service_id)
+                    .await
+                    .unwrap_or(false)
+                {
                     virtiofsd_killed = true;
                 }
             }

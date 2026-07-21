@@ -540,9 +540,7 @@ impl AppState {
             status: s.status.clone(),
             vm_state: s.vm_state.clone(),
             uptime_seconds: s.started_at.elapsed().as_secs(),
-            runtime: s
-                .runtime
-                .or_else(|| disk.as_ref().and_then(|m| m.runtime)),
+            runtime: s.runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime)),
             host_port: disk.as_ref().and_then(|m| m.host_port),
             guest_port: disk.as_ref().and_then(|m| m.guest_port),
         })
@@ -654,7 +652,15 @@ mod tests {
         let status = state.status("test-svc").unwrap();
         assert_eq!(status.status, "deployed");
         assert_eq!(status.vm_state, "running");
-        assert!(state.lock_inner().services.get("test-svc").unwrap().vm_pid.is_some());
+        assert!(
+            state
+                .lock_inner()
+                .services
+                .get("test-svc")
+                .unwrap()
+                .vm_pid
+                .is_some()
+        );
 
         // Detach all processes
         let detached = state.detach_all_processes();
@@ -664,7 +670,10 @@ mod tests {
         let inner = state.lock_inner();
         let svc = inner.services.get("test-svc").unwrap();
         assert!(svc.vm_process.is_none(), "vm_process should be None");
-        assert!(svc.aux_processes.is_empty(), "aux_processes should be empty");
+        assert!(
+            svc.aux_processes.is_empty(),
+            "aux_processes should be empty"
+        );
         assert!(svc.vm_pid.is_none(), "vm_pid should be None");
         assert_eq!(svc.status, "detached");
         assert_eq!(svc.vm_state, "orphaned");
@@ -1003,7 +1012,10 @@ mod tests {
 
         // Give the task time to start waiting
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert!(!handle.is_finished(), "wait_for_deploys should still be waiting");
+        assert!(
+            !handle.is_finished(),
+            "wait_for_deploys should still be waiting"
+        );
 
         // Drop the guard to decrement counter
         drop(guard);
