@@ -418,6 +418,20 @@ fn install_env_wrapper(rootfs: &Path) -> anyhow::Result<()> {
 }
 
 const CONTAINER_NAME_PREFIX: &str = "russel-";
+
+/// Resolve Podman container name: prefer metadata (generation promote may leave
+/// a gen-scoped name), else the canonical `russel-{service_id}`.
+fn resolve_container_name(service_id: &str) -> String {
+    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&path)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(name) = value.get("container_name").and_then(|v| v.as_str())
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+    ContainerRunner::container_name(service_id)
+}
 const LABEL_SERVICE: &str = "russel.service";
 const LABEL_RUNTIME: &str = "russel.runtime";
 const RUNTIME_CONTAINER: &str = "container";
@@ -681,14 +695,14 @@ impl ContainerRunner {
 
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
-        let name = Self::container_name(service_id);
+        let name = resolve_container_name(service_id);
         stop_container(&name).await
     }
 
     /// Stop the container, remove it, and delete the prepared rootfs tree when present.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
-        let name = Self::container_name(service_id);
+        let name = resolve_container_name(service_id);
         stop_container(&name).await?;
         remove_container(&name).await?;
 
