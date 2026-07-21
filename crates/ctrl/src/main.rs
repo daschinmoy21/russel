@@ -6,8 +6,9 @@ mod api;
 mod build;
 mod ch_api;
 mod container;
-// database / health remain scaffold modules (SPEC stubs) — not yet called from deploy.
-// Per-module allow keeps the crate free of a global dead_code blanket (#104).
+// database / health: SPEC scaffold modules (DatabaseProvisioner / HealthChecker).
+// Module-wide allow is intentional until they are wired into the deploy pipeline;
+// remove the allows once those types are called from deploy or api paths (#104).
 #[allow(dead_code)]
 mod database;
 mod deploy;
@@ -155,11 +156,7 @@ async fn cleanup_stale_resources() {
                 };
                 // `ip -o link show` names look like `rsl-a1b2c3d4@NONE:` — strip
                 // trailing colon and optional `@peer` suffix.
-                let base = raw
-                    .trim_end_matches(':')
-                    .split('@')
-                    .next()
-                    .unwrap_or(raw);
+                let base = raw.trim_end_matches(':').split('@').next().unwrap_or(raw);
                 if !is_russel_tap(base) {
                     continue;
                 }

@@ -22,9 +22,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -73,6 +71,7 @@ impl WarmPool {
     }
 
     /// Block until prepare finishes (or immediately if already done).
+    #[allow(dead_code)] // for deploy/API callers that gate on warm-pool readiness
     pub async fn wait_until_prepare_done(&self) {
         if self.is_ready() {
             return;
@@ -450,7 +449,7 @@ impl WarmPool {
 
         // Use boot_vm with restore_url — virtiofsd is spawned by boot_vm.
         let spec = VmSpec {
-            kernel: PathBuf::from("/dev/null"),  // not used when restoring
+            kernel: PathBuf::from("/dev/null"), // not used when restoring
             initramfs: PathBuf::from("/dev/null"),
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
@@ -520,18 +519,13 @@ impl WarmPool {
         // The golden snapshot has tags ["nixstore", "russelcfg"] in order.
         if let Some(fs_arr) = config.get_mut("fs").and_then(|f| f.as_array_mut()) {
             for fs_entry in fs_arr.iter_mut() {
-                let tag = fs_entry
-                    .get("tag")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let tag = fs_entry.get("tag").and_then(|t| t.as_str()).unwrap_or("");
                 match tag {
                     "nixstore" => {
-                        fs_entry["socket"] =
-                            serde_json::Value::String(nixstore_sock.to_string());
+                        fs_entry["socket"] = serde_json::Value::String(nixstore_sock.to_string());
                     }
                     "russelcfg" => {
-                        fs_entry["socket"] =
-                            serde_json::Value::String(cfg_sock.to_string());
+                        fs_entry["socket"] = serde_json::Value::String(cfg_sock.to_string());
                     }
                     _ => {}
                 }
@@ -544,10 +538,10 @@ impl WarmPool {
         }
 
         // Ensure the console is null.
-        if let Some(console) = config.get_mut("console") {
-            if let Some(mode) = console.get_mut("mode") {
-                *mode = serde_json::Value::String("null".to_string());
-            }
+        if let Some(console) = config.get_mut("console")
+            && let Some(mode) = console.get_mut("mode")
+        {
+            *mode = serde_json::Value::String("null".to_string());
         }
 
         let patched = serde_json::to_string_pretty(&config)?;
@@ -559,9 +553,7 @@ impl WarmPool {
 
 use std::sync::LazyLock;
 
-static WARM_POOL: LazyLock<WarmPool> = LazyLock::new(|| {
-    WarmPool::new(microvm::shared_runner())
-});
+static WARM_POOL: LazyLock<WarmPool> = LazyLock::new(|| WarmPool::new(microvm::shared_runner()));
 
 /// Shared warm pool singleton (like `shared_runner()` for deploy.rs).
 pub fn shared_warm_pool() -> &'static WarmPool {

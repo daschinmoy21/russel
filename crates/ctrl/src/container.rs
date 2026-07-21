@@ -43,6 +43,7 @@ impl DebugToolsCache {
     }
 
     /// Resolve or build bash and curl from nixpkgs; results are cached in-memory.
+    #[allow(dead_code)] // optional debug helper for container shells; not on deploy path
     pub async fn ensure_debug_tools(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
         let bash = self.ensure_bash(None).await?;
         let curl = self.ensure_curl(None).await?;
@@ -53,14 +54,16 @@ impl DebugToolsCache {
         if let Some(path) = override_path {
             return Ok(path.to_path_buf());
         }
-        self.ensure_nix_package(&self.bash_cache, "bash", "bash").await
+        self.ensure_nix_package(&self.bash_cache, "bash", "bash")
+            .await
     }
 
     async fn ensure_curl(&self, override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
         if let Some(path) = override_path {
             return Ok(path.to_path_buf());
         }
-        self.ensure_nix_package(&self.curl_cache, "curl", "curl").await
+        self.ensure_nix_package(&self.curl_cache, "curl", "curl")
+            .await
     }
 
     async fn ensure_nix_package(
@@ -174,12 +177,8 @@ fn select_nix_tool_store_path(stdout: &[u8], tool: &str) -> anyhow::Result<PathB
 pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs> {
     let entrypoint = validate_entrypoint(&spec.store_path, &spec.bin_name)?;
     let cache = shared_debug_tools();
-    let bash_store = cache
-        .ensure_bash(spec.bash_store.as_deref())
-        .await?;
-    let curl_store = cache
-        .ensure_curl(spec.curl_store.as_deref())
-        .await?;
+    let bash_store = cache.ensure_bash(spec.bash_store.as_deref()).await?;
+    let curl_store = cache.ensure_curl(spec.curl_store.as_deref()).await?;
 
     let rootfs_path = spec.base_dir.join("rootfs");
     if rootfs_path.exists() {
@@ -306,10 +305,7 @@ fn validate_interpreter_path(
         if interpreter.starts_with(store_path) {
             return Ok(());
         }
-        anyhow::bail!(
-            "{context} does not exist: {}",
-            interpreter.display()
-        );
+        anyhow::bail!("{context} does not exist: {}", interpreter.display());
     }
 
     let resolved = store_path.join(interpreter);
@@ -327,33 +323,16 @@ fn create_layout(rootfs: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let dirs = [
-        "tmp",
-        "var",
-        "var/tmp",
-        "etc",
-        "bin",
-        "usr",
-        "usr/bin",
-        "dev",
-        "proc",
-        "sys",
-        "run",
-        "home",
-        "root",
+        "tmp", "var", "var/tmp", "etc", "bin", "usr", "usr/bin", "dev", "proc", "sys", "run",
+        "home", "root",
     ];
 
     for dir in dirs {
         std::fs::create_dir_all(rootfs.join(dir))?;
     }
 
-    std::fs::set_permissions(
-        rootfs.join("tmp"),
-        std::fs::Permissions::from_mode(0o1777),
-    )?;
-    std::fs::set_permissions(
-        rootfs.join("root"),
-        std::fs::Permissions::from_mode(0o700),
-    )?;
+    std::fs::set_permissions(rootfs.join("tmp"), std::fs::Permissions::from_mode(0o1777))?;
+    std::fs::set_permissions(rootfs.join("root"), std::fs::Permissions::from_mode(0o700))?;
 
     Ok(())
 }
@@ -364,10 +343,7 @@ fn write_etc_files(rootfs: &Path) -> anyhow::Result<()> {
         etc.join("passwd"),
         "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
     )?;
-    std::fs::write(
-        etc.join("group"),
-        "root:x:0:\nnogroup:x:65534:\n",
-    )?;
+    std::fs::write(etc.join("group"), "root:x:0:\nnogroup:x:65534:\n")?;
     std::fs::write(
         etc.join("hosts"),
         "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n",
@@ -402,7 +378,9 @@ fn link_debug_tool(rootfs: &Path, store_path: &Path, tool: &str) -> anyhow::Resu
 }
 
 fn store_bin_to_container_path(host_path: &Path) -> anyhow::Result<PathBuf> {
-    let canonical = host_path.canonicalize().unwrap_or_else(|_| host_path.to_path_buf());
+    let canonical = host_path
+        .canonicalize()
+        .unwrap_or_else(|_| host_path.to_path_buf());
     let path_str = canonical
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 store path: {}", canonical.display()))?;
@@ -443,14 +421,14 @@ const CONTAINER_NAME_PREFIX: &str = "russel-";
 const LABEL_SERVICE: &str = "russel.service";
 const LABEL_RUNTIME: &str = "russel.runtime";
 const RUNTIME_CONTAINER: &str = "container";
-const NIX_STORE_MOUNT: &str =
-    "type=bind,source=/nix/store,destination=/nix/store,ro=true";
+const NIX_STORE_MOUNT: &str = "type=bind,source=/nix/store,destination=/nix/store,ro=true";
 const PODMAN_STOP_TIMEOUT_SECS: &str = "10";
 
 // ── RUSSEL_PODMAN_USER env support (Issue #278598) ───────────────────────────
 
 fn configured_podman_user() -> Option<String> {
-    std::env::var("RUSSEL_PODMAN_USER").ok()
+    std::env::var("RUSSEL_PODMAN_USER")
+        .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s != "root")
 }
@@ -476,7 +454,8 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
             .ok()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
-                out.split(':').nth(5)
+                out.split(':')
+                    .nth(5)
                     .unwrap_or(&format!("/home/{user}"))
                     .to_string()
             })?;
@@ -495,7 +474,8 @@ fn podman_command() -> Command {
         let user = configured_podman_user().unwrap(); // safe: podman_user_env already checked
         let mut cmd = Command::new("sudo");
         cmd.args([
-            "-u", &user,
+            "-u",
+            &user,
             "-H",
             "env",
             &format!("HOME={}", env.home),
@@ -521,7 +501,9 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     };
 
     // Open path components for traversal (resolve symlinks first).
-    let resolved = rootfs.canonicalize().unwrap_or_else(|_| rootfs.to_path_buf());
+    let resolved = rootfs
+        .canonicalize()
+        .unwrap_or_else(|_| rootfs.to_path_buf());
     let mut walk = resolved.as_path();
     loop {
         let output = std::process::Command::new("chmod")
@@ -715,6 +697,8 @@ impl ContainerRunner {
         Ok(())
     }
 
+    /// Inspect a running Russel container (used by e2e tests and future status API).
+    #[allow(dead_code)]
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);
@@ -1081,8 +1065,11 @@ mod tests {
         std::fs::create_dir_all(bin_out.join("bin")).unwrap();
         std::fs::create_dir_all(man_out.join("share/man")).unwrap();
         std::fs::write(bin_out.join("bin/curl"), b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(bin_out.join("bin/curl"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            bin_out.join("bin/curl"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
 
         let stdout = format!(
             "{}\n{}\n{}\n",
@@ -1114,8 +1101,8 @@ mod tests {
         let rootfs = &prepared.rootfs_path;
 
         for dir in [
-            "tmp", "var", "var/tmp", "etc", "bin", "usr", "usr/bin",
-            "dev", "proc", "sys", "run", "home", "root",
+            "tmp", "var", "var/tmp", "etc", "bin", "usr", "usr/bin", "dev", "proc", "sys", "run",
+            "home", "root",
         ] {
             assert!(rootfs.join(dir).is_dir(), "missing directory {dir}");
         }
@@ -1150,7 +1137,10 @@ mod tests {
         let link = prepared.rootfs_path.join("bin/myapp");
         assert!(link.is_symlink());
         let target = std::fs::read_link(&link).unwrap();
-        assert_eq!(target, PathBuf::from("/nix/store/fake-myapp-package/bin/myapp"));
+        assert_eq!(
+            target,
+            PathBuf::from("/nix/store/fake-myapp-package/bin/myapp")
+        );
     }
 
     #[test]
@@ -1179,10 +1169,7 @@ mod tests {
         let store = tmp.path().join("app-store");
         let bin_dir = store.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let script = format!(
-            "#!{}/bin/bash\necho hi\n",
-            interpreter.display()
-        );
+        let script = format!("#!{}/bin/bash\necho hi\n", interpreter.display());
         let bin_path = bin_dir.join("runner");
         std::fs::write(&bin_path, script).unwrap();
 
@@ -1242,7 +1229,10 @@ mod tests {
             host_port: 8080,
             guest_port: 3000,
             memory_mb: 512,
-            env: vec![("PORT".into(), "3000".into()), ("RUSSEL".into(), "1".into())],
+            env: vec![
+                ("PORT".into(), "3000".into()),
+                ("RUSSEL".into(), "1".into()),
+            ],
             extra_args: vec![],
         };
         let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
@@ -1353,16 +1343,14 @@ mod tests {
 
     #[test]
     fn reject_port_override_via_e_flag() {
-        for (arg, next) in [
-            ("-e", Some("PORT=3000")),
-            ("--env", Some("PORT=3000")),
-        ] {
-            let err = validate_podman_passthrough_args(&[
-                arg.to_string(),
-                next.unwrap().to_string(),
-            ])
-            .unwrap_err();
-            assert!(err.to_string().contains("PORT"), "expected PORT rejection for {arg}");
+        for (arg, next) in [("-e", Some("PORT=3000")), ("--env", Some("PORT=3000"))] {
+            let err =
+                validate_podman_passthrough_args(&[arg.to_string(), next.unwrap().to_string()])
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("PORT"),
+                "expected PORT rejection for {arg}"
+            );
         }
     }
 
@@ -1370,7 +1358,10 @@ mod tests {
     fn reject_port_override_via_e_equals_form() {
         for arg in ["-ePORT=3000", "--env=PORT=3000"] {
             let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
-            assert!(err.to_string().contains("PORT"), "expected PORT rejection for {arg}");
+            assert!(
+                err.to_string().contains("PORT"),
+                "expected PORT rejection for {arg}"
+            );
         }
     }
 
@@ -1405,23 +1396,29 @@ mod tests {
     fn reject_privileged() {
         for arg in ["--privileged", "--privileged=true"] {
             let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
-            assert!(err.to_string().contains("privileged"), "expected rejection for {arg}");
+            assert!(
+                err.to_string().contains("privileged"),
+                "expected rejection for {arg}"
+            );
         }
     }
 
     #[test]
     fn reject_network_host() {
         for (flag, value) in [("--network", "host"), ("--net", "host"), ("-net", "host")] {
-            let err = validate_podman_passthrough_args(&[
-                flag.to_string(),
-                value.to_string(),
-            ])
-            .unwrap_err();
-            assert!(err.to_string().contains("host"), "expected rejection for {flag}");
+            let err = validate_podman_passthrough_args(&[flag.to_string(), value.to_string()])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("host"),
+                "expected rejection for {flag}"
+            );
         }
         for eq in ["--network=host", "--net=host"] {
             let err = validate_podman_passthrough_args(&[eq.to_string()]).unwrap_err();
-            assert!(err.to_string().contains("host"), "expected rejection for {eq}");
+            assert!(
+                err.to_string().contains("host"),
+                "expected rejection for {eq}"
+            );
         }
     }
 
@@ -1458,16 +1455,27 @@ mod tests {
                 args.push(v.to_string());
             }
             let err = validate_podman_passthrough_args(&args).unwrap_err();
-            assert!(err.to_string().contains("device"), "expected rejection for {flag}");
+            assert!(
+                err.to_string().contains("device"),
+                "expected rejection for {flag}"
+            );
         }
     }
 
     #[test]
     fn reject_port_publish() {
-        for flag in ["-p", "--publish", "--publish-all", "-P", "--publish=0:8080:80"] {
+        for flag in [
+            "-p",
+            "--publish",
+            "--publish-all",
+            "-P",
+            "--publish=0:8080:80",
+        ] {
             let err = validate_podman_passthrough_args(&[flag.to_string()]).unwrap_err();
-            assert!(err.to_string().contains("publish") || err.to_string().contains("port"),
-                "expected rejection for {flag}");
+            assert!(
+                err.to_string().contains("publish") || err.to_string().contains("port"),
+                "expected rejection for {flag}"
+            );
         }
     }
 
@@ -1476,7 +1484,12 @@ mod tests {
     #[tokio::test]
     async fn prepare_rootfs_creates_env_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = fake_store(tmp.path(), "fake-env-app", "app", b"#!/usr/bin/env bash\necho hi\n");
+        let store = fake_store(
+            tmp.path(),
+            "fake-env-app",
+            "app",
+            b"#!/usr/bin/env bash\necho hi\n",
+        );
         let bash = fake_nix_tool(tmp.path(), "bash");
         let curl = fake_nix_tool(tmp.path(), "curl");
 
@@ -1495,11 +1508,17 @@ mod tests {
         let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "env should be executable");
         let contents = std::fs::read_to_string(&env_path).unwrap();
-        assert!(contents.contains("#!/bin/bash"), "env should delegate to bash");
+        assert!(
+            contents.contains("#!/bin/bash"),
+            "env should delegate to bash"
+        );
 
         // /bin/env symlink should also exist
         let bin_env = prepared.rootfs_path.join("bin/env");
-        assert!(bin_env.is_symlink() || bin_env.is_file(), "bin/env should exist");
+        assert!(
+            bin_env.is_symlink() || bin_env.is_file(),
+            "bin/env should exist"
+        );
     }
 
     #[test]
@@ -1541,20 +1560,28 @@ mod tests {
     #[test]
     fn reject_port_bare_via_e_flag() {
         let err = validate_podman_passthrough_args(&["-e".into(), "PORT".into()]).unwrap_err();
-        assert!(err.to_string().contains("PORT"), "expected PORT rejection for -e PORT");
+        assert!(
+            err.to_string().contains("PORT"),
+            "expected PORT rejection for -e PORT"
+        );
     }
 
     #[test]
     fn reject_port_compact_eport_form() {
         let err = validate_podman_passthrough_args(&["-ePORT".into()]).unwrap_err();
-        assert!(err.to_string().contains("PORT"), "expected PORT rejection for -ePORT");
+        assert!(
+            err.to_string().contains("PORT"),
+            "expected PORT rejection for -ePORT"
+        );
     }
 
     #[test]
     fn reject_port_publish_compact() {
         let err = validate_podman_passthrough_args(&["-p8080:80".into()]).unwrap_err();
-        assert!(err.to_string().contains("publish") || err.to_string().contains("port"),
-            "expected rejection for -p8080:80");
+        assert!(
+            err.to_string().contains("publish") || err.to_string().contains("port"),
+            "expected rejection for -p8080:80"
+        );
     }
 
     #[test]

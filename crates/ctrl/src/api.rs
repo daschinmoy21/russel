@@ -416,6 +416,8 @@ async fn vm_destroy(
     }
 }
 
+// Microvm holds Child handles; Container is tiny — allow until claim payload is boxed.
+#[allow(clippy::large_enum_variant)]
 enum LifecycleClaimKind {
     Microvm {
         runner: MicrovmRunner,

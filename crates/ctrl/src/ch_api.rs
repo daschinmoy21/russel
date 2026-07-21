@@ -31,6 +31,8 @@ impl ChClient {
         }
     }
 
+    /// Accessor for callers that need the raw socket path (e.g. logging, handoff).
+    #[allow(dead_code)] // public API surface; not all call sites use it yet
     pub fn socket(&self) -> &Path {
         &self.api_socket
     }
@@ -66,11 +68,7 @@ pub async fn json_put(
 }
 
 impl ChClient {
-    pub async fn json_put(
-        &self,
-        endpoint: &str,
-        body: &serde_json::Value,
-    ) -> anyhow::Result<()> {
+    pub async fn json_put(&self, endpoint: &str, body: &serde_json::Value) -> anyhow::Result<()> {
         put_request(&self.api_socket, endpoint, Some(body)).await
     }
 }
@@ -82,7 +80,8 @@ pub async fn vm_pause(api_socket: &Path) -> anyhow::Result<()> {
     empty_put(api_socket, "vm.pause").await
 }
 
-/// Resume a paused VM.
+/// Resume a paused VM (pair of `vm_pause`; used after snapshot restore).
+#[allow(dead_code)] // wired when warm-pool restore path lands
 pub async fn vm_resume(api_socket: &Path) -> anyhow::Result<()> {
     empty_put(api_socket, "vm.resume").await
 }

@@ -12,8 +12,8 @@ use russel_core::{
 use crate::{
     build::NixBuilder,
     container::{
-        ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec,
-        default_base_dir, validate_podman_args_for_runtime,
+        ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec, default_base_dir,
+        validate_podman_args_for_runtime,
     },
     database::DatabaseProvisioner,
     git::GitClient,
@@ -126,6 +126,7 @@ impl DeployPipeline {
                     }
                     DeployWorkload::Container {
                         container_id,
+                        container_name,
                         rootfs_path,
                         ..
                     } => {
@@ -133,7 +134,7 @@ impl DeployPipeline {
                             .mark_deployed_container(&service_id, &container_id);
                         (
                             format!(
-                                "container running. localhost:{host_port} -> guest:{guest_port}"
+                                "container {container_name} running. localhost:{host_port} -> guest:{guest_port}"
                             ),
                             None,
                             Some(rootfs_path.display().to_string()),
@@ -236,7 +237,8 @@ impl DeployPipeline {
             })
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
-        let config_path = repo_path.join(PathBuf::from(&request.config_path));
+        // Path-safe resolve under repo root (blocks absolute/.. and oversized configs).
+        let config_path = resolve_config_path(&repo_path, &request.config_path)?;
         let config = Russelfile::load(&config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
@@ -457,7 +459,11 @@ impl DeployPipeline {
             }
         };
 
-        if let Err(error) = self.traefik.register(service_id, workload.port().host).await {
+        if let Err(error) = self
+            .traefik
+            .register(service_id, workload.port().host)
+            .await
+        {
             workload.teardown_network().await;
             PortAllocator::release(service_id);
             return Err(error);
@@ -536,9 +542,8 @@ impl DeployPipeline {
             .await;
 
         let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
-        std::fs::create_dir_all(&cfg_dir).map_err(|e| {
-            anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e)
-        })?;
+        std::fs::create_dir_all(&cfg_dir)
+            .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
         let deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
             alloc.vm_ip, alloc.host_ip, port.guest, app_path
@@ -549,7 +554,11 @@ impl DeployPipeline {
         let initramfs_path = self.runner.build_agent_initramfs().await?;
 
         let create_ms = t.elapsed().as_millis();
-        tracing::info!(service_id, create_ms, "deploy.env written, agent initramfs ready");
+        tracing::info!(
+            service_id,
+            create_ms,
+            "deploy.env written, agent initramfs ready"
+        );
 
         // ── TAP + socat + boot/restore VM ──────────────────────────────
         let _ = tx
@@ -561,8 +570,7 @@ impl DeployPipeline {
         tracing::info!(service_id, "setting up TAP + socat + booting VM");
 
         let t_net = Instant::now();
-        let socat_child =
-            TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
+        let socat_child = TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
         let network_ms = t_net.elapsed().as_millis();
 
         let t_start = Instant::now();
@@ -605,9 +613,8 @@ impl DeployPipeline {
         });
         let content = serde_json::to_string_pretty(&metadata)
             .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-        std::fs::write(&metadata_path, content).map_err(|e| {
-            anyhow::anyhow!("failed to write metadata to {}: {}", metadata_path, e)
-        })?;
+        std::fs::write(&metadata_path, content)
+            .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", metadata_path, e))?;
 
         // Create marker directory for MicrovmRunner::list() discovery
         let microvms_marker = format!("/var/lib/microvms/{}", service_id);
@@ -616,7 +623,12 @@ impl DeployPipeline {
         })?;
 
         let start_ms = t_start.elapsed().as_millis();
-        tracing::info!(service_id, network_ms, start_ms, "network + VM booted/restored");
+        tracing::info!(
+            service_id,
+            network_ms,
+            start_ms,
+            "network + VM booted/restored"
+        );
 
         // ── Wait for VM service to be reachable ────────────────────────
         let t = Instant::now();
@@ -633,8 +645,7 @@ impl DeployPipeline {
             "polling VM readiness"
         );
         let up =
-            TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10))
-                .await;
+            TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10)).await;
         let ready_ms = t.elapsed().as_millis();
         if !up {
             let console_log = format!("/var/lib/russel/{}/console.log", service_id);
@@ -771,8 +782,7 @@ impl DeployPipeline {
             host_port = port.host,
             "polling container readiness"
         );
-        let up =
-            TapForwarder::wait_for_host_port(port.host, Duration::from_secs(10)).await;
+        let up = TapForwarder::wait_for_host_port(port.host, Duration::from_secs(10)).await;
         let ready_ms = t.elapsed().as_millis();
         if !up {
             anyhow::bail!("container not reachable on 127.0.0.1:{} in 10s", port.host);
@@ -935,10 +945,12 @@ async fn attempt_container_rollback(
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
     let old_host_port = old_meta["host_port"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))? as u16;
+        .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))?
+        as u16;
     let old_guest_port = old_meta["guest_port"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))? as u16;
+        .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))?
+        as u16;
     let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
     let old_bin_name = old_meta["bin_name"].as_str().unwrap_or("app");
     let old_rootfs_path = old_meta["rootfs_path"]
@@ -947,7 +959,11 @@ async fn attempt_container_rollback(
     let old_podman_args: Vec<String> = old_meta
         .get("podman_args")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|a| a.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     PortAllocator::reserve(service_id, old_host_port)?;
@@ -967,8 +983,7 @@ async fn attempt_container_rollback(
     let running = containers.start(&start_spec).await?;
 
     // Do not mark deployed until the restored container is reachable.
-    let ready =
-        TapForwarder::wait_for_host_port(old_host_port, Duration::from_secs(10)).await;
+    let ready = TapForwarder::wait_for_host_port(old_host_port, Duration::from_secs(10)).await;
     if !ready {
         if let Err(e) = containers.destroy(service_id).await {
             tracing::warn!(
@@ -1049,9 +1064,8 @@ fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<Pa
         anyhow::bail!("config_path escapes repository root");
     }
 
-    let meta = std::fs::metadata(&config_canon).map_err(|e| {
-        anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display())
-    })?;
+    let meta = std::fs::metadata(&config_canon)
+        .map_err(|e| anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display()))?;
     if !meta.is_file() {
         anyhow::bail!("config_path must be a regular file");
     }
@@ -1192,7 +1206,11 @@ memory = "256mb"
         ));
         std::fs::create_dir_all(&outside).unwrap();
         let outside_file = outside.join("secret.toml");
-        std::fs::write(&outside_file, b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n").unwrap();
+        std::fs::write(
+            &outside_file,
+            b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&outside_file, repo.path().join("escape.toml")).unwrap();
         let err = resolve_config_path(repo.path(), "escape.toml")
             .unwrap_err()
@@ -1292,11 +1310,9 @@ mod deploy_tests {
 
     #[test]
     fn podman_args_rejected_for_microvm_runtime() {
-        let err = validate_podman_args_for_runtime(
-            RuntimeKind::Microvm,
-            &["-v".into(), "/a:/b".into()],
-        )
-        .unwrap_err();
+        let err =
+            validate_podman_args_for_runtime(RuntimeKind::Microvm, &["-v".into(), "/a:/b".into()])
+                .unwrap_err();
         assert!(err.to_string().contains("microvm"));
     }
 
