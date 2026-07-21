@@ -80,7 +80,37 @@ No reload, no API calls, no Traefik binary dependency in Russel.
 }
 ```
 
-## TLS / ACME (future)
+## TLS / ACME
 
-Planned: automatic Let's Encrypt certificates via Traefik's ACME integration.
-For now, terminate TLS at Traefik with your own certificates.
+Enable TLS on dynamic routers written by Russel:
+
+```bash
+export RUSSEL_TRAEFIK_TLS=1
+export RUSSEL_TRAEFIK_CERT_RESOLVER=letsencrypt   # must match Traefik static config
+```
+
+Static Traefik config (example):
+
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: you@example.com
+      storage: /var/lib/traefik/acme.json
+      httpChallenge:
+        entryPoint: web
+
+providers:
+  file:
+    directory: /var/lib/russel/traefik/dynamic
+    watch: true
+```
+
+When `RUSSEL_TRAEFIK_TLS=1`, each service router uses entryPoints `web` +
+`websecure` and sets `tls.certResolver` to `RUSSEL_TRAEFIK_CERT_RESOLVER`.

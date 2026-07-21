@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
@@ -69,7 +73,18 @@ impl GitClient {
         let checkout_root = PathBuf::from("/tmp/russel/checkouts");
         fs::create_dir_all(&checkout_root).context("failed to create checkout directory")?;
 
-        let checkout = checkout_root.join(sanitize_repo_name(repo));
+        // Best-effort GC of old checkouts (age-based) before clone.
+        if let Err(e) = gc_old_checkouts(&checkout_root, Duration::from_secs(24 * 3600)) {
+            tracing::warn!(error = %e, "checkout GC failed (continuing)");
+        }
+
+        // Unique dir per URL: content hash avoids sanitize collisions (#121 / #38).
+        let checkout = checkout_root.join(checkout_dir_name(repo));
+        if checkout.exists() {
+            // Replace existing checkout for this URL (idempotent redeploy).
+            let _ = fs::remove_dir_all(&checkout);
+        }
+
         let output = Command::new("git")
             .arg("clone")
             .arg("--")
@@ -90,8 +105,91 @@ impl GitClient {
     }
 }
 
-fn sanitize_repo_name(repo: &str) -> String {
-    repo.chars()
+/// Stable, unique directory name for a remote repo URL.
+///
+/// Format: `{sanitized_prefix}-{16 hex of FNV-1a of full URL}`.
+fn checkout_dir_name(repo: &str) -> String {
+    let hash = repo.bytes().fold(2_166_136_261u32, |acc, b| {
+        acc.wrapping_mul(16_777_619) ^ b as u32
+    });
+    let prefix: String = repo
+        .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+        .take(48)
+        .collect();
+    let prefix = prefix.trim_matches('-');
+    if prefix.is_empty() {
+        format!("repo-{hash:08x}")
+    } else {
+        format!("{prefix}-{hash:08x}")
+    }
+}
+
+/// Remove checkout directories older than `max_age`.
+pub fn gc_old_checkouts(checkout_root: &Path, max_age: Duration) -> anyhow::Result<usize> {
+    if !checkout_root.exists() {
+        return Ok(0);
+    }
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in fs::read_dir(checkout_root)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if !meta.is_dir() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age > max_age {
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => {
+                    tracing::info!(path = %entry.path().display(), "GC removed old git checkout");
+                    removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "failed to GC git checkout"
+                    );
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn checkout_dir_name_is_unique_for_distinct_urls() {
+        let a = checkout_dir_name("https://github.com/org/repo-a.git");
+        let b = checkout_dir_name("https://github.com/org/repo-b.git");
+        assert_ne!(a, b);
+        // Same URL is stable.
+        assert_eq!(a, checkout_dir_name("https://github.com/org/repo-a.git"));
+    }
+
+    #[test]
+    fn checkout_dir_name_avoids_sanitize_collision() {
+        // Previously both would become the same sanitize string.
+        let a = checkout_dir_name("https://github.com/foo/bar");
+        let b = checkout_dir_name("https://gitlab.com/foo/bar");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn gc_removes_old_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("old-checkout");
+        fs::create_dir_all(&old).unwrap();
+        // Set mtime to the past via filetime is not available; touch then GC with zero age
+        // would remove everything. Use max_age=0 to remove all.
+        let removed = gc_old_checkouts(tmp.path(), Duration::from_secs(0)).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+    }
 }

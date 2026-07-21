@@ -1138,6 +1138,7 @@ exec /bin/sh
         let alloc = crate::network::subnet_for(service_id);
         crate::network::TapForwarder::teardown(&alloc).await?;
         crate::network::PortAllocator::release(service_id);
+        crate::network::release_subnet(service_id);
 
         for dir in &[
             format!("/var/lib/microvms/{service_id}"),

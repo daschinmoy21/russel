@@ -19,6 +19,7 @@ mod ingress;
 mod metadata;
 mod microvm;
 mod network;
+mod secrets;
 mod state;
 mod traefik;
 mod warm_pool;

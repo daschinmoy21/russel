@@ -53,6 +53,21 @@ pub enum Command {
     Vms,
     Stop(StopArgs),
     Destroy(DestroyArgs),
+    /// Manage host-side secrets (stored on the control plane, not in Russelfile).
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsCommand {
+    /// Store a secret value on the control plane.
+    Set { name: String, value: String },
+    /// List secret names (values are never shown).
+    List,
+    /// Delete a secret.
+    Delete { name: String },
 }
 
 #[derive(Debug, Args)]
@@ -626,6 +641,58 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
     }
     let r = resp.json::<String>().await?;
     println!("{}", r);
+    Ok(())
+}
+
+pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> {
+    match action {
+        SecretsCommand::Set { name, value } => {
+            let resp = http_client()
+                .post(format!("{control_plane}/secrets/{name}"))
+                .json(&serde_json::json!({ "value": value }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("secrets set failed ({status}): {body}");
+            }
+            println!("secret {name} stored");
+        }
+        SecretsCommand::List => {
+            let resp = http_client()
+                .get(format!("{control_plane}/secrets"))
+                .send()
+                .await?
+                .error_for_status()?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(arr) = body.get("secrets").and_then(|v| v.as_array()) {
+                if arr.is_empty() {
+                    println!("(no secrets)");
+                } else {
+                    for name in arr {
+                        if let Some(s) = name.as_str() {
+                            println!("{s}");
+                        }
+                    }
+                }
+            } else {
+                println!("{body}");
+            }
+        }
+        SecretsCommand::Delete { name } => {
+            let resp = http_client()
+                .delete(format!("{control_plane}/secrets/{name}"))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("secrets delete failed ({status}): {body}");
+            }
+            println!("secret {name} deleted");
+        }
+    }
     Ok(())
 }
 

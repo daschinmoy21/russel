@@ -12,10 +12,14 @@ use crate::ingress::{Backend, HostRule, Ingress};
 ///   (default `/var/lib/russel/traefik/dynamic`)
 /// - `RUSSEL_TRAEFIK_DOMAIN` — domain suffix for Host rules
 ///   (default `russel.local`)
+/// - `RUSSEL_TRAEFIK_TLS` — when `1`/`true`, attach TLS to routers (websecure)
+/// - `RUSSEL_TRAEFIK_CERT_RESOLVER` — ACME cert resolver name (default `letsencrypt`)
 #[derive(Debug, Clone)]
 pub struct TraefikFileIngress {
     dynamic_dir: PathBuf,
     domain: String,
+    tls_enabled: bool,
+    cert_resolver: String,
 }
 
 impl Default for TraefikFileIngress {
@@ -32,9 +36,20 @@ impl TraefikFileIngress {
             .unwrap_or_else(|_| PathBuf::from("/var/lib/russel/traefik/dynamic"));
         let domain =
             std::env::var("RUSSEL_TRAEFIK_DOMAIN").unwrap_or_else(|_| "russel.local".to_string());
+        let tls_enabled = matches!(
+            std::env::var("RUSSEL_TRAEFIK_TLS")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        let cert_resolver = std::env::var("RUSSEL_TRAEFIK_CERT_RESOLVER")
+            .unwrap_or_else(|_| "letsencrypt".to_string());
         Self {
             dynamic_dir,
             domain,
+            tls_enabled,
+            cert_resolver,
         }
     }
 
@@ -76,14 +91,25 @@ impl Ingress for TraefikFileIngress {
                 )
             })?;
 
+        let mut router = serde_json::json!({
+            "rule": format!("Host(`{}`)", host),
+            "entryPoints": if self.tls_enabled {
+                serde_json::json!(["web", "websecure"])
+            } else {
+                serde_json::json!(["web"])
+            },
+            "service": &service_name,
+        });
+        if self.tls_enabled {
+            router["tls"] = serde_json::json!({
+                "certResolver": self.cert_resolver,
+            });
+        }
+
         let config = serde_json::json!({
             "http": {
                 "routers": {
-                    &router_name: {
-                        "rule": format!("Host(`{}`)", host),
-                        "entryPoints": ["web"],
-                        "service": &service_name,
-                    }
+                    &router_name: router
                 },
                 "services": {
                     &service_name: {
@@ -174,6 +200,15 @@ fn svc_name(service_id: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_ingress(dir: impl Into<PathBuf>, domain: &str) -> TraefikFileIngress {
+        TraefikFileIngress {
+            dynamic_dir: dir.into(),
+            domain: domain.to_string(),
+            tls_enabled: false,
+            cert_resolver: "letsencrypt".to_string(),
+        }
+    }
+
     #[test]
     fn router_service_naming() {
         assert_eq!(router_name("api"), "russel-api");
@@ -183,20 +218,14 @@ mod tests {
 
     #[test]
     fn public_host_default_domain() {
-        let ing = TraefikFileIngress {
-            dynamic_dir: PathBuf::from("/tmp/traefik"),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress("/tmp/traefik", "russel.local");
         assert_eq!(ing.public_host("api"), "api.russel.local");
         assert_eq!(ing.public_host("demo"), "demo.russel.local");
     }
 
     #[test]
     fn public_host_custom_domain() {
-        let ing = TraefikFileIngress {
-            dynamic_dir: PathBuf::from("/tmp/traefik"),
-            domain: "example.com".to_string(),
-        };
+        let ing = test_ingress("/tmp/traefik", "example.com");
         assert_eq!(ing.public_host("api"), "api.example.com");
     }
 
@@ -208,10 +237,7 @@ mod tests {
 
     #[test]
     fn primary_host_returns_public_host() {
-        let ing = TraefikFileIngress {
-            dynamic_dir: PathBuf::from("/tmp/traefik"),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress("/tmp/traefik", "russel.local");
         assert_eq!(
             Ingress::primary_host(&ing, "api"),
             Some("api.russel.local".to_string())
@@ -222,10 +248,7 @@ mod tests {
     async fn register_writes_json_file() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dynamic");
-        let ing = TraefikFileIngress {
-            dynamic_dir: dir.clone(),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress(dir.clone(), "russel.local");
 
         let backend = Backend::localhost(3100);
         Ingress::register(&ing, "api", &backend, &[]).await.unwrap();
@@ -254,10 +277,7 @@ mod tests {
     async fn register_with_custom_host_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dynamic");
-        let ing = TraefikFileIngress {
-            dynamic_dir: dir.clone(),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress(dir.clone(), "russel.local");
 
         let backend = Backend {
             host: "10.0.0.1".to_string(),
@@ -290,10 +310,7 @@ mod tests {
     async fn deregister_removes_file() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dynamic");
-        let ing = TraefikFileIngress {
-            dynamic_dir: dir.clone(),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress(dir.clone(), "russel.local");
 
         // Register then deregister
         let backend = Backend::localhost(3100);
@@ -307,10 +324,7 @@ mod tests {
     #[tokio::test]
     async fn deregister_ignores_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let ing = TraefikFileIngress {
-            dynamic_dir: tmp.path().join("dynamic"),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress(tmp.path().join("dynamic"), "russel.local");
 
         // Should not error on missing file
         Ingress::deregister(&ing, "nonexistent").await.unwrap();
@@ -320,10 +334,7 @@ mod tests {
     async fn swap_rewrites_file_with_new_backend() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dynamic");
-        let ing = TraefikFileIngress {
-            dynamic_dir: dir.clone(),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress(dir.clone(), "russel.local");
 
         // First register with old backend
         let old = Backend::localhost(3100);
@@ -343,12 +354,28 @@ mod tests {
 
     #[test]
     fn host_rule_string_correct() {
-        let ing = TraefikFileIngress {
-            dynamic_dir: PathBuf::from("/tmp"),
-            domain: "russel.local".to_string(),
-        };
+        let ing = test_ingress("/tmp", "russel.local");
         // Service id validated as alphanumeric earlier in pipeline
         assert_eq!(ing.public_host("my-app"), "my-app.russel.local");
+    }
+
+    #[tokio::test]
+    async fn register_with_tls_adds_cert_resolver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dynamic");
+        let mut ing = test_ingress(dir.clone(), "example.com");
+        ing.tls_enabled = true;
+        ing.cert_resolver = "myresolver".to_string();
+
+        Ingress::register(&ing, "api", &Backend::localhost(3100), &[])
+            .await
+            .unwrap();
+        let raw = std::fs::read_to_string(dir.join("api.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let router = &config["http"]["routers"]["russel-api"];
+        assert_eq!(router["entryPoints"][0], "web");
+        assert_eq!(router["entryPoints"][1], "websecure");
+        assert_eq!(router["tls"]["certResolver"], "myresolver");
     }
 
     #[test]

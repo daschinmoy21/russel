@@ -101,6 +101,7 @@ russel destroy <service_id>
 - **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
 - **`--env-file PATH`**: Load `KEY=VALUE` pairs from a file (`#` comments, blank lines skipped). Merged with `[service.env]` and `--env` (later wins).
 - Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
+- **Secrets** (host store, not committed): `russel secrets set NAME VALUE`, `list`, `delete`. In env maps use `secret://NAME` — the control plane resolves the value at deploy time from `/var/lib/russel/secrets/` (mode `0600`).
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.

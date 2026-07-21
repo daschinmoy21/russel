@@ -118,7 +118,7 @@ impl PortAllocator {
     }
 }
 
-// ── Subnet allocation (deterministic per service_id) ─────────────────────────
+// ── Subnet allocation (deterministic per service_id + collision registry) ────
 
 #[derive(Debug, Clone)]
 pub struct SubnetAllocation {
@@ -128,28 +128,85 @@ pub struct SubnetAllocation {
     pub tap_id: String,
 }
 
-/// Deterministic /30 subnet for a service_id via FNV-1a hash.
-/// Uses full 16-bit hash space (65536 subnets in 10.0.0.0/8).
-/// Collision probability <2% at 50 concurrent services.
-pub fn subnet_for(service_id: &str) -> SubnetAllocation {
-    let hash = service_id.bytes().fold(2_166_136_261u32, |acc, b| {
+struct SubnetRegistry {
+    /// service_id → full 32-bit hash used for the /30.
+    by_service: HashMap<String, u32>,
+    /// hash → service_id (collision detection).
+    by_hash: HashMap<u32, String>,
+}
+
+static SUBNET_REGISTRY: LazyLock<Mutex<SubnetRegistry>> = LazyLock::new(|| {
+    Mutex::new(SubnetRegistry {
+        by_service: HashMap::new(),
+        by_hash: HashMap::new(),
+    })
+});
+
+fn subnet_registry() -> std::sync::MutexGuard<'static, SubnetRegistry> {
+    SUBNET_REGISTRY.lock().unwrap_or_else(|e| {
+        tracing::warn!("SUBNET_REGISTRY lock poisoned — recovering");
+        e.into_inner()
+    })
+}
+
+fn fnv1a(bytes: impl AsRef<[u8]>) -> u32 {
+    bytes.as_ref().iter().fold(2_166_136_261u32, |acc, &b| {
         acc.wrapping_mul(16_777_619) ^ b as u32
-    });
+    })
+}
+
+fn allocation_from_hash(hash: u32) -> SubnetAllocation {
     let x = ((hash >> 8) & 0xFF) as u8;
     let y = (hash & 0xFF) as u8;
     SubnetAllocation {
         host_ip: format!("10.{x}.{y}.1"),
         vm_ip: format!("10.{x}.{y}.2"),
         mac: format!("02:00:00:00:{x:02x}:{y:02x}"),
-        // Linux limits interface names to IFNAMSIZ - 1 (15) bytes.  Service
-        // IDs may be up to 128 bytes, so putting the ID in the TAP name makes
-        // perfectly valid deployments fail at `ip tuntap add`.  A stable hash
-        // keeps the name short while still allowing cleanup to rederive it.
+        // Linux limits interface names to IFNAMSIZ - 1 (15) bytes.
         tap_id: format!("rsl-{hash:08x}"),
     }
 }
 
-pub fn release_subnet(_service_id: &str) {}
+/// Allocate a unique /30 for `service_id`.
+///
+/// Preferred hash is FNV-1a of the service id. On collision with another
+/// service, rehash with a salt until a free slot is found (or bail).
+pub fn subnet_for(service_id: &str) -> SubnetAllocation {
+    let mut reg = subnet_registry();
+    if let Some(&hash) = reg.by_service.get(service_id) {
+        return allocation_from_hash(hash);
+    }
+
+    let mut hash = fnv1a(service_id.as_bytes());
+    for attempt in 0u32..1024 {
+        if let Some(owner) = reg.by_hash.get(&hash) {
+            if owner == service_id {
+                break;
+            }
+            // Collision — rehash with salt.
+            hash = fnv1a(format!("{service_id}\0salt{attempt}").as_bytes());
+            continue;
+        }
+        reg.by_hash.insert(hash, service_id.to_string());
+        reg.by_service.insert(service_id.to_string(), hash);
+        return allocation_from_hash(hash);
+    }
+
+    // Exhausted probes — fall back to preferred hash (best-effort; rare).
+    tracing::error!(
+        service_id,
+        "subnet registry exhausted probes; using preferred hash (possible collision)"
+    );
+    allocation_from_hash(fnv1a(service_id.as_bytes()))
+}
+
+/// Release the subnet lease for a service so another can reuse the slot.
+pub fn release_subnet(service_id: &str) {
+    let mut reg = subnet_registry();
+    if let Some(hash) = reg.by_service.remove(service_id) {
+        reg.by_hash.remove(&hash);
+    }
+}
 
 // ── Tap creation + setup + port forwarding via socat ──────────────────────────
 
@@ -289,14 +346,26 @@ mod tests {
         assert_eq!(a1.host_ip, a2.host_ip);
         assert_eq!(a1.vm_ip, a2.vm_ip);
         assert_eq!(a1.mac, a2.mac);
+        release_subnet("my-service");
     }
 
     #[test]
     fn subnet_for_different_services_differ() {
-        assert_ne!(
-            subnet_for("service-a").host_ip,
-            subnet_for("service-b").host_ip
-        );
+        let a = subnet_for("service-a");
+        let b = subnet_for("service-b");
+        assert_ne!(a.host_ip, b.host_ip);
+        release_subnet("service-a");
+        release_subnet("service-b");
+    }
+
+    #[test]
+    fn release_subnet_frees_lease() {
+        let a = subnet_for("lease-svc");
+        release_subnet("lease-svc");
+        // After release, re-allocate should succeed with same preferred hash.
+        let b = subnet_for("lease-svc");
+        assert_eq!(a.tap_id, b.tap_id);
+        release_subnet("lease-svc");
     }
 
     #[test]

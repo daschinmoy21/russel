@@ -295,8 +295,10 @@ impl DeployPipeline {
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
 
         // Merge env: file < request (request wins on key conflict).
+        // Resolve `secret://name` refs from the host secrets store.
         let merged_env = merge_env_maps(&config.service.env, &request.env);
         validate_env_map(&merged_env)?;
+        let merged_env = crate::secrets::resolve_env_secrets(&merged_env)?;
 
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
