@@ -1,8 +1,17 @@
 use std::{
+    fs::{File, OpenOptions},
+    io::Read,
     path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::process::Command;
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
@@ -237,9 +246,13 @@ impl DeployPipeline {
             })
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
-        // Path-safe resolve under repo root (blocks absolute/.. and oversized configs).
-        let config_path = resolve_config_path(&repo_path, &request.config_path)?;
-        let config = Russelfile::load(&config_path)?;
+        // Security contract for config_path:
+        // - relative path only (no absolute / `..`)
+        // - openat traversal under the repo dir with O_DIRECTORY|O_NOFOLLOW on
+        //   every intermediate component and O_NOFOLLOW on the leaf (no path
+        //   reopen after validation; intermediate rename/symlink races closed)
+        // - fstat + bounded read from the same fd (size cap MAX_CONFIG_BYTES)
+        let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
         let resolve_ms = t.elapsed().as_millis();
@@ -1022,8 +1035,8 @@ async fn attempt_container_rollback(
 /// Maximum accepted size for a Russelfile (prevents huge-file DoS via config_path).
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// Resolve `config_path` strictly under `repo_path`.
-fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<PathBuf> {
+/// Validate relative path components of user `config_path` (no absolute / `..`).
+fn validate_relative_config_path(config_path: &str) -> anyhow::Result<&Path> {
     if config_path.is_empty() {
         anyhow::bail!("config_path must not be empty");
     }
@@ -1044,28 +1057,101 @@ fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<Pa
             }
         }
     }
+    Ok(cfg)
+}
 
-    let repo_canon = repo_path.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "cannot resolve repository path {}: {e}",
-            repo_path.display()
-        )
-    })?;
+/// Open and parse a Russelfile strictly under `repo_path` without a
+/// validate-then-reopen TOCTOU window on the path string.
+///
+/// Contract (security-sensitive):
+/// - rejects empty, absolute, and `..` components
+/// - opens the repository directory, then each parent component via `openat`
+///   with `O_DIRECTORY | O_NOFOLLOW` (intermediate symlinks rejected; no
+///   path-based open after `canonicalize` that could race with renames)
+/// - opens the leaf with `openat(..., O_NOFOLLOW)` relative to the final
+///   directory descriptor (final symlink rejected)
+/// - `fstat`s the open fd for regular-file + size cap
+/// - reads at most `MAX_CONFIG_BYTES` from the same open handle
+///
+/// Callers must load configuration only through this helper (or an equivalent
+/// descriptor-relative open) so deploy never reopens a validated path string.
+fn load_russelfile_under_repo(repo_path: &Path, config_path: &str) -> anyhow::Result<Russelfile> {
+    let cfg = validate_relative_config_path(config_path)?;
 
-    let joined = repo_canon.join(cfg);
-    let config_canon = joined.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "config_path '{}' not found under repository: {e}",
-            config_path
-        )
-    })?;
+    let file_name = cfg
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("config_path '{}' has no file name", config_path))?;
 
-    if !config_canon.starts_with(&repo_canon) {
-        anyhow::bail!("config_path escapes repository root");
-    }
+    #[cfg(unix)]
+    let mut file = {
+        let repo_dir = open_directory_fd(repo_path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve repository path {}: {e}",
+                repo_path.display()
+            )
+        })?;
 
-    let meta = std::fs::metadata(&config_canon)
-        .map_err(|e| anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display()))?;
+        // Walk parent components with stable directory descriptors so a rename
+        // of an intermediate directory cannot swap in a symlink after a path
+        // canonicalize (path-based open would follow the new link).
+        let mut dir_fd = repo_dir;
+        if let Some(parent) = cfg.parent() {
+            for component in parent.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::Normal(name) => {
+                        dir_fd =
+                            openat_directory_nofollow(dir_fd.as_raw_fd(), name).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "config_path '{}' not found under repository: {e}",
+                                    config_path
+                                )
+                            })?;
+                    }
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                        // Already rejected by validate_relative_config_path.
+                        anyhow::bail!("config_path must be relative to the repository root");
+                    }
+                }
+            }
+        }
+
+        openat_file_nofollow(dir_fd.as_raw_fd(), file_name).map_err(|e| {
+            // Leaf symlink → ELOOP / "Too many levels of symbolic links"
+            anyhow::anyhow!("cannot open config_path '{}': {e}", config_path)
+        })?
+    };
+
+    #[cfg(not(unix))]
+    let mut file = {
+        let repo_canon = repo_path.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve repository path {}: {e}",
+                repo_path.display()
+            )
+        })?;
+        let joined = repo_canon.join(cfg);
+        let parent = joined.parent().ok_or_else(|| {
+            anyhow::anyhow!("config_path '{}' has no parent directory", config_path)
+        })?;
+        let parent_canon = parent.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "config_path '{}' not found under repository: {e}",
+                config_path
+            )
+        })?;
+        if !parent_canon.starts_with(&repo_canon) {
+            anyhow::bail!("config_path escapes repository root");
+        }
+        OpenOptions::new()
+            .read(true)
+            .open(parent_canon.join(file_name))
+            .map_err(|e| anyhow::anyhow!("cannot open config_path '{}': {e}", config_path))?
+    };
+
+    let meta = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("cannot stat config_path '{}': {e}", config_path))?;
     if !meta.is_file() {
         anyhow::bail!("config_path must be a regular file");
     }
@@ -1076,7 +1162,64 @@ fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<Pa
         );
     }
 
-    Ok(config_canon)
+    // Bound the read itself (not only the pre-check): a concurrent writer could
+    // grow the file after fstat; `take` ensures we never buffer more than cap+1.
+    let mut contents = String::new();
+    file.by_ref()
+        .take(MAX_CONFIG_BYTES.saturating_add(1))
+        .read_to_string(&mut contents)
+        .map_err(|e| anyhow::anyhow!("failed to read config_path '{}': {e}", config_path))?;
+    if (contents.len() as u64) > MAX_CONFIG_BYTES {
+        anyhow::bail!(
+            "config_path exceeds maximum size of {} bytes",
+            MAX_CONFIG_BYTES
+        );
+    }
+
+    Russelfile::load_from_str(&contents)
+}
+
+/// Open `path` as a directory (symlinks on the final component may be followed;
+/// containment is enforced by subsequent `openat` + `O_NOFOLLOW` steps).
+#[cfg(unix)]
+fn open_directory_fd(path: &Path) -> std::io::Result<OwnedFd> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    opts.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
+    let file = opts.open(path)?;
+    Ok(OwnedFd::from(file))
+}
+
+/// `openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`.
+#[cfg(unix)]
+fn openat_directory_nofollow(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<OwnedFd> {
+    let c_name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent_fd, c_name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `openat(parent, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)` — regular file open.
+#[cfg(unix)]
+fn openat_file_nofollow(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<File> {
+    let c_name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent_fd, c_name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(test)]
@@ -1123,81 +1266,81 @@ mod tests {
         f.write_all(body.as_bytes()).unwrap();
     }
 
-    #[test]
-    fn resolve_config_path_accepts_relative_file() {
-        let repo = TempRepo::new();
-        write_config(
-            repo.path(),
-            "Russelfile.toml",
-            r#"[service]
+    const MINIMAL: &str = r#"[service]
 name = "app"
 source = "."
 port = 3000
 memory = "256mb"
-"#,
-        );
-        let resolved = resolve_config_path(repo.path(), "Russelfile.toml").unwrap();
-        assert!(resolved.ends_with("Russelfile.toml"));
-        assert!(resolved.starts_with(repo.path().canonicalize().unwrap()));
+"#;
+
+    #[test]
+    fn load_russelfile_accepts_relative_file() {
+        let repo = TempRepo::new();
+        write_config(repo.path(), "Russelfile.toml", MINIMAL);
+        let cfg = load_russelfile_under_repo(repo.path(), "Russelfile.toml").unwrap();
+        assert_eq!(cfg.service.name, "app");
+        assert_eq!(cfg.service.port, 3000);
     }
 
     #[test]
-    fn resolve_config_path_accepts_nested_relative() {
+    fn load_russelfile_accepts_nested_relative() {
         let repo = TempRepo::new();
-        write_config(
-            repo.path(),
-            "deploy/Russelfile.toml",
-            r#"[service]
-name = "app"
-source = "."
-port = 3000
-memory = "256mb"
-"#,
-        );
-        let resolved = resolve_config_path(repo.path(), "deploy/Russelfile.toml").unwrap();
-        assert!(resolved.ends_with("deploy/Russelfile.toml"));
+        write_config(repo.path(), "deploy/Russelfile.toml", MINIMAL);
+        let cfg = load_russelfile_under_repo(repo.path(), "deploy/Russelfile.toml").unwrap();
+        assert_eq!(cfg.service.name, "app");
     }
 
     #[test]
-    fn resolve_config_path_rejects_absolute() {
+    fn load_russelfile_rejects_absolute() {
         let repo = TempRepo::new();
-        let err = resolve_config_path(repo.path(), "/etc/passwd")
+        let err = load_russelfile_under_repo(repo.path(), "/etc/passwd")
             .unwrap_err()
             .to_string();
         assert!(err.contains("relative"), "{err}");
     }
 
     #[test]
-    fn resolve_config_path_rejects_parent_dir() {
+    fn load_russelfile_rejects_parent_dir() {
         let repo = TempRepo::new();
-        let err = resolve_config_path(repo.path(), "../outside.toml")
+        let err = load_russelfile_under_repo(repo.path(), "../outside.toml")
             .unwrap_err()
             .to_string();
         assert!(err.contains(".."), "{err}");
     }
 
     #[test]
-    fn resolve_config_path_rejects_missing() {
+    fn load_russelfile_rejects_missing() {
         let repo = TempRepo::new();
-        let err = resolve_config_path(repo.path(), "missing.toml")
+        let err = load_russelfile_under_repo(repo.path(), "missing.toml")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not found"), "{err}");
+        assert!(
+            err.contains("not found")
+                || err.contains("cannot open")
+                || err.contains("No such file"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn resolve_config_path_rejects_directory() {
+    fn load_russelfile_rejects_directory() {
         let repo = TempRepo::new();
         std::fs::create_dir(repo.path().join("subdir")).unwrap();
-        let err = resolve_config_path(repo.path(), "subdir")
+        let err = load_russelfile_under_repo(repo.path(), "subdir")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("regular file"), "{err}");
+        // Directory has no file name open as file → open or "regular file" error
+        assert!(
+            err.contains("regular file")
+                || err.contains("cannot open")
+                || err.contains("Is a directory"),
+            "{err}"
+        );
     }
 
     #[cfg(target_family = "unix")]
     #[test]
-    fn resolve_config_path_rejects_symlink_escape() {
+    fn load_russelfile_rejects_symlink_leaf() {
         let repo = TempRepo::new();
         let outside = std::env::temp_dir().join(format!(
             "russel-config-path-outside-{}-{}",
@@ -1206,21 +1349,51 @@ memory = "256mb"
         ));
         std::fs::create_dir_all(&outside).unwrap();
         let outside_file = outside.join("secret.toml");
-        std::fs::write(
-            &outside_file,
-            b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n",
-        )
-        .unwrap();
+        std::fs::write(&outside_file, MINIMAL.as_bytes()).unwrap();
         std::os::unix::fs::symlink(&outside_file, repo.path().join("escape.toml")).unwrap();
-        let err = resolve_config_path(repo.path(), "escape.toml")
+        // O_NOFOLLOW rejects the leaf symlink (does not follow out of the repo).
+        let err = load_russelfile_under_repo(repo.path(), "escape.toml")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("escapes repository root"), "{err}");
+        assert!(
+            err.contains("cannot open")
+                || err.contains("symbolic link")
+                || err.contains("Too many levels")
+                || err.contains("os error"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn load_russelfile_rejects_symlink_intermediate_dir() {
+        let repo = TempRepo::new();
+        let outside = std::env::temp_dir().join(format!(
+            "russel-config-path-outside-dir-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.toml"), MINIMAL.as_bytes()).unwrap();
+        // Intermediate directory component is a symlink → openat O_NOFOLLOW must fail.
+        std::os::unix::fs::symlink(&outside, repo.path().join("linkdir")).unwrap();
+        let err = load_russelfile_under_repo(repo.path(), "linkdir/secret.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not found")
+                || err.contains("cannot open")
+                || err.contains("symbolic link")
+                || err.contains("Too many levels")
+                || err.contains("os error"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
-    fn resolve_config_path_rejects_oversized() {
+    fn load_russelfile_rejects_oversized() {
         let repo = TempRepo::new();
         let path = repo.path().join("huge.toml");
         {
@@ -1229,7 +1402,7 @@ memory = "256mb"
             let pad = vec![b'#'; MAX_CONFIG_BYTES as usize + 1];
             f.write_all(&pad).unwrap();
         }
-        let err = resolve_config_path(repo.path(), "huge.toml")
+        let err = load_russelfile_under_repo(repo.path(), "huge.toml")
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds maximum size"), "{err}");
