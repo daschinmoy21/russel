@@ -1,3 +1,22 @@
+//! On-disk service metadata (`/var/lib/russel/<id>/metadata.json`).
+//!
+//! ## Schema (`schema_version` = 1)
+//!
+//! Shared fields: `schema_version`, `service_id`, `runtime` (`microvm`|`container`),
+//! `host_port`, `guest_port`, `store_path`, `mem_mb`, `deployed_at` (RFC3339),
+//! optional `bin_name`.
+//!
+//! **microVM** also writes: `vm_ip`, `host_ip` (TAP host side), `kernel_path`,
+//! optional `vm_pid` / `socat_pid` / `initramfs` / `app_path`, and
+//! `virtiofsd_pids` (JSON array of u32). Older files may still have singular
+//! `virtiofsd_pid`; readers that care about process cleanup should accept both
+//! until all hosts have redeployed. Deploy/rollback must keep writers and
+//! destroy/stop readers on the same shape — do not mix a new writer with an
+//! old destroy path that only understands `virtiofsd_pid`.
+//!
+//! **container** also writes: `container_id`, `container_name`, `rootfs_path`,
+//! optional `podman_args`.
+
 use std::path::{Path, PathBuf};
 
 use russel_core::config::RuntimeKind;
