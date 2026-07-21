@@ -164,14 +164,14 @@ Russel verifies deployment readiness by TCP-connecting to the guest port for up 
 
 When Traefik is running as the ingress gateway, Russel writes dynamic configuration automatically. Access your service at:
 
-```
+```text
 http://<service_id>.russel.local
 ```
 
 This requires:
 1. Traefik running with the file provider pointed at `/var/lib/russel/traefik/dynamic` (see [docs/traefik.md](traefik.md)).
 2. DNS or `/etc/hosts` entry mapping `*.russel.local` to your host's IP:
-   ```
+   ```text
    127.0.0.1  api.russel.local  demo.russel.local
    ```
 
@@ -181,7 +181,7 @@ This requires:
 
 ---
 
-## 4. Security & Validation
+## 5. Security & Validation
 
 ### Repository URLs
 
@@ -200,7 +200,7 @@ The config file path must be **relative** to the repository root. The control pl
 
 The binary name (from `Russelfile.toml` `bin` or `name`) must match the safe charset `[A-Za-z0-9._+-]` (max 256 characters). It is injected into the guest via a shell-quoted `deploy.env` file — single quotes with embedded `'` escaped as `'\''`.
 
-## 5. Environment Variables
+## 6. Environment Variables
 
 Deploy-time environment variables can be set via three mechanisms, merged in order (later wins):
 
@@ -222,7 +222,7 @@ Deploy-time environment variables can be set via three mechanisms, merged in ord
 
 > **Note:** Secrets (e.g. `DATABASE_URL`) are **not** supported yet. All values are plain text.
 
-## 6. Nix DX vs Docker DX
+## 7. Nix DX vs Docker DX
 
 | Developer Experience | Docker | Russel (Nix + MicroVM) |
 |----------------------|--------|------------------------|

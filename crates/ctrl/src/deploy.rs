@@ -198,7 +198,6 @@ impl DeployPipeline {
                         )
                     }
                 };
-                let host_port = output.port.host;
                 let route_host = self.ingress.primary_host(&service_id);
                 DeployResponse {
                     service_id,

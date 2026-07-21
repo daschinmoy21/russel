@@ -167,7 +167,7 @@ fn router_name(service_id: &str) -> String {
 
 /// Traefik service name for a service: `russel-{service_id}`.
 fn svc_name(service_id: &str) -> String {
-    format!("russel-{service_id}")
+    router_name(service_id)
 }
 
 #[cfg(test)]

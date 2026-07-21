@@ -15,7 +15,7 @@ Russel integrates with [Traefik](https://traefik.io/) as the primary HTTP revers
 
 ### Flow
 
-```
+```text
 Client → Traefik (:80) → 127.0.0.1:<host_port> (socat/podman) → guest:<guest_port>
           ↑                        ↑
      Host(`svc.russel.local`)   dynamic file written by russel-ctrl

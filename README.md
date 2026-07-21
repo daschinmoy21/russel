@@ -103,7 +103,7 @@ russel destroy <service_id>
 - Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
-- Ports today: **`-p HOST:GUEST`** (published binds). See [Networking Model](#networking-model) for the Traefik roadmap.
+- Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
 
 ### Repo URLs
 
@@ -159,7 +159,7 @@ FEATURE_X = "1"
   -- -v /data:/data:ro --network bridge
 ```
 
-Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring (planned for Traefik integration), expose a `/health` endpoint on `PORT` as a convention.
+Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring, expose a `/health` endpoint on `PORT` as a convention (Traefik is already the ingress).
 
 ## Networking Model
 
@@ -325,7 +325,7 @@ pre-allocated.
 
 - **Subnet collision detection** — 16-bit FNV-1a space, <2% collision at 50 services. Add when scale demands it.
 - **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
-- **Traefik/Database/Health stubs** — documented placeholders, fully functional via direct socat access.
+- **Database/Health stubs** — documented placeholders, fully functional via direct socat access.
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 - **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
 

@@ -1,6 +1,6 @@
 # Traefik Gateway Setup
 
-Russel integrates with [Traefik](https://traefik.io/) v1/v2 as the primary HTTP reverse proxy
+Russel integrates with [Traefik](https://traefik.io/) v2 as the primary HTTP reverse proxy
 (file provider). No API calls — Russel writes dynamic configuration files; Traefik watches the
 directory and picks up changes automatically.
 
@@ -10,7 +10,7 @@ directory and picks up changes automatically.
 
 ## Static Traefik Configuration
 
-Save as `traefik.yml` (v2+) or the equivalent TOML for v1:
+Save as `traefik.yml`:
 
 ```yaml
 entryPoints:
@@ -40,7 +40,7 @@ traefik --configFile=traefik.yml
 
 Traefik routes by `Host` header. Add entries to `/etc/hosts`:
 
-```
+```text
 127.0.0.1  api.russel.local  demo.russel.local
 ```
 
