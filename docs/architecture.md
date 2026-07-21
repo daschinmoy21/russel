@@ -100,6 +100,25 @@ On `SIGINT`/`SIGTERM`, the control plane:
 - Old containers are stopped only after new args are fully validated.
 - Readiness is confirmed by TCP-polling the published host port for up to 10 s.
 
+### Durable State & Startup Reconcile
+
+On startup, the control plane scans `/var/lib/russel` for service metadata
+and rehydrates in-memory state before the HTTP router starts:
+
+- **Live processes** (VM PIDs, socat, virtiofsd, or running containers) are
+  adopted as `deployed`/`running` with their ports claimed in the allocator.
+  No fake `Child` handles are created — microVMs are observed-only.
+- **Dead/stopped services** are registered as `stopped` so status endpoints
+  return accurate data without waiting for `GET /vms` lazy discovery.
+- A lightweight catalog (`/var/lib/russel/ctrl-catalog.json`) is written
+  atomically after reconcile and on key lifecycle transitions (deploy, stop,
+  destroy, failure). This is informational; `metadata.json` remains the
+  authoritative source of truth.
+
+This closes the biggest operational gap (AUDIT BUG-07 / GitHub #10): after a
+control plane restart, `GET /vm/{id}/status` immediately reflects the
+observed state of running workloads.
+
 ---
 
 ## Cloud Hypervisor Integration

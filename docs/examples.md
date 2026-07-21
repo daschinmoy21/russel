@@ -233,6 +233,8 @@ PORT=8000 ./result/bin/app
 | Use case        | Untrusted workloads, strict isolation              | Trusted / lighter isolation           |
 
 Both paths use the **same Nix store path** as the build artifact. Choose runtime with
-`service.type` in Russelfile (`microvm` default, or `container`). Changing type and
-redeploying is supported today with downtime; **zero-downtime swap is planned later**
-(see deferred issues).
+`service.type` in Russelfile (`microvm` default, or `container`). Redeploying an
+existing service is **candidate-first**: the new generation boots under a
+generation runtime key, Traefik is cut over via `Ingress::swap`, then the old
+generation is drained. Backend host ports may change across generations; the
+stable public host (`http://<service_id>.russel.local`) does not.

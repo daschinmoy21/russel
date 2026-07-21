@@ -15,6 +15,8 @@ mod ingress;
 mod metadata;
 mod microvm;
 mod network;
+mod reconcile;
+mod secrets;
 mod state;
 mod traefik;
 mod warm_pool;
@@ -53,6 +55,15 @@ async fn main() -> Result<()> {
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
+
+    // Build state early so reconcile can rehydrate services from disk
+    // before the router starts serving requests.
+    let state = AppState::default();
+
+    // Rehydrate observed service state from on-disk metadata so status
+    // endpoints work without waiting for GET /vms lazy discovery.
+    let report = crate::reconcile::reconcile_startup(&state).await;
+    tracing::info!(?report, "startup reconcile complete");
 
     // Start warm pool prepare in the background so the first deploy after
     // ctrl restart can restore from a paused snapshot instead of cold booting.
@@ -229,22 +240,66 @@ async fn cleanup_stale_resources() {
 }
 
 /// Collect tap_ids for all live services that have metadata on disk.
+///
+/// Also re-primes `SUBNET_REGISTRY` from saved host_ip so collision leases
+/// survive control-plane restarts (stable mapping, not rehash-from-id).
 fn live_service_tap_ids() -> std::collections::HashSet<String> {
-    use crate::network::subnet_for;
+    use crate::network::{
+        allocation_from_network_key, claim_subnet_key, network_key_from_host_ip, subnet_for,
+    };
     let mut taps = std::collections::HashSet::new();
+    let mut services = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/var/lib/russel") {
         for entry in entries.flatten() {
             if let Ok(ft) = entry.file_type()
                 && ft.is_dir()
                 && let Some(name) = entry.file_name().to_str()
             {
-                if name.ends_with(".bak") {
+                if name.ends_with(".bak") || name == "traefik" || name == "secrets" {
                     continue;
                 }
-                if entry.path().join("metadata.json").exists() {
-                    taps.insert(subnet_for(name).tap_id);
+                let meta_path = entry.path().join("metadata.json");
+                if !meta_path.exists() {
+                    continue;
                 }
+                let (tap, host_ip) = match std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                {
+                    Some(v) => (
+                        v.get("tap_id").and_then(|t| t.as_str()).map(str::to_string),
+                        v.get("host_ip")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string),
+                    ),
+                    None => (None, None),
+                };
+                services.push((
+                    name.to_string(),
+                    tap,
+                    host_ip.and_then(|ip| network_key_from_host_ip(&ip)),
+                ));
             }
+        }
+    }
+    // Restore all saved assignments before asking the allocator for any
+    // legacy/missing mapping. Sorting removes read_dir order from the result.
+    services.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, _, key) in &services {
+        if let Some(key) = key
+            && let Err(e) = claim_subnet_key(name, *key)
+        {
+            tracing::warn!(service_id = %name, error = %e, "failed to restore subnet lease");
+        }
+    }
+    for (name, tap, key) in services {
+        if let Some(t) = tap {
+            taps.insert(t);
+        } else if let Some(key) = key {
+            taps.insert(allocation_from_network_key(key).tap_id);
+        } else {
+            // Legacy metadata without a persisted network identity.
+            taps.insert(subnet_for(&name).tap_id);
         }
     }
     taps
