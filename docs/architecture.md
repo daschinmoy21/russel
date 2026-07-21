@@ -10,6 +10,8 @@ lifecycles, and host-side networking.
 Shared steps:
 
 1. **Resolve**: Clone or locate the source repository, parse `Russelfile.toml` (including `service.type`).
+   - Local repos must be absolute paths; remote repos restricted to `https://`, `http://`, `ssh://`, `git@host:path`.
+   - Config file opened via `openat` + `O_NOFOLLOW` under repo root; 1 MiB size cap; binary name validated against `[A-Za-z0-9._+-]`.
 2. **Build**: Auto-generate a `flake.nix` if none exists, then `nix build` → store path.
 
 Then branch on `RuntimeKind` (`microvm` default, or `container`):
@@ -23,12 +25,41 @@ Then branch on `RuntimeKind` (`microvm` default, or `container`):
 ### Container path (Russel containers)
 
 3. **Rootfs**: Docker-like tree under `/var/lib/russel/<id>/rootfs` (bash/curl, `/tmp`, `/var`, app symlinks).
-4. **Start**: Rootless Podman `--rootfs` + bind-mount host `/nix/store:ro`, publish `-p HOST:GUEST`.
+4. **Start**: Rootless Podman `--rootfs` + bind-mount host `/nix/store:ro`, publish `-p HOST:GUEST`. Old container is stopped only **after** podman args are validated (fail-closed).
 5. **Metadata**: same directory with `runtime: container`, `container_id`, `rootfs_path`, …
 
-6. **Traefik**: Register backend (placeholder — planned for multi-node routing).
-
 CLI `--runtime` must match Russelfile `type` when provided; the file is source of truth.
+
+### Redeploy & Rollback
+
+On redeploy, the pipeline:
+1. Takes ownership of old child processes from the supervisor (`take_processes`).
+2. Kills and waits for old children (up to 5 s, then force-kill) so ports are freed.
+3. Renames existing service directories to `.bak` for rollback.
+4. Tears down prior runtime resources (TAP, ports).
+5. Proceeds with the new deploy.
+
+If the new deploy fails and a backup exists, Russel attempts automatic rollback: `.bak` directories are restored, the previous VM or container is re-spawned, metadata is re-written, and a readiness check confirms the rollback before reporting `rolled_back`.
+
+### Auth & Bind Policy
+
+All API routes pass through a Bearer-auth middleware:
+- When `RUSSEL_API_TOKEN` is set, every request must include `Authorization: Bearer <token>` (constant-time comparison).
+- When unset on loopback, the control plane runs in dev mode with a warning.
+- Binding to a non-loopback address **requires** `RUSSEL_API_TOKEN`; otherwise the control plane refuses to start.
+
+### Control Plane Shutdown
+
+On `SIGINT`/`SIGTERM`, the control plane:
+1. Waits for in-flight deploy tasks to complete.
+2. Detaches all workload child processes (they keep running).
+3. On next startup, removes only **orphan** TAP interfaces (`rsl-<hex>`) that have no corresponding live service directory under `/var/lib/russel/<id>/metadata.json`. Host iptables chains are never flushed.
+
+### Container Lifecycle
+
+- Rootless Podman is verified (`podman info`) before any container operation.
+- Old containers are stopped only after new args are fully validated.
+- Readiness is confirmed by TCP-polling the published host port for up to 10 s.
 
 ---
 

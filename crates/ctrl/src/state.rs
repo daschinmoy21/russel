@@ -308,21 +308,69 @@ impl AppState {
     }
 
     /// Mark a container deployment as running (no VM child processes).
+    /// Spawns a lightweight liveness supervisor that polls podman.
     pub fn mark_deployed_container(&self, service_id: &str, container_id: &str) {
-        let mut inner = self.lock_inner();
-        let s = inner.services.entry(service_id.to_string()).or_default();
-        s.status = "deployed".to_string();
-        s.vm_state = "running".to_string();
-        s.started_at = Instant::now();
-        s.vm_pid = None;
-        s.vm_process = None;
-        s.container_id = Some(container_id.to_string());
-        s.runtime = Some(RuntimeKind::Container);
-        s.aux_processes.clear();
-        s.logs
-            .push_str(&format!("container running (id: {container_id})\n"));
-        s.prebuild_status = None;
-        s.prebuild_vm_state = None;
+        let generation = {
+            let mut inner = self.lock_inner();
+            let s = inner.services.entry(service_id.to_string()).or_default();
+            s.status = "deployed".to_string();
+            s.vm_state = "running".to_string();
+            s.started_at = Instant::now();
+            s.vm_pid = None;
+            s.vm_process = None;
+            s.container_id = Some(container_id.to_string());
+            s.runtime = Some(RuntimeKind::Container);
+            s.aux_processes.clear();
+            s.logs
+                .push_str(&format!("container running (id: {container_id})\n"));
+            s.prebuild_status = None;
+            s.prebuild_vm_state = None;
+            s.process_generation = s.process_generation.wrapping_add(1);
+            s.process_generation
+        };
+        self.spawn_container_supervisor(service_id.to_string(), container_id.to_string(), generation);
+    }
+
+    /// Lightweight container liveness supervisor: polls podman inspect every 30s.
+    /// If the container is no longer running, marks the service failed.
+    fn spawn_container_supervisor(&self, service_id: String, container_id: String, generation: u64) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            // Initial delay to let container settle.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                // Check we still own this generation.
+                {
+                    let inner = state.lock_inner();
+                    let Some(s) = inner.services.get(&service_id) else {
+                        return;
+                    };
+                    if s.process_generation != generation {
+                        return;
+                    }
+                    if s.status != "deployed" || s.vm_state != "running" {
+                        return;
+                    }
+                }
+                // Poll podman inspect for the container.
+                let alive = check_container_running(&container_id).await;
+                if !alive {
+                    tracing::warn!(
+                        service_id = %service_id,
+                        container_id = %container_id,
+                        "container is no longer running — marking failed"
+                    );
+                    state.mark_failed(&service_id, format!("container {container_id} is not running"));
+                    return;
+                }
+            }
+        });
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
@@ -552,7 +600,7 @@ impl AppState {
         let mut output = s.logs.clone();
         let runtime = s
             .runtime
-            .unwrap_or_else(|| crate::metadata::prior_runtime_from_disk(service_id));
+            .unwrap_or_else(|| crate::metadata::prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm));
         match runtime {
             RuntimeKind::Microvm => {
                 let console_path = format!("/var/lib/russel/{service_id}/console.log");
@@ -614,6 +662,23 @@ impl AppState {
             notified.as_mut().await;
         }
     }
+}
+
+/// Check if a container is still running via `podman inspect`.
+async fn check_container_running(container_id: &str) -> bool {
+    let output = match tokio::process::Command::new("podman")
+        .args(["inspect", container_id, "--format", "{{.State.Running}}"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim() == "true"
 }
 
 #[cfg(test)]

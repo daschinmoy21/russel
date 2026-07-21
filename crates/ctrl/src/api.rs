@@ -3,7 +3,9 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
 };
 use russel_core::api::{
@@ -32,7 +34,47 @@ pub fn router(state: AppState) -> Router {
         .route("/vms", get(vms_list))
         .route("/vm/{service_id}/stop", post(vm_stop))
         .route("/vm/{service_id}", delete(vm_destroy))
+        .layer(middleware::from_fn(auth_middleware))
         .with_state(state)
+}
+
+/// Constant-time token comparison to avoid timing side-channels.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Bearer auth middleware: if RUSSEL_API_TOKEN is set, require it on every request.
+async fn auth_middleware(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let expected = match std::env::var("RUSSEL_API_TOKEN").ok() {
+        Some(t) if !t.is_empty() => t,
+        _ => return Ok(next.run(request).await),
+    };
+
+    let header = request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let provided = header
+        .strip_prefix("Bearer ")
+        .unwrap_or("");
+
+    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
 }
 
 async fn deploy(
@@ -251,7 +293,7 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
             let runtime = state
                 .status(id)
                 .and_then(|s| s.runtime)
-                .or_else(|| Some(prior_runtime_from_disk(id)));
+                .or_else(|| prior_runtime_from_disk(id));
             ServiceSummary {
                 service_id: id.clone(),
                 runtime,

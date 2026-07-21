@@ -30,6 +30,9 @@ nix develop
 # Build everything
 cargo build
 
+# Optional: set an API token (if set on ctrl, set the same value here)
+export RUSSEL_API_TOKEN=your-secret-token
+
 # Run the control plane
 ./target/debug/russel-ctrl
 
@@ -60,6 +63,19 @@ A future `russel build` wrapper could provide a friendlier, project-aware interf
 
 The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_CTRL_ADDR`). All endpoints use HTTP/JSON; `/deploy` returns an NDJSON event stream with progress and timing.
 
+### Authentication
+
+When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route requires an `Authorization: Bearer <token>` header. The CLI reads the same environment variable and sends it automatically. On loopback without a token the control plane runs in dev mode (with a warning); binding to a non-loopback address **requires** `RUSSEL_API_TOKEN` or the control plane refuses to start. For production deployments, always set `RUSSEL_API_TOKEN` and bind to the internal interface where your reverse proxy lives.
+
+### Bind Policy
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Loopback (`127.0.0.1:…`) + no token | Dev mode (warn, no auth) |
+| Loopback + `RUSSEL_API_TOKEN` set | Bearer auth required on all routes |
+| Non-loopback + no token | **Refuses to start** |
+| Non-loopback + `RUSSEL_API_TOKEN` set | Bearer auth required on all routes |
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/deploy` | Deploy or re-deploy a service (returns NDJSON stream) |
@@ -83,7 +99,21 @@ russel destroy <service_id>
 ```
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
-- Ports today: **`-p HOST:GUEST`** (published binds). Traefik later.
+- Ports today: **`-p HOST:GUEST`** (published binds). See [Networking Model](#networking-model) for the Traefik roadmap.
+
+### Repo URLs
+
+- **Local deploys** must use **absolute** paths (the CLI canonicalizes relative paths before sending). The control plane rejects relative paths, `file://` URLs, and `..` components.
+- **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local metadata hosts (`169.254.169.254`) are blocked.
+
+### Config Path & Bin Name
+
+- `--config` must be a **relative** path under the repository root. The control plane opens it via `openat` with `O_NOFOLLOW` (symlinks rejected) and enforces a 1 MiB size cap.
+- The binary name (from `Russelfile.toml` `bin` or `name`) must match `[A-Za-z0-9._+-]` (max 256 chars). It is injected into the guest via a shell-quoted `deploy.env` file.
+
+### Redeploy
+
+Redeploying an existing service kills and waits for old processes before reusing ports. If a new deploy fails after a prior successful deployment, Russel attempts automatic **rollback** to the previous running service. A successful rollback reports status `rolled_back`; the CLI exit code is non-zero so CI pipelines can detect the failure.
 
 ## Project Requirements
 
@@ -125,9 +155,30 @@ Russel checks readiness by TCP-connecting to the published host port (container)
 
 ## Networking Model
 
-- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `vm-<id>`, `socat` host→guest port forward.
+- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward.
 - **Container:** Rootless Podman publishes `-p HOST:GUEST` (from CLI `-p` / allocator).
-- Traefik integration is planned for multi-node ingress (current: placeholder).
+
+### Port Publishing (today)
+
+`-p HOST:GUEST` publishes a host port via `socat` (microVM) or Podman port mapping (container). Both paths go through the port allocator so host ports never collide across services.
+
+### Traefik Gateway (planned)
+
+Future: Traefik becomes the **primary ingress gateway**. Public traffic hits Traefik; applications only declare a **listen port** (`service.port` in Russelfile = guest/backend port). The host port is auto-allocated as a private backend — no user `-p` required for normal HTTP apps. `-p` remains available as an escape hatch for direct host publishing until Traefik lands.
+
+## Lifecycle
+
+### Redeploy & Rollback
+
+On redeploy, Russel stops the old workload (kill + wait up to 5 s, then force-kill) before allocating ports for the new one. If the new deploy fails and a previous deployment existed, Russel attempts automatic rollback: the old service directory and metadata are restored, the previous VM or container is re-spawned, and a readiness check confirms the rollback before reporting `rolled_back`.
+
+### Control Plane Shutdown
+
+Stopping the control plane (`SIGINT`/`SIGTERM`) **does not** destroy running workloads — they are detached and keep running. On the next startup, the control plane removes only **orphan** TAP interfaces that have no corresponding live service directory (`/var/lib/russel/<id>/metadata.json`). Host iptables rules (Docker, VPN, admin) are never touched.
+
+### Container Lifecycle
+
+Containers are started only after podman arguments are fully validated and rootless mode is confirmed. For redeploys, the old container is stopped only after validation succeeds (fail-closed). Readiness is confirmed by TCP-polling the published host port.
 
 ## Boot & Network Timing Optimization (Under 2s Boot)
 
@@ -253,6 +304,7 @@ pre-allocated.
 - **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
 - **Traefik/Database/Health stubs** — documented placeholders, fully functional via direct socat access.
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
+- **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
 
 ## License
 

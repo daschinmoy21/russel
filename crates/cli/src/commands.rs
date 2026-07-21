@@ -5,11 +5,28 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
+use reqwest::header::{HeaderMap, AUTHORIZATION};
 use russel_core::{
     RuntimeKind,
     api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse},
     config::{Russelfile, resolve_runtime},
 };
+
+/// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
+fn http_client() -> reqwest::Client {
+    let mut headers = HeaderMap::new();
+    if let Ok(token) = std::env::var("RUSSEL_API_TOKEN") {
+        if !token.is_empty() {
+            if let Ok(value) = format!("Bearer {}", token).parse() {
+                headers.insert(AUTHORIZATION, value);
+            }
+        }
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("failed to build HTTP client")
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -139,7 +156,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     println!();
 
     // ── Send deploy request ────────────────────────────────────────────────
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut response = client
         .post(format!("{control_plane}/deploy"))
         .timeout(Duration::from_secs(300))
@@ -447,7 +464,9 @@ pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
         Some(id) => format!("{control_plane}/vm/{id}/status"),
         None => format!("{control_plane}/status"),
     };
-    let r = reqwest::get(&url)
+    let r = http_client()
+        .get(&url)
+        .send()
         .await?
         .error_for_status()?
         .json::<StatusResponse>()
@@ -473,7 +492,9 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
         Some(id) => format!("{control_plane}/vm/{id}/logs"),
         None => format!("{control_plane}/logs"),
     };
-    let r = reqwest::get(&url)
+    let r = http_client()
+        .get(&url)
+        .send()
         .await?
         .error_for_status()?
         .json::<LogsResponse>()
@@ -483,7 +504,9 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
 }
 
 pub async fn vms(control_plane: &str) -> Result<()> {
-    let r = reqwest::get(format!("{control_plane}/vms"))
+    let r = http_client()
+        .get(format!("{control_plane}/vms"))
+        .send()
         .await?
         .error_for_status()?
         .json::<VmsResponse>()
@@ -511,7 +534,7 @@ pub async fn vms(control_plane: &str) -> Result<()> {
 }
 
 pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
-    let r = reqwest::Client::new()
+    let r = http_client()
         .post(format!("{control_plane}/vm/{id}/stop"))
         .send()
         .await?
@@ -523,7 +546,7 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
 }
 
 pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .delete(format!("{control_plane}/vm/{id}"))
         .send()
         .await?;

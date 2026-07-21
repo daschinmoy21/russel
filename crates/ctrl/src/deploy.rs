@@ -84,6 +84,26 @@ impl DeployPipeline {
         let vm_id = service_id.clone();
 
         tracing::info!(service_id = %service_id, repo = %request.repo_url, "deploy started");
+
+        // Validate service_id before touching any state (#4).
+        if let Err(e) = MicrovmRunner::validate_service_id(&service_id) {
+            tracing::error!(service_id = %service_id, error = %e, "deploy rejected: invalid service_id");
+            return DeployResponse {
+                service_id,
+                vm_id,
+                status: "failed".to_string(),
+                store_path: None,
+                microvm_config_path: None,
+                runner_path: None,
+                port: None,
+                elapsed_ms: started.elapsed().as_millis(),
+                timing: None,
+                vm_ip: None,
+                runtime: request.runtime,
+                message: e.to_string(),
+            };
+        }
+
         if let Err(e) = self.state.mark_building(&service_id) {
             tracing::error!(service_id = %service_id, error = %e, "deploy rejected: service busy");
             return DeployResponse {
@@ -233,8 +253,6 @@ impl DeployPipeline {
         request: DeployRequest,
         tx: tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<DeployInnerResult> {
-        MicrovmRunner::validate_service_id(service_id)?;
-
         // ── 1. Resolve repo ──────────────────────────────────────────────────
         let t = Instant::now();
         let _ = tx
@@ -244,8 +262,7 @@ impl DeployPipeline {
             })
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
-        let config_path = resolve_config_path(&repo_path, &request.config_path)?;
-        let config = Russelfile::load(&config_path)?;
+        let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
         let resolve_ms = t.elapsed().as_millis();
@@ -306,20 +323,35 @@ impl DeployPipeline {
             );
         }
 
-        let prior_runtime = prior_runtime_from_disk(service_id);
+        let prior_runtime = resolve_prior_runtime(service_id).await;
 
         let russel_dir = format!("/var/lib/russel/{}", service_id);
         let microvms_dir = format!("/var/lib/microvms/{}", service_id);
         let russel_bak = format!("{}.bak", russel_dir);
         let microvms_bak = format!("{}.bak", microvms_dir);
-        let has_russel_backup = Path::new(&russel_dir).exists();
-        let has_microvms_backup = Path::new(&microvms_dir).exists();
-        let has_backup = has_russel_backup;
-        if has_russel_backup {
+        let has_russel_dir = Path::new(&russel_dir).exists();
+        let has_microvms_dir = Path::new(&microvms_dir).exists();
+        let has_backup = has_russel_dir;
+
+        // Order (fixes #120):
+        // 1. take_processes — disarm supervisor first
+        // 2. kill+wait old children so ports are freed
+        // 3. rename dirs to .bak (for rollback)  
+        // 4. destroy_prior_runtime — cleans TAP/ports without needing metadata
+        let (old_vm_proc, old_aux_procs) = self
+            .state
+            .take_processes(service_id)
+            .unwrap_or((None, Vec::new()));
+
+        // Kill+wait taken children first so ports are free before destroy.
+        kill_and_wait_children(old_vm_proc, old_aux_procs).await;
+
+        // Now rename dirs to .bak for rollback content.
+        if has_russel_dir {
             if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
                 anyhow::bail!("failed to backup russel directory: {}", e);
             }
-            if has_microvms_backup
+            if has_microvms_dir
                 && let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await
             {
                 let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
@@ -327,23 +359,20 @@ impl DeployPipeline {
             }
         }
 
-        let (old_vm_proc, old_aux_procs) = self
-            .state
-            .take_processes(service_id)
-            .unwrap_or((None, Vec::new()));
-
-        if let Err(e) =
-            destroy_prior_runtime(prior_runtime, service_id, &self.runner, &self.containers).await
-        {
-            self.state
-                .restore_processes(service_id, old_vm_proc, old_aux_procs);
-            if has_backup {
-                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
-                if has_microvms_backup {
-                    let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+        // Destroy prior runtime: processes already reaped, so stop is no-op;
+        // destroy still tears down TAP, releases port, removes .bak dirs.
+        if let Some(prior_kind) = prior_runtime {
+            if let Err(e) =
+                destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers).await
+            {
+                if has_backup {
+                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                    if has_microvms_dir {
+                        let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+                    }
                 }
+                anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
             }
-            anyhow::bail!("failed to teardown prior {}: {}", prior_runtime, e);
         }
 
         let mut port_reservation = None;
@@ -396,16 +425,16 @@ impl DeployPipeline {
         let (workload, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
             Ok(val) => val,
             Err(deploy_err) => {
-                tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback (prior runtime was {prior_runtime})");
+                tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback (prior runtime was {prior_runtime:?})");
                 cleanup_failed_deploy(runtime, service_id, &self.runner, &self.containers).await;
-                if has_backup && prior_runtime == RuntimeKind::Microvm {
+                if has_backup && prior_runtime == Some(RuntimeKind::Microvm) {
                     let rollback_res = attempt_microvm_rollback(
                         service_id,
                         &russel_dir,
                         &microvms_dir,
                         &russel_bak,
                         &microvms_bak,
-                        has_microvms_backup,
+                        has_microvms_dir,
                         &self.runner,
                         &self.state,
                     )
@@ -419,7 +448,7 @@ impl DeployPipeline {
                                 .expect("port reservation exists")
                                 .disarm();
                             return Ok(DeployInnerResult::RolledBack {
-                                runtime: prior_runtime,
+                                runtime: prior_runtime.unwrap_or(RuntimeKind::Microvm),
                                 error: deploy_err.to_string(),
                             });
                         }
@@ -427,7 +456,7 @@ impl DeployPipeline {
                             tracing::error!(service_id, error = %rollback_err, "CRITICAL: Rollback failed. Old VM could not be restored.");
                         }
                     }
-                } else if has_backup && prior_runtime == RuntimeKind::Container {
+                } else if has_backup && prior_runtime == Some(RuntimeKind::Container) {
                     let rollback_res = attempt_container_rollback(
                         service_id,
                         &russel_dir,
@@ -445,7 +474,7 @@ impl DeployPipeline {
                                 .expect("port reservation exists")
                                 .disarm();
                             return Ok(DeployInnerResult::RolledBack {
-                                runtime: prior_runtime,
+                                runtime: prior_runtime.unwrap_or(RuntimeKind::Container),
                                 error: deploy_err.to_string(),
                             });
                         }
@@ -459,7 +488,7 @@ impl DeployPipeline {
                         &microvms_dir,
                         &russel_bak,
                         &microvms_bak,
-                        has_microvms_backup,
+                        has_microvms_dir,
                     )
                     .await;
                 }
@@ -472,7 +501,20 @@ impl DeployPipeline {
             .register(service_id, workload.port().host)
             .await
         {
+            // Full workload teardown on traefik registration failure (#116).
             workload.teardown_network().await;
+            match &workload {
+                DeployWorkload::Microvm { .. } => {
+                    if let Err(e) = self.runner.destroy(service_id).await {
+                        tracing::warn!(service_id, error = %e, "failed to destroy microVM after traefik failure");
+                    }
+                }
+                DeployWorkload::Container { .. } => {
+                    if let Err(e) = self.containers.destroy(service_id).await {
+                        tracing::warn!(service_id, error = %e, "failed to destroy container after traefik failure");
+                    }
+                }
+            }
             PortAllocator::release(service_id);
             return Err(error);
         }
@@ -482,18 +524,12 @@ impl DeployPipeline {
                 .args(["-rf", &format!("{}.bak", russel_dir)])
                 .output()
                 .await;
-            if has_microvms_backup {
+            if has_microvms_dir {
                 let _ = Command::new("rm")
                     .args(["-rf", &format!("{}.bak", microvms_dir)])
                     .output()
                     .await;
             }
-        }
-        if let Some(mut p) = old_vm_proc {
-            let _ = p.kill().await;
-        }
-        for mut p in old_aux_procs {
-            let _ = p.kill().await;
         }
 
         self.state.attach_flake_path(service_id, repo_path.clone());
@@ -537,6 +573,7 @@ impl DeployPipeline {
         );
 
         let bin_name = config.service.bin_name().to_string();
+        validate_bin_name(&bin_name)?;
         let mem_mb = config.service.memory.as_mebibytes();
         let app_path = format!("{}/bin/{bin_name}", store_path.display());
 
@@ -552,9 +589,13 @@ impl DeployPipeline {
         let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
         std::fs::create_dir_all(&cfg_dir)
             .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
+        // Shell-quote APP path to prevent injection through deploy.env
         let deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
-            alloc.vm_ip, alloc.host_ip, port.guest, app_path
+            alloc.vm_ip,
+            alloc.host_ip,
+            port.guest,
+            shell_quote(&app_path)
         );
         std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
 
@@ -715,6 +756,7 @@ impl DeployPipeline {
         );
 
         let bin_name = config.service.bin_name().to_string();
+        validate_bin_name(&bin_name)?;
         let mem_mb = config.service.memory.as_mebibytes();
         let base_dir = default_base_dir(service_id);
 
@@ -804,6 +846,66 @@ impl DeployPipeline {
             network_ms,
             ready_ms,
         ))
+    }
+}
+
+/// Resolve the prior runtime for a service before redeploy.
+///
+/// 1. Check on-disk metadata first (`prior_runtime_from_disk`).
+/// 2. If no metadata (None), probe for a podman container named `russel-{service_id}`.
+/// 3. If no container but the internal dirs exist, treat as legacy Microvm.
+/// 4. Otherwise None (first deploy).
+async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKind> {
+    if let Some(runtime) = prior_runtime_from_disk(service_id) {
+        return Some(runtime);
+    }
+
+    // Probe podman for a running/stopped container with the russel label.
+    let container_name = format!("russel-{}", service_id);
+    let probe = Command::new("podman")
+        .args(["container", "exists", &container_name])
+        .output()
+        .await;
+    if let Ok(out) = &probe {
+        if out.status.success() {
+            tracing::info!(
+                service_id,
+                container = %container_name,
+                "discovered existing podman container (no metadata)"
+            );
+            return Some(RuntimeKind::Container);
+        }
+    }
+
+    // No metadata and no container: if any russel/microvms directory exists,
+    // assume legacy Microvm so teardown can proceed correctly.
+    let russel_dir = format!("/var/lib/russel/{}", service_id);
+    let microvms_dir = format!("/var/lib/microvms/{}", service_id);
+    if Path::new(&russel_dir).exists() || Path::new(&microvms_dir).exists() {
+        tracing::info!(
+            service_id,
+            "no metadata but dirs exist — treating prior as legacy Microvm"
+        );
+        return Some(RuntimeKind::Microvm);
+    }
+
+    None
+}
+
+/// Kill + wait (with timeout, then force) all old children so ports are free.
+async fn kill_and_wait_children(
+    old_vm_proc: Option<tokio::process::Child>,
+    old_aux_procs: Vec<tokio::process::Child>,
+) {
+    let mut children: Vec<tokio::process::Child> = old_vm_proc.into_iter().collect();
+    children.extend(old_aux_procs);
+    for mut child in children {
+        let _ = child.kill().await;
+        let wait = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        if !matches!(wait, Ok(Ok(_))) {
+            // Force kill if still alive after timeout.
+            tracing::warn!("child process did not exit gracefully after SIGKILL");
+        }
     }
 }
 
@@ -941,7 +1043,10 @@ async fn attempt_microvm_rollback(
     std::fs::create_dir_all(&cfg_dir)?;
     let deploy_env = format!(
         "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
-        alloc.vm_ip, alloc.host_ip, guest_port, app_path
+        alloc.vm_ip,
+        alloc.host_ip,
+        guest_port,
+        shell_quote(&app_path)
     );
     std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
 
@@ -1170,6 +1275,33 @@ async fn attempt_container_rollback(
 /// Maximum accepted size for a Russelfile (prevents huge-file DoS via config_path).
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
+/// Validate a binary/service name for shell safety: only `[A-Za-z0-9._+-]`.
+/// Rejects empty strings, whitespace, shell metacharacters.
+pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("bin_name must not be empty");
+    }
+    if name.len() > 256 {
+        anyhow::bail!("bin_name too long (max 256 characters)");
+    }
+    let valid = name.bytes().all(|c| {
+        c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-'
+    });
+    if !valid {
+        anyhow::bail!(
+            "bin_name '{}' contains invalid characters (only A-Za-z0-9._+- allowed)",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Shell-safe single-quoted value for deploy.env: escapes embedded `'` as `'\''`.
+pub fn shell_quote(value: &str) -> String {
+    let escaped = value.replace('\'', "'\\''");
+    format!("'{}'", escaped)
+}
+
 /// Validate relative path components of user `config_path` (no absolute / `..`).
 fn validate_relative_config_path(config_path: &str) -> anyhow::Result<&Path> {
     if config_path.is_empty() {
@@ -1284,8 +1416,9 @@ fn load_russelfile_under_repo(repo_path: &Path, config_path: &str) -> anyhow::Re
             .map_err(|e| anyhow::anyhow!("cannot open config_path '{}': {e}", config_path))?
     };
 
-    let meta = std::fs::metadata(&config_canon)
-        .map_err(|e| anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("cannot stat opened config_path: {e}"))?;
     if !meta.is_file() {
         anyhow::bail!("config_path must be a regular file");
     }

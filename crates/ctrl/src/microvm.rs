@@ -1313,7 +1313,7 @@ echo "Configuring $IFACE: ip=$VM_IP gw=$HOST_IP port=$PORT"
 export PORT
 cd /
 echo "exec $APP"
-exec $APP
+exec "$APP"
 echo "ERROR: exec failed! Spawning emergency shell..."
 exec /bin/sh
 "#;

@@ -152,7 +152,26 @@ Russel verifies deployment readiness by TCP-connecting to the guest port for up 
 
 ---
 
-## 4. Nix DX vs Docker DX
+## 4. Security & Validation
+
+### Repository URLs
+
+- **Local deploys** require **absolute** paths. The CLI canonicalizes relative paths before sending; the control plane rejects relative paths, `file://` URLs, and `..` traversal components.
+- **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local metadata hosts (`169.254.169.254`) are blocked. URLs starting with `-` (git option injection) are rejected.
+
+### Config Path (`--config`)
+
+The config file path must be **relative** to the repository root. The control plane opens it safely:
+
+- Path components are walked with `openat` + `O_NOFOLLOW` — symlinks at any level (including the leaf) are rejected.
+- Opened files must be regular files (not directories or devices).
+- A **1 MiB size cap** is enforced (both via `fstat` pre-check and a bounded `read`).
+
+### Binary Name
+
+The binary name (from `Russelfile.toml` `bin` or `name`) must match the safe charset `[A-Za-z0-9._+-]` (max 256 characters). It is injected into the guest via a shell-quoted `deploy.env` file — single quotes with embedded `'` escaped as `'\''`.
+
+## 5. Nix DX vs Docker DX
 
 | Developer Experience | Docker | Russel (Nix + MicroVM) |
 |----------------------|--------|------------------------|
