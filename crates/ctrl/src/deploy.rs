@@ -13,9 +13,13 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use std::collections::HashMap;
+
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::{RuntimeKind, Russelfile, resolve_runtime},
+    config::{
+        RuntimeKind, Russelfile, merge_env_maps, resolve_runtime, validate_env_map,
+    },
 };
 
 use crate::{
@@ -265,6 +269,11 @@ impl DeployPipeline {
         let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
+
+        // Merge env: file < request (request wins on key conflict).
+        let merged_env = merge_env_maps(&config.service.env, &request.env);
+        validate_env_map(&merged_env)?;
+
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
             service_id,
@@ -403,6 +412,7 @@ impl DeployPipeline {
                         &build.store_path,
                         &port,
                         kernel.as_ref().unwrap(),
+                        &merged_env,
                         &tx,
                     )
                     .await
@@ -414,6 +424,7 @@ impl DeployPipeline {
                         &build.store_path,
                         &port,
                         &request.podman_args,
+                        &merged_env,
                         &tx,
                     )
                     .await
@@ -561,6 +572,7 @@ impl DeployPipeline {
         store_path: &Path,
         port: &PortMapping,
         kernel_info: &KernelInfo,
+        env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         let alloc: SubnetAllocation = subnet_for(service_id);
@@ -590,13 +602,17 @@ impl DeployPipeline {
         std::fs::create_dir_all(&cfg_dir)
             .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
         // Shell-quote APP path to prevent injection through deploy.env
-        let deploy_env = format!(
+        let mut deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
             alloc.vm_ip,
             alloc.host_ip,
             port.guest,
             shell_quote(&app_path)
         );
+        // Append user env vars, shell-quoted.
+        for (key, value) in env {
+            deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
+        }
         std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
 
         // Agent initramfs is cached after first use — no app baked in.
@@ -746,6 +762,7 @@ impl DeployPipeline {
         store_path: &Path,
         port: &PortMapping,
         podman_args: &[String],
+        env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
@@ -792,7 +809,7 @@ impl DeployPipeline {
             host_port: port.host,
             guest_port: port.guest,
             memory_mb: mem_mb,
-            env: vec![("PORT".to_string(), port.guest.to_string())],
+            env: build_container_env(port.guest, env),
             extra_args: podman_args.to_vec(),
         };
         let running = self.containers.start(&start_spec).await?;
@@ -1300,6 +1317,23 @@ pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
 pub fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\\''");
     format!("'{}'", escaped)
+}
+
+/// Build the env list for a container start spec: PORT first (managed),
+/// then user env vars (already validated; PORT filtered out to prevent override).
+pub fn build_container_env(
+    guest_port: u16,
+    user_env: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> =
+        vec![("PORT".to_string(), guest_port.to_string())];
+    for (key, value) in user_env {
+        if key == "PORT" {
+            continue; // managed by Russel, user cannot override
+        }
+        env.push((key.clone(), value.clone()));
+    }
+    env
 }
 
 /// Validate relative path components of user `config_path` (no absolute / `..`).

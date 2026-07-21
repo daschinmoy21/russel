@@ -334,6 +334,13 @@ bin = "api"
 # CLI --runtime must match this value if provided.
 type = "microvm"
 
+# Optional: user-defined environment variables (deploy-time injection).
+# Keys: ^[A-Za-z_][A-Za-z0-9_]*$. Reserved: PORT, VM_IP, HOST_IP, APP.
+# Max 64 keys, 4096 bytes per value. Plain text only (no secrets yet).
+[service.env]
+LOG_LEVEL = "info"
+FEATURE_X = "1"
+
 [dependencies]
 build = ["pkg-config", "openssl"]
 runtime = ["cacert"]

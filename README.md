@@ -90,13 +90,17 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 ## CLI Commands
 
 ```bash
-russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container] [-- <podman-run-args...>]
+russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] [-- <podman-run-args...>]
 russel status [<service_id>]
 russel logs [<service_id>]
 russel vms
 russel stop <service_id>
 russel destroy <service_id>
 ```
+
+- **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
+- **`--env-file PATH`**: Load `KEY=VALUE` pairs from a file (`#` comments, blank lines skipped). Merged with `[service.env]` and `--env` (later wins).
+- Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). See [Networking Model](#networking-model) for the Traefik roadmap.
@@ -127,6 +131,10 @@ port = 3000
 memory = "256mb"
 bin = "api"    # optional — defaults to name
 type = "microvm"  # optional: "microvm" (default) or "container"
+
+[service.env]    # optional — user-defined environment variables
+LOG_LEVEL = "info"
+FEATURE_X = "1"
 ```
 
 ### Runtimes

@@ -1291,7 +1291,9 @@ while [ ! -f /config/deploy.env ]; do
 done
 
 # Source deployment config.
+set -a
 . /config/deploy.env
+set +a
 
 # Find network interface (net.ifnames=0 friendly).
 IFACE="eth0"

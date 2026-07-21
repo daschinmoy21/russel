@@ -907,6 +907,7 @@ dependencies = [
  "russel-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

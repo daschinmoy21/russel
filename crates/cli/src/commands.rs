@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -9,7 +10,7 @@ use reqwest::header::{HeaderMap, AUTHORIZATION};
 use russel_core::{
     RuntimeKind,
     api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse},
-    config::{Russelfile, resolve_runtime},
+    config::{Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
 /// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
@@ -83,6 +84,14 @@ pub struct DeployArgs {
         num_args = 0..
     )]
     pub podman_args: Vec<String>,
+
+    /// Set an environment variable for the deployed service (repeatable).
+    #[arg(long = "env", value_name = "KEY=VALUE", num_args = 1)]
+    pub env: Vec<String>,
+
+    /// Path to a file with KEY=VALUE lines (comments with #, blank lines skipped).
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_file: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -155,6 +164,19 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     }
     println!();
 
+    // ── Build env map from CLI args ───────────────────────────────────────
+    let mut cli_env: HashMap<String, String> = HashMap::new();
+    if let Some(ref env_file_path) = args.env_file {
+        let file_env = parse_env_file(env_file_path)?;
+        cli_env = merge_env_maps(&cli_env, &file_env);
+    }
+    for raw in &args.env {
+        let (key, value) = parse_env_kv(raw)?;
+        cli_env.insert(key, value);
+    }
+    // Validate CLI env before sending.
+    validate_env_map(&cli_env)?;
+
     // ── Send deploy request ────────────────────────────────────────────────
     let client = http_client();
     let mut response = client
@@ -167,6 +189,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             port,
             runtime,
             podman_args: args.podman_args,
+            env: cli_env,
         })
         .send()
         .await?
@@ -440,6 +463,34 @@ fn normalize_repo_arg(repo: &str) -> Result<String> {
     Ok(repo.to_string())
 }
 
+/// Parse a single `KEY=VALUE` string into a (key, value) pair.
+fn parse_env_kv(raw: &str) -> Result<(String, String)> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow!("env must be KEY=VALUE, got: {raw}"))?;
+    if key.is_empty() {
+        anyhow::bail!("env key must not be empty in: {raw}");
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Parse a `--env-file` path: each non-empty line is KEY=VALUE, `#` starts a comment.
+fn parse_env_file(path: &str) -> Result<HashMap<String, String>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read env file: {path}"))?;
+    let mut map = HashMap::new();
+    for (i, line) in contents.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (key, value) = parse_env_kv(trimmed)
+            .with_context(|| format!("{}:{}: invalid env line", path, i + 1))?;
+        map.insert(key, value);
+    }
+    Ok(map)
+}
+
 fn parse_port_mapping(value: &str) -> Result<PortMapping> {
     let (host, guest) = value
         .split_once(':')
@@ -666,6 +717,41 @@ mod tests {
             }
             _ => panic!("expected deploy subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_env_kv_valid() {
+        let (k, v) = parse_env_kv("FOO=bar").unwrap();
+        assert_eq!(k, "FOO");
+        assert_eq!(v, "bar");
+    }
+
+    #[test]
+    fn parse_env_kv_equals_in_value() {
+        let (k, v) = parse_env_kv("FOO=bar=baz").unwrap();
+        assert_eq!(k, "FOO");
+        assert_eq!(v, "bar=baz");
+    }
+
+    #[test]
+    fn parse_env_kv_no_equals() {
+        assert!(parse_env_kv("FOOBAR").is_err());
+    }
+
+    #[test]
+    fn parse_env_kv_empty_key() {
+        assert!(parse_env_kv("=value").is_err());
+    }
+
+    #[test]
+    fn parse_env_file_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "LOG_LEVEL=info\n# comment\n\nFEATURE_X=1\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("LOG_LEVEL"), Some(&"info".to_string()));
+        assert_eq!(map.get("FEATURE_X"), Some(&"1".to_string()));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

@@ -45,6 +45,14 @@ bin = "my-app"
 # This is the source of truth. CLI --runtime must match if provided.
 type = "microvm"
 
+# Optional: User-defined environment variables injected at deploy time.
+# Keys must start with a letter or underscore, contain only [A-Za-z0-9_].
+# Reserved keys (PORT, VM_IP, HOST_IP, APP) are rejected.
+# Values are plain text (no secrets support yet). Max 64 keys, 4096 bytes each.
+[service.env]
+LOG_LEVEL = "info"
+FEATURE_X = "1"
+
 # Optional: Database provisioning (planned — current: placeholder)
 [database.postgres]
 enabled = false
@@ -171,7 +179,29 @@ The config file path must be **relative** to the repository root. The control pl
 
 The binary name (from `Russelfile.toml` `bin` or `name`) must match the safe charset `[A-Za-z0-9._+-]` (max 256 characters). It is injected into the guest via a shell-quoted `deploy.env` file — single quotes with embedded `'` escaped as `'\''`.
 
-## 5. Nix DX vs Docker DX
+## 5. Environment Variables
+
+Deploy-time environment variables can be set via three mechanisms, merged in order (later wins):
+
+1. **`[service.env]` in Russelfile.toml** — project defaults, checked into version control.
+2. **`--env-file PATH`** — a file with `KEY=VALUE` lines (`#` comments, blank lines skipped).
+3. **`--env KEY=VALUE`** — repeatable CLI flag, highest priority.
+
+### Validation
+
+- Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` (start with letter or underscore, alphanumeric + underscore).
+- Reserved keys **`PORT`**, **`VM_IP`**, **`HOST_IP`**, **`APP`** are rejected (managed by Russel).
+- Values must not contain NUL bytes. Maximum value length is 4096 bytes.
+- Maximum 64 keys total after merging all sources.
+
+### Injection
+
+- **microVM:** Custom env vars are appended to `/config/deploy.env` (shell-quoted) and exported before the app starts.
+- **Container:** Custom env vars are passed via `podman run -e` after the managed `PORT` variable.
+
+> **Note:** Secrets (e.g. `DATABASE_URL`) are **not** supported yet. All values are plain text.
+
+## 6. Nix DX vs Docker DX
 
 | Developer Experience | Docker | Russel (Nix + MicroVM) |
 |----------------------|--------|------------------------|
