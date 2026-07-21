@@ -61,6 +61,8 @@ pub struct DeployArgs {
     #[arg(value_name = "REPO")]
     pub repo: String,
 
+    /// Publish a host port (e.g. 8080:3000). Optional: when omitted, Traefik
+    /// provides the primary HTTP ingress via `http://<service_id>.russel.local`.
     #[arg(short = 'p', long = "publish", value_name = "HOST:GUEST")]
     pub port: Option<String>,
 
@@ -344,10 +346,24 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     step("vm-id", &r.vm_id, "");
     step("status", &r.status, "");
 
+    // ── Traefik route (primary ingress) ──────────────────────────────────
+    if let Some(route_host) = &r.route_host {
+        println!(
+            "  \x1b[2m{:>10}\x1b[0m  \x1b[1mhttp://{}\x1b[0m  \x1b[2m(Traefik Host rule)\x1b[0m",
+            "route", route_host
+        );
+    }
+
     if let Some(p) = &r.port {
+        let guest = p.guest;
+        let backend_label = if r.route_host.is_some() {
+            format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, guest)
+        } else {
+            format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, guest)
+        };
         step(
-            "port",
-            &format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, p.guest),
+            if r.route_host.is_some() { "backend" } else { "port" },
+            &backend_label,
             "",
         );
     }

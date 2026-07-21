@@ -74,7 +74,7 @@ impl DeployPipeline {
             runner: microvm::shared_runner(),
             containers: ContainerRunner::new(),
             ports: PortAllocator,
-            traefik: TraefikClient,
+            traefik: TraefikClient::from_env(),
         }
     }
 
@@ -105,6 +105,8 @@ impl DeployPipeline {
                 vm_ip: None,
                 runtime: request.runtime,
                 message: e.to_string(),
+                route_host: None,
+                backend_port: None,
             };
         }
 
@@ -123,6 +125,8 @@ impl DeployPipeline {
                 vm_ip: None,
                 runtime: request.runtime,
                 message: e.to_string(),
+                route_host: None,
+                backend_port: None,
             };
         }
 
@@ -181,6 +185,8 @@ impl DeployPipeline {
                         )
                     }
                 };
+                let host_port = output.port.host;
+                let route_host = Some(self.traefik.public_host(&service_id));
                 DeployResponse {
                     service_id,
                     vm_id,
@@ -194,6 +200,8 @@ impl DeployPipeline {
                     vm_ip,
                     runtime: Some(output.runtime),
                     message,
+                    route_host,
+                    backend_port: Some(host_port),
                 }
             }
             Ok(DeployInnerResult::RolledBack {
@@ -222,6 +230,8 @@ impl DeployPipeline {
                     message: format!(
                         "deployment failed but rolled back successfully: {original_error}"
                     ),
+                    route_host: None,
+                    backend_port: None,
                 }
             }
             Err(error) => {
@@ -246,6 +256,8 @@ impl DeployPipeline {
                     vm_ip: None,
                     runtime: request_runtime,
                     message: error.to_string(),
+                    route_host: None,
+                    backend_port: None,
                 }
             }
         }

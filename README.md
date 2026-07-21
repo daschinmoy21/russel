@@ -170,9 +170,24 @@ Russel checks readiness by TCP-connecting to the published host port (container)
 
 `-p HOST:GUEST` publishes a host port via `socat` (microVM) or Podman port mapping (container). Both paths go through the port allocator so host ports never collide across services.
 
-### Traefik Gateway (planned)
+### Traefik Gateway
 
-Future: Traefik becomes the **primary ingress gateway**. Public traffic hits Traefik; applications only declare a **listen port** (`service.port` in Russelfile = guest/backend port). The host port is auto-allocated as a private backend — no user `-p` required for normal HTTP apps. `-p` remains available as an escape hatch for direct host publishing until Traefik lands.
+Traefik is the **primary HTTP ingress gateway**. Russel writes dynamic configuration files into `/var/lib/russel/traefik/dynamic/` (override with `RUSSEL_TRAEFIK_DYNAMIC_DIR`). Each deployed service gets a Host rule: `<service_id>.<domain>` (domain defaults to `russel.local`, override with `RUSSEL_TRAEFIK_DOMAIN`).
+
+```yaml
+# Static Traefik config snippet (traefik.yml)
+entryPoints:
+  web:
+    address: ":80"
+providers:
+  file:
+    directory: /var/lib/russel/traefik/dynamic
+    watch: true
+```
+
+With Traefik running, access your service at `http://<service_id>.russel.local` (requires DNS or `/etc/hosts` entry pointing to Traefik's IP). The host port is auto-allocated as a private backend — no user `-p` required for normal HTTP apps. `-p` remains available as an escape hatch for direct host publishing.
+
+On destroy/stop, Russel removes the dynamic config file so Traefik stops routing to the dead backend. Redeploy re-registers with the new backend port.
 
 ## Lifecycle
 

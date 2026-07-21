@@ -37,6 +37,12 @@ pub struct DeployResponse {
     pub vm_ip: Option<String>,
     #[serde(default)]
     pub runtime: Option<RuntimeKind>,
+    /// Traefik Host rule hostname (e.g. `api.russel.local`).
+    #[serde(default)]
+    pub route_host: Option<String>,
+    /// Published host port (backend for Traefik).
+    #[serde(default)]
+    pub backend_port: Option<u16>,
 }
 
 /// Millisecond breakdown of each deploy phase, included in every successful response.
@@ -142,6 +148,8 @@ mod tests {
                 timing: None,
                 vm_ip: Some("10.0.5.2".into()),
                 runtime: Some(RuntimeKind::Microvm),
+                route_host: Some("svc.russel.local".into()),
+                backend_port: Some(8080),
             })),
             DeployEvent::Error("build failed".into()),
         ];

@@ -22,6 +22,7 @@ use crate::{
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     state::{AppState, LifecycleClaim},
+    traefik::TraefikClient,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -393,6 +394,11 @@ async fn vm_stop(
 
     match result {
         Ok(_) => {
+            // Unregister from Traefik so it stops routing to this backend.
+            let traefik = TraefikClient::from_env();
+            if let Err(e) = traefik.unregister(&service_id).await {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to unregister from Traefik during stop");
+            }
             tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
             state.set_status(&service_id, "stopped", "none");
             Ok(Json(format!("stopped {label} {service_id}")))
@@ -435,6 +441,11 @@ async fn vm_destroy(
 
     match result {
         Ok(_) => {
+            // Unregister from Traefik so it stops routing to this (now destroyed) backend.
+            let traefik = TraefikClient::from_env();
+            if let Err(e) = traefik.unregister(&service_id).await {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to unregister from Traefik during destroy");
+            }
             if runtime == RuntimeKind::Microvm {
                 release_subnet(&service_id);
             }
