@@ -115,9 +115,15 @@ russel destroy <service_id>
 - `--config` must be a **relative** path under the repository root. The control plane opens it via `openat` with `O_NOFOLLOW` (symlinks rejected) and enforces a 1 MiB size cap.
 - The binary name (from `Russelfile.toml` `bin` or `name`) must match `[A-Za-z0-9._+-]` (max 256 chars). It is injected into the guest via a shell-quoted `deploy.env` file.
 
-### Redeploy
+### Redeploy / update
 
 Redeploying an existing service kills and waits for old processes before reusing ports. If a new deploy fails after a prior successful deployment, Russel attempts automatic **rollback** to the previous running service. A successful rollback reports status `rolled_back`; the CLI exit code is non-zero so CI pipelines can detect the failure.
+
+**`russel update <id>`** re-applies desired state from the `repo_url` / `config_path` recorded in metadata at the last successful deploy (override with `--repo` / `--config`).
+
+### Health
+
+The control plane probes `127.0.0.1:<host_port>` every `RUSSEL_HEALTH_INTERVAL_SECS` (default 30). After three consecutive failures the service is marked failed. Set `RUSSEL_HEALTH_RESTART=1` to auto-redeploy from the recorded source.
 
 ## Project Requirements
 

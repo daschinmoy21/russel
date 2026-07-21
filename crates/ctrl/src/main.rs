@@ -6,14 +6,10 @@ mod api;
 mod build;
 mod ch_api;
 mod container;
-// database / health: SPEC scaffold modules (DatabaseProvisioner / HealthChecker).
-// Module-wide allow is intentional until they are wired into the deploy pipeline;
-// remove the allows once those types are called from deploy or api paths (#104).
-#[allow(dead_code)]
-mod database;
+// Database provisioning was a no-op stub; Russelfile already rejects enabled
+// [database] sections. Dropped in favor of external DBs (see docs).
 mod deploy;
 mod git;
-#[allow(dead_code)]
 mod health;
 mod ingress;
 mod metadata;
@@ -75,6 +71,11 @@ async fn main() -> Result<()> {
     // router state. Child handles are spawned with kill_on_drop(true); without
     // an explicit detach, dropping AppState would SIGKILL every VM on exit.
     let state = AppState::default();
+
+    // Periodic TCP health probes; set RUSSEL_HEALTH_RESTART=1 to redeploy
+    // after 3 consecutive failures when metadata records repo_url.
+    crate::health::spawn_health_loop(state.clone());
+
     let app: Router = api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
 

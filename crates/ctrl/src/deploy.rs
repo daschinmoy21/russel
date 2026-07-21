@@ -27,7 +27,6 @@ use crate::{
         ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec, default_base_dir,
         validate_podman_args_for_runtime,
     },
-    database::DatabaseProvisioner,
     git::GitClient,
     ingress::{self, Backend, Ingress},
     metadata::{build_container_metadata, build_microvm_metadata, write_metadata},
@@ -38,6 +37,22 @@ use crate::{
 };
 
 pub use crate::metadata::prior_runtime_from_disk;
+
+/// Persist repo/config so update + health restart can rebuild desired state.
+fn record_source_in_metadata(
+    service_id: &str,
+    repo_url: &str,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("read metadata for source record: {e}"))?;
+    let mut value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("parse metadata for source record: {e}"))?;
+    value["repo_url"] = serde_json::json!(repo_url);
+    value["config_path"] = serde_json::json!(config_path);
+    write_metadata(&path, &value)
+}
 
 /// Typed outcome of `deploy_inner` — success, rollback, or hard failure.
 enum DeployInnerResult {
@@ -50,8 +65,6 @@ pub struct DeployPipeline {
     state: AppState,
     git: GitClient,
     builder: NixBuilder,
-    #[allow(dead_code)]
-    database: DatabaseProvisioner,
     runner: MicrovmRunner,
     containers: ContainerRunner,
     ports: PortAllocator,
@@ -64,7 +77,6 @@ impl std::fmt::Debug for DeployPipeline {
             .field("state", &self.state)
             .field("git", &self.git)
             .field("builder", &self.builder)
-            .field("database", &self.database)
             .field("runner", &self.runner)
             .field("containers", &self.containers)
             .field("ports", &self.ports)
@@ -79,7 +91,6 @@ impl DeployPipeline {
             state,
             git: GitClient,
             builder: NixBuilder,
-            database: DatabaseProvisioner,
             // DeployPipeline is constructed per request.  Keep the expensive
             // kernel/busybox/module resolution cache alive across requests so
             // the benchmark's later VMs measure VM work rather than repeated
@@ -567,6 +578,12 @@ impl DeployPipeline {
         }
 
         self.state.attach_flake_path(service_id, repo_path.clone());
+        // Record source so `russel update` / health restart can redeploy.
+        if let Err(e) =
+            record_source_in_metadata(service_id, &request.repo_url, &request.config_path)
+        {
+            tracing::warn!(service_id, error = %e, "failed to record source in metadata");
+        }
         port_reservation
             .as_mut()
             .expect("port reservation exists")
