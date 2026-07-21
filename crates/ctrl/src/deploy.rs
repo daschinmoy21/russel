@@ -12,8 +12,8 @@ use russel_core::{
 use crate::{
     build::NixBuilder,
     container::{
-        ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec,
-        default_base_dir, validate_podman_args_for_runtime,
+        ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec, default_base_dir,
+        validate_podman_args_for_runtime,
     },
     database::DatabaseProvisioner,
     git::GitClient,
@@ -457,7 +457,11 @@ impl DeployPipeline {
             }
         };
 
-        if let Err(error) = self.traefik.register(service_id, workload.port().host).await {
+        if let Err(error) = self
+            .traefik
+            .register(service_id, workload.port().host)
+            .await
+        {
             workload.teardown_network().await;
             PortAllocator::release(service_id);
             return Err(error);
@@ -536,9 +540,8 @@ impl DeployPipeline {
             .await;
 
         let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
-        std::fs::create_dir_all(&cfg_dir).map_err(|e| {
-            anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e)
-        })?;
+        std::fs::create_dir_all(&cfg_dir)
+            .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
         let deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
             alloc.vm_ip, alloc.host_ip, port.guest, app_path
@@ -549,7 +552,11 @@ impl DeployPipeline {
         let initramfs_path = self.runner.build_agent_initramfs().await?;
 
         let create_ms = t.elapsed().as_millis();
-        tracing::info!(service_id, create_ms, "deploy.env written, agent initramfs ready");
+        tracing::info!(
+            service_id,
+            create_ms,
+            "deploy.env written, agent initramfs ready"
+        );
 
         // ── TAP + socat + boot/restore VM ──────────────────────────────
         let _ = tx
@@ -561,8 +568,7 @@ impl DeployPipeline {
         tracing::info!(service_id, "setting up TAP + socat + booting VM");
 
         let t_net = Instant::now();
-        let socat_child =
-            TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
+        let socat_child = TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
         let network_ms = t_net.elapsed().as_millis();
 
         let t_start = Instant::now();
@@ -610,7 +616,12 @@ impl DeployPipeline {
         })?;
 
         let start_ms = t_start.elapsed().as_millis();
-        tracing::info!(service_id, network_ms, start_ms, "network + VM booted/restored");
+        tracing::info!(
+            service_id,
+            network_ms,
+            start_ms,
+            "network + VM booted/restored"
+        );
 
         // ── Wait for VM service to be reachable ────────────────────────
         let t = Instant::now();
@@ -627,8 +638,7 @@ impl DeployPipeline {
             "polling VM readiness"
         );
         let up =
-            TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10))
-                .await;
+            TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10)).await;
         let ready_ms = t.elapsed().as_millis();
         if !up {
             let console_log = format!("/var/lib/russel/{}/console.log", service_id);
@@ -765,8 +775,7 @@ impl DeployPipeline {
             host_port = port.host,
             "polling container readiness"
         );
-        let up =
-            TapForwarder::wait_for_host_port(port.host, Duration::from_secs(10)).await;
+        let up = TapForwarder::wait_for_host_port(port.host, Duration::from_secs(10)).await;
         let ready_ms = t.elapsed().as_millis();
         if !up {
             anyhow::bail!("container not reachable on 127.0.0.1:{} in 10s", port.host);
@@ -886,25 +895,34 @@ async fn attempt_microvm_rollback(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing bin_name"))?
         .to_string();
-    let app_path = old_meta["app_path"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing app_path"))?
-        .to_string();
-    let store_path = old_meta["store_path"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing store_path"))?
-        .to_string();
+
+    // Resolve app/store paths. Prefer explicit fields; support legacy metadata
+    // that stored the Nix store directory in `app_path` and omitted `store_path`.
+    let (app_path, store_path) = resolve_rollback_app_paths(
+        old_meta["app_path"].as_str(),
+        old_meta["store_path"].as_str(),
+        &bin_name,
+    )?;
     if !Path::new(&app_path).exists() {
         anyhow::bail!("app_path does not exist: {app_path}");
     }
 
-    let initramfs_from_meta = old_meta["initramfs"]
+    // Require initramfs key; rebuild only when the recorded path is gone on disk.
+    let initramfs_recorded = old_meta["initramfs"]
         .as_str()
-        .map(PathBuf::from)
-        .filter(|p| p.exists());
-    let initramfs_path = match initramfs_from_meta {
-        Some(path) => path,
-        None => runner.build_agent_initramfs().await?,
+        .ok_or_else(|| anyhow::anyhow!("missing initramfs"))?;
+    let initramfs_path = {
+        let recorded = PathBuf::from(initramfs_recorded);
+        if recorded.exists() {
+            recorded
+        } else {
+            tracing::warn!(
+                service_id,
+                path = %recorded.display(),
+                "recorded initramfs missing on disk — rebuilding agent initramfs"
+            );
+            runner.build_agent_initramfs().await?
+        }
     };
 
     // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick
@@ -920,40 +938,53 @@ async fn attempt_microvm_rollback(
     // 4. Reserve port
     PortAllocator::reserve(service_id, host_port)?;
 
+    // Helper: tear down anything acquired after port reservation.
+    async fn cleanup_rollback_resources(
+        service_id: &str,
+        alloc: &SubnetAllocation,
+        runner: &MicrovmRunner,
+        vm_child: Option<tokio::process::Child>,
+        aux: Option<Vec<tokio::process::Child>>,
+    ) {
+        drop(vm_child);
+        drop(aux);
+        if let Err(e) = runner.destroy(service_id).await {
+            tracing::warn!(service_id, error = %e, "failed to destroy partial rollback microVM");
+        }
+        let _ = TapForwarder::teardown(alloc).await;
+        PortAllocator::release(service_id);
+    }
+
     // 5–6. Network + boot; clean up on any failure after reservation
     let cfg_dir_path = PathBuf::from(&cfg_dir);
-    let boot_result: anyhow::Result<(tokio::process::Child, Vec<tokio::process::Child>, tokio::process::Child)> =
-        async {
-            let socat_child =
-                TapForwarder::setup(service_id, &alloc, host_port, guest_port).await?;
-            let pool = shared_warm_pool();
-            let BootOutput {
-                vm_child,
-                virtiofsd_children,
-            } = pool
-                .restore_or_boot(
-                    service_id,
-                    &kernel_path,
-                    &initramfs_path,
-                    &alloc,
-                    mem_mb,
-                    &cfg_dir_path,
-                )
-                .await
-                .map_err(|e| {
-                    // Drop socat via kill_on_drop when we leave this scope on error —
-                    // also tear down TAP so we do not leak the interface.
-                    e
-                })?;
-            Ok((vm_child, virtiofsd_children, socat_child))
-        }
-        .await;
+    let boot_result: anyhow::Result<(
+        tokio::process::Child,
+        Vec<tokio::process::Child>,
+        tokio::process::Child,
+    )> = async {
+        let socat_child = TapForwarder::setup(service_id, &alloc, host_port, guest_port).await?;
+        let pool = shared_warm_pool();
+        let BootOutput {
+            vm_child,
+            virtiofsd_children,
+        } = pool
+            .restore_or_boot(
+                service_id,
+                &kernel_path,
+                &initramfs_path,
+                &alloc,
+                mem_mb,
+                &cfg_dir_path,
+            )
+            .await?;
+        Ok((vm_child, virtiofsd_children, socat_child))
+    }
+    .await;
 
     let (vm_child, virtiofsd_children, socat_child) = match boot_result {
         Ok(v) => v,
         Err(e) => {
-            let _ = TapForwarder::teardown(&alloc).await;
-            PortAllocator::release(service_id);
+            cleanup_rollback_resources(service_id, &alloc, runner, None, None).await;
             return Err(e.context("microVM rollback boot failed"));
         }
     };
@@ -967,14 +998,7 @@ async fn attempt_microvm_rollback(
         // Tear down partial restore; do not report rolled_back for a dead service.
         let mut aux = vec![socat_child];
         aux.extend(virtiofsd_children);
-        // kill children by dropping after explicit destroy attempt
-        drop(vm_child);
-        drop(aux);
-        if let Err(e) = runner.destroy(service_id).await {
-            tracing::warn!(service_id, error = %e, "failed to destroy unready rolled-back microVM");
-        }
-        let _ = TapForwarder::teardown(&alloc).await;
-        PortAllocator::release(service_id);
+        cleanup_rollback_resources(service_id, &alloc, runner, Some(vm_child), Some(aux)).await;
         anyhow::bail!(
             "rolled-back microVM not reachable on {}:{guest_port} within 10s",
             alloc.vm_ip
@@ -998,13 +1022,52 @@ async fn attempt_microvm_rollback(
         Some(&bin_name),
         Some(&initramfs_path.display().to_string()),
     );
-    write_metadata(&old_metadata_path, &meta)?;
+    if let Err(e) = write_metadata(&old_metadata_path, &meta) {
+        let mut aux = vec![socat_child];
+        aux.extend(virtiofsd_children);
+        cleanup_rollback_resources(service_id, &alloc, runner, Some(vm_child), Some(aux)).await;
+        return Err(e.context("microVM rollback metadata write failed"));
+    }
 
     let mut aux = vec![socat_child];
     aux.extend(virtiofsd_children);
     state.mark_deployed_with_aux(service_id, vm_child, aux);
 
     Ok(())
+}
+
+/// Resolve `app_path` / `store_path` for rollback.
+///
+/// Current metadata writes both. Legacy writers stored the Nix store directory
+/// in `app_path` and omitted `store_path`, so APP would be `/nix/store/<hash>`
+/// instead of `/nix/store/<hash>/bin/<bin>`. Reconstruct in that case.
+fn resolve_rollback_app_paths(
+    app_from_meta: Option<&str>,
+    store_from_meta: Option<&str>,
+    bin_name: &str,
+) -> anyhow::Result<(String, String)> {
+    let bin_suffix = format!("/bin/{bin_name}");
+    match (app_from_meta, store_from_meta) {
+        (Some(app), Some(store)) => {
+            // Bare store dir written as app_path (or missing /bin/<bin>) → reconstruct.
+            if app.ends_with(&bin_suffix) {
+                Ok((app.to_string(), store.to_string()))
+            } else {
+                Ok((format!("{store}{bin_suffix}"), store.to_string()))
+            }
+        }
+        // Legacy: only app_path — may be full binary path or bare store dir.
+        (Some(app), None) => {
+            if let Some(store) = app.strip_suffix(&bin_suffix) {
+                Ok((app.to_string(), store.to_string()))
+            } else {
+                // Treat app_path as the store directory.
+                Ok((format!("{app}{bin_suffix}"), app.to_string()))
+            }
+        }
+        (None, Some(store)) => Ok((format!("{store}{bin_suffix}"), store.to_string())),
+        (None, None) => anyhow::bail!("missing app_path and store_path in rollback metadata"),
+    }
 }
 
 async fn attempt_container_rollback(
@@ -1020,10 +1083,12 @@ async fn attempt_container_rollback(
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
     let old_host_port = old_meta["host_port"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))? as u16;
+        .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))?
+        as u16;
     let old_guest_port = old_meta["guest_port"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))? as u16;
+        .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))?
+        as u16;
     let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
     let old_bin_name = old_meta["bin_name"].as_str().unwrap_or("app");
     let old_rootfs_path = old_meta["rootfs_path"]
@@ -1032,7 +1097,11 @@ async fn attempt_container_rollback(
     let old_podman_args: Vec<String> = old_meta
         .get("podman_args")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|a| a.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     PortAllocator::reserve(service_id, old_host_port)?;
@@ -1052,8 +1121,7 @@ async fn attempt_container_rollback(
     let running = containers.start(&start_spec).await?;
 
     // Do not mark deployed until the restored container is reachable.
-    let ready =
-        TapForwarder::wait_for_host_port(old_host_port, Duration::from_secs(10)).await;
+    let ready = TapForwarder::wait_for_host_port(old_host_port, Duration::from_secs(10)).await;
     if !ready {
         if let Err(e) = containers.destroy(service_id).await {
             tracing::warn!(
@@ -1134,9 +1202,8 @@ fn resolve_config_path(repo_path: &Path, config_path: &str) -> anyhow::Result<Pa
         anyhow::bail!("config_path escapes repository root");
     }
 
-    let meta = std::fs::metadata(&config_canon).map_err(|e| {
-        anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display())
-    })?;
+    let meta = std::fs::metadata(&config_canon)
+        .map_err(|e| anyhow::anyhow!("cannot stat config_path {}: {e}", config_canon.display()))?;
     if !meta.is_file() {
         anyhow::bail!("config_path must be a regular file");
     }
@@ -1277,7 +1344,11 @@ memory = "256mb"
         ));
         std::fs::create_dir_all(&outside).unwrap();
         let outside_file = outside.join("secret.toml");
-        std::fs::write(&outside_file, b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n").unwrap();
+        std::fs::write(
+            &outside_file,
+            b"[service]\nname=\"x\"\nsource=\".\"\nport=1\nmemory=\"1mb\"\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&outside_file, repo.path().join("escape.toml")).unwrap();
         let err = resolve_config_path(repo.path(), "escape.toml")
             .unwrap_err()
@@ -1377,11 +1448,9 @@ mod deploy_tests {
 
     #[test]
     fn podman_args_rejected_for_microvm_runtime() {
-        let err = validate_podman_args_for_runtime(
-            RuntimeKind::Microvm,
-            &["-v".into(), "/a:/b".into()],
-        )
-        .unwrap_err();
+        let err =
+            validate_podman_args_for_runtime(RuntimeKind::Microvm, &["-v".into(), "/a:/b".into()])
+                .unwrap_err();
         assert!(err.to_string().contains("microvm"));
     }
 

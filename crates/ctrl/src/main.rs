@@ -152,11 +152,7 @@ async fn cleanup_stale_resources() {
                 };
                 // `ip -o link show` names look like `rsl-a1b2c3d4@NONE:` — strip
                 // trailing colon and optional `@peer` suffix.
-                let base = raw
-                    .trim_end_matches(':')
-                    .split('@')
-                    .next()
-                    .unwrap_or(raw);
+                let base = raw.trim_end_matches(':').split('@').next().unwrap_or(raw);
                 if !is_russel_tap(base) {
                     continue;
                 }

@@ -7,9 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use russel_core::{
     RuntimeKind,
-    api::{
-        DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse,
-    },
+    api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse},
     config::{Russelfile, resolve_runtime},
 };
 

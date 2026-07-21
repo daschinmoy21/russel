@@ -232,6 +232,9 @@ mod tests {
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
         assert_eq!(meta["runtime"], "microvm");
         assert_eq!(meta["bin_name"], "myapp");
+        assert_eq!(meta["host_ip"], "10.0.1.1");
+        assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
+        assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
         assert!(meta["deployed_at"].as_str().unwrap().ends_with('Z'));
 
         let container = build_container_metadata(
