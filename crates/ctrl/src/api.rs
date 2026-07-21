@@ -339,13 +339,9 @@ async fn vm_stop(
 
     let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
     let result = match claim {
-        LifecycleClaimKind::Microvm {
-            runner,
-            vm_child,
-            aux_processes,
-        } => {
-            let result = runner.stop(&service_id).await;
-            reap_children(vm_child, aux_processes).await;
+        LifecycleClaimKind::Microvm(claim) => {
+            let result = claim.runner.stop(&service_id).await;
+            reap_children(claim.vm_child, claim.aux_processes).await;
             result
         }
         LifecycleClaimKind::Container { runner } => runner.stop(&service_id).await,
@@ -375,13 +371,9 @@ async fn vm_destroy(
 
     let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
     let result = match claim {
-        LifecycleClaimKind::Microvm {
-            runner,
-            vm_child,
-            aux_processes,
-        } => {
-            let result = runner.destroy(&service_id).await;
-            reap_children(vm_child, aux_processes).await;
+        LifecycleClaimKind::Microvm(claim) => {
+            let result = claim.runner.destroy(&service_id).await;
+            reap_children(claim.vm_child, claim.aux_processes).await;
             result
         }
         LifecycleClaimKind::Container { runner } => {
@@ -416,17 +408,16 @@ async fn vm_destroy(
     }
 }
 
-// Microvm holds Child handles; Container is tiny — allow until claim payload is boxed.
-#[allow(clippy::large_enum_variant)]
+struct MicrovmLifecycleClaim {
+    runner: MicrovmRunner,
+    vm_child: Option<Child>,
+    aux_processes: Vec<Child>,
+}
+
 enum LifecycleClaimKind {
-    Microvm {
-        runner: MicrovmRunner,
-        vm_child: Option<Child>,
-        aux_processes: Vec<Child>,
-    },
-    Container {
-        runner: ContainerRunner,
-    },
+    // Box large variant payload (clippy large_enum_variant).
+    Microvm(Box<MicrovmLifecycleClaim>),
+    Container { runner: ContainerRunner },
 }
 
 fn runtime_label(runtime: RuntimeKind) -> &'static str {
@@ -461,11 +452,11 @@ fn claim_lifecycle_operation(
         };
 
     let claim = match runtime {
-        RuntimeKind::Microvm => LifecycleClaimKind::Microvm {
+        RuntimeKind::Microvm => LifecycleClaimKind::Microvm(Box::new(MicrovmLifecycleClaim {
             runner: MicrovmRunner::new(),
             vm_child,
             aux_processes,
-        },
+        })),
         RuntimeKind::Container => LifecycleClaimKind::Container {
             runner: ContainerRunner::new(),
         },
