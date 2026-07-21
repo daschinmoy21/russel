@@ -345,7 +345,10 @@ impl DeployPipeline {
                 description: "Resolving source & Russelfile".into(),
             })
             .await;
-        let (repo_path, _checkout_lease) = self.git.clone_or_use_local(&request.repo_url).await?;
+        let (repo_path, checkout_lease) =
+            self.git.clone_or_use_local(&request.repo_url).await?;
+        let _checkout_lease = self.git.hold_checkout(&repo_path);
+        drop(checkout_lease);
         let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;

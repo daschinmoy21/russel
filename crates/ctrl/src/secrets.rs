@@ -112,7 +112,7 @@ pub(crate) fn secure_write(path: &Path, content: &[u8], kind: &str) -> anyhow::R
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, &path).map_err(|e| {
+    std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         anyhow::anyhow!("rename {kind} into place: {e}")
     })?;
