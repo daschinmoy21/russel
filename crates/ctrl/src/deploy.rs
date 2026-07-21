@@ -18,9 +18,7 @@ use std::collections::HashMap;
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::{
-        RuntimeKind, Russelfile, merge_env_maps, resolve_runtime, validate_env_map,
-    },
+    config::{RuntimeKind, Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
 use crate::{
@@ -372,7 +370,7 @@ impl DeployPipeline {
         // Order (fixes #120):
         // 1. take_processes — disarm supervisor first
         // 2. kill+wait old children so ports are freed
-        // 3. rename dirs to .bak (for rollback)  
+        // 3. rename dirs to .bak (for rollback)
         // 4. destroy_prior_runtime — cleans TAP/ports without needing metadata
         let (old_vm_proc, old_aux_procs) = self
             .state
@@ -397,18 +395,17 @@ impl DeployPipeline {
 
         // Destroy prior runtime: processes already reaped, so stop is no-op;
         // destroy still tears down TAP, releases port, removes .bak dirs.
-        if let Some(prior_kind) = prior_runtime {
-            if let Err(e) =
+        if let Some(prior_kind) = prior_runtime
+            && let Err(e) =
                 destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers).await
-            {
-                if has_backup {
-                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
-                    if has_microvms_dir {
-                        let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
-                    }
+        {
+            if has_backup {
+                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                if has_microvms_dir {
+                    let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
                 }
-                anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
             }
+            anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
         }
 
         let mut port_reservation = None;
@@ -910,15 +907,15 @@ async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKind> {
         .args(["container", "exists", &container_name])
         .output()
         .await;
-    if let Ok(out) = &probe {
-        if out.status.success() {
-            tracing::info!(
-                service_id,
-                container = %container_name,
-                "discovered existing podman container (no metadata)"
-            );
-            return Some(RuntimeKind::Container);
-        }
+    if let Ok(out) = &probe
+        && out.status.success()
+    {
+        tracing::info!(
+            service_id,
+            container = %container_name,
+            "discovered existing podman container (no metadata)"
+        );
+        return Some(RuntimeKind::Container);
     }
 
     // No metadata and no container: if any russel/microvms directory exists,
@@ -1328,9 +1325,9 @@ pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
     if name.len() > 256 {
         anyhow::bail!("bin_name too long (max 256 characters)");
     }
-    let valid = name.bytes().all(|c| {
-        c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-'
-    });
+    let valid = name
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-');
     if !valid {
         anyhow::bail!(
             "bin_name '{}' contains invalid characters (only A-Za-z0-9._+- allowed)",
@@ -1352,8 +1349,7 @@ pub fn build_container_env(
     guest_port: u16,
     user_env: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> =
-        vec![("PORT".to_string(), guest_port.to_string())];
+    let mut env: Vec<(String, String)> = vec![("PORT".to_string(), guest_port.to_string())];
     for (key, value) in user_env {
         if key == "PORT" {
             continue; // managed by Russel, user cannot override

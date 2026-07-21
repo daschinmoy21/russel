@@ -30,8 +30,8 @@ impl TraefikFileIngress {
         let dynamic_dir = std::env::var("RUSSEL_TRAEFIK_DYNAMIC_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/var/lib/russel/traefik/dynamic"));
-        let domain = std::env::var("RUSSEL_TRAEFIK_DOMAIN")
-            .unwrap_or_else(|_| "russel.local".to_string());
+        let domain =
+            std::env::var("RUSSEL_TRAEFIK_DOMAIN").unwrap_or_else(|_| "russel.local".to_string());
         Self {
             dynamic_dir,
             domain,
@@ -228,9 +228,7 @@ mod tests {
         };
 
         let backend = Backend::localhost(3100);
-        Ingress::register(&ing, "api", &backend, &[])
-            .await
-            .unwrap();
+        Ingress::register(&ing, "api", &backend, &[]).await.unwrap();
 
         let file_path = dir.join("api.json");
         assert!(file_path.exists());
@@ -299,9 +297,7 @@ mod tests {
 
         // Register then deregister
         let backend = Backend::localhost(3100);
-        Ingress::register(&ing, "api", &backend, &[])
-            .await
-            .unwrap();
+        Ingress::register(&ing, "api", &backend, &[]).await.unwrap();
         assert!(dir.join("api.json").exists());
 
         Ingress::deregister(&ing, "api").await.unwrap();
@@ -331,15 +327,13 @@ mod tests {
 
         // First register with old backend
         let old = Backend::localhost(3100);
-        Ingress::register(&ing, "api", &old, &[])
-            .await
-            .unwrap();
+        Ingress::register(&ing, "api", &old, &[]).await.unwrap();
 
         // Swap to new backend
         let new = Backend::localhost(3200);
         Ingress::swap(&ing, "api", &new).await.unwrap();
 
-        let raw = std::fs::read_to_string(&dir.join("api.json")).unwrap();
+        let raw = std::fs::read_to_string(dir.join("api.json")).unwrap();
         let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             config["http"]["services"]["russel-api"]["loadBalancer"]["servers"][0]["url"],
@@ -360,10 +354,11 @@ mod tests {
     #[test]
     fn from_env_defaults_when_unset() {
         let ing = TraefikFileIngress::default();
-        assert!(ing
-            .dynamic_dir
-            .to_string_lossy()
-            .contains("traefik/dynamic"));
+        assert!(
+            ing.dynamic_dir
+                .to_string_lossy()
+                .contains("traefik/dynamic")
+        );
         assert!(!ing.domain.is_empty());
     }
 

@@ -114,10 +114,7 @@ pub fn validate_env_key(key: &str) -> anyhow::Result<()> {
     if !first.is_ascii_alphabetic() && first != b'_' {
         anyhow::bail!("env key '{}' must start with a letter or underscore", key);
     }
-    if !key
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || c == b'_')
-    {
+    if !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
         anyhow::bail!(
             "env key '{}' contains invalid characters (only A-Za-z0-9_ allowed)",
             key
@@ -420,7 +417,10 @@ LOG_LEVEL = "info"
 FEATURE_X = "1"
 "#;
         let config: Russelfile = toml::from_str(toml).unwrap();
-        assert_eq!(config.service.env.get("LOG_LEVEL"), Some(&"info".to_string()));
+        assert_eq!(
+            config.service.env.get("LOG_LEVEL"),
+            Some(&"info".to_string())
+        );
         assert_eq!(config.service.env.get("FEATURE_X"), Some(&"1".to_string()));
         assert_eq!(config.service.env.len(), 2);
     }
@@ -435,7 +435,10 @@ FEATURE_X = "1"
     #[test]
     fn validate_env_key_rejects_invalid() {
         for key in &["", "1FOO", "MY-VAR", "a.b", "BAZ!"] {
-            assert!(validate_env_key(key).is_err(), "expected rejection for {key:?}");
+            assert!(
+                validate_env_key(key).is_err(),
+                "expected rejection for {key:?}"
+            );
         }
     }
 
@@ -445,7 +448,10 @@ FEATURE_X = "1"
             let mut map = HashMap::new();
             map.insert(key.to_string(), "val".to_string());
             let err = validate_env_map(&map).unwrap_err();
-            assert!(err.to_string().contains("reserved"), "expected reserved for {key}: {err}");
+            assert!(
+                err.to_string().contains("reserved"),
+                "expected reserved for {key}: {err}"
+            );
         }
     }
 

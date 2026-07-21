@@ -67,9 +67,7 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let provided = header
-        .strip_prefix("Bearer ")
-        .unwrap_or("");
+    let provided = header.strip_prefix("Bearer ").unwrap_or("");
 
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);

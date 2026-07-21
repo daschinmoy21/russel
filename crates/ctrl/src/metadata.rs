@@ -91,9 +91,8 @@ pub fn resolve_lifecycle_runtime(
     state_runtime: Option<RuntimeKind>,
     service_id: &str,
 ) -> RuntimeKind {
-    state_runtime.unwrap_or_else(|| {
-        prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm)
-    })
+    state_runtime
+        .unwrap_or_else(|| prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm))
 }
 
 /// Build versioned metadata JSON for a microVM deployment.

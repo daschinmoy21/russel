@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use reqwest::header::{HeaderMap, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap};
 use russel_core::{
     RuntimeKind,
     api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse},
@@ -16,12 +16,11 @@ use russel_core::{
 /// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
 fn http_client() -> reqwest::Client {
     let mut headers = HeaderMap::new();
-    if let Ok(token) = std::env::var("RUSSEL_API_TOKEN") {
-        if !token.is_empty() {
-            if let Ok(value) = format!("Bearer {}", token).parse() {
-                headers.insert(AUTHORIZATION, value);
-            }
-        }
+    if let Ok(token) = std::env::var("RUSSEL_API_TOKEN")
+        && !token.is_empty()
+        && let Ok(value) = format!("Bearer {}", token).parse()
+    {
+        headers.insert(AUTHORIZATION, value);
     }
     reqwest::Client::builder()
         .default_headers(headers)
@@ -356,13 +355,13 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
 
     if let Some(p) = &r.port {
         let guest = p.guest;
-        let backend_label = if r.route_host.is_some() {
-            format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, guest)
-        } else {
-            format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, guest)
-        };
+        let backend_label = format!("localhost:\x1b[1m{}\x1b[0m → guest:{}", p.host, guest);
         step(
-            if r.route_host.is_some() { "backend" } else { "port" },
+            if r.route_host.is_some() {
+                "backend"
+            } else {
+                "port"
+            },
             &backend_label,
             "",
         );

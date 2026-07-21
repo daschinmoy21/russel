@@ -898,6 +898,8 @@ exec /bin/sh
     /// Legacy boot wrapper — kept for backward compat.
     ///
     /// Prefer `boot_vm(spec)` for new code.
+    // legacy cold-boot helper retained for warm-pool/future
+    #[allow(dead_code)]
     pub async fn boot(
         &self,
         service_id: &str,

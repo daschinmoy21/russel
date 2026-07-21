@@ -50,11 +50,9 @@ pub trait Ingress: Send + Sync {
 
     /// Point an existing service at a new backend without dropping the route
     /// (zero-downtime generation swap). v1 may re-write the same file.
-    async fn swap(
-        &self,
-        service_id: &str,
-        new_backend: &Backend,
-    ) -> anyhow::Result<()>;
+    // public API for zero-downtime cutover; called from tests via trait
+    #[allow(dead_code)]
+    async fn swap(&self, service_id: &str, new_backend: &Backend) -> anyhow::Result<()>;
 
     /// Primary public host for CLI display (first rule or derived default).
     fn primary_host(&self, service_id: &str) -> Option<String>;
