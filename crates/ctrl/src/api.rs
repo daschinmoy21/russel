@@ -18,11 +18,11 @@ use tokio_stream::StreamExt;
 use crate::{
     container::{ContainerRunner, container_log_path},
     deploy::DeployPipeline,
+    ingress::default_ingress,
     metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     state::{AppState, LifecycleClaim},
-    traefik::TraefikClient,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -394,10 +394,10 @@ async fn vm_stop(
 
     match result {
         Ok(_) => {
-            // Unregister from Traefik so it stops routing to this backend.
-            let traefik = TraefikClient::from_env();
-            if let Err(e) = traefik.unregister(&service_id).await {
-                tracing::warn!(service_id = %service_id, error = %e, "failed to unregister from Traefik during stop");
+            // Deregister from ingress so the proxy stops routing to this backend.
+            let ingress = default_ingress();
+            if let Err(e) = ingress.deregister(&service_id).await {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during stop");
             }
             tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
             state.set_status(&service_id, "stopped", "none");
@@ -441,10 +441,10 @@ async fn vm_destroy(
 
     match result {
         Ok(_) => {
-            // Unregister from Traefik so it stops routing to this (now destroyed) backend.
-            let traefik = TraefikClient::from_env();
-            if let Err(e) = traefik.unregister(&service_id).await {
-                tracing::warn!(service_id = %service_id, error = %e, "failed to unregister from Traefik during destroy");
+            // Deregister from ingress so the proxy stops routing to this (now destroyed) backend.
+            let ingress = default_ingress();
+            if let Err(e) = ingress.deregister(&service_id).await {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during destroy");
             }
             if runtime == RuntimeKind::Microvm {
                 release_subnet(&service_id);

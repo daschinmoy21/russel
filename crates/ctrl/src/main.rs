@@ -15,6 +15,7 @@ mod deploy;
 mod git;
 #[allow(dead_code)]
 mod health;
+mod ingress;
 mod metadata;
 mod microvm;
 mod network;

@@ -5,6 +5,10 @@ lifecycles, and host-side networking.
 
 ---
 
+## Ingress Trait
+
+Deploy uses the `Ingress` trait (defined in `crates/ctrl/src/ingress.rs`) to advertise service backends to a reverse proxy. `TraefikFileIngress` (in `crates/ctrl/src/traefik.rs`) is the default implementation, writing Traefik dynamic configuration files. Future proxies (Caddy, Envoy, NGINX) implement the same trait — deploy, stop, and destroy never import Traefik types directly.
+
 ## Traefik Gateway
 
 Russel integrates with [Traefik](https://traefik.io/) as the primary HTTP reverse proxy. The control plane writes dynamic configuration files (JSON) into a watched directory. Traefik picks up changes automatically — no reload signal needed.

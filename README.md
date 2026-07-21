@@ -19,7 +19,7 @@ Russel is split into three crates:
 3. **Branch on runtime**
    - **microvm (default):** minimal initramfs → TAP + socat + virtiofsd → Cloud Hypervisor → guest runs app from virtiofs `/nix/store`.
    - **container:** prepare Docker-like rootfs → rootless Podman `--rootfs` + `/nix/store:ro` bind → publish `-p HOST:GUEST`.
-4. **Ready** — TCP readiness on guest (microVM) or published host port (container); metadata written under `/var/lib/russel/<id>/`.
+4. **Ready** — TCP readiness on guest (microVM) or published host port (container); metadata written under `/var/lib/russel/<id>/`. Register with the `Ingress` trait (default: `TraefikFileIngress` writes Traefik dynamic config) so the reverse proxy can route traffic to the new backend.
 
 ## Quick Start
 

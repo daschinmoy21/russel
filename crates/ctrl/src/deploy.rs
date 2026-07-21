@@ -2,6 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::process::Command;
@@ -30,11 +31,11 @@ use crate::{
     },
     database::DatabaseProvisioner,
     git::GitClient,
+    ingress::{self, Backend, Ingress},
     metadata::{build_container_metadata, build_microvm_metadata, write_metadata},
     microvm::{self, BootOutput, KernelInfo, MicrovmRunner},
     network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
     state::AppState,
-    traefik::TraefikClient,
     warm_pool::shared_warm_pool,
 };
 
@@ -47,7 +48,6 @@ enum DeployInnerResult {
     RolledBack { runtime: RuntimeKind, error: String },
 }
 
-#[derive(Debug)]
 pub struct DeployPipeline {
     state: AppState,
     git: GitClient,
@@ -57,7 +57,22 @@ pub struct DeployPipeline {
     runner: MicrovmRunner,
     containers: ContainerRunner,
     ports: PortAllocator,
-    traefik: TraefikClient,
+    ingress: Arc<dyn Ingress>,
+}
+
+impl std::fmt::Debug for DeployPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployPipeline")
+            .field("state", &self.state)
+            .field("git", &self.git)
+            .field("builder", &self.builder)
+            .field("database", &self.database)
+            .field("runner", &self.runner)
+            .field("containers", &self.containers)
+            .field("ports", &self.ports)
+            .field("ingress", &"Arc<dyn Ingress>")
+            .finish()
+    }
 }
 
 impl DeployPipeline {
@@ -74,7 +89,7 @@ impl DeployPipeline {
             runner: microvm::shared_runner(),
             containers: ContainerRunner::new(),
             ports: PortAllocator,
-            traefik: TraefikClient::from_env(),
+            ingress: ingress::default_ingress(),
         }
     }
 
@@ -186,7 +201,7 @@ impl DeployPipeline {
                     }
                 };
                 let host_port = output.port.host;
-                let route_host = Some(self.traefik.public_host(&service_id));
+                let route_host = self.ingress.primary_host(&service_id);
                 DeployResponse {
                     service_id,
                     vm_id,
@@ -520,8 +535,8 @@ impl DeployPipeline {
         };
 
         if let Err(error) = self
-            .traefik
-            .register(service_id, workload.port().host)
+            .ingress
+            .register(service_id, &Backend::localhost(workload.port().host), &[])
             .await
         {
             // Full workload teardown on traefik registration failure (#116).
