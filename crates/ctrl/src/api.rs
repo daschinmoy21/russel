@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/logs", get(logs_all))
         .route("/vms", get(vms_list))
         .route("/vm/{service_id}/stop", post(vm_stop))
+        .route("/vm/{service_id}/update", post(vm_update))
         .route("/vm/{service_id}", delete(vm_destroy))
         .route("/secrets", get(secrets_list))
         .route("/secrets/{name}", post(secrets_set).delete(secrets_delete))
@@ -409,6 +410,151 @@ async fn vm_stop(
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
+}
+
+/// Desired-state update: re-read recorded Russelfile source and redeploy.
+///
+/// Optional body may override `repo_url` / `config_path`. When omitted, both
+/// are taken from on-disk metadata written by the last successful deploy.
+#[derive(Debug, Default, serde::Deserialize)]
+struct UpdateBody {
+    #[serde(default)]
+    repo_url: Option<String>,
+    #[serde(default)]
+    config_path: Option<String>,
+}
+
+async fn vm_update(
+    State(state): State<AppState>,
+    Path(service_id): Path<String>,
+    body: Option<Json<UpdateBody>>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let meta: serde_json::Value = if std::path::Path::new(&path).exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read metadata: {e}"),
+            )
+        })?;
+        serde_json::from_str(&content).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("parse metadata: {e}"),
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    let repo_url = body
+        .repo_url
+        .or_else(|| {
+            meta.get("repo_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "no repo_url in request or metadata; pass {\"repo_url\":\"...\"} or redeploy once first".into(),
+            )
+        })?;
+    let config_path = body
+        .config_path
+        .or_else(|| {
+            meta.get("config_path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "Russelfile.toml".into());
+
+    let host_port = meta
+        .get("host_port")
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u16);
+    let guest_port = meta
+        .get("guest_port")
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u16)
+        .unwrap_or(3000);
+    let runtime = meta
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    let request = DeployRequest {
+        repo_url,
+        config_path,
+        vm_id: Some(service_id.clone()),
+        port: host_port.map(|host| russel_core::api::PortMapping {
+            host,
+            guest: guest_port,
+        }),
+        runtime,
+        env: Default::default(),
+        podman_args: vec![],
+    };
+
+    tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);
+
+    // Same NDJSON stream as POST /deploy so CLI reuses event parsing.
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    let deploy_tx = tx.clone();
+    let monitor_state = state.clone();
+    let deploy_guard = state.begin_deploy();
+    let sid = service_id.clone();
+    let sid2 = service_id.clone();
+    let deploy_handle = tokio::spawn(async move {
+        let _guard = deploy_guard;
+        let pipeline = DeployPipeline::new(state);
+        let response = pipeline.deploy(request, deploy_tx.clone()).await;
+        let _ = deploy_tx
+            .send(DeployEvent::Complete(Box::new(response)))
+            .await;
+        tracing::info!(service_id = %sid, "update deploy finished");
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = deploy_handle.await
+            && e.is_panic()
+        {
+            let panic = e.into_panic();
+            let detail = panic
+                .downcast_ref::<&'static str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "update deploy task panicked".to_string());
+            tracing::error!(
+                service_id = %sid2,
+                panic = %detail,
+                "update deploy task panicked"
+            );
+            monitor_state.mark_failed(&sid2, detail);
+            let _ = tx
+                .send(DeployEvent::Error("update deploy task failed".to_string()))
+                .await;
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|msg| {
+        let json = serde_json::to_string(&msg).map_err(std::io::Error::other)?;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
+    });
+
+    axum::response::Response::builder()
+        .header("Content-Type", "application/x-ndjson")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build update stream: {e}"),
+            )
+        })
 }
 
 async fn vm_destroy(

@@ -9,7 +9,10 @@ use clap::{Args, Parser, Subcommand};
 use reqwest::header::{AUTHORIZATION, HeaderMap};
 use russel_core::{
     RuntimeKind,
-    api::{DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse, VmsResponse},
+    api::{
+        DeployEvent, DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse,
+        VmsResponse,
+    },
     config::{Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
@@ -53,6 +56,23 @@ pub enum Command {
     Vms,
     Stop(StopArgs),
     Destroy(DestroyArgs),
+    /// Re-apply desired state from the recorded Russelfile source (or override).
+    Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Service id to update.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Override repo URL / local path (default: value recorded at last deploy).
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Override config path relative to the repo (default: recorded or Russelfile.toml).
+    #[arg(long)]
+    pub config: Option<String>,
     /// Manage host-side secrets (stored on the control plane, not in Russelfile).
     Secrets {
         #[command(subcommand)]
@@ -214,95 +234,12 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         .await?
         .error_for_status()?;
 
-    // Byte buffer so multi-byte UTF-8 never splits across chunk boundaries (#103).
-    const MAX_NDJSON_LINE: usize = 8 * 1024 * 1024;
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut final_response = None;
-
-    while let Some(chunk) = response.chunk().await? {
-        buffer.extend_from_slice(&chunk);
-        while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
-            // Cap per complete record (not the multi-record aggregate buffer).
-            if i > MAX_NDJSON_LINE {
-                anyhow::bail!("control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes");
-            }
-            let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
-            // drop trailing newline
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-            if line_bytes.is_empty() || line_bytes.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            let line = std::str::from_utf8(line_bytes)
-                .context("control plane sent non-UTF-8 NDJSON line")?;
-            let event: russel_core::api::DeployEvent = serde_json::from_str(line)
-                .with_context(|| format!("failed to parse event from control plane: {}", line))?;
-
-            match event {
-                russel_core::api::DeployEvent::Progress {
-                    phase: p,
-                    description: d,
-                } => {
-                    phase(&p, &d);
-                }
-                russel_core::api::DeployEvent::Complete(resp) => {
-                    final_response = Some(resp);
-                }
-                russel_core::api::DeployEvent::Error(err) => {
-                    anyhow::bail!("deploy failed: {}", err);
-                }
-            }
-        }
-        // Incomplete trailing line without newline so far.
-        if buffer.len() > MAX_NDJSON_LINE {
-            anyhow::bail!(
-                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
-            );
-        }
-    }
-
-    // Final record without trailing newline (EOF).
-    if !buffer.is_empty() {
-        if buffer.len() > MAX_NDJSON_LINE {
-            anyhow::bail!(
-                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
-            );
-        }
-        let line = std::str::from_utf8(&buffer)
-            .context("control plane sent non-UTF-8 final NDJSON record")?;
-        let line = line.trim();
-        if !line.is_empty() {
-            let event: russel_core::api::DeployEvent =
-                serde_json::from_str(line).with_context(|| {
-                    format!("failed to parse final event from control plane: {}", line)
-                })?;
-            match event {
-                russel_core::api::DeployEvent::Progress {
-                    phase: p,
-                    description: d,
-                } => {
-                    phase(&p, &d);
-                }
-                russel_core::api::DeployEvent::Complete(resp) => {
-                    final_response = Some(resp);
-                }
-                russel_core::api::DeployEvent::Error(err) => {
-                    anyhow::bail!("deploy failed: {}", err);
-                }
-            }
-        }
-    }
-
-    let response = final_response.ok_or_else(|| {
-        anyhow::anyhow!(
-            "control plane closed connection before complete. \
-             Run `russel logs` or check `russel status` for details."
-        )
-    })?;
+    let response = stream_deploy_events(&mut response, "deploy").await?;
 
     println!();
     let status = response.status.clone();
     let message = response.message.clone();
-    print_deploy_response(*response, wall.elapsed());
+    print_deploy_response(response, wall.elapsed());
 
     if !deploy_status_is_success(&status) {
         anyhow::bail!("deploy failed (status={status}): {message}");
@@ -626,6 +563,109 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
         .json::<String>()
         .await?;
     println!("{}", r);
+    Ok(())
+}
+
+pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
+    let wall = Instant::now();
+    println!();
+    println!("  \x1b[1;36mrussel update\x1b[0m  {}", args.id);
+    println!();
+
+    let mut body = serde_json::Map::new();
+    if let Some(repo) = args.repo {
+        let repo_url = normalize_repo_arg(&repo)?;
+        body.insert("repo_url".into(), serde_json::json!(repo_url));
+    }
+    if let Some(config) = args.config {
+        body.insert("config_path".into(), serde_json::json!(config));
+    }
+
+    let client = http_client();
+    let mut response = client
+        .post(format!("{control_plane}/vm/{}/update", args.id))
+        .timeout(Duration::from_secs(300))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let response = stream_deploy_events(&mut response, "update").await?;
+    let status = response.status.clone();
+    print_deploy_response(response, wall.elapsed());
+    if !deploy_status_is_success(&status) {
+        anyhow::bail!("update finished with status {status}");
+    }
+    Ok(())
+}
+
+async fn stream_deploy_events(
+    response: &mut reqwest::Response,
+    operation: &str,
+) -> Result<DeployResponse> {
+    const MAX_NDJSON_LINE: usize = 8 * 1024 * 1024;
+    let mut buffer = Vec::new();
+    let mut final_response = None;
+
+    while let Some(chunk) = response.chunk().await? {
+        buffer.extend_from_slice(&chunk);
+        while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+            if i > MAX_NDJSON_LINE {
+                anyhow::bail!("control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes");
+            }
+            let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
+            if line_bytes.is_empty() || line_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let line = std::str::from_utf8(line_bytes)
+                .context("control plane sent non-UTF-8 NDJSON line")?;
+            let event: DeployEvent = serde_json::from_str(line)
+                .with_context(|| format!("failed to parse event from control plane: {line}"))?;
+            handle_deploy_event(event, operation, &mut final_response)?;
+        }
+        if buffer.len() > MAX_NDJSON_LINE {
+            anyhow::bail!(
+                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
+            );
+        }
+    }
+
+    if !buffer.is_empty() {
+        if buffer.len() > MAX_NDJSON_LINE {
+            anyhow::bail!(
+                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
+            );
+        }
+        let line = std::str::from_utf8(&buffer)
+            .context("control plane sent non-UTF-8 final NDJSON record")?
+            .trim();
+        if !line.is_empty() {
+            let event: DeployEvent = serde_json::from_str(line).with_context(|| {
+                format!("failed to parse final event from control plane: {line}")
+            })?;
+            handle_deploy_event(event, operation, &mut final_response)?;
+        }
+    }
+
+    final_response
+        .map(|response| *response)
+        .ok_or_else(|| anyhow!("control plane closed connection before {operation} completed"))
+}
+
+fn handle_deploy_event(
+    event: DeployEvent,
+    operation: &str,
+    final_response: &mut Option<Box<DeployResponse>>,
+) -> Result<()> {
+    match event {
+        DeployEvent::Progress {
+            phase: p,
+            description: d,
+        } => phase(&p, &d),
+        DeployEvent::Complete(response) => *final_response = Some(response),
+        DeployEvent::Error(error) => anyhow::bail!("{operation} failed: {error}"),
+    }
     Ok(())
 }
 

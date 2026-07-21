@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
         Command::Vms => commands::vms(&cli.control_plane).await?,
         Command::Stop(args) => commands::stop_vm(&args.id, &cli.control_plane).await?,
         Command::Destroy(args) => commands::destroy_vm(&args.id, &cli.control_plane).await?,
+        Command::Update(args) => commands::update(args, &cli.control_plane).await?,
         Command::Secrets { action } => commands::secrets(action, &cli.control_plane).await?,
     }
 
