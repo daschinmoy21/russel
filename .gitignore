@@ -6,3 +6,4 @@ result-*
 microvm.nix/
 .commandcode/
 .kiro/
+.pi-subagents/

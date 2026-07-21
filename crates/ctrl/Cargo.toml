@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+libc = "0.2"
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

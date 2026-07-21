@@ -1,3 +1,22 @@
+//! On-disk service metadata (`/var/lib/russel/<id>/metadata.json`).
+//!
+//! ## Schema (`schema_version` = 1)
+//!
+//! Shared fields: `schema_version`, `service_id`, `runtime` (`microvm`|`container`),
+//! `host_port`, `guest_port`, `store_path`, `mem_mb`, `deployed_at` (RFC3339),
+//! optional `bin_name`.
+//!
+//! **microVM** also writes: `vm_ip`, `host_ip` (TAP host side), `kernel_path`,
+//! optional `vm_pid` / `socat_pid` / `initramfs` / `app_path`, and
+//! `virtiofsd_pids` (JSON array of u32). Older files may still have singular
+//! `virtiofsd_pid`; readers that care about process cleanup should accept both
+//! until all hosts have redeployed. Deploy/rollback must keep writers and
+//! destroy/stop readers on the same shape — do not mix a new writer with an
+//! old destroy path that only understands `virtiofsd_pid`.
+//!
+//! **container** also writes: `container_id`, `container_name`, `rootfs_path`,
+//! optional `podman_args`.
+
 use std::path::{Path, PathBuf};
 
 use russel_core::config::RuntimeKind;
@@ -73,6 +92,7 @@ pub fn resolve_lifecycle_runtime(
 
 /// Build versioned metadata JSON for a microVM deployment.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // unit-tested; deploy path still builds metadata inline
 pub fn build_microvm_metadata(
     service_id: &str,
     host_port: u16,
@@ -231,6 +251,9 @@ mod tests {
         );
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
         assert_eq!(meta["runtime"], "microvm");
+        assert_eq!(meta["host_ip"], "10.0.1.1");
+        assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
+        assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
         assert_eq!(meta["bin_name"], "myapp");
         assert_eq!(meta["host_ip"], "10.0.1.1");
         assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));

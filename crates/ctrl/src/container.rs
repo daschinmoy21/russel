@@ -43,6 +43,7 @@ impl DebugToolsCache {
     }
 
     /// Resolve or build bash and curl from nixpkgs; results are cached in-memory.
+    #[allow(dead_code)] // optional debug helper for container shells; not on deploy path
     pub async fn ensure_debug_tools(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
         let bash = self.ensure_bash(None).await?;
         let curl = self.ensure_curl(None).await?;
@@ -696,6 +697,8 @@ impl ContainerRunner {
         Ok(())
     }
 
+    /// Inspect a running Russel container (used by e2e tests and future status API).
+    #[allow(dead_code)]
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);
