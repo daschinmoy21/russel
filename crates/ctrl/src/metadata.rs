@@ -221,6 +221,47 @@ pub fn build_microvm_metadata(
     bin_name: Option<&str>,
     initramfs_path: Option<&str>,
 ) -> serde_json::Value {
+    build_microvm_metadata_with_gen(
+        service_id,
+        host_port,
+        guest_port,
+        vm_ip,
+        host_ip,
+        vm_pid,
+        virtiofsd_pids,
+        socat_pid,
+        kernel_path,
+        store_path,
+        mem_mb,
+        app_path,
+        bin_name,
+        initramfs_path,
+        None,
+        None,
+    )
+}
+
+/// Like [`build_microvm_metadata`] but records generation + TAP identity for
+/// zero-downtime cutover (candidate may keep a gen-scoped TAP after promote).
+#[allow(clippy::too_many_arguments)]
+pub fn build_microvm_metadata_with_gen(
+    service_id: &str,
+    host_port: u16,
+    guest_port: u16,
+    vm_ip: &str,
+    host_ip: &str,
+    vm_pid: Option<u32>,
+    virtiofsd_pids: &[u32],
+    socat_pid: Option<u32>,
+    kernel_path: &str,
+    store_path: &str,
+    mem_mb: u16,
+    app_path: Option<&str>,
+    bin_name: Option<&str>,
+    initramfs_path: Option<&str>,
+    generation_id: Option<&str>,
+    tap_id: Option<&str>,
+) -> serde_json::Value {
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "service_id": service_id,
@@ -252,6 +293,12 @@ pub fn build_microvm_metadata(
     if let Some(path) = initramfs_path {
         meta["initramfs"] = serde_json::json!(path);
     }
+    if let Some(gid) = generation_id {
+        meta["generation_id"] = serde_json::json!(gid);
+    }
+    if let Some(tap) = tap_id {
+        meta["tap_id"] = serde_json::json!(tap);
+    }
     meta
 }
 
@@ -267,6 +314,35 @@ pub fn build_container_metadata(
     mem_mb: u16,
     bin_name: Option<&str>,
     podman_args: &[String],
+) -> serde_json::Value {
+    build_container_metadata_with_gen(
+        service_id,
+        host_port,
+        guest_port,
+        store_path,
+        container_id,
+        container_name,
+        rootfs_path,
+        mem_mb,
+        bin_name,
+        podman_args,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_container_metadata_with_gen(
+    service_id: &str,
+    host_port: u16,
+    guest_port: u16,
+    store_path: &str,
+    container_id: &str,
+    container_name: &str,
+    rootfs_path: &str,
+    mem_mb: u16,
+    bin_name: Option<&str>,
+    podman_args: &[String],
+    generation_id: Option<&str>,
 ) -> serde_json::Value {
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -287,7 +363,21 @@ pub fn build_container_metadata(
     if !podman_args.is_empty() {
         meta["podman_args"] = serde_json::json!(podman_args);
     }
+    if let Some(gid) = generation_id {
+        meta["generation_id"] = serde_json::json!(gid);
+    }
     meta
+}
+
+/// Rewrite `service_id` in an existing metadata file after generation promote.
+pub fn rewrite_metadata_service_id(path: impl AsRef<Path>, service_id: &str) -> anyhow::Result<()> {
+    let path = path.as_ref();
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read metadata {}: {e}", path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("parse metadata {}: {e}", path.display()))?;
+    value["service_id"] = serde_json::json!(service_id);
+    write_metadata(path, &value)
 }
 
 pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> anyhow::Result<()> {

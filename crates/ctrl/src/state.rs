@@ -584,6 +584,22 @@ impl AppState {
         }
     }
 
+    /// Move in-memory process ownership from a generation runtime key to the
+    /// stable service id after a zero-downtime promote.
+    pub fn rekey_service(&self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let mut inner = self.lock_inner();
+        if let Some(mut s) = inner.services.remove(from) {
+            // Drop residual entry for `to` (old generation already drained).
+            let _ = inner.services.remove(to);
+            s.logs
+                .push_str(&format!("rekeyed generation {from} -> {to}\n"));
+            inner.services.insert(to.to_string(), s);
+        }
+    }
+
     /// Release ownership of all tracked child processes without killing them.
     ///
     /// Used on control-plane shutdown so `kill_on_drop` Child destructors do

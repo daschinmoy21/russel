@@ -30,7 +30,10 @@ use crate::{
     database::DatabaseProvisioner,
     git::GitClient,
     ingress::{self, Backend, Ingress},
-    metadata::{build_container_metadata, build_microvm_metadata, write_metadata},
+    metadata::{
+        build_container_metadata, build_container_metadata_with_gen, build_microvm_metadata,
+        build_microvm_metadata_with_gen, rewrite_metadata_service_id, write_metadata,
+    },
     microvm::{self, BootOutput, KernelInfo, MicrovmRunner},
     network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
     state::AppState,
@@ -38,6 +41,60 @@ use crate::{
 };
 
 pub use crate::metadata::prior_runtime_from_disk;
+
+/// Short random generation id (8 lowercase hex chars).
+fn new_generation_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Fold pid into the low 32 bits we keep: rapid same-ns deploys from
+    // different processes stay distinct; output is always 8 lowercase hex digits.
+    let mixed = (nanos as u32) ^ std::process::id();
+    format!("{mixed:08x}")
+}
+
+/// Promote a candidate generation directory tree to the stable service id.
+///
+/// Called only after the old generation has been destroyed, so `service_id`
+/// paths are free. Rewrites `service_id` inside metadata.json.
+async fn promote_generation(runtime_key: &str, service_id: &str) -> anyhow::Result<()> {
+    if runtime_key == service_id {
+        return Ok(());
+    }
+    let pairs = [
+        (
+            format!("/var/lib/russel/{runtime_key}"),
+            format!("/var/lib/russel/{service_id}"),
+        ),
+        (
+            format!("/var/lib/microvms/{runtime_key}"),
+            format!("/var/lib/microvms/{service_id}"),
+        ),
+    ];
+    for (from, to) in pairs {
+        if !Path::new(&from).exists() {
+            continue;
+        }
+        if Path::new(&to).exists() {
+            anyhow::bail!("promote target already exists: {to}");
+        }
+        tokio::fs::rename(&from, &to)
+            .await
+            .map_err(|e| anyhow::anyhow!("rename {from} -> {to}: {e}"))?;
+    }
+    let meta_path = format!("/var/lib/russel/{service_id}/metadata.json");
+    if Path::new(&meta_path).exists() {
+        rewrite_metadata_service_id(&meta_path, service_id)?;
+    }
+    tracing::info!(
+        runtime_key,
+        service_id,
+        "promoted candidate generation to stable service id"
+    );
+    Ok(())
+}
 
 /// Typed outcome of `deploy_inner` — success, rollback, or hard failure.
 enum DeployInnerResult {
@@ -357,6 +414,19 @@ impl DeployPipeline {
         }
 
         let prior_runtime = resolve_prior_runtime(service_id).await;
+        let dual_live = prior_runtime.is_some();
+
+        // Generation identity: when replacing a live service, boot the candidate
+        // under `{service_id}_g{gen}` so the active generation keeps its TAP/port
+        // until ingress.swap and cutover complete (zero-downtime path).
+        let generation_id = new_generation_id();
+        let runtime_key = if dual_live {
+            let key = format!("{service_id}_g{generation_id}");
+            MicrovmRunner::validate_service_id(&key)?;
+            key
+        } else {
+            service_id.to_string()
+        };
 
         let russel_dir = format!("/var/lib/russel/{}", service_id);
         let microvms_dir = format!("/var/lib/microvms/{}", service_id);
@@ -364,65 +434,101 @@ impl DeployPipeline {
         let microvms_bak = format!("{}.bak", microvms_dir);
         let has_russel_dir = Path::new(&russel_dir).exists();
         let has_microvms_dir = Path::new(&microvms_dir).exists();
-        let has_backup = has_russel_dir;
+        let has_backup = has_russel_dir && !dual_live;
 
-        // Order (fixes #120):
-        // 1. take_processes — disarm supervisor first
-        // 2. kill+wait old children so ports are freed
-        // 3. rename dirs to .bak (for rollback)
-        // 4. destroy_prior_runtime — cleans TAP/ports without needing metadata
-        let (old_vm_proc, old_aux_procs) = self
-            .state
-            .take_processes(service_id)
-            .unwrap_or((None, Vec::new()));
+        // Cold path only: destroy-in-place before boot (no live prior).
+        // Dual-live keeps the active generation untouched until cutover.
+        if !dual_live {
+            // Order (fixes #120):
+            // 1. take_processes — disarm supervisor first
+            // 2. kill+wait old children so ports are freed
+            // 3. rename dirs to .bak (for rollback)
+            // 4. destroy_prior_runtime — cleans TAP/ports without needing metadata
+            let (old_vm_proc, old_aux_procs) = self
+                .state
+                .take_processes(service_id)
+                .unwrap_or((None, Vec::new()));
 
-        // Kill+wait taken children first so ports are free before destroy.
-        kill_and_wait_children(old_vm_proc, old_aux_procs).await;
+            kill_and_wait_children(old_vm_proc, old_aux_procs).await;
 
-        // Now rename dirs to .bak for rollback content.
-        if has_russel_dir {
-            if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
-                anyhow::bail!("failed to backup russel directory: {}", e);
-            }
-            if has_microvms_dir
-                && let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await
-            {
-                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
-                anyhow::bail!("failed to backup microvms directory: {}", e);
-            }
-        }
-
-        // Destroy prior runtime: processes already reaped, so stop is no-op;
-        // destroy still tears down TAP, releases port, removes .bak dirs.
-        if let Some(prior_kind) = prior_runtime
-            && let Err(e) =
-                destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers).await
-        {
-            if has_backup {
-                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
-                if has_microvms_dir {
-                    let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+            if has_russel_dir {
+                if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
+                    anyhow::bail!("failed to backup russel directory: {}", e);
+                }
+                if has_microvms_dir
+                    && let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await
+                {
+                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                    anyhow::bail!("failed to backup microvms directory: {}", e);
                 }
             }
-            anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
+
+            if let Some(prior_kind) = prior_runtime
+                && let Err(e) =
+                    destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers)
+                        .await
+            {
+                if has_backup {
+                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                    if has_microvms_dir {
+                        let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+                    }
+                }
+                anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
+            }
+        } else {
+            tracing::info!(
+                service_id,
+                generation_id = %generation_id,
+                runtime_key = %runtime_key,
+                "dual-live redeploy: keeping active generation until candidate is ready"
+            );
+            let _ = tx
+                .send(DeployEvent::Progress {
+                    phase: "candidate".into(),
+                    description: format!(
+                        "Booting generation {generation_id} alongside active service"
+                    ),
+                })
+                .await;
         }
 
         let mut port_reservation = None;
         let deploy_result = async {
-            port_reservation = Some(PortReservation::new(service_id));
-            let port = match request.port.clone() {
-                Some(p) => {
-                    PortAllocator::reserve(service_id, p.host)?;
-                    p
+            // Port reservations are keyed by the runtime key (gen-scoped on dual-live).
+            port_reservation = Some(PortReservation::new(&runtime_key));
+            let port = if dual_live {
+                // Always allocate a fresh backend port for the candidate so the
+                // active generation keeps its listener. Fixed -p is Traefik-facing
+                // after cutover; backend port may differ across generations.
+                if request.port.is_some() {
+                    tracing::info!(
+                        service_id,
+                        "dual-live redeploy: ignoring fixed -p for candidate backend; \
+                         Traefik host stays stable via Ingress::swap"
+                    );
                 }
-                None => {
-                    let ports = self.ports.clone();
-                    let service_id = service_id.to_string();
-                    let host =
-                        tokio::task::spawn_blocking(move || ports.next(&service_id)).await??;
-                    PortMapping {
-                        host,
-                        guest: config.service.port,
+                let ports = self.ports.clone();
+                let key = runtime_key.clone();
+                let host = tokio::task::spawn_blocking(move || ports.next(&key)).await??;
+                PortMapping {
+                    host,
+                    guest: config.service.port,
+                }
+            } else {
+                match request.port.clone() {
+                    Some(p) => {
+                        PortAllocator::reserve(&runtime_key, p.host)?;
+                        p
+                    }
+                    None => {
+                        let ports = self.ports.clone();
+                        let key = runtime_key.clone();
+                        let host = tokio::task::spawn_blocking(move || ports.next(&key)).await??;
+                        PortMapping {
+                            host,
+                            guest: config.service.port,
+                        }
                     }
                 }
             };
@@ -430,25 +536,27 @@ impl DeployPipeline {
             match runtime {
                 RuntimeKind::Microvm => {
                     self.deploy_microvm(
-                        service_id,
+                        &runtime_key,
                         &config,
                         &build.store_path,
                         &port,
                         kernel.as_ref().unwrap(),
                         &merged_env,
                         &tx,
+                        Some(generation_id.as_str()),
                     )
                     .await
                 }
                 RuntimeKind::Container => {
                     self.deploy_container(
-                        service_id,
+                        &runtime_key,
                         &config,
                         &build.store_path,
                         &port,
                         &request.podman_args,
                         &merged_env,
                         &tx,
+                        Some(generation_id.as_str()),
                     )
                     .await
                 }
@@ -459,8 +567,14 @@ impl DeployPipeline {
         let (workload, create_ms, start_ms, network_ms, ready_ms) = match deploy_result {
             Ok(val) => val,
             Err(deploy_err) => {
-                tracing::error!(service_id, error = %deploy_err, "Deployment failed — cleaning up and attempting rollback (prior runtime was {prior_runtime:?})");
-                cleanup_failed_deploy(runtime, service_id, &self.runner, &self.containers).await;
+                tracing::error!(service_id, runtime_key = %runtime_key, error = %deploy_err, "Deployment failed — cleaning up candidate (prior runtime was {prior_runtime:?})");
+                // Only destroy the candidate; dual-live leaves the active generation alone.
+                cleanup_failed_deploy(runtime, &runtime_key, &self.runner, &self.containers).await;
+                if dual_live {
+                    // Active generation never stopped — report hard failure without rollback.
+                    return Err(deploy_err
+                        .context("candidate generation failed; active generation left untouched"));
+                }
                 if has_backup && prior_runtime == Some(RuntimeKind::Microvm) {
                     let rollback_res = attempt_microvm_rollback(
                         service_id,
@@ -530,43 +644,103 @@ impl DeployPipeline {
             }
         };
 
-        if let Err(error) = self
-            .ingress
-            .register(service_id, &Backend::localhost(workload.port().host), &[])
-            .await
-        {
-            // Full workload teardown on traefik registration failure (#116).
+        let backend = Backend::localhost(workload.port().host);
+        let ingress_result = if dual_live {
+            // Zero-downtime cutover: rewrite Traefik backend for the stable service id.
+            tracing::info!(
+                service_id,
+                backend = %backend.url(),
+                generation_id = %generation_id,
+                "Ingress::swap — pointing stable route at candidate generation"
+            );
+            self.ingress.swap(service_id, &backend).await
+        } else {
+            self.ingress.register(service_id, &backend, &[]).await
+        };
+
+        if let Err(error) = ingress_result {
+            // Full candidate teardown on ingress failure (#116). Active gen stays if dual-live.
             workload.teardown_network().await;
             match &workload {
                 DeployWorkload::Microvm { .. } => {
-                    if let Err(e) = self.runner.destroy(service_id).await {
-                        tracing::warn!(service_id, error = %e, "failed to destroy microVM after traefik failure");
+                    if let Err(e) = self.runner.destroy(&runtime_key).await {
+                        tracing::warn!(runtime_key = %runtime_key, error = %e, "failed to destroy microVM after ingress failure");
                     }
                 }
                 DeployWorkload::Container { .. } => {
-                    if let Err(e) = self.containers.destroy(service_id).await {
-                        tracing::warn!(service_id, error = %e, "failed to destroy container after traefik failure");
+                    if let Err(e) = self.containers.destroy(&runtime_key).await {
+                        tracing::warn!(runtime_key = %runtime_key, error = %e, "failed to destroy container after ingress failure");
                     }
                 }
             }
-            PortAllocator::release(service_id);
+            PortAllocator::release(&runtime_key);
             return Err(error);
         }
 
-        if has_backup {
-            let _ = Command::new("rm")
-                .args(["-rf", &format!("{}.bak", russel_dir)])
-                .output()
+        if dual_live {
+            // Drain old generation only after successful swap.
+            let _ = tx
+                .send(DeployEvent::Progress {
+                    phase: "cutover".into(),
+                    description: "Draining previous generation after ingress swap".into(),
+                })
                 .await;
-            if has_microvms_dir {
+
+            let (old_vm_proc, old_aux_procs) = self
+                .state
+                .take_processes(service_id)
+                .unwrap_or((None, Vec::new()));
+            kill_and_wait_children(old_vm_proc, old_aux_procs).await;
+
+            if let Some(prior_kind) = prior_runtime
+                && let Err(e) =
+                    destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers)
+                        .await
+            {
+                tracing::error!(
+                    service_id,
+                    error = %e,
+                    "CRITICAL: candidate is live and swapped but old generation destroy failed"
+                );
+                // Continue promote — traffic is already on the candidate.
+            }
+
+            // Promote candidate dirs to the stable service_id path.
+            if let Err(e) = promote_generation(&runtime_key, service_id).await {
+                tracing::error!(
+                    service_id,
+                    runtime_key = %runtime_key,
+                    error = %e,
+                    "CRITICAL: failed to promote generation dirs; candidate still running under runtime key"
+                );
+                // Keep state under runtime_key so stop/destroy can find it.
+                self.state
+                    .attach_flake_path(&runtime_key, repo_path.clone());
+            } else {
+                // Re-key port + in-memory state to the stable service id.
+                PortAllocator::release(&runtime_key);
+                if let Err(e) = PortAllocator::claim_existing(service_id, workload.port().host) {
+                    tracing::warn!(service_id, error = %e, "failed to claim port under service_id after promote");
+                }
+                self.state.rekey_service(&runtime_key, service_id);
+                self.state.attach_flake_path(service_id, repo_path.clone());
+            }
+        } else {
+            if has_backup {
                 let _ = Command::new("rm")
-                    .args(["-rf", &format!("{}.bak", microvms_dir)])
+                    .args(["-rf", &format!("{}.bak", russel_dir)])
                     .output()
                     .await;
+                if has_microvms_dir {
+                    let _ = Command::new("rm")
+                        .args(["-rf", &format!("{}.bak", microvms_dir)])
+                        .output()
+                        .await;
+                }
             }
+            self.state.attach_flake_path(service_id, repo_path.clone());
         }
 
-        self.state.attach_flake_path(service_id, repo_path.clone());
         port_reservation
             .as_mut()
             .expect("port reservation exists")
@@ -597,6 +771,7 @@ impl DeployPipeline {
         kernel_info: &KernelInfo,
         env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
+        generation_id: Option<&str>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         let alloc: SubnetAllocation = subnet_for(service_id);
         tracing::info!(
@@ -681,7 +856,7 @@ impl DeployPipeline {
         // ── Write metadata via build_microvm_metadata ────────────────
         let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
         let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
-        let meta = build_microvm_metadata(
+        let meta = build_microvm_metadata_with_gen(
             service_id,
             port.host,
             port.guest,
@@ -696,6 +871,8 @@ impl DeployPipeline {
             Some(&app_path),
             Some(&bin_name),
             Some(&initramfs_path.display().to_string()),
+            generation_id,
+            Some(&alloc.tap_id),
         );
         write_metadata(&metadata_path, &meta)?;
 
@@ -787,6 +964,7 @@ impl DeployPipeline {
         podman_args: &[String],
         env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
+        generation_id: Option<&str>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
             service_id,
@@ -841,7 +1019,7 @@ impl DeployPipeline {
         tracing::info!(service_id, start_ms, "container started");
 
         let metadata_path = base_dir.join("metadata.json");
-        let metadata = build_container_metadata(
+        let metadata = build_container_metadata_with_gen(
             service_id,
             port.host,
             port.guest,
@@ -852,6 +1030,7 @@ impl DeployPipeline {
             mem_mb,
             Some(&bin_name),
             podman_args,
+            generation_id,
         );
         write_metadata(&metadata_path, &metadata)?;
 
@@ -1550,6 +1729,44 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn generation_id_is_short_hex() {
+        let id = new_generation_id();
+        assert_eq!(id.len(), 8);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generation_runtime_key_is_valid_service_id() {
+        let id = new_generation_id();
+        let key = format!("api_g{id}");
+        MicrovmRunner::validate_service_id(&key).unwrap();
+    }
+
+    #[test]
+    fn metadata_records_generation_and_tap() {
+        let meta = build_microvm_metadata_with_gen(
+            "api_gdeadbeef",
+            3100,
+            3000,
+            "10.0.1.2",
+            "10.0.1.1",
+            Some(1),
+            &[],
+            None,
+            "/k",
+            "/s",
+            512,
+            None,
+            None,
+            None,
+            Some("deadbeef"),
+            Some("rsl-abcd1234"),
+        );
+        assert_eq!(meta["generation_id"], "deadbeef");
+        assert_eq!(meta["tap_id"], "rsl-abcd1234");
+    }
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
