@@ -19,6 +19,7 @@ mod ingress;
 mod metadata;
 mod microvm;
 mod network;
+mod reconcile;
 mod state;
 mod traefik;
 mod warm_pool;
@@ -58,6 +59,15 @@ async fn main() -> Result<()> {
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
 
+    // Build state early so reconcile can rehydrate services from disk
+    // before the router starts serving requests.
+    let state = AppState::default();
+
+    // Rehydrate observed service state from on-disk metadata so status
+    // endpoints work without waiting for GET /vms lazy discovery.
+    let report = crate::reconcile::reconcile_startup(&state).await;
+    tracing::info!(?report, "startup reconcile complete");
+
     // Start warm pool prepare in the background so the first deploy after
     // ctrl restart can restore from a paused snapshot instead of cold booting.
     // Failures are logged but never block the control plane from serving.
@@ -74,7 +84,6 @@ async fn main() -> Result<()> {
     // Keep a clone so we can detach workload children after Axum drops the
     // router state. Child handles are spawned with kill_on_drop(true); without
     // an explicit detach, dropping AppState would SIGKILL every VM on exit.
-    let state = AppState::default();
     let app: Router = api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
 

@@ -37,6 +37,20 @@ pub struct LoadedMetadata {
     pub container_id: Option<String>,
 }
 
+/// Full on-disk record for a service, used by startup reconcile to rehydrate
+/// observed state without Child process handles.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceDiskRecord {
+    pub service_id: Option<String>,
+    pub runtime: Option<RuntimeKind>,
+    pub host_port: Option<u16>,
+    pub guest_port: Option<u16>,
+    pub container_id: Option<String>,
+    pub vm_pid: Option<u32>,
+    pub socat_pid: Option<u32>,
+    pub virtiofsd_pids: Vec<u32>,
+}
+
 /// Parse `runtime` from on-disk metadata JSON.
 ///
 /// Returns the parsed runtime if the `runtime` key is present and valid.
@@ -84,6 +98,99 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
+}
+
+/// Load full service metadata from disk for reconcile.
+/// Parses defensively: missing fields are left as None / empty.
+#[allow(dead_code)] // public API — callers outside this crate may use it
+pub fn load_service_disk_record(service_id: &str) -> Option<ServiceDiskRecord> {
+    load_service_disk_record_from(&metadata_path(service_id))
+}
+
+/// Load service metadata from an arbitrary path (for tests / custom base dirs).
+pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let virtiofsd_pids = value
+        .get("virtiofsd_pids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            // Legacy: singular virtiofsd_pid
+            value
+                .get("virtiofsd_pid")
+                .and_then(|v| v.as_u64())
+                .map(|n| vec![n as u32])
+                .unwrap_or_default()
+        });
+
+    Some(ServiceDiskRecord {
+        service_id: value
+            .get("service_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        runtime: value
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok()),
+        host_port: value
+            .get("host_port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16),
+        guest_port: value
+            .get("guest_port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16),
+        container_id: value
+            .get("container_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        vm_pid: value
+            .get("vm_pid")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u32),
+        socat_pid: value
+            .get("socat_pid")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u32),
+        virtiofsd_pids,
+    })
+}
+
+/// Atomic write of the control plane catalog JSON to `/var/lib/russel/ctrl-catalog.json`.
+pub fn write_ctrl_catalog(catalog: &serde_json::Value) -> anyhow::Result<()> {
+    write_ctrl_catalog_to(&PathBuf::from("/var/lib/russel/ctrl-catalog.json"), catalog)
+}
+
+/// Atomic write of the control plane catalog JSON to an arbitrary path.
+pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow::Result<()> {
+    let tmp_path = path.with_extension("json.tmp");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create catalog parent {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+
+    let content = serde_json::to_string_pretty(catalog)
+        .map_err(|e| anyhow::anyhow!("failed to serialize catalog: {}", e))?;
+
+    std::fs::write(&tmp_path, &content)
+        .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
+
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| anyhow::anyhow!("failed to rename catalog tmp: {}", e))?;
+
+    Ok(())
 }
 
 /// Resolve lifecycle runtime: prefer in-memory state, else on-disk metadata.
@@ -381,5 +488,107 @@ mod tests {
         assert_eq!(value["host_port"], 3100);
         assert_eq!(value["guest_port"], 3000);
         assert_eq!(value["container_id"], "abc");
+    }
+
+    // ── ServiceDiskRecord tests ──────────────────────────────────────────────
+
+    #[test]
+    fn service_disk_record_parses_microvm_fields() {
+        let meta = build_microvm_metadata(
+            "api",
+            3100,
+            3000,
+            "10.0.1.2",
+            "10.0.1.1",
+            Some(42),
+            &[43, 44],
+            Some(45),
+            "/nix/store/kernel",
+            "/nix/store/app",
+            512,
+            Some("/nix/store/app/bin/myapp"),
+            Some("myapp"),
+            None,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let rec = load_service_disk_record_from(&path).unwrap();
+        assert_eq!(rec.service_id.as_deref(), Some("api"));
+        assert_eq!(rec.host_port, Some(3100));
+        assert_eq!(rec.guest_port, Some(3000));
+        assert_eq!(rec.vm_pid, Some(42));
+        assert_eq!(rec.socat_pid, Some(45));
+        assert_eq!(rec.virtiofsd_pids, vec![43, 44]);
+        assert_eq!(rec.runtime, Some(RuntimeKind::Microvm));
+    }
+
+    #[test]
+    fn service_disk_record_legacy_singular_virtiofsd_pid() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "service_id": "api",
+            "runtime": "microvm",
+            "host_port": 3100,
+            "guest_port": 3000,
+            "vm_pid": 42,
+            "socat_pid": 45,
+            "virtiofsd_pid": 99
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let rec = load_service_disk_record_from(&path).unwrap();
+        // Legacy singular field is expanded into virtiofsd_pids.
+        assert_eq!(rec.virtiofsd_pids, vec![99]);
+        assert_eq!(rec.vm_pid, Some(42));
+        assert_eq!(rec.host_port, Some(3100));
+    }
+
+    #[test]
+    fn service_disk_record_defensive_parse_missing_fields() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "service_id": "minimal"
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let rec = load_service_disk_record_from(&path).unwrap();
+        assert_eq!(rec.service_id.as_deref(), Some("minimal"));
+        assert!(rec.vm_pid.is_none());
+        assert!(rec.host_port.is_none());
+        assert!(rec.virtiofsd_pids.is_empty());
+        assert!(rec.runtime.is_none());
+    }
+
+    // ── Catalog write / read tests ───────────────────────────────────────────
+
+    #[test]
+    fn catalog_write_and_read_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("ctrl-catalog.json");
+        let catalog = serde_json::json!({
+            "schema_version": 1,
+            "updated_at": deployed_at_now(),
+            "services": {
+                "api": {
+                    "status": "deployed",
+                    "runtime": "microvm",
+                    "host_port": 3100
+                }
+            }
+        });
+        let content = serde_json::to_string_pretty(&catalog).unwrap();
+        std::fs::write(&catalog_path, &content).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        assert_eq!(read["schema_version"], 1);
+        assert_eq!(read["services"]["api"]["status"], "deployed");
+        assert_eq!(read["services"]["api"]["host_port"], 3100);
     }
 }
