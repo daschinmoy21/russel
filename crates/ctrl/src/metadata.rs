@@ -1,3 +1,22 @@
+//! On-disk service metadata (`/var/lib/russel/<id>/metadata.json`).
+//!
+//! ## Schema (`schema_version` = 1)
+//!
+//! Shared fields: `schema_version`, `service_id`, `runtime` (`microvm`|`container`),
+//! `host_port`, `guest_port`, `store_path`, `mem_mb`, `deployed_at` (RFC3339),
+//! optional `bin_name`.
+//!
+//! **microVM** also writes: `vm_ip`, `host_ip` (TAP host side), `kernel_path`,
+//! optional `vm_pid` / `socat_pid` / `initramfs` / `app_path`, and
+//! `virtiofsd_pids` (JSON array of u32). Older files may still have singular
+//! `virtiofsd_pid`; readers that care about process cleanup should accept both
+//! until all hosts have redeployed. Deploy/rollback must keep writers and
+//! destroy/stop readers on the same shape — do not mix a new writer with an
+//! old destroy path that only understands `virtiofsd_pid`.
+//!
+//! **container** also writes: `container_id`, `container_name`, `rootfs_path`,
+//! optional `podman_args`.
+
 use std::path::{Path, PathBuf};
 
 use russel_core::config::RuntimeKind;
@@ -78,12 +97,14 @@ pub fn build_microvm_metadata(
     host_port: u16,
     guest_port: u16,
     vm_ip: &str,
+    host_ip: &str,
     vm_pid: Option<u32>,
-    virtiofsd_pid: Option<u32>,
+    virtiofsd_pids: &[u32],
     socat_pid: Option<u32>,
     kernel_path: &str,
     store_path: &str,
     mem_mb: u16,
+    app_path: Option<&str>,
     bin_name: Option<&str>,
     initramfs_path: Option<&str>,
 ) -> serde_json::Value {
@@ -94,6 +115,7 @@ pub fn build_microvm_metadata(
         "host_port": host_port,
         "guest_port": guest_port,
         "vm_ip": vm_ip,
+        "host_ip": host_ip,
         "kernel_path": kernel_path,
         "store_path": store_path,
         "mem_mb": mem_mb,
@@ -102,11 +124,14 @@ pub fn build_microvm_metadata(
     if let Some(pid) = vm_pid {
         meta["vm_pid"] = serde_json::json!(pid);
     }
-    if let Some(pid) = virtiofsd_pid {
-        meta["virtiofsd_pid"] = serde_json::json!(pid);
+    if !virtiofsd_pids.is_empty() {
+        meta["virtiofsd_pids"] = serde_json::json!(virtiofsd_pids);
     }
     if let Some(pid) = socat_pid {
         meta["socat_pid"] = serde_json::json!(pid);
+    }
+    if let Some(path) = app_path {
+        meta["app_path"] = serde_json::json!(path);
     }
     if let Some(name) = bin_name {
         meta["bin_name"] = serde_json::json!(name);
@@ -212,17 +237,22 @@ mod tests {
             3100,
             3000,
             "10.0.1.2",
+            "10.0.1.1",
             Some(42),
-            Some(43),
+            &[43u32],
             Some(44),
             "/nix/store/kernel",
             "/nix/store/app",
             512,
+            Some("/nix/store/app/bin/myapp"),
             Some("myapp"),
             Some("/var/lib/russel/api/initramfs.cpio"),
         );
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
         assert_eq!(meta["runtime"], "microvm");
+        assert_eq!(meta["host_ip"], "10.0.1.1");
+        assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
+        assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
         assert_eq!(meta["bin_name"], "myapp");
         assert!(meta["deployed_at"].as_str().unwrap().ends_with('Z'));
 

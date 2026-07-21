@@ -416,7 +416,8 @@ async fn vm_destroy(
     }
 }
 
-// Microvm holds process handles; size imbalance vs Container is expected.
+// Microvm holds process handles; size imbalance vs Container is expected
+// (short-lived claim — boxing would churn match sites).
 #[allow(clippy::large_enum_variant)]
 enum LifecycleClaimKind {
     Microvm {
