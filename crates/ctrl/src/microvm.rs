@@ -1047,7 +1047,10 @@ exec /bin/sh
         };
 
         if !vm_stopped {
-            let tap = crate::network::subnet_for(service_id).tap_id;
+            let tap = metadata
+                .as_ref()
+                .and_then(|m| m.tap_id.clone())
+                .unwrap_or_else(|| crate::network::subnet_for(service_id).tap_id);
             self.pkill_service_process(
                 service_id,
                 "cloud-hypervisor",
@@ -1133,9 +1136,12 @@ exec /bin/sh
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
         Self::validate_service_id(service_id)?;
 
+        // Prefer on-disk network identity (generation-scoped TAP) before stop
+        // clears processes; fall back to deterministic subnet_for.
+        let alloc = network_alloc_for_service(service_id);
+
         self.stop(service_id).await?;
 
-        let alloc = crate::network::subnet_for(service_id);
         crate::network::TapForwarder::teardown(&alloc).await?;
         crate::network::PortAllocator::release(service_id);
         crate::network::release_subnet(service_id);
@@ -1339,6 +1345,9 @@ struct ProcessMetadata {
     vm_pid: Option<u32>,
     virtiofsd_pids: Vec<u32>,
     socat_pid: Option<u32>,
+    tap_id: Option<String>,
+    host_ip: Option<String>,
+    vm_ip: Option<String>,
 }
 
 fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
@@ -1371,7 +1380,36 @@ fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
             .get("socat_pid")
             .and_then(|pid| pid.as_u64())
             .map(|pid| pid as u32),
+        tap_id: value
+            .get("tap_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        host_ip: value
+            .get("host_ip")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        vm_ip: value
+            .get("vm_ip")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
+}
+
+/// Prefer generation-recorded TAP / IPs so destroy still works after promote.
+fn network_alloc_for_service(service_id: &str) -> crate::network::SubnetAllocation {
+    let fallback = crate::network::subnet_for(service_id);
+    let Some(meta) = read_metadata(service_id) else {
+        return fallback;
+    };
+    match (meta.tap_id, meta.host_ip, meta.vm_ip) {
+        (Some(tap_id), Some(host_ip), Some(vm_ip)) => crate::network::SubnetAllocation {
+            host_ip,
+            vm_ip,
+            mac: fallback.mac,
+            tap_id,
+        },
+        _ => fallback,
+    }
 }
 
 async fn terminate_owned_process(pid: u32, service_id: &str) -> anyhow::Result<bool> {
