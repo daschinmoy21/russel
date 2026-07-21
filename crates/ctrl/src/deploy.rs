@@ -49,16 +49,10 @@ fn new_generation_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // Mix time with process id for uniqueness across rapid deploys.
-    let mixed = nanos ^ ((std::process::id() as u128) << 32);
-    format!("{mixed:x}")
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
+    // Fold pid into the low 32 bits we keep: rapid same-ns deploys from
+    // different processes stay distinct; output is always 8 lowercase hex digits.
+    let mixed = (nanos as u32) ^ std::process::id();
+    format!("{mixed:08x}")
 }
 
 /// Promote a candidate generation directory tree to the stable service id.

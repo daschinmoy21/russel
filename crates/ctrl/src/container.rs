@@ -706,9 +706,11 @@ impl ContainerRunner {
         stop_container(&name).await?;
         remove_container(&name).await?;
 
-        let rootfs_path = default_base_dir(service_id).join("rootfs");
-        if rootfs_path.exists() {
-            tokio::fs::remove_dir_all(&rootfs_path).await?;
+        // Remove the entire service base dir (metadata, rootfs, logs) — match
+        // MicrovmRunner::destroy cleanup of /var/lib/russel/{service_id}.
+        let base = default_base_dir(service_id);
+        if base.exists() {
+            tokio::fs::remove_dir_all(&base).await?;
         }
         Ok(())
     }
