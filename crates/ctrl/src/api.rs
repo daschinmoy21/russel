@@ -427,6 +427,9 @@ async fn vm_update(
     Path(service_id): Path<String>,
     body: Option<Json<UpdateBody>>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
     let body = body.map(|j| j.0).unwrap_or_default();
     let path = format!("/var/lib/russel/{service_id}/metadata.json");
     let meta: serde_json::Value = if std::path::Path::new(&path).exists() {
@@ -500,9 +503,11 @@ async fn vm_update(
     // Same NDJSON stream as POST /deploy so CLI reuses event parsing.
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
+    let monitor_state = state.clone();
     let deploy_guard = state.begin_deploy();
     let sid = service_id.clone();
-    tokio::spawn(async move {
+    let sid2 = service_id.clone();
+    let deploy_handle = tokio::spawn(async move {
         let _guard = deploy_guard;
         let pipeline = DeployPipeline::new(state);
         let response = pipeline.deploy(request, deploy_tx.clone()).await;
@@ -510,6 +515,28 @@ async fn vm_update(
             .send(DeployEvent::Complete(Box::new(response)))
             .await;
         tracing::info!(service_id = %sid, "update deploy finished");
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = deploy_handle.await
+            && e.is_panic()
+        {
+            let panic = e.into_panic();
+            let detail = panic
+                .downcast_ref::<&'static str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "update deploy task panicked".to_string());
+            tracing::error!(
+                service_id = %sid2,
+                panic = %detail,
+                "update deploy task panicked"
+            );
+            monitor_state.mark_failed(&sid2, detail);
+            let _ = tx
+                .send(DeployEvent::Error("update deploy task failed".to_string()))
+                .await;
+        }
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|msg| {

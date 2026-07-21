@@ -49,8 +49,16 @@ fn record_source_in_metadata(
         .map_err(|e| anyhow::anyhow!("read metadata for source record: {e}"))?;
     let mut value: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("parse metadata for source record: {e}"))?;
-    value["repo_url"] = serde_json::json!(repo_url);
-    value["config_path"] = serde_json::json!(config_path);
+    let object = if let Some(object) = value.as_object_mut() {
+        object
+    } else {
+        value = serde_json::json!({});
+        value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("failed to create metadata object"))?
+    };
+    object.insert("repo_url".into(), serde_json::json!(repo_url));
+    object.insert("config_path".into(), serde_json::json!(config_path));
     write_metadata(&path, &value)
 }
 

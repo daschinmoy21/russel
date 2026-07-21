@@ -60,7 +60,6 @@ pub fn spawn_health_loop(state: AppState) {
         return;
     }
     tokio::spawn(async move {
-        let checker = HealthChecker;
         let mut failures: HashMap<String, u32> = HashMap::new();
         let mut interval = tokio::time::interval(probe_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -72,6 +71,7 @@ pub fn spawn_health_loop(state: AppState) {
         loop {
             interval.tick().await;
             let ids = state.list_services();
+            let mut checks = tokio::task::JoinSet::new();
             for id in ids {
                 let Some(status) = state.status(&id) else {
                     continue;
@@ -87,7 +87,21 @@ pub fn spawn_health_loop(state: AppState) {
                     continue;
                 };
                 let addr = format!("127.0.0.1:{port}");
-                if checker.check(&addr).await {
+                checks.spawn(async move {
+                    let reachable = HealthChecker.check(&addr).await;
+                    (id, addr, port, reachable)
+                });
+            }
+
+            while let Some(result) = checks.join_next().await {
+                let (id, addr, port, reachable) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::error!(%error, "health probe task failed");
+                        continue;
+                    }
+                };
+                if reachable {
                     failures.remove(&id);
                     continue;
                 }
@@ -108,7 +122,29 @@ pub fn spawn_health_loop(state: AppState) {
                     format!("health check failed for {addr} (3 consecutive probes)"),
                 );
                 if restart_enabled() {
-                    try_auto_restart(&state, &id).await;
+                    let restart_state = state.clone();
+                    let restart_id = id.clone();
+                    let log_id = restart_id.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::spawn(async move {
+                            try_auto_restart(&restart_state, &restart_id).await;
+                        })
+                        .await;
+                        if let Err(error) = result {
+                            if error.is_panic() {
+                                tracing::error!(
+                                    service_id = %log_id,
+                                    "health auto-restart panicked"
+                                );
+                            } else {
+                                tracing::error!(
+                                    service_id = %log_id,
+                                    %error,
+                                    "health auto-restart task was cancelled"
+                                );
+                            }
+                        }
+                    });
                 }
             }
         }

@@ -85,6 +85,7 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 | `GET`  | `/vm/{service_id}/logs`   | Get logs for a service |
 | `GET`  | `/vms`                     | List registered services |
 | `POST` | `/vm/{service_id}/stop`    | Stop a service (microVM or container) |
+| `POST` | `/vm/{service_id}/update`  | Redeploy from recorded/overridden source (returns NDJSON stream) |
 | `DELETE`| `/vm/{service_id}`         | Destroy a service and clean up resources |
 
 ## CLI Commands
@@ -96,6 +97,7 @@ russel logs [<service_id>]
 russel vms
 russel stop <service_id>
 russel destroy <service_id>
+russel update <service_id> [--repo REPO] [--config PATH]
 ```
 
 - **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
