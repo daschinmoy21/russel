@@ -1,15 +1,19 @@
-// ponytail: scaffold modules have unused items; allowed deliberately for the MVP.
-// Remove these allows once HealthChecker, DatabaseProvisioner, and TraefikClient
-// are integrated into the deploy pipeline.
-#![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+// clippy::type_complexity / too_many_arguments: deploy/lifecycle signatures are wide
+// by design (runtime + process handoff); silence until those APIs are split.
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 mod api;
 mod build;
 mod ch_api;
 mod container;
+// database / health: SPEC scaffold modules (DatabaseProvisioner / HealthChecker).
+// Module-wide allow is intentional until they are wired into the deploy pipeline;
+// remove the allows once those types are called from deploy or api paths (#104).
+#[allow(dead_code)]
 mod database;
 mod deploy;
 mod git;
+#[allow(dead_code)]
 mod health;
 mod metadata;
 mod microvm;

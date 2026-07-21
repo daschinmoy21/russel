@@ -477,6 +477,7 @@ impl MicrovmRunner {
     ///
     /// When the microvm kernel is in use, prefer the agent initramfs +
     /// deploy.env path instead — it avoids per-deploy CPIO rebuilds.
+    #[allow(dead_code)] // cold-boot fallback; agent initramfs path is preferred
     pub async fn build_initramfs(
         &self,
         service_id: &str,
@@ -575,6 +576,7 @@ impl MicrovmRunner {
         Ok(())
     }
 
+    #[allow(dead_code)] // only used by cold-boot build_initramfs
     fn generate_init_script(
         &self,
         alloc: &SubnetAllocation,
@@ -1194,6 +1196,7 @@ exec /bin/sh
     }
 
     /// List registered microVMs (from /var/lib/microvms).
+    #[allow(dead_code)] // admin/status helper; not yet exposed via API
     pub async fn list(&self) -> anyhow::Result<Vec<String>> {
         let mut vms = Vec::new();
         let state_dir = Path::new("/var/lib/microvms");
@@ -1399,15 +1402,4 @@ async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     !process_is_alive(pid)
-}
-
-fn escape_regex(s: &str) -> String {
-    let mut escaped = String::new();
-    for c in s.chars() {
-        if ".+*?^$()[]{}|\\".contains(c) {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
 }

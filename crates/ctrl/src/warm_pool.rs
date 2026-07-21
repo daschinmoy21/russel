@@ -71,6 +71,7 @@ impl WarmPool {
     }
 
     /// Block until prepare finishes (or immediately if already done).
+    #[allow(dead_code)] // for deploy/API callers that gate on warm-pool readiness
     pub async fn wait_until_prepare_done(&self) {
         if self.is_ready() {
             return;

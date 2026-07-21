@@ -92,6 +92,7 @@ pub fn resolve_lifecycle_runtime(
 
 /// Build versioned metadata JSON for a microVM deployment.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // unit-tested; deploy path still builds metadata inline
 pub fn build_microvm_metadata(
     service_id: &str,
     host_port: u16,

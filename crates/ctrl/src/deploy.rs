@@ -135,6 +135,7 @@ impl DeployPipeline {
                     }
                     DeployWorkload::Container {
                         container_id,
+                        container_name,
                         rootfs_path,
                         ..
                     } => {
@@ -142,7 +143,7 @@ impl DeployPipeline {
                             .mark_deployed_container(&service_id, &container_id);
                         (
                             format!(
-                                "container running. localhost:{host_port} -> guest:{guest_port}"
+                                "container {container_name} running. localhost:{host_port} -> guest:{guest_port}"
                             ),
                             None,
                             Some(rootfs_path.display().to_string()),
