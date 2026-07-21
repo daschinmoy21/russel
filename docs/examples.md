@@ -22,9 +22,12 @@ These examples use Russel's current Linux microVM backend. Before deploying any 
    cargo build
    ```
 
-5. Start the control plane in the first terminal. It listens on `127.0.0.1:7878` by default:
+5. Start the control plane in the first terminal. It listens on `127.0.0.1:7878` by default.
+   On loopback, auth is optional (dev mode). For production, set `RUSSEL_API_TOKEN` and
+   pass the same token to the CLI:
 
    ```bash
+   export RUSSEL_API_TOKEN=your-secret-token  # optional on loopback; required for non-loopback
    ./target/debug/russel-ctrl
    ```
 

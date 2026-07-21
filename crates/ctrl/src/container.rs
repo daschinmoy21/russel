@@ -630,6 +630,10 @@ impl ContainerRunner {
 
     pub async fn start(&self, spec: &ContainerStartSpec) -> anyhow::Result<RunningContainer> {
         crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
+
+        // Validate args + rootless BEFORE stopping old container (#115).
+        let log_path = container_log_path(&spec.service_id);
+        let args = build_run_args(spec, &log_path)?;
         Self::ensure_rootless().await?;
 
         let name = Self::container_name(&spec.service_id);
@@ -639,12 +643,10 @@ impl ContainerRunner {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let log_path = container_log_path(&spec.service_id);
         if let Some(parent) = log_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let args = build_run_args(spec, &log_path)?;
         // ponytail: make rootfs readable for configured podman user when running via sudo
         ensure_rootfs_readable_for_podman_user(&spec.rootfs.rootfs_path)?;
         let output = run_podman(&args).await?;

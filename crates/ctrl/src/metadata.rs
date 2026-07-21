@@ -37,25 +37,29 @@ pub struct LoadedMetadata {
     pub container_id: Option<String>,
 }
 
-/// Parse `runtime` from on-disk metadata JSON; legacy entries without the field
-/// default to microVM.
-pub fn prior_runtime_from_metadata(content: &str) -> RuntimeKind {
+/// Parse `runtime` from on-disk metadata JSON.
+///
+/// Returns the parsed runtime if the `runtime` key is present and valid.
+/// If the JSON is valid but the `runtime` key is missing, defaults to
+/// `Microvm` (legacy metadata). Returns `None` only for unreadable or
+/// invalid JSON.
+pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
     let value: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
-        Err(_) => return RuntimeKind::Microvm,
+        Err(_) => return None,
     };
     value
         .get("runtime")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok())
-        .unwrap_or(RuntimeKind::Microvm)
+        .or(Some(RuntimeKind::Microvm))
 }
 
-pub fn prior_runtime_from_disk(service_id: &str) -> RuntimeKind {
+/// Read prior runtime from disk, returning None when no metadata exists
+/// or the file is corrupt/unreadable.
+pub fn prior_runtime_from_disk(service_id: &str) -> Option<RuntimeKind> {
     let path = metadata_path(service_id);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return RuntimeKind::Microvm;
-    };
+    let content = std::fs::read_to_string(&path).ok()?;
     prior_runtime_from_metadata(&content)
 }
 
@@ -87,7 +91,9 @@ pub fn resolve_lifecycle_runtime(
     state_runtime: Option<RuntimeKind>,
     service_id: &str,
 ) -> RuntimeKind {
-    state_runtime.unwrap_or_else(|| prior_runtime_from_disk(service_id))
+    state_runtime.unwrap_or_else(|| {
+        prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm)
+    })
 }
 
 /// Build versioned metadata JSON for a microVM deployment.
@@ -279,27 +285,33 @@ mod tests {
     #[test]
     fn prior_runtime_defaults_to_microvm_when_missing() {
         let json = r#"{"service_id":"api","host_port":3100}"#;
-        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Microvm);
+        assert_eq!(
+            prior_runtime_from_metadata(json),
+            Some(RuntimeKind::Microvm)
+        );
     }
 
     #[test]
     fn prior_runtime_reads_container_field() {
         let json = r#"{"runtime":"container","service_id":"api"}"#;
-        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Container);
+        assert_eq!(
+            prior_runtime_from_metadata(json),
+            Some(RuntimeKind::Container)
+        );
     }
 
     #[test]
     fn prior_runtime_reads_microvm_field() {
         let json = r#"{"runtime":"microvm","service_id":"api"}"#;
-        assert_eq!(prior_runtime_from_metadata(json), RuntimeKind::Microvm);
+        assert_eq!(
+            prior_runtime_from_metadata(json),
+            Some(RuntimeKind::Microvm)
+        );
     }
 
     #[test]
-    fn prior_runtime_invalid_json_defaults_microvm() {
-        assert_eq!(
-            prior_runtime_from_metadata("not json"),
-            RuntimeKind::Microvm
-        );
+    fn prior_runtime_invalid_json_returns_none() {
+        assert_eq!(prior_runtime_from_metadata("not json"), None);
     }
 
     #[test]
@@ -362,7 +374,10 @@ mod tests {
             &[],
         ))
         .unwrap();
-        assert_eq!(prior_runtime_from_metadata(&json), RuntimeKind::Container);
+        assert_eq!(
+            prior_runtime_from_metadata(&json),
+            Some(RuntimeKind::Container)
+        );
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["host_port"], 3100);
         assert_eq!(value["guest_port"], 3000);

@@ -76,6 +76,25 @@ async fn main() -> Result<()> {
     let state = AppState::default();
     let app: Router = api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
+
+    // Auth + bind policy: if RUSSEL_API_TOKEN is set, require Bearer auth.
+    // If unset, only allow loopback binds (dev mode).
+    let token = std::env::var("RUSSEL_API_TOKEN").ok();
+    let is_loopback = bind_addr.starts_with("127.0.0.1:") || bind_addr.starts_with("[::1]:");
+    if token.is_some() {
+        info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
+    } else if is_loopback {
+        tracing::warn!(
+            "RUSSEL_API_TOKEN is not set — running in dev mode (loopback-only). \
+             Set RUSSEL_API_TOKEN for production."
+        );
+    } else {
+        anyhow::bail!(
+            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}'",
+            bind_addr
+        );
+    }
+
     let listener = TcpListener::bind(&bind_addr).await?;
 
     info!(
@@ -138,8 +157,14 @@ async fn shutdown_signal() {
 /// `POSTROUTING`, `FORWARD`). Those belong to Docker, VPN, and the host admin.
 /// When Russel needs firewall rules it must install dedicated `RUSSEL_*` chains
 /// and only remove those.
+///
+/// Only deletes TAP interfaces with no corresponding live service directory
+/// (`/var/lib/russel/<id>/metadata.json`).
 async fn cleanup_stale_resources() {
     use tokio::process::Command;
+
+    // Collect all expected TAP ids from live service directories.
+    let live_taps = live_service_tap_ids();
 
     // Remove stale TAP interfaces owned by Russel (`rsl-<8 hex chars>`).
     // See `network::subnet_for` for the naming scheme.
@@ -158,6 +183,11 @@ async fn cleanup_stale_resources() {
                 // trailing colon and optional `@peer` suffix.
                 let base = raw.trim_end_matches(':').split('@').next().unwrap_or(raw);
                 if !is_russel_tap(base) {
+                    continue;
+                }
+                // Only delete if no live service maps to this TAP.
+                if live_taps.contains(base) {
+                    tracing::debug!(tap = base, "keeping TAP — live service exists");
                     continue;
                 }
                 match Command::new("ip")
@@ -194,6 +224,28 @@ async fn cleanup_stale_resources() {
     }
 
     tracing::info!("stale resource cleanup finished (Russel TAPs only; host iptables untouched)");
+}
+
+/// Collect tap_ids for all live services that have metadata on disk.
+fn live_service_tap_ids() -> std::collections::HashSet<String> {
+    use crate::network::subnet_for;
+    let mut taps = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/var/lib/russel") {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type()
+                && ft.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                if name.ends_with(".bak") {
+                    continue;
+                }
+                if entry.path().join("metadata.json").exists() {
+                    taps.insert(subnet_for(name).tap_id);
+                }
+            }
+        }
+    }
+    taps
 }
 
 /// True for current Russel TAP names: `rsl-` + exactly 8 lowercase hex digits.

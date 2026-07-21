@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -46,9 +47,19 @@ pub struct NixBuilder;
 impl NixBuilder {
     pub async fn ensure_flake_exists(&self, repo_path: &Path) -> Result<()> {
         let flake_path = repo_path.join("flake.nix");
-        if flake_path.exists() {
-            return Ok(());
+        // Use create_new for atomic check-and-create (fail if exists, no TOCTOU).
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
+        let mut file = match opts.open(&flake_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
 
         let system = current_system().await;
         tracing::info!(system = %system, "No flake.nix found. Auto-detecting project type to generate a default flake.");
@@ -115,7 +126,8 @@ impl NixBuilder {
             )
         };
 
-        std::fs::write(&flake_path, flake_content)?;
+        file.write_all(flake_content.as_bytes())?;
+        file.sync_all()?;
         tracing::info!("Successfully generated default flake.nix");
         Ok(())
     }
