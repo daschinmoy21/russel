@@ -510,24 +510,18 @@ mod tests {
             Some("myapp"),
             None,
         );
-        let json = serde_json::to_string(&meta).unwrap();
-        // Write to temp dir so load_service_disk_record can find it via metadata_path.
         let tmp = tempfile::tempdir().unwrap();
-        let svc_dir = tmp.path().join("api");
-        std::fs::create_dir(&svc_dir).unwrap();
-        std::fs::write(svc_dir.join("metadata.json"), &json).unwrap();
+        let path = tmp.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_string(&meta).unwrap()).unwrap();
 
-        // Read back via manual parse (load_service_disk_record reads /var/lib/russel).
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["vm_pid"], 42);
-        assert_eq!(value["socat_pid"], 45);
-        let pids: Vec<u32> = value["virtiofsd_pids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap() as u32)
-            .collect();
-        assert_eq!(pids, vec![43, 44]);
+        let rec = load_service_disk_record_from(&path).unwrap();
+        assert_eq!(rec.service_id.as_deref(), Some("api"));
+        assert_eq!(rec.host_port, Some(3100));
+        assert_eq!(rec.guest_port, Some(3000));
+        assert_eq!(rec.vm_pid, Some(42));
+        assert_eq!(rec.socat_pid, Some(45));
+        assert_eq!(rec.virtiofsd_pids, vec![43, 44]);
+        assert_eq!(rec.runtime, Some(RuntimeKind::Microvm));
     }
 
     #[test]
@@ -542,10 +536,15 @@ mod tests {
             "socat_pid": 45,
             "virtiofsd_pid": 99
         });
-        let value: serde_json::Value = json;
-        assert_eq!(value["virtiofsd_pid"], 99);
-        // "virtiofsd_pids" array takes precedence; absent here.
-        assert!(value.get("virtiofsd_pids").is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let rec = load_service_disk_record_from(&path).unwrap();
+        // Legacy singular field is expanded into virtiofsd_pids.
+        assert_eq!(rec.virtiofsd_pids, vec![99]);
+        assert_eq!(rec.vm_pid, Some(42));
+        assert_eq!(rec.host_port, Some(3100));
     }
 
     #[test]
@@ -554,11 +553,16 @@ mod tests {
             "schema_version": 1,
             "service_id": "minimal"
         });
-        let value: serde_json::Value = json;
-        // All reconcile fields are optional.
-        assert_eq!(value["service_id"], "minimal");
-        assert!(value.get("vm_pid").is_none());
-        assert!(value.get("host_port").is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let rec = load_service_disk_record_from(&path).unwrap();
+        assert_eq!(rec.service_id.as_deref(), Some("minimal"));
+        assert!(rec.vm_pid.is_none());
+        assert!(rec.host_port.is_none());
+        assert!(rec.virtiofsd_pids.is_empty());
+        assert!(rec.runtime.is_none());
     }
 
     // ── Catalog write / read tests ───────────────────────────────────────────

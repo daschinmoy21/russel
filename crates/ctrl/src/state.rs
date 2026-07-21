@@ -817,19 +817,27 @@ impl AppState {
     ///
     /// Atomic write: temp file + rename. The catalog is informational;
     /// `metadata.json` remains the source of truth for runtime details.
+    ///
+    /// Snapshot under the mutex, then do all disk I/O outside the critical
+    /// section so state transitions are not serialized behind filesystem reads.
     pub fn write_catalog(&self) -> anyhow::Result<()> {
-        let inner = self.lock_inner();
-        let mut services_map = serde_json::Map::new();
+        let snapshot: Vec<(String, String, Option<RuntimeKind>, Option<u16>)> = {
+            let inner = self.lock_inner();
+            inner
+                .services
+                .iter()
+                .map(|(id, s)| (id.clone(), s.status.clone(), s.runtime, s.host_port))
+                .collect()
+        };
 
-        for (id, s) in &inner.services {
-            let disk = crate::metadata::load_metadata_from_disk(id);
-            let host_port = s
-                .host_port
-                .or_else(|| disk.as_ref().and_then(|m| m.host_port));
-            let runtime = s.runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime));
+        let mut services_map = serde_json::Map::new();
+        for (id, status, runtime, host_port) in snapshot {
+            let disk = crate::metadata::load_metadata_from_disk(&id);
+            let host_port = host_port.or_else(|| disk.as_ref().and_then(|m| m.host_port));
+            let runtime = runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime));
 
             let mut entry = serde_json::json!({
-                "status": s.status,
+                "status": status,
             });
 
             if let Some(r) = runtime {
@@ -839,7 +847,7 @@ impl AppState {
                 entry["host_port"] = serde_json::json!(port);
             }
 
-            services_map.insert(id.clone(), entry);
+            services_map.insert(id, entry);
         }
 
         let catalog = serde_json::json!({

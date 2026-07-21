@@ -158,22 +158,25 @@ async fn reconcile_service(
 
 // ── Liveness probes ───────────────────────────────────────────────────────────
 
-/// Check whether a microVM's constituent processes are alive via `kill(pid, 0)`.
+/// Check whether a microVM's constituent processes are alive *and* match the
+/// expected identity (guards against PID reuse after ctrl restart).
 fn probe_microvm_alive(record: &ServiceDiskRecord) -> bool {
+    let service_id = record.service_id.as_deref().unwrap_or("");
+
     if let Some(pid) = record.vm_pid
-        && pid_alive(pid)
+        && pid_matches(pid, &["cloud-hypervisor"], service_id)
     {
         return true;
     }
 
     if let Some(pid) = record.socat_pid
-        && pid_alive(pid)
+        && pid_matches(pid, &["socat", "socat-russel"], service_id)
     {
         return true;
     }
 
     for &pid in &record.virtiofsd_pids {
-        if pid_alive(pid) {
+        if pid_matches(pid, &["virtiofsd"], service_id) {
             return true;
         }
     }
@@ -199,13 +202,41 @@ async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
     false
 }
 
-/// Returns true if `kill(pid, 0)` succeeds (process exists).
-fn pid_alive(pid: u32) -> bool {
+/// Returns true if the PID exists *and* its cmdline matches expected identity.
+///
+/// `kill(pid, 0)` alone is subject to PID reuse; we also require that
+/// `/proc/<pid>/cmdline` contains one of `needles` (and, when non-empty,
+/// the service id) before treating the process as our workload.
+fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
     if pid == 0 {
         return false;
     }
     // SAFETY: signal 0 performs existence check without delivering a signal.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
+        Err(_) => return false,
+    };
+    let has_needle = needles.iter().any(|n| cmdline.contains(n));
+    if !has_needle {
+        return false;
+    }
+    // When we know the service id, require it appear (path, arg0, or similar)
+    // so a recycled PID running the same binary for another service is rejected.
+    if !service_id.is_empty() && !cmdline.contains(service_id) {
+        // cloud-hypervisor may only embed the TAP name, not the service id;
+        // accept if any needle already matched and service_id is empty-checked above.
+        // For socat/virtiofsd the service id is always in the path or arg0.
+        if needles.contains(&"cloud-hypervisor") {
+            // CH cmdline has tap=rsl-... and path under /var/lib/russel/{id}/
+            // If service_id not present, still require russel path fragment.
+            return cmdline.contains("/var/lib/russel/") || cmdline.contains("tap=");
+        }
+        return false;
+    }
+    true
 }
 
 async fn container_running(container_id: &str) -> bool {
@@ -278,13 +309,42 @@ mod tests {
         path
     }
 
+    /// Spawn a long-lived process whose path/argv contain the socat identity
+    /// for `service_id`. Writes a temp shebang script named `socat-russel-{id}`
+    /// (coreutils multi-call sleep rejects a renamed argv0).
+    fn spawn_fake_socat(service_id: &str) -> (tempfile::TempDir, std::process::Child) {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join(format!("socat-russel-{service_id}"));
+        // Do not `exec` — keep the script path in argv0 so identity matching
+        // can see `socat-russel-{id}` in /proc/pid/cmdline.
+        std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let child = std::process::Command::new(&bin)
+            .spawn()
+            .expect("spawn fake socat");
+        (dir, child)
+    }
+
+    #[test]
+    fn pid_matches_rejects_unrelated_live_pid() {
+        // Current test process is alive but is not cloud-hypervisor/socat.
+        let me = std::process::id();
+        assert!(!pid_matches(me, &["cloud-hypervisor"], "api"));
+        assert!(!pid_matches(me, &["socat", "socat-russel"], "api"));
+    }
+
     #[tokio::test]
     async fn reconcile_running_microvm_adopted() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let my_pid = std::process::id();
+        let (_dir, mut fake) = spawn_fake_socat("api");
+        let pid = fake.id();
 
-        write_microvm_metadata(base, "api", Some(my_pid), None, 3100);
+        write_microvm_metadata(base, "api", None, Some(pid), 3100);
 
         let state = AppState::default();
         let report = reconcile_startup_in(&state, base).await;
@@ -296,6 +356,7 @@ mod tests {
         assert_eq!(status.vm_state, "running");
         assert_eq!(status.host_port, Some(3100));
         assert_eq!(status.runtime, Some(RuntimeKind::Microvm));
+        let _ = fake.kill();
     }
 
     #[tokio::test]
@@ -388,9 +449,10 @@ mod tests {
     async fn reconcile_running_microvm_claims_port() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let my_pid = std::process::id();
+        let (_dir, mut fake) = spawn_fake_socat("port-svc");
+        let pid = fake.id();
 
-        write_microvm_metadata(base, "port-svc", Some(my_pid), None, 9000);
+        write_microvm_metadata(base, "port-svc", None, Some(pid), 9000);
 
         let state = AppState::default();
         let _report = reconcile_startup_in(&state, base).await;
@@ -402,15 +464,17 @@ mod tests {
         assert!(err.to_string().contains("already claimed"));
 
         PortAllocator::release("port-svc");
+        let _ = fake.kill();
     }
 
     #[tokio::test]
     async fn reconcile_does_not_overwrite_live_handles() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let my_pid = std::process::id();
+        let (_dir, mut fake) = spawn_fake_socat("live-svc");
+        let pid = fake.id();
 
-        write_microvm_metadata(base, "live-svc", Some(my_pid), None, 3105);
+        write_microvm_metadata(base, "live-svc", None, Some(pid), 3105);
 
         let state = AppState::default();
 
@@ -423,9 +487,6 @@ mod tests {
 
         let _report = reconcile_startup_in(&state, base).await;
 
-        // Should still be adopted=1 (the reconcile found it running),
-        // but the status should NOT have been overwritten from the
-        // mark_deployed_with_aux call.
         // The in-memory state still reflects the deployed status,
         // and vm_process is Some (not overwritten).
         let inner = state.lock_inner();
@@ -433,6 +494,21 @@ mod tests {
         assert!(svc.vm_process.is_some(), "live Child handle preserved");
         assert_eq!(svc.status, "deployed");
         assert_eq!(svc.vm_state, "running");
+        drop(inner);
+        let _ = fake.kill();
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_pid_reuse_without_identity() {
+        // Current process PID is live but not a russel workload binary.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        write_microvm_metadata(base, "reuse-svc", Some(std::process::id()), None, 3300);
+
+        let state = AppState::default();
+        let report = reconcile_startup_in(&state, base).await;
+        assert_eq!(report.adopted_running, 0);
+        assert_eq!(report.stopped, 1);
     }
 
     #[tokio::test]
@@ -455,10 +531,11 @@ mod tests {
     async fn reconcile_multiple_services() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let my_pid = std::process::id();
+        let (_da, mut a) = spawn_fake_socat("live-a");
+        let (_db, mut b) = spawn_fake_socat("live-b");
 
-        write_microvm_metadata(base, "live-a", Some(my_pid), None, 3110);
-        write_microvm_metadata(base, "live-b", Some(my_pid), None, 3111);
+        write_microvm_metadata(base, "live-a", None, Some(a.id()), 3110);
+        write_microvm_metadata(base, "live-b", None, Some(b.id()), 3111);
         write_microvm_metadata(base, "dead-c", Some(999_999_999), None, 3112);
 
         let state = AppState::default();
@@ -466,6 +543,8 @@ mod tests {
 
         assert_eq!(report.adopted_running, 2);
         assert_eq!(report.stopped, 1);
+        let _ = a.kill();
+        let _ = b.kill();
         assert_eq!(state.list_services().len(), 3);
     }
 
@@ -473,7 +552,7 @@ mod tests {
     async fn reconcile_with_socat_or_virtiofsd_pid_alive() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let my_pid = std::process::id();
+        let (_dd, mut fake) = spawn_fake_socat("socat-only");
 
         let dir = base.join("socat-only");
         std::fs::create_dir_all(&dir).unwrap();
@@ -483,7 +562,7 @@ mod tests {
             "runtime": "microvm",
             "host_port": 3400,
             "guest_port": 3000,
-            "socat_pid": my_pid,
+            "socat_pid": fake.id(),
             "virtiofsd_pids": []
         });
         std::fs::write(
@@ -498,5 +577,6 @@ mod tests {
         assert_eq!(report.adopted_running, 1);
         let status = state.status("socat-only").unwrap();
         assert_eq!(status.status, "deployed");
+        let _ = fake.kill();
     }
 }
