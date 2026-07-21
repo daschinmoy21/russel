@@ -5,13 +5,10 @@
 //! never written into Russelfile; deploy resolves `secret://name` env refs.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(test)]
-use std::path::Path;
 
 const DEFAULT_SECRETS_DIR: &str = "/var/lib/russel/secrets";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -64,14 +61,30 @@ pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("chmod secrets dir: {e}"))?;
     }
 
-    // Atomic replace: write temp in the same directory, then rename.
+    secure_write(&path, value.as_bytes(), "secret")?;
+    Ok(())
+}
+
+/// Write a sensitive file atomically with restrictive permissions.
+///
+/// The parent directory must already exist. The temporary file is created in
+/// that directory so the final rename remains atomic on the same filesystem.
+pub(crate) fn secure_write(path: &Path, content: &[u8], kind: &str) -> anyhow::Result<()> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
         ^ u128::from(TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let tmp = parent.join(format!(".{name}.tmp.{nonce:x}"));
-    {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{kind} path has no parent"))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp.{nonce:x}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+    ));
+    let write_result = (|| -> anyhow::Result<()> {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -82,21 +95,26 @@ pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
         }
         let mut f = options
             .open(&tmp)
-            .map_err(|e| anyhow::anyhow!("create secret tmp: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("create {kind} tmp: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| anyhow::anyhow!("chmod secret tmp: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("chmod {kind} tmp: {e}"))?;
         }
-        f.write_all(value.as_bytes())
-            .map_err(|e| anyhow::anyhow!("write secret tmp: {e}"))?;
+        f.write_all(content)
+            .map_err(|e| anyhow::anyhow!("write {kind} tmp: {e}"))?;
         f.sync_all()
-            .map_err(|e| anyhow::anyhow!("fsync secret tmp: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("fsync {kind} tmp: {e}"))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     std::fs::rename(&tmp, &path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        anyhow::anyhow!("rename secret into place: {e}")
+        anyhow::anyhow!("rename {kind} into place: {e}")
     })?;
     Ok(())
 }
