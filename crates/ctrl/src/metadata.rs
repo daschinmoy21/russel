@@ -48,7 +48,10 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
             .get("runtime")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse().ok()),
-        host_port: value.get("host_port").and_then(|v| v.as_u64()).map(|p| p as u16),
+        host_port: value
+            .get("host_port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16),
         guest_port: value
             .get("guest_port")
             .and_then(|v| v.as_u64())
@@ -153,7 +156,11 @@ pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> a
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!("failed to create metadata parent {}: {}", parent.display(), e)
+            anyhow::anyhow!(
+                "failed to create metadata parent {}: {}",
+                parent.display(),
+                e
+            )
         })?;
     }
     let content = serde_json::to_string_pretty(metadata)
@@ -255,7 +262,10 @@ mod tests {
 
     #[test]
     fn prior_runtime_invalid_json_defaults_microvm() {
-        assert_eq!(prior_runtime_from_metadata("not json"), RuntimeKind::Microvm);
+        assert_eq!(
+            prior_runtime_from_metadata("not json"),
+            RuntimeKind::Microvm
+        );
     }
 
     #[test]

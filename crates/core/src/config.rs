@@ -36,9 +36,7 @@ impl Russelfile {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
     #[default]
@@ -62,19 +60,16 @@ impl FromStr for RuntimeKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "microvm" => Ok(Self::Microvm),
             "container" => Ok(Self::Container),
-            other => anyhow::bail!(
-                "unknown runtime {other:?}, expected \"microvm\" or \"container\""
-            ),
+            other => {
+                anyhow::bail!("unknown runtime {other:?}, expected \"microvm\" or \"container\"")
+            }
         }
     }
 }
 
 /// Resolve effective runtime: Russelfile `service.type` is source of truth.
 /// CLI `--runtime` must match when provided; otherwise the file value is used.
-pub fn resolve_runtime(
-    file: RuntimeKind,
-    cli: Option<RuntimeKind>,
-) -> anyhow::Result<RuntimeKind> {
+pub fn resolve_runtime(file: RuntimeKind, cli: Option<RuntimeKind>) -> anyhow::Result<RuntimeKind> {
     match cli {
         None => Ok(file),
         Some(cli_kind) if cli_kind == file => Ok(file),

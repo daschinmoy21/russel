@@ -96,11 +96,13 @@ impl PortAllocator {
     pub fn claim_existing(service_id: &str, port: u16) -> anyhow::Result<()> {
         let mut registry = port_registry();
         // Reject if a different service already owns this port.
-        if let Some(other_id) = registry
-            .allocations
-            .iter()
-            .find_map(|(id, &p)| if p == port && id != service_id { Some(id.clone()) } else { None })
-        {
+        if let Some(other_id) = registry.allocations.iter().find_map(|(id, &p)| {
+            if p == port && id != service_id {
+                Some(id.clone())
+            } else {
+                None
+            }
+        }) {
             anyhow::bail!("port {port} already claimed by service '{other_id}'");
         }
         // If this service already has a different port, release it first.
