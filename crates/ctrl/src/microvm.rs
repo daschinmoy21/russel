@@ -898,6 +898,8 @@ exec /bin/sh
     /// Legacy boot wrapper — kept for backward compat.
     ///
     /// Prefer `boot_vm(spec)` for new code.
+    // legacy cold-boot helper retained for warm-pool/future
+    #[allow(dead_code)]
     pub async fn boot(
         &self,
         service_id: &str,
@@ -1291,7 +1293,9 @@ while [ ! -f /config/deploy.env ]; do
 done
 
 # Source deployment config.
+set -a
 . /config/deploy.env
+set +a
 
 # Find network interface (net.ifnames=0 friendly).
 IFACE="eth0"

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::RuntimeKind;
@@ -13,6 +15,9 @@ pub struct DeployRequest {
     /// Extra `podman run` arguments (container runtime only).
     #[serde(default)]
     pub podman_args: Vec<String>,
+    /// User-defined environment variables. Overrides Russelfile `[service.env]`.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32,6 +37,12 @@ pub struct DeployResponse {
     pub vm_ip: Option<String>,
     #[serde(default)]
     pub runtime: Option<RuntimeKind>,
+    /// Traefik Host rule hostname (e.g. `api.russel.local`).
+    #[serde(default)]
+    pub route_host: Option<String>,
+    /// Published host port (backend for Traefik).
+    #[serde(default)]
+    pub backend_port: Option<u16>,
 }
 
 /// Millisecond breakdown of each deploy phase, included in every successful response.
@@ -137,6 +148,8 @@ mod tests {
                 timing: None,
                 vm_ip: Some("10.0.5.2".into()),
                 runtime: Some(RuntimeKind::Microvm),
+                route_host: Some("svc.russel.local".into()),
+                backend_port: Some(8080),
             })),
             DeployEvent::Error("build failed".into()),
         ];
@@ -159,6 +172,7 @@ mod tests {
             }),
             runtime: Some(RuntimeKind::Container),
             podman_args: vec!["-v".into(), "/data:/data:ro".into()],
+            env: HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("my-id"));
@@ -176,6 +190,33 @@ mod tests {
     }
 
     #[test]
+    fn deploy_request_env_roundtrip() {
+        let mut env = HashMap::new();
+        env.insert("LOG_LEVEL".to_string(), "debug".to_string());
+        let req = DeployRequest {
+            repo_url: "https://example.com/repo.git".into(),
+            config_path: "Russelfile.toml".into(),
+            vm_id: None,
+            port: None,
+            runtime: None,
+            podman_args: vec![],
+            env,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("LOG_LEVEL"));
+        assert!(json.contains("debug"));
+        let parsed: DeployRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.env.get("LOG_LEVEL"), Some(&"debug".to_string()));
+    }
+
+    #[test]
+    fn deploy_request_env_defaults_empty() {
+        let json = r#"{"repo_url":"https://example.com/repo.git","config_path":"Russelfile.toml"}"#;
+        let req: DeployRequest = serde_json::from_str(json).unwrap();
+        assert!(req.env.is_empty());
+    }
+
+    #[test]
     fn deploy_request_podman_args_roundtrip() {
         let req = DeployRequest {
             repo_url: "https://example.com/repo.git".into(),
@@ -187,6 +228,7 @@ mod tests {
                 "--mount".into(),
                 "type=bind,source=/tmp/x,destination=/data".into(),
             ],
+            env: HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: DeployRequest = serde_json::from_str(&json).unwrap();

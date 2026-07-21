@@ -19,7 +19,7 @@ Russel is split into three crates:
 3. **Branch on runtime**
    - **microvm (default):** minimal initramfs → TAP + socat + virtiofsd → Cloud Hypervisor → guest runs app from virtiofs `/nix/store`.
    - **container:** prepare Docker-like rootfs → rootless Podman `--rootfs` + `/nix/store:ro` bind → publish `-p HOST:GUEST`.
-4. **Ready** — TCP readiness on guest (microVM) or published host port (container); metadata written under `/var/lib/russel/<id>/`.
+4. **Ready** — TCP readiness on guest (microVM) or published host port (container); metadata written under `/var/lib/russel/<id>/`. Register with the `Ingress` trait (default: `TraefikFileIngress` writes Traefik dynamic config) so the reverse proxy can route traffic to the new backend.
 
 ## Quick Start
 
@@ -90,7 +90,7 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 ## CLI Commands
 
 ```bash
-russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container] [-- <podman-run-args...>]
+russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] [-- <podman-run-args...>]
 russel status [<service_id>]
 russel logs [<service_id>]
 russel vms
@@ -98,8 +98,12 @@ russel stop <service_id>
 russel destroy <service_id>
 ```
 
+- **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
+- **`--env-file PATH`**: Load `KEY=VALUE` pairs from a file (`#` comments, blank lines skipped). Merged with `[service.env]` and `--env` (later wins).
+- Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
+
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
-- Ports today: **`-p HOST:GUEST`** (published binds). See [Networking Model](#networking-model) for the Traefik roadmap.
+- Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
 
 ### Repo URLs
 
@@ -127,6 +131,10 @@ port = 3000
 memory = "256mb"
 bin = "api"    # optional — defaults to name
 type = "microvm"  # optional: "microvm" (default) or "container"
+
+[service.env]    # optional — user-defined environment variables
+LOG_LEVEL = "info"
+FEATURE_X = "1"
 ```
 
 ### Runtimes
@@ -151,7 +159,7 @@ type = "microvm"  # optional: "microvm" (default) or "container"
   -- -v /data:/data:ro --network bridge
 ```
 
-Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring (planned for Traefik integration), expose a `/health` endpoint on `PORT` as a convention.
+Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring, expose a `/health` endpoint on `PORT` as a convention (Traefik is already the ingress).
 
 ## Networking Model
 
@@ -162,9 +170,24 @@ Russel checks readiness by TCP-connecting to the published host port (container)
 
 `-p HOST:GUEST` publishes a host port via `socat` (microVM) or Podman port mapping (container). Both paths go through the port allocator so host ports never collide across services.
 
-### Traefik Gateway (planned)
+### Traefik Gateway
 
-Future: Traefik becomes the **primary ingress gateway**. Public traffic hits Traefik; applications only declare a **listen port** (`service.port` in Russelfile = guest/backend port). The host port is auto-allocated as a private backend — no user `-p` required for normal HTTP apps. `-p` remains available as an escape hatch for direct host publishing until Traefik lands.
+Traefik is the **primary HTTP ingress gateway**. Russel writes dynamic configuration files into `/var/lib/russel/traefik/dynamic/` (override with `RUSSEL_TRAEFIK_DYNAMIC_DIR`). Each deployed service gets a Host rule: `<service_id>.<domain>` (domain defaults to `russel.local`, override with `RUSSEL_TRAEFIK_DOMAIN`).
+
+```yaml
+# Static Traefik config snippet (traefik.yml)
+entryPoints:
+  web:
+    address: ":80"
+providers:
+  file:
+    directory: /var/lib/russel/traefik/dynamic
+    watch: true
+```
+
+With Traefik running, access your service at `http://<service_id>.russel.local` (requires DNS or `/etc/hosts` entry pointing to Traefik's IP). The host port is auto-allocated as a private backend — no user `-p` required for normal HTTP apps. `-p` remains available as an escape hatch for direct host publishing.
+
+On destroy/stop, Russel removes the dynamic config file so Traefik stops routing to the dead backend. Redeploy re-registers with the new backend port.
 
 ## Lifecycle
 
@@ -302,7 +325,7 @@ pre-allocated.
 
 - **Subnet collision detection** — 16-bit FNV-1a space, <2% collision at 50 services. Add when scale demands it.
 - **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
-- **Traefik/Database/Health stubs** — documented placeholders, fully functional via direct socat access.
+- **Database/Health stubs** — documented placeholders, fully functional via direct socat access.
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 - **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
 

@@ -5,6 +5,45 @@ lifecycles, and host-side networking.
 
 ---
 
+## Ingress Trait
+
+Deploy uses the `Ingress` trait (defined in `crates/ctrl/src/ingress.rs`) to advertise service backends to a reverse proxy. `TraefikFileIngress` (in `crates/ctrl/src/traefik.rs`) is the default implementation, writing Traefik dynamic configuration files. Future proxies (Caddy, Envoy, NGINX) implement the same trait — deploy, stop, and destroy never import Traefik types directly.
+
+## Traefik Gateway
+
+Russel integrates with [Traefik](https://traefik.io/) as the primary HTTP reverse proxy. The control plane writes dynamic configuration files (JSON) into a watched directory. Traefik picks up changes automatically — no reload signal needed.
+
+### Flow
+
+```text
+Client → Traefik (:80) → 127.0.0.1:<host_port> (socat/podman) → guest:<guest_port>
+          ↑                        ↑
+     Host(`svc.russel.local`)   dynamic file written by russel-ctrl
+```
+
+1. On deploy success, russel-ctrl writes `{service_id}.json` to the dynamic config directory.
+2. Traefik's file provider watches the directory and applies the new router + service.
+3. On stop/destroy, russel-ctrl removes the file; Traefik stops routing.
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `/var/lib/russel/traefik/dynamic` | Directory for dynamic config files |
+| `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Domain suffix for Host rules |
+
+### Router / Service Naming
+
+- Router: `russel-{service_id}`
+- Service: `russel-{service_id}`
+- Rule: `Host(\`{service_id}.{domain}\`)`
+- EntryPoints: `web`
+- Backend: `http://127.0.0.1:{host_port}`
+
+See [docs/traefik.md](traefik.md) for a complete static Traefik configuration example.
+
+---
+
 ## Deployment Pipeline
 
 Shared steps:

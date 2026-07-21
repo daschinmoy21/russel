@@ -328,12 +328,21 @@ impl AppState {
             s.process_generation = s.process_generation.wrapping_add(1);
             s.process_generation
         };
-        self.spawn_container_supervisor(service_id.to_string(), container_id.to_string(), generation);
+        self.spawn_container_supervisor(
+            service_id.to_string(),
+            container_id.to_string(),
+            generation,
+        );
     }
 
     /// Lightweight container liveness supervisor: polls podman inspect every 30s.
     /// If the container is no longer running, marks the service failed.
-    fn spawn_container_supervisor(&self, service_id: String, container_id: String, generation: u64) {
+    fn spawn_container_supervisor(
+        &self,
+        service_id: String,
+        container_id: String,
+        generation: u64,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
@@ -366,7 +375,10 @@ impl AppState {
                         container_id = %container_id,
                         "container is no longer running — marking failed"
                     );
-                    state.mark_failed(&service_id, format!("container {container_id} is not running"));
+                    state.mark_failed(
+                        &service_id,
+                        format!("container {container_id} is not running"),
+                    );
                     return;
                 }
             }
@@ -504,6 +516,8 @@ impl AppState {
         }
     }
 
+    // kept for deploy error recovery / future reconcile
+    #[allow(dead_code)]
     pub fn restore_processes(
         &self,
         service_id: &str,
@@ -598,9 +612,9 @@ impl AppState {
         let inner = self.lock_inner();
         let s = inner.services.get(service_id)?;
         let mut output = s.logs.clone();
-        let runtime = s
-            .runtime
-            .unwrap_or_else(|| crate::metadata::prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm));
+        let runtime = s.runtime.unwrap_or_else(|| {
+            crate::metadata::prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm)
+        });
         match runtime {
             RuntimeKind::Microvm => {
                 let console_path = format!("/var/lib/russel/{service_id}/console.log");

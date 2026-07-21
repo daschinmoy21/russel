@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait = "0.1"
 axum.workspace = true
 libc = "0.2"
 serde.workspace = true

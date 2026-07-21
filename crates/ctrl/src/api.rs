@@ -18,6 +18,7 @@ use tokio_stream::StreamExt;
 use crate::{
     container::{ContainerRunner, container_log_path},
     deploy::DeployPipeline,
+    ingress::default_ingress,
     metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
@@ -66,9 +67,7 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let provided = header
-        .strip_prefix("Bearer ")
-        .unwrap_or("");
+    let provided = header.strip_prefix("Bearer ").unwrap_or("");
 
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);
@@ -393,6 +392,11 @@ async fn vm_stop(
 
     match result {
         Ok(_) => {
+            // Deregister from ingress so the proxy stops routing to this backend.
+            let ingress = default_ingress();
+            if let Err(e) = ingress.deregister(&service_id).await {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during stop");
+            }
             tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
             state.set_status(&service_id, "stopped", "none");
             Ok(Json(format!("stopped {label} {service_id}")))
@@ -435,6 +439,11 @@ async fn vm_destroy(
 
     match result {
         Ok(_) => {
+            // Deregister from ingress so the proxy stops routing to this (now destroyed) backend.
+            let ingress = default_ingress();
+            if let Err(e) = ingress.deregister(&service_id).await {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during destroy");
+            }
             if runtime == RuntimeKind::Microvm {
                 release_subnet(&service_id);
             }

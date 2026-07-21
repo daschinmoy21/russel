@@ -2,6 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::process::Command;
@@ -13,9 +14,11 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use std::collections::HashMap;
+
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::{RuntimeKind, Russelfile, resolve_runtime},
+    config::{RuntimeKind, Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
 use crate::{
@@ -26,11 +29,11 @@ use crate::{
     },
     database::DatabaseProvisioner,
     git::GitClient,
+    ingress::{self, Backend, Ingress},
     metadata::{build_container_metadata, build_microvm_metadata, write_metadata},
     microvm::{self, BootOutput, KernelInfo, MicrovmRunner},
     network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
     state::AppState,
-    traefik::TraefikClient,
     warm_pool::shared_warm_pool,
 };
 
@@ -43,7 +46,6 @@ enum DeployInnerResult {
     RolledBack { runtime: RuntimeKind, error: String },
 }
 
-#[derive(Debug)]
 pub struct DeployPipeline {
     state: AppState,
     git: GitClient,
@@ -53,7 +55,22 @@ pub struct DeployPipeline {
     runner: MicrovmRunner,
     containers: ContainerRunner,
     ports: PortAllocator,
-    traefik: TraefikClient,
+    ingress: Arc<dyn Ingress>,
+}
+
+impl std::fmt::Debug for DeployPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployPipeline")
+            .field("state", &self.state)
+            .field("git", &self.git)
+            .field("builder", &self.builder)
+            .field("database", &self.database)
+            .field("runner", &self.runner)
+            .field("containers", &self.containers)
+            .field("ports", &self.ports)
+            .field("ingress", &"Arc<dyn Ingress>")
+            .finish()
+    }
 }
 
 impl DeployPipeline {
@@ -70,7 +87,7 @@ impl DeployPipeline {
             runner: microvm::shared_runner(),
             containers: ContainerRunner::new(),
             ports: PortAllocator,
-            traefik: TraefikClient,
+            ingress: ingress::default_ingress(),
         }
     }
 
@@ -101,6 +118,8 @@ impl DeployPipeline {
                 vm_ip: None,
                 runtime: request.runtime,
                 message: e.to_string(),
+                route_host: None,
+                backend_port: None,
             };
         }
 
@@ -119,6 +138,8 @@ impl DeployPipeline {
                 vm_ip: None,
                 runtime: request.runtime,
                 message: e.to_string(),
+                route_host: None,
+                backend_port: None,
             };
         }
 
@@ -177,6 +198,7 @@ impl DeployPipeline {
                         )
                     }
                 };
+                let route_host = self.ingress.primary_host(&service_id);
                 DeployResponse {
                     service_id,
                     vm_id,
@@ -190,6 +212,8 @@ impl DeployPipeline {
                     vm_ip,
                     runtime: Some(output.runtime),
                     message,
+                    route_host,
+                    backend_port: Some(host_port),
                 }
             }
             Ok(DeployInnerResult::RolledBack {
@@ -218,6 +242,8 @@ impl DeployPipeline {
                     message: format!(
                         "deployment failed but rolled back successfully: {original_error}"
                     ),
+                    route_host: None,
+                    backend_port: None,
                 }
             }
             Err(error) => {
@@ -242,6 +268,8 @@ impl DeployPipeline {
                     vm_ip: None,
                     runtime: request_runtime,
                     message: error.to_string(),
+                    route_host: None,
+                    backend_port: None,
                 }
             }
         }
@@ -265,6 +293,11 @@ impl DeployPipeline {
         let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
+
+        // Merge env: file < request (request wins on key conflict).
+        let merged_env = merge_env_maps(&config.service.env, &request.env);
+        validate_env_map(&merged_env)?;
+
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
             service_id,
@@ -336,7 +369,7 @@ impl DeployPipeline {
         // Order (fixes #120):
         // 1. take_processes — disarm supervisor first
         // 2. kill+wait old children so ports are freed
-        // 3. rename dirs to .bak (for rollback)  
+        // 3. rename dirs to .bak (for rollback)
         // 4. destroy_prior_runtime — cleans TAP/ports without needing metadata
         let (old_vm_proc, old_aux_procs) = self
             .state
@@ -361,18 +394,17 @@ impl DeployPipeline {
 
         // Destroy prior runtime: processes already reaped, so stop is no-op;
         // destroy still tears down TAP, releases port, removes .bak dirs.
-        if let Some(prior_kind) = prior_runtime {
-            if let Err(e) =
+        if let Some(prior_kind) = prior_runtime
+            && let Err(e) =
                 destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers).await
-            {
-                if has_backup {
-                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
-                    if has_microvms_dir {
-                        let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
-                    }
+        {
+            if has_backup {
+                let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                if has_microvms_dir {
+                    let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
                 }
-                anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
             }
+            anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
         }
 
         let mut port_reservation = None;
@@ -403,6 +435,7 @@ impl DeployPipeline {
                         &build.store_path,
                         &port,
                         kernel.as_ref().unwrap(),
+                        &merged_env,
                         &tx,
                     )
                     .await
@@ -414,6 +447,7 @@ impl DeployPipeline {
                         &build.store_path,
                         &port,
                         &request.podman_args,
+                        &merged_env,
                         &tx,
                     )
                     .await
@@ -497,8 +531,8 @@ impl DeployPipeline {
         };
 
         if let Err(error) = self
-            .traefik
-            .register(service_id, workload.port().host)
+            .ingress
+            .register(service_id, &Backend::localhost(workload.port().host), &[])
             .await
         {
             // Full workload teardown on traefik registration failure (#116).
@@ -561,6 +595,7 @@ impl DeployPipeline {
         store_path: &Path,
         port: &PortMapping,
         kernel_info: &KernelInfo,
+        env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         let alloc: SubnetAllocation = subnet_for(service_id);
@@ -590,13 +625,17 @@ impl DeployPipeline {
         std::fs::create_dir_all(&cfg_dir)
             .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
         // Shell-quote APP path to prevent injection through deploy.env
-        let deploy_env = format!(
+        let mut deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
             alloc.vm_ip,
             alloc.host_ip,
             port.guest,
             shell_quote(&app_path)
         );
+        // Append user env vars, shell-quoted.
+        for (key, value) in env {
+            deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
+        }
         std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
 
         // Agent initramfs is cached after first use — no app baked in.
@@ -746,6 +785,7 @@ impl DeployPipeline {
         store_path: &Path,
         port: &PortMapping,
         podman_args: &[String],
+        env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
@@ -792,7 +832,7 @@ impl DeployPipeline {
             host_port: port.host,
             guest_port: port.guest,
             memory_mb: mem_mb,
-            env: vec![("PORT".to_string(), port.guest.to_string())],
+            env: build_container_env(port.guest, env),
             extra_args: podman_args.to_vec(),
         };
         let running = self.containers.start(&start_spec).await?;
@@ -866,15 +906,15 @@ async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKind> {
         .args(["container", "exists", &container_name])
         .output()
         .await;
-    if let Ok(out) = &probe {
-        if out.status.success() {
-            tracing::info!(
-                service_id,
-                container = %container_name,
-                "discovered existing podman container (no metadata)"
-            );
-            return Some(RuntimeKind::Container);
-        }
+    if let Ok(out) = &probe
+        && out.status.success()
+    {
+        tracing::info!(
+            service_id,
+            container = %container_name,
+            "discovered existing podman container (no metadata)"
+        );
+        return Some(RuntimeKind::Container);
     }
 
     // No metadata and no container: if any russel/microvms directory exists,
@@ -1284,9 +1324,9 @@ pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
     if name.len() > 256 {
         anyhow::bail!("bin_name too long (max 256 characters)");
     }
-    let valid = name.bytes().all(|c| {
-        c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-'
-    });
+    let valid = name
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-');
     if !valid {
         anyhow::bail!(
             "bin_name '{}' contains invalid characters (only A-Za-z0-9._+- allowed)",
@@ -1300,6 +1340,22 @@ pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
 pub fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\\''");
     format!("'{}'", escaped)
+}
+
+/// Build the env list for a container start spec: PORT first (managed),
+/// then user env vars (already validated; PORT filtered out to prevent override).
+pub fn build_container_env(
+    guest_port: u16,
+    user_env: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![("PORT".to_string(), guest_port.to_string())];
+    for (key, value) in user_env {
+        if key == "PORT" {
+            continue; // managed by Russel, user cannot override
+        }
+        env.push((key.clone(), value.clone()));
+    }
+    env
 }
 
 /// Validate relative path components of user `config_path` (no absolute / `..`).

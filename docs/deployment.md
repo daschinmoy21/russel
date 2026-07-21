@@ -45,6 +45,14 @@ bin = "my-app"
 # This is the source of truth. CLI --runtime must match if provided.
 type = "microvm"
 
+# Optional: User-defined environment variables injected at deploy time.
+# Keys must start with a letter or underscore, contain only [A-Za-z0-9_].
+# Reserved keys (PORT, VM_IP, HOST_IP, APP) are rejected.
+# Values are plain text (no secrets support yet). Max 64 keys, 4096 bytes each.
+[service.env]
+LOG_LEVEL = "info"
+FEATURE_X = "1"
+
 # Optional: Database provisioning (planned — current: placeholder)
 [database.postgres]
 enabled = false
@@ -148,11 +156,32 @@ If your app is already distributed as a precompiled binary in Nixpkgs (e.g., Pyt
 
 Russel verifies deployment readiness by TCP-connecting to the guest port for up to 10 seconds. If the port doesn't respond, Russel attempts rollback to the previous working VM (only when a prior VM backup exists). For an initial deployment with no backup, readiness failure cleans up the attempted VM and returns failure without restoring a prior VM.
 
-**Recommended convention**: Expose a `GET /health` endpoint on your app's `PORT`. While Russel doesn't currently check HTTP status, this endpoint will be used by future Traefik health checks and is a good practice for any service.
+**Recommended convention**: Expose a `GET /health` endpoint on your app's `PORT`. While Russel doesn't currently check HTTP status, this endpoint will be used by Traefik health checks and is a good practice for any service.
+
+## 4. Accessing Your Service
+
+### Via Traefik (recommended)
+
+When Traefik is running as the ingress gateway, Russel writes dynamic configuration automatically. Access your service at:
+
+```text
+http://<service_id>.russel.local
+```
+
+This requires:
+1. Traefik running with the file provider pointed at `/var/lib/russel/traefik/dynamic` (see [docs/traefik.md](traefik.md)).
+2. DNS or `/etc/hosts` entry mapping `*.russel.local` to your host's IP:
+   ```text
+   127.0.0.1  api.russel.local  demo.russel.local
+   ```
+
+### Via Direct Port
+
+`-p HOST:GUEST` publishes a host port. Access directly at `http://localhost:<HOST>`.
 
 ---
 
-## 4. Security & Validation
+## 5. Security & Validation
 
 ### Repository URLs
 
@@ -171,7 +200,29 @@ The config file path must be **relative** to the repository root. The control pl
 
 The binary name (from `Russelfile.toml` `bin` or `name`) must match the safe charset `[A-Za-z0-9._+-]` (max 256 characters). It is injected into the guest via a shell-quoted `deploy.env` file — single quotes with embedded `'` escaped as `'\''`.
 
-## 5. Nix DX vs Docker DX
+## 6. Environment Variables
+
+Deploy-time environment variables can be set via three mechanisms, merged in order (later wins):
+
+1. **`[service.env]` in Russelfile.toml** — project defaults, checked into version control.
+2. **`--env-file PATH`** — a file with `KEY=VALUE` lines (`#` comments, blank lines skipped).
+3. **`--env KEY=VALUE`** — repeatable CLI flag, highest priority.
+
+### Validation
+
+- Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` (start with letter or underscore, alphanumeric + underscore).
+- Reserved keys **`PORT`**, **`VM_IP`**, **`HOST_IP`**, **`APP`** are rejected (managed by Russel).
+- Values must not contain NUL bytes. Maximum value length is 4096 bytes.
+- Maximum 64 keys total after merging all sources.
+
+### Injection
+
+- **microVM:** Custom env vars are appended to `/config/deploy.env` (shell-quoted) and exported before the app starts.
+- **Container:** Custom env vars are passed via `podman run -e` after the managed `PORT` variable.
+
+> **Note:** Secrets (e.g. `DATABASE_URL`) are **not** supported yet. All values are plain text.
+
+## 7. Nix DX vs Docker DX
 
 | Developer Experience | Docker | Russel (Nix + MicroVM) |
 |----------------------|--------|------------------------|
