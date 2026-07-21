@@ -1,11 +1,34 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    sync::{LazyLock, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
+
+static ACTIVE_CHECKOUTS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn active_checkouts() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    ACTIVE_CHECKOUTS.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("ACTIVE_CHECKOUTS lock poisoned — recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Lease for a checkout that is still being read by a deployment.
+pub struct CheckoutLease {
+    path: PathBuf,
+}
+
+impl Drop for CheckoutLease {
+    fn drop(&mut self) {
+        active_checkouts().remove(&self.path);
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct GitClient;
@@ -78,12 +101,9 @@ impl GitClient {
             tracing::warn!(error = %e, "checkout GC failed (continuing)");
         }
 
-        // Unique dir per URL: content hash avoids sanitize collisions (#121 / #38).
-        let checkout = checkout_root.join(checkout_dir_name(repo));
-        if checkout.exists() {
-            // Replace existing checkout for this URL (idempotent redeploy).
-            let _ = fs::remove_dir_all(&checkout);
-        }
+        // Immutable per-deploy workdir: URL hash prefix + unique deploy stamp so
+        // concurrent deploys / age-based GC cannot clobber an in-use checkout.
+        let checkout = checkout_root.join(unique_checkout_dir_name(repo));
 
         let output = Command::new("git")
             .arg("clone")
@@ -95,23 +115,57 @@ impl GitClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if let Err(cleanup_err) = fs::remove_dir_all(&checkout)
+                && cleanup_err.kind() != std::io::ErrorKind::NotFound
+            {
+                anyhow::bail!(
+                    "git clone failed for {repo}: {} (also failed to remove partial checkout {}: {})",
+                    stderr.trim(),
+                    checkout.display(),
+                    cleanup_err
+                );
+            }
             anyhow::bail!(
                 "git clone failed for {repo}: {}.\nUse an absolute path for local deploys.",
                 stderr.trim()
             );
         }
 
+        active_checkouts().insert(checkout.clone());
         Ok(checkout)
+    }
+
+    /// Keep a resolved checkout out of age-based GC until the caller finishes
+    /// reading it. The checkout is immutable and may safely be used by other
+    /// concurrent deployments, but must not be removed while this lease lives.
+    pub fn hold_checkout(&self, path: &Path) -> CheckoutLease {
+        active_checkouts().insert(path.to_path_buf());
+        CheckoutLease {
+            path: path.to_path_buf(),
+        }
     }
 }
 
-/// Stable, unique directory name for a remote repo URL.
+fn fnv1a_u64(bytes: impl AsRef<[u8]>) -> u64 {
+    bytes
+        .as_ref()
+        .iter()
+        .fold(14_695_981_039_346_656_037u64, |acc, &b| {
+            acc.wrapping_mul(1_099_511_628_211) ^ b as u64
+        })
+}
+
+/// Stable URL identity: the standard 64-bit FNV-1a result as 16 lowercase hex
+/// digits.
+fn url_hash_hex(repo: &str) -> String {
+    format!("{:016x}", fnv1a_u64(repo.as_bytes()))
+}
+
+/// Stable, unique directory name stem for a remote repo URL.
 ///
-/// Format: `{sanitized_prefix}-{16 hex of FNV-1a of full URL}`.
+/// Format: `{sanitized_prefix}-{16 hex FNV identity}`.
 fn checkout_dir_name(repo: &str) -> String {
-    let hash = repo.bytes().fold(2_166_136_261u32, |acc, b| {
-        acc.wrapping_mul(16_777_619) ^ b as u32
-    });
+    let hash = url_hash_hex(repo);
     let prefix: String = repo
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -119,26 +173,80 @@ fn checkout_dir_name(repo: &str) -> String {
         .collect();
     let prefix = prefix.trim_matches('-');
     if prefix.is_empty() {
-        format!("repo-{hash:08x}")
+        format!("repo-{hash}")
     } else {
-        format!("{prefix}-{hash:08x}")
+        format!("{prefix}-{hash}")
     }
 }
 
+/// Per-deploy immutable directory under the URL stem.
+fn unique_checkout_dir_name(repo: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stamp = format!("{:x}", nanos ^ ((std::process::id() as u128) << 16));
+    format!(
+        "{}-d{}",
+        checkout_dir_name(repo),
+        &stamp[..stamp.len().min(12)]
+    )
+}
+
 /// Remove checkout directories older than `max_age`.
+///
+/// Filesystem errors on individual entries are logged and skipped so one
+/// bad directory does not abort GC of the rest.
 pub fn gc_old_checkouts(checkout_root: &Path, max_age: Duration) -> anyhow::Result<usize> {
     if !checkout_root.exists() {
         return Ok(0);
     }
     let now = SystemTime::now();
     let mut removed = 0usize;
-    for entry in fs::read_dir(checkout_root)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
+    let entries = match fs::read_dir(checkout_root) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read checkout root for GC");
+            return Ok(0);
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "skip unreadable checkout entry during GC");
+                continue;
+            }
+        };
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %e,
+                    "skip checkout with unreadable metadata during GC"
+                );
+                continue;
+            }
+        };
         if !meta.is_dir() {
             continue;
         }
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified = match meta.modified() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %e,
+                    "skip checkout with unknown mtime during GC"
+                );
+                continue;
+            }
+        };
+        if active_checkouts().contains(&entry.path()) {
+            tracing::debug!(path = %entry.path().display(), "skip active checkout during GC");
+            continue;
+        }
         let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
         if age > max_age {
             match fs::remove_dir_all(entry.path()) {
@@ -171,25 +279,55 @@ mod tests {
         assert_ne!(a, b);
         // Same URL is stable.
         assert_eq!(a, checkout_dir_name("https://github.com/org/repo-a.git"));
+        // 16 hex digits in the hash suffix.
+        let hash = a.rsplit('-').next().unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn checkout_dir_name_avoids_sanitize_collision() {
-        // Previously both would become the same sanitize string.
-        let a = checkout_dir_name("https://github.com/foo/bar");
-        let b = checkout_dir_name("https://gitlab.com/foo/bar");
+        // Identical 48-char sanitized prefix; only the hash must distinguish them.
+        let base = "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let a = checkout_dir_name(&format!("{base}/one"));
+        let b = checkout_dir_name(&format!("{base}/two"));
         assert_ne!(a, b);
+        // Prefixes before the 16-hex hash should match.
+        let pa = a.rsplit_once('-').unwrap().0;
+        let pb = b.rsplit_once('-').unwrap().0;
+        assert_eq!(pa, pb);
     }
 
     #[test]
-    fn gc_removes_old_dirs() {
+    fn gc_removes_only_stale_dirs() {
         let tmp = TempDir::new().unwrap();
-        let old = tmp.path().join("old-checkout");
-        fs::create_dir_all(&old).unwrap();
-        // Set mtime to the past via filetime is not available; touch then GC with zero age
-        // would remove everything. Use max_age=0 to remove all.
-        let removed = gc_old_checkouts(tmp.path(), Duration::from_secs(0)).unwrap();
+        let stale = tmp.path().join("stale-checkout");
+        let fresh = tmp.path().join("fresh-checkout");
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+
+        let now = SystemTime::now();
+        let stale_time = now - Duration::from_secs(2 * 3600);
+        fs::File::open(&stale)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(stale_time))
+            .unwrap();
+        fs::File::open(&fresh)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(now))
+            .unwrap();
+
+        let removed = gc_old_checkouts(tmp.path(), Duration::from_secs(3600)).unwrap();
         assert_eq!(removed, 1);
-        assert!(!old.exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn unique_checkout_dirs_share_stem() {
+        let stem = checkout_dir_name("https://github.com/org/repo.git");
+        let a = unique_checkout_dir_name("https://github.com/org/repo.git");
+        assert!(a.starts_with(&stem));
+        assert!(a.contains("-d"));
     }
 }

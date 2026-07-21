@@ -44,7 +44,10 @@ impl TraefikFileIngress {
             "1" | "true" | "yes" | "on"
         );
         let cert_resolver = std::env::var("RUSSEL_TRAEFIK_CERT_RESOLVER")
-            .unwrap_or_else(|_| "letsencrypt".to_string());
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "letsencrypt".to_string());
         Self {
             dynamic_dir,
             domain,
@@ -199,6 +202,12 @@ fn svc_name(service_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn test_ingress(dir: impl Into<PathBuf>, domain: &str) -> TraefikFileIngress {
         TraefikFileIngress {
@@ -380,6 +389,9 @@ mod tests {
 
     #[test]
     fn from_env_defaults_when_unset() {
+        let _lock = env_lock();
+        let previous = std::env::var_os("RUSSEL_TRAEFIK_CERT_RESOLVER");
+        unsafe { std::env::remove_var("RUSSEL_TRAEFIK_CERT_RESOLVER") };
         let ing = TraefikFileIngress::default();
         assert!(
             ing.dynamic_dir
@@ -387,6 +399,27 @@ mod tests {
                 .contains("traefik/dynamic")
         );
         assert!(!ing.domain.is_empty());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RUSSEL_TRAEFIK_CERT_RESOLVER", value),
+                None => std::env::remove_var("RUSSEL_TRAEFIK_CERT_RESOLVER"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_blank_resolver_defaults() {
+        let _lock = env_lock();
+        let previous = std::env::var_os("RUSSEL_TRAEFIK_CERT_RESOLVER");
+        unsafe { std::env::set_var("RUSSEL_TRAEFIK_CERT_RESOLVER", "  ") };
+        let ing = TraefikFileIngress::from_env();
+        assert_eq!(ing.cert_resolver, "letsencrypt");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RUSSEL_TRAEFIK_CERT_RESOLVER", value),
+                None => std::env::remove_var("RUSSEL_TRAEFIK_CERT_RESOLVER"),
+            }
+        }
     }
 
     #[test]

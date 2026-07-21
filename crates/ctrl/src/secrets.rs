@@ -4,12 +4,17 @@
 //! This is intentionally a simple single-node store — not a KMS. Values are
 //! never written into Russelfile; deploy resolves `secret://name` env refs.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(test)]
 use std::path::Path;
 
 const DEFAULT_SECRETS_DIR: &str = "/var/lib/russel/secrets";
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Validate a secret name: alphanumeric, `_`, `-`, length 1..=64.
 pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
@@ -39,7 +44,7 @@ fn secret_path(name: &str) -> anyhow::Result<PathBuf> {
     Ok(secrets_dir().join(name))
 }
 
-/// Persist a secret value (mode 0600). Overwrites if present.
+/// Persist a secret value (mode 0600). Overwrites if present via atomic rename.
 pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("secret value must not be empty");
@@ -48,21 +53,51 @@ pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
         anyhow::bail!("secret value too large (max 64 KiB)");
     }
     let path = secret_path(name)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("create secrets dir: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-    std::fs::write(&path, value).map_err(|e| anyhow::anyhow!("write secret: {e}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("secret path has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("create secrets dir: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("chmod secret: {e}"))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow::anyhow!("chmod secrets dir: {e}"))?;
     }
+
+    // Atomic replace: write temp in the same directory, then rename.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let tmp = parent.join(format!(".{name}.tmp.{nonce:x}"));
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut f = options
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("create secret tmp: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("chmod secret tmp: {e}"))?;
+        }
+        f.write_all(value.as_bytes())
+            .map_err(|e| anyhow::anyhow!("write secret tmp: {e}"))?;
+        f.sync_all()
+            .map_err(|e| anyhow::anyhow!("fsync secret tmp: {e}"))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("rename secret into place: {e}")
+    })?;
     Ok(())
 }
 
@@ -94,6 +129,10 @@ pub fn list_secrets() -> anyhow::Result<Vec<String>> {
         if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
             && let Some(name) = entry.file_name().to_str()
         {
+            // Skip temp files.
+            if name.starts_with('.') {
+                continue;
+            }
             names.push(name.to_string());
         }
     }
@@ -120,22 +159,34 @@ pub fn resolve_env_secrets(
 }
 
 /// Test helper: operate under an arbitrary secrets root.
+/// Serialized via a process-wide mutex; restores env even on panic.
 #[cfg(test)]
 pub fn with_secrets_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-    // SAFETY: tests run single-threaded for secrets module; env is restored.
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    struct EnvRestore(Option<std::ffi::OsString>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("RUSSEL_SECRETS_DIR", v),
+                    None => std::env::remove_var("RUSSEL_SECRETS_DIR"),
+                }
+            }
+        }
+    }
+
     let prev = std::env::var_os("RUSSEL_SECRETS_DIR");
-    // std::env::set_var is unsafe on recent rustc when multi-threaded.
+    let _restore = EnvRestore(prev);
     unsafe {
         std::env::set_var("RUSSEL_SECRETS_DIR", dir);
     }
-    let result = f();
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("RUSSEL_SECRETS_DIR", v),
-            None => std::env::remove_var("RUSSEL_SECRETS_DIR"),
-        }
-    }
-    result
+    f()
 }
 
 #[cfg(test)]

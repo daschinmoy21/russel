@@ -2,8 +2,11 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::process::Command;
 
@@ -38,6 +41,8 @@ use crate::{
 };
 
 pub use crate::metadata::prior_runtime_from_disk;
+
+static SECURE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Typed outcome of `deploy_inner` — success, rollback, or hard failure.
 enum DeployInnerResult {
@@ -290,15 +295,18 @@ impl DeployPipeline {
             })
             .await;
         let repo_path = self.git.clone_or_use_local(&request.repo_url).await?;
+        let _checkout_lease = self.git.hold_checkout(&repo_path);
         let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
         let runtime = resolve_runtime(config.service.runtime, request.runtime)?;
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
 
         // Merge env: file < request (request wins on key conflict).
-        // Resolve `secret://name` refs from the host secrets store.
+        // Resolve `secret://name` refs from the host secrets store, then
+        // re-validate so expanded values cannot smuggle reserved keys / bad chars.
         let merged_env = merge_env_maps(&config.service.env, &request.env);
         validate_env_map(&merged_env)?;
         let merged_env = crate::secrets::resolve_env_secrets(&merged_env)?;
+        validate_env_map(&merged_env)?;
 
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
@@ -626,6 +634,12 @@ impl DeployPipeline {
         let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
         std::fs::create_dir_all(&cfg_dir)
             .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| anyhow::anyhow!("chmod config dir: {e}"))?;
+        }
         // Shell-quote APP path to prevent injection through deploy.env
         let mut deploy_env = format!(
             "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
@@ -634,11 +648,11 @@ impl DeployPipeline {
             port.guest,
             shell_quote(&app_path)
         );
-        // Append user env vars, shell-quoted.
+        // Append user env vars, shell-quoted (may include expanded secrets).
         for (key, value) in env {
             deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
         }
-        std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
+        write_secure_file(format!("{cfg_dir}/deploy.env"), &deploy_env)?;
 
         // Agent initramfs is cached after first use — no app baked in.
         let initramfs_path = self.runner.build_agent_initramfs().await?;
@@ -1083,6 +1097,11 @@ async fn attempt_microvm_rollback(
     let alloc = subnet_for(service_id);
     let cfg_dir = format!("{}/cfg", russel_dir);
     std::fs::create_dir_all(&cfg_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let deploy_env = format!(
         "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
         alloc.vm_ip,
@@ -1090,7 +1109,7 @@ async fn attempt_microvm_rollback(
         guest_port,
         shell_quote(&app_path)
     );
-    std::fs::write(format!("{cfg_dir}/deploy.env"), deploy_env)?;
+    write_secure_file(format!("{cfg_dir}/deploy.env"), &deploy_env)?;
 
     // 4. Reserve port
     PortAllocator::reserve(service_id, host_port)?;
@@ -1339,6 +1358,53 @@ pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
 }
 
 /// Shell-safe single-quoted value for deploy.env: escapes embedded `'` as `'\''`.
+/// Write `content` to `path` with mode 0600 via temp file + atomic rename.
+fn write_secure_file(path: impl AsRef<std::path::Path>, content: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("secure file path has no parent"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(SECURE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let tmp = parent.join(format!(
+        ".{}.tmp.{nonce:x}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
+    ));
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut f = options
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("create secure tmp {}: {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("chmod secure tmp: {e}"))?;
+        }
+        f.write_all(content.as_bytes())
+            .map_err(|e| anyhow::anyhow!("write secure tmp: {e}"))?;
+        f.sync_all()
+            .map_err(|e| anyhow::anyhow!("fsync secure tmp: {e}"))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("rename secure file into place: {e}")
+    })?;
+    Ok(())
+}
+
 pub fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\\''");
     format!("'{}'", escaped)

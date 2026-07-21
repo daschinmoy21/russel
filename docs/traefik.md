@@ -82,9 +82,12 @@ No reload, no API calls, no Traefik binary dependency in Russel.
 
 ## TLS / ACME
 
-Enable TLS on dynamic routers written by Russel:
+Enable TLS on dynamic routers written by Russel. Use a **public DNS name**
+(not `russel.local`) and ensure ports 80/443 are reachable for the HTTP-01
+challenge:
 
 ```bash
+export RUSSEL_TRAEFIK_DOMAIN=example.com          # public domain, DNS A/AAAA → host
 export RUSSEL_TRAEFIK_TLS=1
 export RUSSEL_TRAEFIK_CERT_RESOLVER=letsencrypt   # must match Traefik static config
 ```
@@ -102,6 +105,8 @@ certificatesResolvers:
   letsencrypt:
     acme:
       email: you@example.com
+      # Create with mode 0600, owned by the Traefik user, on persistent storage:
+      #   install -m 600 -o traefik -g traefik /dev/null /var/lib/traefik/acme.json
       storage: /var/lib/traefik/acme.json
       httpChallenge:
         entryPoint: web
@@ -113,4 +118,5 @@ providers:
 ```
 
 When `RUSSEL_TRAEFIK_TLS=1`, each service router uses entryPoints `web` +
-`websecure` and sets `tls.certResolver` to `RUSSEL_TRAEFIK_CERT_RESOLVER`.
+`websecure` and sets `tls.certResolver` to `RUSSEL_TRAEFIK_CERT_RESOLVER`
+(blank env values fall back to `letsencrypt`).
