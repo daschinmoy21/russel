@@ -625,8 +625,17 @@ impl AppState {
         let Some(s) = inner.services.get_mut(service_id) else {
             return LifecycleClaim::NotFound;
         };
-        // Prevent concurrent lifecycle ops on the same service
-        if s.status == "stopping" || s.status == "destroying" || s.status == "building" {
+        // Prevent concurrent lifecycle ops on a different kind of op.
+        // Same-op re-entry (stop while "stopping", destroy while "destroying")
+        // is allowed so a hung first attempt can be retried/forced. Destroy is
+        // also allowed to supersede a stuck stop.
+        let busy = match s.status.as_str() {
+            "building" => true,
+            "destroying" => status != "destroying",
+            "stopping" => status != "stopping" && status != "destroying",
+            _ => false,
+        };
+        if busy {
             return LifecycleClaim::Busy;
         }
         s.status = status.to_string();
@@ -1189,6 +1198,32 @@ mod tests {
         assert!(matches!(
             state.begin_lifecycle_operation("nope", "stopping", "pending"),
             LifecycleClaim::NotFound
+        ));
+    }
+
+    #[test]
+    fn test_begin_lifecycle_allows_stop_reentry_when_stuck_stopping() {
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.set_status("svc-1", "deployed", "running");
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Claimed(_, _)
+        ));
+        // Second stop while already stopping — recovery / force path.
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Claimed(_, _)
+        ));
+        // Destroy may supersede stuck stop.
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
+            LifecycleClaim::Claimed(_, _)
+        ));
+        // Stop cannot run while destroying.
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Busy
         ));
     }
 
