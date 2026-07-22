@@ -58,6 +58,11 @@ pub enum Command {
     Destroy(DestroyArgs),
     /// Re-apply desired state from the recorded Russelfile source (or override).
     Update(UpdateArgs),
+    /// Manage host-side secrets (stored on the control plane, not in Russelfile).
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -73,11 +78,6 @@ pub struct UpdateArgs {
     /// Override config path relative to the repo (default: recorded or Russelfile.toml).
     #[arg(long)]
     pub config: Option<String>,
-    /// Manage host-side secrets (stored on the control plane, not in Russelfile).
-    Secrets {
-        #[command(subcommand)]
-        action: SecretsCommand,
-    },
 }
 
 #[derive(Debug, Subcommand)]
