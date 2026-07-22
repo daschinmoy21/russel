@@ -12,7 +12,7 @@ use russel_core::api::{
     DeployEvent, DeployRequest, LogsResponse, ServiceSummary, StatusResponse, VmsResponse,
 };
 use russel_core::config::RuntimeKind;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio_stream::StreamExt;
 
 use crate::{
@@ -201,7 +201,7 @@ async fn append_podman_logs(service_id: &str, output: &mut String) {
         return;
     }
 
-    let result = Command::new("podman")
+    let result = crate::container::podman_command()
         .args(["logs", "--tail", "200", &name])
         .output()
         .await;
@@ -318,7 +318,7 @@ async fn discover_podman_containers(
     seen: &mut std::collections::HashSet<String>,
 ) {
     // Format: "name\tstate" so we can claim ports only for running containers.
-    let output = Command::new("podman")
+    let output = crate::container::podman_command()
         .args([
             "ps",
             "-a",

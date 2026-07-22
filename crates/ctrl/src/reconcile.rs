@@ -240,7 +240,7 @@ fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
 }
 
 async fn container_running(container_id: &str) -> bool {
-    let output = match tokio::process::Command::new("podman")
+    let output = match crate::container::podman_command()
         .args(["inspect", container_id, "--format", "{{.State.Running}}"])
         .output()
         .await
