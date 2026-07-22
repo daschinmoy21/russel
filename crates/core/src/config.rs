@@ -96,6 +96,10 @@ pub struct ServiceConfig {
     /// User-defined environment variables injected at deploy time.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// When true, include bash + curl debug tools in the container rootfs.
+    /// Defaults to false for production hardening.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 impl ServiceConfig {

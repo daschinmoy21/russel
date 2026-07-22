@@ -1031,6 +1031,7 @@ impl DeployPipeline {
             base_dir: base_dir.clone(),
             bash_store: None,
             curl_store: None,
+            debug: config.service.debug,
         };
         let prepared = self.containers.prepare(&rootfs_spec).await?;
         let create_ms = t.elapsed().as_millis();

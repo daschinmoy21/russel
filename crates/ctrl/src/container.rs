@@ -22,6 +22,9 @@ pub struct RootfsSpec {
     pub bash_store: Option<PathBuf>,
     /// Test injection: skip `nix build` for curl when set.
     pub curl_store: Option<PathBuf>,
+    /// When true, include bash + curl debug tools in the container rootfs.
+    /// Defaults to false for production hardening.
+    pub debug: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,9 +179,6 @@ fn select_nix_tool_store_path(stdout: &[u8], tool: &str) -> anyhow::Result<PathB
 /// resolve without copying store objects into the rootfs.
 pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs> {
     let entrypoint = validate_entrypoint(&spec.store_path, &spec.bin_name)?;
-    let cache = shared_debug_tools();
-    let bash_store = cache.ensure_bash(spec.bash_store.as_deref()).await?;
-    let curl_store = cache.ensure_curl(spec.curl_store.as_deref()).await?;
 
     let rootfs_path = spec.base_dir.join("rootfs");
     if rootfs_path.exists() {
@@ -187,15 +187,26 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
     create_layout(&rootfs_path)?;
     write_etc_files(&rootfs_path)?;
     link_store_binary(&rootfs_path, &entrypoint, &spec.bin_name)?;
-    link_debug_tool(&rootfs_path, &bash_store, "bash")?;
-    link_debug_tool(&rootfs_path, &curl_store, "curl")?;
-    install_env_wrapper(&rootfs_path)?;
+
+    if spec.debug {
+        let cache = shared_debug_tools();
+        let bash_store = cache.ensure_bash(spec.bash_store.as_deref()).await?;
+        let curl_store = cache.ensure_curl(spec.curl_store.as_deref()).await?;
+        link_debug_tool(&rootfs_path, &bash_store, "bash")?;
+        link_debug_tool(&rootfs_path, &curl_store, "curl")?;
+        install_env_wrapper(&rootfs_path)?;
+        tracing::info!(
+            service_id = %spec.service_id,
+            "debug mode: bash + curl linked into rootfs"
+        );
+    }
 
     let container_entrypoint = PathBuf::from(format!("/bin/{}", spec.bin_name));
     tracing::info!(
         service_id = %spec.service_id,
         rootfs = %rootfs_path.display(),
         entrypoint = %container_entrypoint.display(),
+        debug = spec.debug,
         "container rootfs prepared"
     );
 
@@ -950,6 +961,17 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "k8s-file".to_string(),
         "--log-opt".to_string(),
         format!("path={log_path}"),
+        // ── Hardening: drop all capabilities, prevent privilege escalation,
+        //     mount rootfs read-only with writable tmpfs for /tmp and /run.
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--read-only".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+        "--tmpfs".to_string(),
+        "/run".to_string(),
     ];
 
     if !spec.extra_args.is_empty() {
@@ -1113,6 +1135,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: false,
         };
 
         let prepared = prepare_rootfs(&spec).await.unwrap();
@@ -1149,6 +1172,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: false,
         };
 
         let prepared = prepare_rootfs(&spec).await.unwrap();
@@ -1281,6 +1305,16 @@ mod tests {
         assert!(args.contains(&"PORT=3000".to_string()));
         assert!(args.contains(&"RUSSEL=1".to_string()));
         assert_eq!(args.last().unwrap(), "/bin/api");
+
+        // ── Hardening flags ─────────────────────────────────────────────
+        assert!(args.contains(&"--cap-drop".to_string()));
+        assert!(args.contains(&"ALL".to_string()));
+        assert!(args.contains(&"--security-opt".to_string()));
+        assert!(args.contains(&"no-new-privileges".to_string()));
+        assert!(args.contains(&"--read-only".to_string()));
+        assert!(args.contains(&"--tmpfs".to_string()));
+        assert!(args.contains(&"/tmp".to_string()));
+        assert!(args.contains(&"/run".to_string()));
 
         // --rootfs PATH must be immediately before COMMAND so flags are not
         // misparsed as the container executable (crun: `--mount` not found).
@@ -1518,6 +1552,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: true,
         };
 
         let prepared = prepare_rootfs(&spec).await.unwrap();
@@ -1682,6 +1717,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: false,
         };
         let prepared = runner.prepare(&rootfs_spec).await.unwrap();
 
