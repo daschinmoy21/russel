@@ -6,6 +6,7 @@ memory = "256mb"
 # Binary name produced by `go build` (last component of module path).
 # russel uses this for ExecStart in the generated deploy.nix.
 bin = "basic-http"
+# debug = true   # enable bash, curl, /usr/bin/env in container rootfs
 
 [database.postgres]
 enabled = false

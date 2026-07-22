@@ -101,9 +101,11 @@ curl http://localhost:8080/
 Set `type = "container"` in `Russelfile.toml` (source of truth). Optionally pass
 `--runtime container` — it must **match** the file or deploy errors.
 
-Russel prepares a Docker-like rootfs (with `/tmp`, `/var`, bash, curl) under
-`/var/lib/russel/<id>/rootfs` and starts rootless Podman with `--rootfs` plus a
-read-only bind of host `/nix/store`. **Do not** use a bare package path as rootfs.
+Russel prepares a rootfs under `/var/lib/russel/<id>/rootfs` and starts rootless
+Podman with `--rootfs` plus a read-only bind of host `/nix/store`. By default
+(`debug = false`) the rootfs is hardened: read-only with tmpfs `/tmp` and `/run`
+only, no bash/curl. Set `debug = true` in your Russelfile to include shell
+debugging tools. **Do not** use a bare package path as rootfs.
 
 ```toml
 # examples/basic-http/Russelfile.toml
@@ -111,6 +113,7 @@ read-only bind of host `/nix/store`. **Do not** use a bare package path as rootf
 name = "api"
 # ...
 type = "container"
+# debug = true   # enable bash, curl, /usr/bin/env in rootfs for shell-entrypoint / local debug
 ```
 
 ```bash
