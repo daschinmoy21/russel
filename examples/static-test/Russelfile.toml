@@ -1,6 +1,11 @@
+# static-test — Python http.server via Nix writeShellScriptBin.
+# Serves index.html in this directory. Absolute /nix/store shebang; debug optional.
+
 [service]
 name = "static-test"
 source = "."
 port = 8000
 memory = "256mb"
+type = "container"
 bin = "app"
+# debug = true

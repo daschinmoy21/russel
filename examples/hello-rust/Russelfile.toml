@@ -1,0 +1,9 @@
+# hello-rust — pure-std Rust HTTP (no crates.io deps). ELF entrypoint; debug not required.
+
+[service]
+name = "hello-rust"
+source = "."
+port = 3000
+memory = "128mb"
+type = "container"
+bin = "hello-rust"
