@@ -23,7 +23,7 @@ Russel is split into three crates:
 
 ## Quick Start
 
-**Requirements:** Linux host with Nix (flakes), KVM (`/dev/kvm`), and permission to create TAP devices / manage iptables. The control plane needs a writable `/var/lib/russel`.
+**Requirements:** Linux host with Nix (flakes), rootless Podman (`podman info` reports rootless), and a writable `/var/lib/russel`. For microVM deploys only: KVM (`/dev/kvm`), TAP, iptables.
 
 ```bash
 # 1. Dev shell (Rust + cloud-hypervisor + podman on Linux)
