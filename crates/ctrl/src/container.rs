@@ -461,7 +461,11 @@ const LABEL_SERVICE: &str = "russel.service";
 const LABEL_RUNTIME: &str = "russel.runtime";
 const RUNTIME_CONTAINER: &str = "container";
 const NIX_STORE_MOUNT: &str = "type=bind,source=/nix/store,destination=/nix/store,ro=true";
-const PODMAN_STOP_TIMEOUT_SECS: &str = "10";
+/// Grace period passed to `podman stop -t` before Podman sends SIGKILL.
+const PODMAN_STOP_TIMEOUT_SECS: &str = "5";
+/// Hard ceiling for the whole stop attempt (stop + kill). Prevents hung HTTP
+/// handlers when Podman itself stalls in "Stopping".
+const PODMAN_STOP_WALL_SECS: u64 = 20;
 
 // ── RUSSEL_PODMAN_USER env support (Issue #278598) ───────────────────────────
 
@@ -1184,19 +1188,72 @@ async fn stop_and_remove_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn stop_container(name: &str) -> anyhow::Result<()> {
-    let output = podman_command()
+    let stop_fut = podman_command()
         .args(["stop", "-t", PODMAN_STOP_TIMEOUT_SECS, name])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run podman stop: {e}"))?;
+        .output();
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PODMAN_STOP_WALL_SECS),
+        stop_fut,
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() || is_missing_container(&output) => {
+            return Ok(());
+        }
+        Ok(Ok(output)) => {
+            tracing::warn!(
+                container = %name,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "podman stop failed — forcing kill"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(container = %name, error = %e, "podman stop spawn failed — forcing kill");
+        }
+        Err(_) => {
+            tracing::warn!(
+                container = %name,
+                wall_secs = PODMAN_STOP_WALL_SECS,
+                "podman stop timed out — forcing kill"
+            );
+        }
+    }
+
+    // Force path: SIGKILL via podman, treat missing as success.
+    force_kill_container(name).await
+}
+
+async fn force_kill_container(name: &str) -> anyhow::Result<()> {
+    let kill_fut = podman_command().args(["kill", name]).output();
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), kill_fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            anyhow::bail!("failed to run podman kill: {e}");
+        }
+        Err(_) => {
+            anyhow::bail!("podman kill timed out for container {name}");
+        }
+    };
 
     if output.status.success() || is_missing_container(&output) {
         return Ok(());
     }
 
+    // Last resort: rm -f (also kills).
+    let rm = podman_command()
+        .args(["rm", "-f", name])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run podman rm -f: {e}"))?;
+    if rm.status.success() || is_missing_container(&rm) {
+        return Ok(());
+    }
+
     anyhow::bail!(
-        "podman stop failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "podman kill/rm failed for {name}: kill={} rm={}",
+        String::from_utf8_lossy(&output.stderr).trim(),
+        String::from_utf8_lossy(&rm.stderr).trim()
     )
 }
 
