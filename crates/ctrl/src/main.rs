@@ -57,6 +57,9 @@ async fn main() -> Result<()> {
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
+    // Hybrid privileges: microVM uses this process (often root/sudo for TAP/KVM);
+    // containers use rootless podman as RUSSEL_PODMAN_USER or SUDO_USER.
+    container::log_podman_identity();
 
     // Build state early so reconcile can rehydrate services from disk
     // before the router starts serving requests.
