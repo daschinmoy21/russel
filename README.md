@@ -60,12 +60,12 @@ curl http://127.0.0.1:8080/health
 
 **Without `-p`:** Traefik is the primary HTTP ingress. Omit publish and open `http://<service_id>.russel.local` once Traefik watches `/var/lib/russel/traefik/dynamic` (see [docs/traefik.md](docs/traefik.md)).
 
-**Container runtime:** set `type = "container"` in the Russelfile (and pass `--runtime container` only if it matches). Needs **rootless** Podman.
+**Container runtime:** the example Russelfile already has `type = "container"`. Pass `--runtime container` only if it matches. Needs **rootless** Podman.
 
 If ctrl runs under `sudo` for microVMs, container deploys use rootless podman as `RUSSEL_PODMAN_USER` or `SUDO_USER` (not root). That user needs `podman info` → rootless true and `/run/user/$(id -u)` (try `loginctl enable-linger $USER` on headless hosts).
 
 ```bash
-# After editing examples/basic-http/Russelfile.toml → type = "container"
+# Container path (examples/basic-http already sets type = "container")
 ./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id test-api \
   --runtime container
 ```
