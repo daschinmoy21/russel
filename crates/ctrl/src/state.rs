@@ -956,7 +956,7 @@ impl AppState {
 
 /// Check if a container is still running via `podman inspect`.
 async fn check_container_running(container_id: &str) -> bool {
-    let output = match tokio::process::Command::new("podman")
+    let output = match crate::container::podman_command()
         .args(["inspect", container_id, "--format", "{{.State.Running}}"])
         .output()
         .await

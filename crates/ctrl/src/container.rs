@@ -603,7 +603,7 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
 
 /// Build a `Command` that runs `podman <args>` as the configured user when
 /// ctrl is root and a non-root podman user was resolved (env or SUDO_USER).
-fn podman_command() -> Command {
+pub(crate) fn podman_command() -> Command {
     if let Some(env) = podman_user_env() {
         let mut cmd = Command::new("sudo");
         cmd.args(["-u", &env.user, "-H", "env"]);
