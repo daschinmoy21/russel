@@ -23,33 +23,73 @@ Russel is split into three crates:
 
 ## Quick Start
 
+**Requirements:** Linux host with Nix (flakes), rootless Podman (`podman info` reports rootless), and a writable `/var/lib/russel`. For microVM deploys only: KVM (`/dev/kvm`), TAP, iptables.
+
 ```bash
-# Enter the dev shell (Rust toolchain + dependencies)
+# 1. Dev shell (Rust + cloud-hypervisor + podman on Linux)
 nix develop
 
-# Build everything
+# 2. Build CLI + control plane
 cargo build
+# → target/debug/russel-cli
+# → target/debug/russel-ctrl
 
-# Optional: set an API token (if set on ctrl, set the same value here)
-export RUSSEL_API_TOKEN=your-secret-token
+# 3. Optional auth (required if binding non-loopback)
+export RUSSEL_API_TOKEN=your-secret-token   # same value in both terminals
 
-# Run the control plane
+# 4. Start control plane (terminal 1) — default http://127.0.0.1:7878
 ./target/debug/russel-ctrl
+# override bind: RUSSEL_CTRL_ADDR=127.0.0.1:7878
 
-# In another terminal, deploy the example app
+# 5. Deploy example (terminal 2, from repo root)
 ./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id test-api
+# CLI target: RUSSEL_CONTROL_PLANE=http://127.0.0.1:7878 (default)
 
-# List running VMs
+# 6. Verify
+curl http://127.0.0.1:8080/health
+# → ok
+
+./target/debug/russel-cli status test-api
 ./target/debug/russel-cli vms
+./target/debug/russel-cli logs test-api
 
-# Stop or destroy a VM
+# 7. Tear down
 ./target/debug/russel-cli stop test-api
 ./target/debug/russel-cli destroy test-api
 ```
 
+**Without `-p`:** Traefik is the primary HTTP ingress. Omit publish and open `http://<service_id>.russel.local` once Traefik watches `/var/lib/russel/traefik/dynamic` (see [docs/traefik.md](docs/traefik.md)).
+
+**Container runtime:** the example Russelfile already has `type = "container"`. Pass `--runtime container` only if it matches. Needs **rootless** Podman.
+
+If ctrl runs under `sudo` for microVMs, container deploys use rootless podman as `RUSSEL_PODMAN_USER` or `SUDO_USER` (not root). That user needs `podman info` → rootless true and `/run/user/$(id -u)` (try `loginctl enable-linger $USER` on headless hosts).
+
+```bash
+# Container path (examples/basic-http already sets type = "container")
+./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id test-api \
+  --runtime container
+```
+
+**Secrets** (host store under `/var/lib/russel/secrets/`, mode `0600`):
+
+```bash
+printf '%s' "$DB_PASSWORD" | ./target/debug/russel-cli secrets set DB_PASSWORD
+./target/debug/russel-cli secrets list
+# Reference in Russelfile or --env as secret://DB_PASSWORD
+```
+
+**Update** a running service from its last deploy source:
+
+```bash
+./target/debug/russel-cli update test-api
+# optional overrides: --repo PATH_OR_URL --config Russelfile.toml
+```
+
+More walkthroughs: [docs/examples.md](docs/examples.md) · packaging: [docs/deployment.md](docs/deployment.md).
+
 ## Build Command
 
-There is currently no `russel build` command. Russel builds an application automatically during `russel deploy`; the control plane invokes Nix with the repository's `packages.<system>.default` output and returns the resulting store path internally. Use `nix build` directly only when you want to inspect or run an application artifact without deploying a microVM.
+There is currently no `russel-cli build` command. Russel builds an application automatically during `russel-cli deploy`; the control plane invokes Nix with the repository's `packages.<system>.default` output and returns the resulting store path internally. Use `nix build` directly only when you want to inspect or run an application artifact without deploying a microVM.
 
 For example:
 
@@ -93,20 +133,27 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 
 ## CLI Commands
 
+Binaries are `russel-cli` and `russel-ctrl` (debug: `./target/debug/...`). Clap program name is `russel`.
+
 ```bash
-russel deploy <repo-url> [-p HOST:GUEST] [--config PATH] [--vm-id ID] [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] [-- <podman-run-args...>]
-russel status [<service_id>]
-russel logs [<service_id>]
-russel vms
-russel stop <service_id>
-russel destroy <service_id>
-russel update <service_id> [--repo REPO] [--config PATH]
+russel-cli deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
+  [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] \
+  [-- <podman-run-args...>]          # container only, after --
+russel-cli status [<service_id>]
+russel-cli logs [<service_id>]
+russel-cli vms
+russel-cli stop <service_id>
+russel-cli destroy <service_id>
+russel-cli update <service_id> [--repo REPO] [--config PATH]
+russel-cli secrets set <name>        # value from stdin
+russel-cli secrets list
+russel-cli secrets delete <name>
 ```
 
 - **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
 - **`--env-file PATH`**: Load `KEY=VALUE` pairs from a file (`#` comments, blank lines skipped). Merged with `[service.env]` and `--env` (later wins).
 - Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
-- **Secrets** (host store, not committed): `printf '%s' "$VAL" | russel secrets set NAME`, `list`, `delete` (value from stdin, never argv). In env maps use `secret://NAME` — the control plane resolves the value at deploy time from `/var/lib/russel/secrets/` (mode `0600`). HTTP: `GET /secrets`, `POST /secrets/{name}`, `DELETE /secrets/{name}` (Bearer auth when configured).
+- **Secrets** (host store, not committed): `printf '%s' "$VAL" | russel-cli secrets set NAME`, `list`, `delete` (value from stdin, never argv). In env maps use `secret://NAME` — the control plane resolves the value at deploy time from `/var/lib/russel/secrets/` (mode `0600`). HTTP: `GET /secrets`, `POST /secrets/{name}`, `DELETE /secrets/{name}` (Bearer auth when configured).
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
@@ -125,7 +172,7 @@ russel update <service_id> [--repo REPO] [--config PATH]
 
 Redeploying an existing service kills and waits for old processes before reusing ports. If a new deploy fails after a prior successful deployment, Russel attempts automatic **rollback** to the previous running service. A successful rollback reports status `rolled_back`; the CLI exit code is non-zero so CI pipelines can detect the failure.
 
-**`russel update <id>`** re-applies desired state from the `repo_url` / `config_path` recorded in metadata at the last successful deploy (override with `--repo` / `--config`).
+**`russel-cli update <id>`** re-applies desired state from the `repo_url` / `config_path` recorded in metadata at the last successful deploy (override with `--repo` / `--config`).
 
 ### Health
 
@@ -242,7 +289,7 @@ Russel currently runs the control plane on **Linux only**. The `russel-ctrl` bin
 The host also needs:
 
 - For microVMs: a working KVM setup (`/dev/kvm`), permission to create TAP devices and change networking/iptables rules.
-- For containers: **rootless Podman** configured and working (`podman info` reports rootless). Russel does not use rootful Podman.
+- For containers: **rootless Podman** configured and working (`podman info` reports rootless). Russel does not use rootful Podman. When ctrl runs as root (`sudo`), set `RUSSEL_PODMAN_USER` or rely on `SUDO_USER` so podman runs as that user.
 - A writable `/var/lib/russel` directory for service state, logs, rootfs, and metadata.
 
 After Nix is installed, the repository flake provides Rust, `rust-analyzer`, Cloud Hypervisor, Podman (Linux), and related tools:
@@ -264,15 +311,18 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 ├── examples/
 │   ├── basic-http/   # Go app with flake.nix + /health
 │   ├── filebrowser/  # Nix wrapper around pkgs.filebrowser
+│   ├── shortlink/    # Shortlink service example
 │   └── static-test/  # Static HTML served via Python http.server
 ├── nix/
 │   ├── microvm/      # legacy/reference configs; runtime boots Cloud Hypervisor directly
 │   └── modules/      # host NixOS modules
 ├── docs/
-│   ├── architecture.md   # Control plane internals
+│   ├── architecture.md    # Control plane internals
 │   ├── auto-generation.md # Flake auto-detection
 │   ├── deployment.md      # App packaging guide
-│   └── examples.md        # Example projects (microVM + container)
+│   ├── examples.md        # Example projects (microVM + container)
+│   ├── russelfile.md      # Russelfile reference / design
+│   └── traefik.md         # Traefik ingress setup
 ├── flake.nix         # development shell
 └── README.md
 ```
@@ -337,7 +387,7 @@ pre-allocated.
 
 - **Subnet collision detection** — 16-bit FNV-1a space, <2% collision at 50 services. Add when scale demands it.
 - **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
-- **Database/Health stubs** — documented placeholders, fully functional via direct socat access.
+- **Database stubs** — `[database.*]` in Russelfile is still a placeholder; health probes + optional restart are implemented (`RUSSEL_HEALTH_*`).
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 - **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
 

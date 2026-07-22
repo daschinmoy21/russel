@@ -15,7 +15,7 @@ These examples use Russel's current Linux microVM backend. Before deploying any 
 
    If you are not using Nix for the development shell, install equivalent packages with your system package manager.
 2. Use a Linux host with KVM enabled and access to `/dev/kvm`.
-3. Ensure the account running `russel-ctrl` can create TAP devices and change networking/iptables rules. Run it with the required root privileges or equivalent narrowly scoped capabilities.
+3. Ensure the account running `russel-ctrl` can create TAP devices (microVMs need root or `CAP_NET_ADMIN` + KVM). For a hybrid setup, start ctrl with `sudo -E` so microVMs are privileged while containers use rootless Podman as `SUDO_USER` (or set `RUSSEL_PODMAN_USER`).
 4. Build the workspace once:
 
    ```bash
@@ -28,7 +28,9 @@ These examples use Russel's current Linux microVM backend. Before deploying any 
 
    ```bash
    export RUSSEL_API_TOKEN=your-secret-token  # optional on loopback; required for non-loopback
-   ./target/debug/russel-ctrl
+   # microVM + container hybrid (recommended when you need TAP/KVM):
+   sudo -E ./target/debug/russel-ctrl
+   # container-only: ./target/debug/russel-ctrl   # as your user, rootless podman
    ```
 
    Keep it running while deploying from a second terminal. The examples below assume commands are run from the repository root.

@@ -52,10 +52,12 @@ debug = false
 # Optional: User-defined environment variables injected at deploy time.
 # Keys must start with a letter or underscore, contain only [A-Za-z0-9_].
 # Reserved keys (PORT, VM_IP, HOST_IP, APP) are rejected.
-# Values are plain text (no secrets support yet). Max 64 keys, 4096 bytes each.
+# Plain values or secret://NAME refs (resolved from host secrets store).
+# Max 64 keys, 4096 bytes each.
 [service.env]
 LOG_LEVEL = "info"
 FEATURE_X = "1"
+# DB_PASSWORD = "secret://DB_PASSWORD"
 
 # Optional: Database provisioning (planned — current: placeholder)
 [database.postgres]
@@ -226,7 +228,22 @@ Deploy-time environment variables can be set via three mechanisms, merged in ord
 - **microVM:** Custom env vars are appended to `/config/deploy.env` (shell-quoted) and exported before the app starts.
 - **Container:** Custom env vars are passed via `podman run -e` after the managed `PORT` variable.
 
-> **Note:** Secrets (e.g. `DATABASE_URL`) are **not** supported yet. All values are plain text.
+### Secrets
+
+Store secret values on the control plane host (not in the Russelfile). Values live under
+`/var/lib/russel/secrets/` (mode `0600`). Reference them in env maps as `secret://NAME`;
+the control plane resolves them at deploy time.
+
+```bash
+printf '%s' "$VAL" | russel-cli secrets set NAME
+russel-cli secrets list
+russel-cli secrets delete NAME
+```
+
+```toml
+[service.env]
+DATABASE_URL = "secret://DATABASE_URL"
+```
 
 ## 7. Nix DX vs Docker DX
 
