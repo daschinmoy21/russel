@@ -336,43 +336,39 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     if let Some(store) = &r.store_path {
         step("store", &format!("\x1b[2m{store}\x1b[0m"), "");
     }
-    if let Some(flake) = &r.microvm_config_path {
-        step("deploy.nix", &format!("\x1b[2m{flake}\x1b[0m"), "");
+    if let Some(artifact) = &r.microvm_config_path {
+        let label = if r.runtime.as_ref().map_or(false, |rt| matches!(rt, RuntimeKind::Container)) {
+            "rootfs"
+        } else {
+            "initramfs"
+        };
+        step(label, &format!("\x1b[2m{artifact}\x1b[0m"), "");
     }
 
     // ── Timing breakdown ───────────────────────────────────────────────────
     if let Some(t) = &r.timing {
         println!();
-        println!("  \x1b[1;2mPhase timing & Docker Comparison:\x1b[0m");
+        println!("  \x1b[1;2mPhase timing:\x1b[0m");
         timing_row("resolve", t.resolve_ms, "repo + Russelfile");
 
-        let docker_build_note = if t.build_ms < 3000 {
-            " (Nix cache hit: fast incremental build - Docker equivalent takes 10s-30s)"
-        } else {
-            " (Nix package build - Docker equivalent takes 20s-60s)"
-        };
+        let cache_note = if t.build_ms < 3000 { " (cache hit)" } else { "" };
         timing_row(
             "build",
             t.build_ms,
-            &format!("nix build (package){}", docker_build_note),
+            &format!("build (package){}", cache_note),
         );
 
-        timing_row(
-            "create",
-            t.create_ms,
-            "build minimal initramfs (BusyBox + modules)",
-        );
-        timing_row("network", t.network_ms, "TAP + socat port forwarding setup");
-        timing_row(
-            "start",
-            t.start_ms,
-            "spawn virtiofsd + boot cloud-hypervisor",
-        );
-        timing_row(
-            "ready",
-            t.ready_ms,
-            "guest app network socket ready (VM is live)",
-        );
+        let is_container = r.runtime.as_ref().map_or(false, |rt| matches!(rt, RuntimeKind::Container));
+        if is_container {
+            timing_row("create", t.create_ms, "prepare container rootfs");
+            timing_row("start", t.start_ms, "start rootless Podman container");
+            timing_row("ready", t.ready_ms, "container service reachable");
+        } else {
+            timing_row("create", t.create_ms, "build minimal initramfs (BusyBox + modules)");
+            timing_row("network", t.network_ms, "TAP + socat port forwarding setup");
+            timing_row("start", t.start_ms, "spawn virtiofsd + boot cloud-hypervisor");
+            timing_row("ready", t.ready_ms, "guest app network socket ready (VM is live)");
+        }
     }
 
     println!();

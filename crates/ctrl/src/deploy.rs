@@ -389,12 +389,12 @@ impl DeployPipeline {
             "repo resolved"
         );
 
-        // ── 2. Nix build (+ kernel stack only for microVM) ───────────────────
+        // ── 2. Build (+ kernel stack only for microVM) ───────────────────
         let t = Instant::now();
         let build_description = if runtime == RuntimeKind::Microvm {
-            "Building Nix package + ensuring kernel/busybox/modules"
+            "Building package + ensuring kernel/busybox/modules"
         } else {
-            "Building Nix package"
+            "Building package"
         };
         let _ = tx
             .send(DeployEvent::Progress {
