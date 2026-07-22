@@ -25,6 +25,42 @@ use crate::{
     state::{AppState, LifecycleClaim},
 };
 
+/// Pure token normalize: unset/blank/whitespace → None.
+pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Non-empty RUSSEL_API_TOKEN after trim; None if unset/blank.
+pub fn configured_api_token() -> Option<String> {
+    normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref())
+}
+
+/// Parse max concurrent deploys (default 4, clamp 1..=64).
+pub fn parse_max_concurrent_deploys(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse().ok())
+        .map(|n: usize| n.clamp(1, 64))
+        .unwrap_or(4)
+}
+
+/// Max concurrent deploy tasks, from RUSSEL_MAX_CONCURRENT_DEPLOYS (default 4).
+fn max_concurrent_deploys() -> usize {
+    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        parse_max_concurrent_deploys(
+            std::env::var("RUSSEL_MAX_CONCURRENT_DEPLOYS")
+                .ok()
+                .as_deref(),
+        )
+    });
+    *MAX
+}
+
+/// Global semaphore bounding in-flight deploy/update tasks.
+fn deploy_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
+        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(max_concurrent_deploys()));
+    &SEM
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/deploy", post(deploy))
@@ -54,14 +90,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Bearer auth middleware: if RUSSEL_API_TOKEN is set, require it on every request.
+/// Bearer auth middleware: if RUSSEL_API_TOKEN is set (non-empty, trimmed),
+/// require it on every request.
 async fn auth_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let expected = match std::env::var("RUSSEL_API_TOKEN").ok() {
-        Some(t) if !t.is_empty() => t,
-        _ => return Ok(next.run(request).await),
+    let Some(expected) = configured_api_token() else {
+        return Ok(next.run(request).await);
     };
 
     let header = request
@@ -92,6 +128,30 @@ async fn deploy(
         "POST /deploy"
     );
 
+    // Bound concurrent deploys: if all slots are busy, return 503 immediately.
+    let permit = match deploy_semaphore().try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            let max = max_concurrent_deploys();
+            return axum::response::Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "text/plain")
+                .body(axum::body::Body::from(format!(
+                    "too many concurrent deploys (max {max}); retry later"
+                )))
+                .unwrap_or_else(|e| {
+                    axum::response::Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(axum::body::Body::from(e.to_string()))
+                        .unwrap_or_else(|_| {
+                            axum::response::Response::new(axum::body::Body::from(
+                                "internal server error",
+                            ))
+                        })
+                });
+        }
+    };
+
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
     let monitor_state = state.clone();
@@ -102,6 +162,7 @@ async fn deploy(
     let deploy_guard = state.begin_deploy();
 
     let deploy_handle = tokio::spawn(async move {
+        let _permit = permit;
         let _guard = deploy_guard;
         let pipeline = DeployPipeline::new(state);
         let response = pipeline.deploy(request, deploy_tx.clone()).await;
@@ -153,15 +214,14 @@ async fn deploy(
     axum::response::Response::builder()
         .header("Content-Type", "application/x-ndjson")
         .body(axum::body::Body::from_stream(stream))
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to build NDJSON stream response");
-            e
-        })
         .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to build NDJSON stream response");
             axum::response::Response::builder()
                 .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(axum::body::Body::from(e.to_string()))
-                .expect("500 response")
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new(axum::body::Body::from("internal server error"))
+                })
         })
 }
 
@@ -502,6 +562,18 @@ async fn vm_update(
 
     tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);
 
+    // Bound concurrent deploys (same semaphore as POST /deploy).
+    let permit = match deploy_semaphore().try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            let max = max_concurrent_deploys();
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("too many concurrent deploys (max {max}); retry later"),
+            ));
+        }
+    };
+
     // Same NDJSON stream as POST /deploy so CLI reuses event parsing.
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
@@ -510,6 +582,7 @@ async fn vm_update(
     let sid = service_id.clone();
     let sid2 = service_id.clone();
     let deploy_handle = tokio::spawn(async move {
+        let _permit = permit;
         let _guard = deploy_guard;
         let pipeline = DeployPipeline::new(state);
         let response = pipeline.deploy(request, deploy_tx.clone()).await;
@@ -717,8 +790,42 @@ async fn secrets_delete(Path(name): Path<String>) -> Result<StatusCode, (StatusC
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── auth / concurrency helpers ─────────────────────────────────────
+
+    #[test]
+    fn token_normalize_empty() {
+        assert_eq!(normalize_api_token(None), None);
+        assert_eq!(normalize_api_token(Some("")), None);
+        assert_eq!(normalize_api_token(Some("   ")), None);
+    }
+
+    #[test]
+    fn token_normalize_valid() {
+        assert_eq!(
+            normalize_api_token(Some("secret")),
+            Some("secret".to_string())
+        );
+        assert_eq!(
+            normalize_api_token(Some("  secret  ")),
+            Some("secret".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_max_concurrent_deploys_clamps() {
+        assert_eq!(parse_max_concurrent_deploys(None), 4);
+        assert_eq!(parse_max_concurrent_deploys(Some("")), 4);
+        assert_eq!(parse_max_concurrent_deploys(Some("8")), 8);
+        assert_eq!(parse_max_concurrent_deploys(Some("0")), 1);
+        assert_eq!(parse_max_concurrent_deploys(Some("999")), 64);
+        assert_eq!(parse_max_concurrent_deploys(Some("nope")), 4);
+    }
+
+    // ── existing tests ─────────────────────────────────────────────────
 
     #[test]
     fn resolve_lifecycle_runtime_uses_state_over_disk_default() {

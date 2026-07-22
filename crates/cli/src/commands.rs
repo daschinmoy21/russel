@@ -25,10 +25,13 @@ fn http_client() -> reqwest::Client {
     {
         headers.insert(AUTHORIZATION, value);
     }
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .expect("failed to build HTTP client")
+    match reqwest::Client::builder().default_headers(headers).build() {
+        Ok(c) => c,
+        Err(e) => {
+            // Builder only fails on TLS backend issues — treat as fatal init.
+            panic!("failed to build HTTP client: {e}")
+        }
+    }
 }
 
 /// Map a reqwest error into a user-friendly message when the control plane is unreachable.
@@ -349,7 +352,11 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         step("store", &format!("\x1b[2m{store}\x1b[0m"), "");
     }
     if let Some(artifact) = &r.microvm_config_path {
-        let label = if r.runtime.as_ref().map_or(false, |rt| matches!(rt, RuntimeKind::Container)) {
+        let label = if r
+            .runtime
+            .as_ref()
+            .is_some_and(|rt| matches!(rt, RuntimeKind::Container))
+        {
             "rootfs"
         } else {
             "initramfs"
@@ -365,16 +372,31 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
 
         timing_row("build", t.build_ms, "build (package)");
 
-        let is_container = r.runtime.as_ref().map_or(false, |rt| matches!(rt, RuntimeKind::Container));
+        let is_container = r
+            .runtime
+            .as_ref()
+            .is_some_and(|rt| matches!(rt, RuntimeKind::Container));
         if is_container {
             timing_row("create", t.create_ms, "prepare container rootfs");
             timing_row("start", t.start_ms, "start rootless Podman container");
             timing_row("ready", t.ready_ms, "container service reachable");
         } else {
-            timing_row("create", t.create_ms, "build minimal initramfs (BusyBox + modules)");
+            timing_row(
+                "create",
+                t.create_ms,
+                "build minimal initramfs (BusyBox + modules)",
+            );
             timing_row("network", t.network_ms, "TAP + socat port forwarding setup");
-            timing_row("start", t.start_ms, "spawn virtiofsd + boot cloud-hypervisor");
-            timing_row("ready", t.ready_ms, "guest app network socket ready (VM is live)");
+            timing_row(
+                "start",
+                t.start_ms,
+                "spawn virtiofsd + boot cloud-hypervisor",
+            );
+            timing_row(
+                "ready",
+                t.ready_ms,
+                "guest app network socket ready (VM is live)",
+            );
         }
     }
 
@@ -767,6 +789,7 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -916,14 +939,8 @@ mod tests {
             .unwrap_err();
         let mapped = map_control_plane_error(err, "http://127.0.0.1:7878");
         let msg = mapped.to_string();
-        assert!(
-            msg.contains("cannot reach control plane at"),
-            "got: {msg}"
-        );
-        assert!(
-            msg.contains("is russel-ctrl running?"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("cannot reach control plane at"), "got: {msg}");
+        assert!(msg.contains("is russel-ctrl running?"), "got: {msg}");
     }
 
     // Non-connect branch is just Error::from(err) — nothing worth unit-testing.

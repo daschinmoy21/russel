@@ -58,7 +58,12 @@ pub async fn init_current_system() -> Result<()> {
 pub fn current_system() -> &'static str {
     CURRENT_SYSTEM
         .get()
-        .expect("current_system() called before init_current_system() — call init_current_system() at startup")
+        .unwrap_or_else(|| {
+            panic!(
+                "current_system() called before init_current_system() — \
+                 call init_current_system() at startup"
+            )
+        })
         .as_str()
 }
 
