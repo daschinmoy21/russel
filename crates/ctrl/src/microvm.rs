@@ -242,7 +242,7 @@ impl MicrovmRunner {
     }
 
     async fn build_stock_kernel(&self) -> anyhow::Result<PathBuf> {
-        let system = crate::build::current_system().await;
+        let system = crate::build::current_system();
         tracing::info!(system = %system, "building stock kernel from nixpkgs");
         let output = Command::new("nix")
             .args([
@@ -294,7 +294,7 @@ impl MicrovmRunner {
             return Ok(path);
         }
 
-        let system = crate::build::current_system().await;
+        let system = crate::build::current_system();
         tracing::info!(system = %system, "building busybox from nixpkgs");
         let output = Command::new("nix")
             .args([
@@ -338,7 +338,7 @@ impl MicrovmRunner {
             return Ok(Some(path));
         }
 
-        let system = crate::build::current_system().await;
+        let system = crate::build::current_system();
         tracing::info!(system = %system, "resolving kernel modules from nixpkgs");
         let expr = format!(
             "let pkgs = import <nixpkgs> {{ system = \"{system}\"; }}; in pkgs.linux.modules"

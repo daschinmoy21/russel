@@ -11,12 +11,10 @@ pub struct BuildOutput {
 }
 
 static CURRENT_SYSTEM: OnceLock<String> = OnceLock::new();
-
-pub async fn current_system() -> String {
-    if let Some(sys) = CURRENT_SYSTEM.get() {
-        return sys.clone();
-    }
-    let out = Command::new("nix")
+/// Detect and cache the Nix system triple (e.g. `x86_64-linux`).
+/// Called once at startup; must complete before any build/deploy.
+pub async fn init_current_system() -> Result<()> {
+    let output = Command::new("nix")
         .args([
             "eval",
             "--impure",
@@ -25,20 +23,31 @@ pub async fn current_system() -> String {
             "builtins.currentSystem",
         ])
         .output()
-        .await;
-    let sys = match out {
-        Ok(output) if output.status.success() => {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                s
-            } else {
-                "x86_64-linux".to_string()
-            }
-        }
-        _ => "x86_64-linux".to_string(),
-    };
-    let _ = CURRENT_SYSTEM.set(sys.clone());
-    sys
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to detect Nix system: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let sys = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sys.is_empty() {
+        anyhow::bail!("nix eval builtins.currentSystem returned empty output");
+    }
+
+    let _ = CURRENT_SYSTEM.set(sys);
+    Ok(())
+}
+
+/// Return the cached system triple; panics if `init_current_system` was not called.
+#[inline]
+pub fn current_system() -> &'static str {
+    CURRENT_SYSTEM
+        .get()
+        .expect("current_system() called before init_current_system() — call init_current_system() at startup")
+        .as_str()
 }
 
 #[derive(Debug, Default)]
@@ -61,7 +70,7 @@ impl NixBuilder {
             Err(e) => return Err(e.into()),
         };
 
-        let system = current_system().await;
+        let system = current_system();
         tracing::info!(system = %system, "No flake.nix found. Auto-detecting project type to generate a default flake.");
 
         let flake_content = if repo_path.join("Cargo.toml").exists() {
@@ -127,7 +136,6 @@ impl NixBuilder {
         };
 
         file.write_all(flake_content.as_bytes())?;
-        file.sync_all()?;
         tracing::info!("Successfully generated default flake.nix");
         Ok(())
     }
@@ -135,7 +143,7 @@ impl NixBuilder {
     pub async fn build(&self, repo_path: &Path) -> Result<BuildOutput> {
         self.ensure_flake_exists(repo_path).await?;
 
-        let system = current_system().await;
+        let system = current_system();
         let flake_ref = format!("path:{}#packages.{}.default", repo_path.display(), system);
         let mut output = Command::new("nix")
             .arg("build")

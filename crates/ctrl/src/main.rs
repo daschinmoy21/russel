@@ -52,6 +52,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+
+    // Detect Nix system triple once at startup — cached for all builds/deploys.
+    crate::build::init_current_system().await?;
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
