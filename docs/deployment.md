@@ -45,6 +45,10 @@ bin = "my-app"
 # This is the source of truth. CLI --runtime must match if provided.
 type = "microvm"
 
+# Optional: include bash, curl, and /usr/bin/env in container rootfs for
+# debugging. Default false (hardened: no shell tools, read-only rootfs).
+debug = false
+
 # Optional: User-defined environment variables injected at deploy time.
 # Keys must start with a letter or underscore, contain only [A-Za-z0-9_].
 # Reserved keys (PORT, VM_IP, HOST_IP, APP) are rejected.
@@ -169,8 +173,10 @@ http://<service_id>.russel.local
 ```
 
 This requires:
+
 1. Traefik running with the file provider pointed at `/var/lib/russel/traefik/dynamic` (see [docs/traefik.md](traefik.md)).
 2. DNS or `/etc/hosts` entry mapping `*.russel.local` to your host's IP:
+
    ```text
    127.0.0.1  api.russel.local  demo.russel.local
    ```

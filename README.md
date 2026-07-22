@@ -156,7 +156,7 @@ FEATURE_X = "1"
 | `microvm` (default) | KVM / Cloud Hypervisor | KVM, TAP, virtiofsd, socat |
 | `container` | Rootless Podman `--rootfs` | Rootless Podman |
 
-**Russel containers** prepare a Docker-like rootfs under `/var/lib/russel/<id>/rootfs` (with `/tmp`, `/var`, bash, curl for debugging) and bind-mount the host `/nix/store` read-only. Do **not** pass a bare Nix package path as `--rootfs` yourself — use `russel deploy`.
+**Russel containers** prepare a rootfs under `/var/lib/russel/<id>/rootfs` and bind-mount the host `/nix/store` read-only. By default (`debug = false`) the rootfs is **read-only** (tmpfs `/tmp` and `/run` only) with no bash, curl, or `/usr/bin/env` — entrypoints must be statically linked or use an absolute `/nix/store/…` interpreter. Set `debug = true` in your Russelfile to include shell debugging tools. Do **not** pass a bare Nix package path as `--rootfs` yourself — use `russel deploy`.
 
 ```bash
 # MicroVM (default)
