@@ -366,6 +366,7 @@ impl AppState {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut consecutive_failures: u32 = 0;
             loop {
                 interval.tick().await;
                 // Check we still own this generation.
@@ -382,19 +383,37 @@ impl AppState {
                     }
                 }
                 // Poll podman inspect for the container.
+                // Require two consecutive failures before marking failed —
+                // podman inspect can transiently return false even when the
+                // container is healthy (e.g. brief podman state inconsistency).
                 let alive = check_container_running(&container_id).await;
-                if !alive {
+                if alive {
+                    consecutive_failures = 0;
+                    continue;
+                }
+                consecutive_failures += 1;
+                if consecutive_failures < 2 {
                     tracing::warn!(
                         service_id = %service_id,
                         container_id = %container_id,
-                        "container is no longer running — marking failed"
+                        consecutive_failures,
+                        "container appears down — will retry next cycle"
                     );
-                    state.mark_failed(
-                        &service_id,
-                        format!("container {container_id} is not running"),
-                    );
-                    return;
+                    continue;
                 }
+                tracing::warn!(
+                    service_id = %service_id,
+                    container_id = %container_id,
+                    "container is no longer running after {consecutive_failures} checks — marking failed"
+                );
+                // Use generation-conditional mark so a concurrent redeploy
+                // that bumps process_generation is not wrongly marked failed.
+                state.mark_failed_if_generation(
+                    &service_id,
+                    generation,
+                    format!("container {container_id} is not running"),
+                );
+                return;
             }
         });
     }
@@ -403,34 +422,7 @@ impl AppState {
         let needs_supervisor = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-
-            // If the prior service had a running VM and processes haven't been
-            // taken yet (prebuild snapshot is still set), the build failed before
-            // take_processes — restore the previous deployment state.
-            if s.prebuild_vm_state.as_deref() == Some("running") {
-                let prev_status = s.prebuild_status.take().unwrap_or_default();
-                let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
-                s.status = prev_status;
-                s.vm_state = prev_vm_state;
-                // Bump generation to restart supervision on the restored deployment.
-                s.process_generation = s.process_generation.wrapping_add(1);
-                let g = s.process_generation;
-                s.logs.push_str(&format!(
-                    "BUILD FAILED (previous deployment preserved): {}\n",
-                    error
-                ));
-                Some(g)
-            } else {
-                // No prior VM to restore — standard failure.
-                s.prebuild_status = None;
-                s.prebuild_vm_state = None;
-                s.status = "failed".to_string();
-                s.vm_state = "failed".to_string();
-                s.vm_pid = None;
-                s.logs.push_str(&error);
-                s.logs.push('\n');
-                None
-            }
+            Self::apply_failure_transition(s, &error)
         };
 
         if let Some(g) = needs_supervisor {
@@ -440,6 +432,77 @@ impl AppState {
         // Best-effort catalog update.
         if let Err(e) = self.write_catalog() {
             tracing::warn!(error = %e, "failed to write catalog after mark_failed");
+        }
+    }
+
+    /// Atomically mark a service failed only if the current generation matches
+    /// `expected_generation` and the service is still deployed/running.
+    ///
+    /// Returns `true` if the service was marked failed, `false` if the
+    /// generation, status, or service changed (caller should exit quietly).
+    ///
+    /// Used by the container liveness supervisor to avoid marking a newer
+    /// deployment generation as failed after a slow `podman inspect` await.
+    pub fn mark_failed_if_generation(
+        &self,
+        service_id: &str,
+        expected_generation: u64,
+        error: String,
+    ) -> bool {
+        let needs_supervisor = {
+            let mut inner = self.lock_inner();
+            let Some(s) = inner.services.get_mut(service_id) else {
+                return false;
+            };
+            if s.process_generation != expected_generation {
+                return false;
+            }
+            if s.status != "deployed" || s.vm_state != "running" {
+                return false;
+            }
+            Self::apply_failure_transition(s, &error)
+        };
+
+        if let Some(g) = needs_supervisor {
+            self.spawn_process_supervisor(service_id.to_string(), g);
+        }
+
+        if let Err(e) = self.write_catalog() {
+            tracing::warn!(error = %e, "failed to write catalog after mark_failed_if_generation");
+        }
+
+        true
+    }
+
+    /// Apply the failure state transition to a ServiceState in-place.
+    ///
+    /// If a prebuild snapshot exists (previous deployment still running),
+    /// restores that state and returns the new generation for supervisor
+    /// restart. Otherwise sets standard `failed`/`failed` state.
+    fn apply_failure_transition(s: &mut ServiceState, error: &str) -> Option<u64> {
+        if s.prebuild_vm_state.as_deref() == Some("running") {
+            let prev_status = s.prebuild_status.take().unwrap_or_default();
+            let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
+            s.status = prev_status;
+            s.vm_state = prev_vm_state;
+            // Bump generation to restart supervision on the restored deployment.
+            s.process_generation = s.process_generation.wrapping_add(1);
+            let g = s.process_generation;
+            s.logs.push_str(&format!(
+                "BUILD FAILED (previous deployment preserved): {}\n",
+                error
+            ));
+            Some(g)
+        } else {
+            // No prior VM to restore — standard failure.
+            s.prebuild_status = None;
+            s.prebuild_vm_state = None;
+            s.status = "failed".to_string();
+            s.vm_state = "failed".to_string();
+            s.vm_pid = None;
+            s.logs.push_str(error);
+            s.logs.push('\n');
+            None
         }
     }
 

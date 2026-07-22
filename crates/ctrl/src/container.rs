@@ -22,6 +22,9 @@ pub struct RootfsSpec {
     pub bash_store: Option<PathBuf>,
     /// Test injection: skip `nix build` for curl when set.
     pub curl_store: Option<PathBuf>,
+    /// When true, include bash + curl debug tools in the container rootfs.
+    /// Defaults to false for production hardening.
+    pub debug: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,10 +178,7 @@ fn select_nix_tool_store_path(stdout: &[u8], tool: &str) -> anyhow::Result<PathB
 /// type=bind,source=/nix/store,target=/nix/store,readonly`) so closure paths
 /// resolve without copying store objects into the rootfs.
 pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs> {
-    let entrypoint = validate_entrypoint(&spec.store_path, &spec.bin_name)?;
-    let cache = shared_debug_tools();
-    let bash_store = cache.ensure_bash(spec.bash_store.as_deref()).await?;
-    let curl_store = cache.ensure_curl(spec.curl_store.as_deref()).await?;
+    let entrypoint = validate_entrypoint(&spec.store_path, &spec.bin_name, spec.debug)?;
 
     let rootfs_path = spec.base_dir.join("rootfs");
     if rootfs_path.exists() {
@@ -187,15 +187,26 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
     create_layout(&rootfs_path)?;
     write_etc_files(&rootfs_path)?;
     link_store_binary(&rootfs_path, &entrypoint, &spec.bin_name)?;
-    link_debug_tool(&rootfs_path, &bash_store, "bash")?;
-    link_debug_tool(&rootfs_path, &curl_store, "curl")?;
-    install_env_wrapper(&rootfs_path)?;
+
+    if spec.debug {
+        let cache = shared_debug_tools();
+        let bash_store = cache.ensure_bash(spec.bash_store.as_deref()).await?;
+        let curl_store = cache.ensure_curl(spec.curl_store.as_deref()).await?;
+        link_debug_tool(&rootfs_path, &bash_store, "bash")?;
+        link_debug_tool(&rootfs_path, &curl_store, "curl")?;
+        install_env_wrapper(&rootfs_path)?;
+        tracing::info!(
+            service_id = %spec.service_id,
+            "debug mode: bash + curl linked into rootfs"
+        );
+    }
 
     let container_entrypoint = PathBuf::from(format!("/bin/{}", spec.bin_name));
     tracing::info!(
         service_id = %spec.service_id,
         rootfs = %rootfs_path.display(),
         entrypoint = %container_entrypoint.display(),
+        debug = spec.debug,
         "container rootfs prepared"
     );
 
@@ -206,7 +217,7 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
 }
 
 /// Require `store_path/bin/<bin_name>` and validate script shebangs when present.
-pub fn validate_entrypoint(store_path: &Path, bin_name: &str) -> anyhow::Result<PathBuf> {
+pub fn validate_entrypoint(store_path: &Path, bin_name: &str, debug: bool) -> anyhow::Result<PathBuf> {
     let bin_path = store_path.join("bin").join(bin_name);
     if !bin_path.exists() {
         anyhow::bail!(
@@ -225,13 +236,13 @@ pub fn validate_entrypoint(store_path: &Path, bin_name: &str) -> anyhow::Result<
     }
 
     if meta.is_file() {
-        validate_shebang(store_path, &bin_path)?;
+        validate_shebang(store_path, &bin_path, debug)?;
     }
 
     Ok(bin_path)
 }
 
-fn validate_shebang(store_path: &Path, bin_path: &Path) -> anyhow::Result<()> {
+fn validate_shebang(store_path: &Path, bin_path: &Path, debug: bool) -> anyhow::Result<()> {
     let contents = std::fs::read(bin_path)?;
     let prefix = b"#!";
     if contents.len() < prefix.len() || &contents[..prefix.len()] != prefix {
@@ -251,6 +262,16 @@ fn validate_shebang(store_path: &Path, bin_path: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("empty shebang in {}", bin_path.display()))?;
 
     if interpreter == "/usr/bin/env" || interpreter == "/bin/env" {
+        // The env wrapper + bash are only installed when debug is enabled.
+        if !debug {
+            anyhow::bail!(
+                "entrypoint uses `{interpreter} …` shebang but debug mode is disabled. \
+                 Set `debug = true` in Russelfile [service] to include bash and the \
+                 /usr/bin/env wrapper, or use an absolute /nix/store/… interpreter path \
+                 in {}",
+                bin_path.display()
+            );
+        }
         // Rootfs installs a minimal `env` wrapper that is `exec "$@"`.
         // Only the staged form `#!/usr/bin/env <program>` is supported —
         // reject options (`env -S …`), extra args, and pathy program names.
@@ -950,6 +971,17 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "k8s-file".to_string(),
         "--log-opt".to_string(),
         format!("path={log_path}"),
+        // ── Hardening: drop all capabilities, prevent privilege escalation,
+        //     mount rootfs read-only with writable tmpfs for /tmp and /run.
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--read-only".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+        "--tmpfs".to_string(),
+        "/run".to_string(),
     ];
 
     if !spec.extra_args.is_empty() {
@@ -1113,6 +1145,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: false,
         };
 
         let prepared = prepare_rootfs(&spec).await.unwrap();
@@ -1133,6 +1166,20 @@ mod tests {
         assert_eq!(tmp_mode, 0o1777);
 
         assert_eq!(prepared.entrypoint, PathBuf::from("/bin/app"));
+
+        // debug: false — bash, curl, and env wrapper must be absent.
+        assert!(
+            !rootfs.join("bin/bash").exists(),
+            "bash must not be present when debug=false"
+        );
+        assert!(
+            !rootfs.join("bin/curl").exists(),
+            "curl must not be present when debug=false"
+        );
+        assert!(
+            !rootfs.join("usr/bin/env").exists(),
+            "/usr/bin/env must not be present when debug=false"
+        );
     }
 
     #[tokio::test]
@@ -1149,6 +1196,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: false,
         };
 
         let prepared = prepare_rootfs(&spec).await.unwrap();
@@ -1167,7 +1215,7 @@ mod tests {
         let store = tmp.path().join("empty-store");
         std::fs::create_dir_all(store.join("bin")).unwrap();
 
-        let err = validate_entrypoint(&store, "missing").unwrap_err();
+        let err = validate_entrypoint(&store, "missing", false).unwrap_err();
         assert!(err.to_string().contains("entrypoint missing"));
     }
 
@@ -1176,7 +1224,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = fake_store(tmp.path(), "fake-app-package", "app", b"\x7fELF");
 
-        let path = validate_entrypoint(&store, "app").unwrap();
+        let path = validate_entrypoint(&store, "app", false).unwrap();
         assert_eq!(path, store.join("bin/app"));
     }
 
@@ -1191,7 +1239,7 @@ mod tests {
         let bin_path = bin_dir.join("runner");
         std::fs::write(&bin_path, script).unwrap();
 
-        validate_entrypoint(&store, "runner").unwrap();
+        validate_entrypoint(&store, "runner", false).unwrap();
     }
 
     #[test]
@@ -1206,7 +1254,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = validate_entrypoint(&store, "runner").unwrap_err();
+        let err = validate_entrypoint(&store, "runner", false).unwrap_err();
         assert!(err.to_string().contains("shebang interpreter"));
     }
 
@@ -1281,6 +1329,16 @@ mod tests {
         assert!(args.contains(&"PORT=3000".to_string()));
         assert!(args.contains(&"RUSSEL=1".to_string()));
         assert_eq!(args.last().unwrap(), "/bin/api");
+
+        // ── Hardening flags: verify flag/value adjacency, not just presence ──
+        let has_adjacent = |flag: &str, val: &str| -> bool {
+            args.windows(2).any(|w| w[0] == flag && w[1] == val)
+        };
+        assert!(has_adjacent("--cap-drop", "ALL"), "--cap-drop ALL must be adjacent");
+        assert!(has_adjacent("--security-opt", "no-new-privileges"), "--security-opt no-new-privileges must be adjacent");
+        assert!(args.contains(&"--read-only".to_string()), "--read-only must be present");
+        assert!(has_adjacent("--tmpfs", "/tmp"), "--tmpfs /tmp must be adjacent");
+        assert!(has_adjacent("--tmpfs", "/run"), "--tmpfs /run must be adjacent");
 
         // --rootfs PATH must be immediately before COMMAND so flags are not
         // misparsed as the container executable (crun: `--mount` not found).
@@ -1518,6 +1576,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: true,
         };
 
         let prepared = prepare_rootfs(&spec).await.unwrap();
@@ -1546,7 +1605,7 @@ mod tests {
         let bin_dir = store.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::write(bin_dir.join("runner"), "#!/usr/bin/env bash\necho hi\n").unwrap();
-        validate_entrypoint(&store, "runner").unwrap();
+        validate_entrypoint(&store, "runner", true).unwrap();
     }
 
     #[test]
@@ -1556,7 +1615,7 @@ mod tests {
         let bin_dir = store.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::write(bin_dir.join("runner"), "#!/usr/bin/env\necho hi\n").unwrap();
-        let err = validate_entrypoint(&store, "runner").unwrap_err();
+        let err = validate_entrypoint(&store, "runner", true).unwrap_err();
         assert!(err.to_string().contains("program name"), "{err}");
     }
 
@@ -1571,7 +1630,7 @@ mod tests {
             "#!/usr/bin/env ../bin/bash\necho hi\n",
         )
         .unwrap();
-        let err = validate_entrypoint(&store, "runner").unwrap_err();
+        let err = validate_entrypoint(&store, "runner", true).unwrap_err();
         assert!(err.to_string().contains("path"), "{err}");
     }
 
@@ -1682,6 +1741,7 @@ mod tests {
             base_dir: tmp.path().to_path_buf(),
             bash_store: Some(bash),
             curl_store: Some(curl),
+            debug: false,
         };
         let prepared = runner.prepare(&rootfs_spec).await.unwrap();
 
