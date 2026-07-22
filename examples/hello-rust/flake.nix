@@ -16,6 +16,7 @@
         nativeBuildInputs = [ pkgs.rustc ];
         buildPhase = ''
           runHook preBuild
+          # Link libc for SIGTERM/SIGINT handlers (podman stop).
           rustc -C opt-level=2 -o hello-rust src/main.rs
           runHook postBuild
         '';
