@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     info!(
         detached,
         "control plane stopped; left workloads running \
-         (use `russel vms` / `russel destroy <id>` to manage them)"
+         (restart the control plane, then use `russel vms` / `russel destroy <id>` to manage them)"
     );
 
     serve_result?;

@@ -31,6 +31,17 @@ fn http_client() -> reqwest::Client {
         .expect("failed to build HTTP client")
 }
 
+/// Map a reqwest error into a user-friendly message when the control plane is unreachable.
+fn map_control_plane_error(err: reqwest::Error, control_plane: &str) -> anyhow::Error {
+    if err.is_connect() {
+        anyhow::anyhow!(
+            "cannot reach control plane at {control_plane} (is russel-ctrl running? restart it, then retry)"
+        )
+    } else {
+        anyhow::Error::from(err)
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "russel",
@@ -231,7 +242,8 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             env: cli_env,
         })
         .send()
-        .await?
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?
         .error_for_status()?;
 
     let response = stream_deploy_events(&mut response, "deploy").await?;
@@ -479,7 +491,8 @@ pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
     let r = http_client()
         .get(&url)
         .send()
-        .await?
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?
         .error_for_status()?
         .json::<StatusResponse>()
         .await?;
@@ -507,7 +520,8 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
     let r = http_client()
         .get(&url)
         .send()
-        .await?
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?
         .error_for_status()?
         .json::<LogsResponse>()
         .await?;
@@ -519,7 +533,8 @@ pub async fn vms(control_plane: &str) -> Result<()> {
     let r = http_client()
         .get(format!("{control_plane}/vms"))
         .send()
-        .await?
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?
         .error_for_status()?
         .json::<VmsResponse>()
         .await?;
@@ -549,7 +564,8 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
     let r = http_client()
         .post(format!("{control_plane}/vm/{id}/stop"))
         .send()
-        .await?
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?
         .error_for_status()?
         .json::<String>()
         .await?;
@@ -578,7 +594,8 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
         .timeout(Duration::from_secs(300))
         .json(&body)
         .send()
-        .await?
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?
         .error_for_status()?;
 
     let response = stream_deploy_events(&mut response, "update").await?;
@@ -664,7 +681,8 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
     let resp = http_client()
         .delete(format!("{control_plane}/vm/{id}"))
         .send()
-        .await?;
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?;
     // Do not treat bare 404 as success: unmatched routes and "not in memory"
     // can 404 while runtime resources still exist. Server returns 200 with an
     // "already gone" body when destroy was intentionally idempotent.
@@ -700,7 +718,8 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
                 .post(format!("{control_plane}/secrets/{name}"))
                 .json(&serde_json::json!({ "value": value }))
                 .send()
-                .await?;
+                .await
+                .map_err(|e| map_control_plane_error(e, control_plane))?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -712,7 +731,8 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             let resp = http_client()
                 .get(format!("{control_plane}/secrets"))
                 .send()
-                .await?
+                .await
+                .map_err(|e| map_control_plane_error(e, control_plane))?
                 .error_for_status()?;
             let body: serde_json::Value = resp.json().await?;
             if let Some(arr) = body.get("secrets").and_then(|v| v.as_array()) {
@@ -733,7 +753,8 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             let resp = http_client()
                 .delete(format!("{control_plane}/secrets/{name}"))
                 .send()
-                .await?;
+                .await
+                .map_err(|e| map_control_plane_error(e, control_plane))?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -884,6 +905,28 @@ mod tests {
         assert_eq!(map.get("FEATURE_X"), Some(&"1".to_string()));
         assert_eq!(map.len(), 2);
     }
+
+    #[tokio::test]
+    async fn map_control_plane_error_connect() {
+        // Trigger a real connect error by hitting an unroutable port.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        let mapped = map_control_plane_error(err, "http://127.0.0.1:7878");
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains("cannot reach control plane at"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("is russel-ctrl running?"),
+            "got: {msg}"
+        );
+    }
+
+    // Non-connect branch is just Error::from(err) — nothing worth unit-testing.
 
     #[test]
     fn deploy_parses_mount_style_podman_args() {
