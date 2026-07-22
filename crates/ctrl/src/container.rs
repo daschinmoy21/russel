@@ -440,16 +440,102 @@ const PODMAN_STOP_TIMEOUT_SECS: &str = "10";
 
 // ── RUSSEL_PODMAN_USER env support (Issue #278598) ───────────────────────────
 
+// ── Rootless podman user (Issue #278598) ─────────────────────────────────────
+// microVMs need a privileged ctrl (TAP/KVM). Containers must stay rootless.
+// When ctrl is root, run podman as RUSSEL_PODMAN_USER or SUDO_USER.
+
+/// Pure resolution: explicit env wins, then SUDO_USER when euid is root.
+fn resolve_podman_user(
+    explicit: Option<&str>,
+    sudo_user: Option<&str>,
+    euid: u32,
+) -> Option<String> {
+    let normalize = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() || t == "root" { None } else { Some(t.to_string()) }
+    };
+    if let Some(u) = explicit.and_then(normalize) {
+        return Some(u);
+    }
+    if euid == 0 {
+        return sudo_user.and_then(normalize);
+    }
+    None
+}
+
 fn configured_podman_user() -> Option<String> {
-    std::env::var("RUSSEL_PODMAN_USER")
+    let explicit = std::env::var("RUSSEL_PODMAN_USER").ok();
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let euid = unsafe { libc::geteuid() };
+    resolve_podman_user(explicit.as_deref(), sudo_user.as_deref(), euid)
+}
+
+/// Where the active podman identity came from (for startup logs / errors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodmanUserSource {
+    Env,
+    SudoUser,
+    Ambient,
+}
+
+pub fn podman_user_source() -> PodmanUserSource {
+    let explicit = std::env::var("RUSSEL_PODMAN_USER")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != "root")
+        .filter(|s| !s.is_empty() && s != "root");
+    if explicit.is_some() {
+        return PodmanUserSource::Env;
+    }
+    let euid = unsafe { libc::geteuid() };
+    let sudo = std::env::var("SUDO_USER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "root");
+    if euid == 0 && sudo.is_some() {
+        PodmanUserSource::SudoUser
+    } else {
+        PodmanUserSource::Ambient
+    }
+}
+
+/// Log which identity will run `podman` (call once at ctrl startup).
+pub fn log_podman_identity() {
+    match (configured_podman_user(), podman_user_source()) {
+        (Some(user), PodmanUserSource::Env) => {
+            tracing::info!(
+                user = %user,
+                "container podman identity: {user} (RUSSEL_PODMAN_USER) — microVM stays privileged"
+            );
+        }
+        (Some(user), PodmanUserSource::SudoUser) => {
+            tracing::info!(
+                user = %user,
+                "container podman identity: {user} (SUDO_USER) — microVM stays privileged"
+            );
+        }
+        (_, PodmanUserSource::Ambient) | (None, _) => {
+            let euid = unsafe { libc::geteuid() };
+            if euid == 0 {
+                tracing::warn!(
+                    "ctrl is root and no RUSSEL_PODMAN_USER/SUDO_USER — container deploys \
+                     will fail rootless check; set RUSSEL_PODMAN_USER=<user> or run via \
+                     sudo from a non-root account"
+                );
+            } else {
+                tracing::info!(
+                    euid,
+                    "container podman identity: ambient uid (rootless podman as this user)"
+                );
+            }
+        }
+    }
 }
 
 struct PodmanUserEnv {
+    user: String,
     home: String,
     xdg_runtime: String,
+    dbus: Option<String>,
 }
 
 fn podman_user_env() -> Option<&'static PodmanUserEnv> {
@@ -462,6 +548,9 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+        if uid.is_empty() {
+            return None;
+        }
         let home = std::process::Command::new("getent")
             .args(["passwd", &user])
             .output()
@@ -473,42 +562,101 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
                     .unwrap_or(&format!("/home/{user}"))
                     .to_string()
             })?;
-        Some(PodmanUserEnv {
-            home,
-            xdg_runtime: format!("/run/user/{uid}"),
-        })
+        let xdg_runtime = format!("/run/user/{uid}");
+        let dbus_path = format!("{xdg_runtime}/bus");
+        let dbus = std::path::Path::new(&dbus_path)
+            .exists()
+            .then(|| format!("unix:path={dbus_path}"));
+        if !std::path::Path::new(&xdg_runtime).exists() {
+            tracing::warn!(
+                user = %user,
+                path = %xdg_runtime,
+                "XDG_RUNTIME_DIR missing for podman user — enable lingering \
+                 (loginctl enable-linger {user}) or log in once"
+            );
+        }
+        Some(PodmanUserEnv { user, home, xdg_runtime, dbus })
     })
     .as_ref()
 }
 
 /// Build a `Command` that runs `podman <args>` as the configured user when
-/// `RUSSEL_PODMAN_USER` is set (sudo wrapper with rootless env vars).
+/// ctrl is root and a non-root podman user was resolved (env or SUDO_USER).
 fn podman_command() -> Command {
     if let Some(env) = podman_user_env() {
-        let user = configured_podman_user().unwrap(); // safe: podman_user_env already checked
         let mut cmd = Command::new("sudo");
-        cmd.args([
-            "-u",
-            &user,
-            "-H",
-            "env",
-            &format!("HOME={}", env.home),
-            &format!("XDG_RUNTIME_DIR={}", env.xdg_runtime),
-            "podman",
-        ]);
+        cmd.args(["-u", &env.user, "-H", "env"]);
+        cmd.arg(format!("HOME={}", env.home));
+        cmd.arg(format!("XDG_RUNTIME_DIR={}", env.xdg_runtime));
+        if let Some(ref dbus) = env.dbus {
+            cmd.arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"));
+        }
+        cmd.arg("podman");
         cmd
     } else {
-        Command::new("podman")
+        // Ambient podman. If ctrl is root (no user wrap), strip session vars
+        // that `sudo -E` may have preserved — otherwise rootful podman writes
+        // crun state into the invoking user's /run/user/UID as root:root and
+        // later rootless runs fail with Permission denied.
+        let mut cmd = Command::new("podman");
+        if unsafe { libc::geteuid() } == 0 {
+            cmd.env_remove("XDG_RUNTIME_DIR");
+            cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
+        }
+        cmd
     }
+}
+
+/// Remove root-owned OCI runtime dirs under the podman user's XDG_RUNTIME_DIR.
+///
+/// A prior rootful `podman` that inherited `XDG_RUNTIME_DIR=/run/user/UID`
+/// (common with `sudo -E`) leaves `crun/` owned by root:root mode 0700. Rootless
+/// podman then cannot open its own runtime dir.
+fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
+    let Some(env) = podman_user_env() else {
+        return Ok(());
+    };
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+
+    for name in ["crun", "runc"] {
+        let path = std::path::Path::new(&env.xdg_runtime).join(name);
+        if !path.exists() {
+            continue;
+        }
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "skip runtime dir sanitize");
+                continue;
+            }
+        };
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != 0 {
+            continue;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            user = %env.user,
+            "removing root-owned podman runtime dir under user XDG_RUNTIME_DIR \
+             (leftover from rootful podman; blocks rootless)"
+        );
+        std::fs::remove_dir_all(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to remove root-owned {} (blocks rootless podman for {}): {e}. \
+                 Run: sudo rm -rf {}",
+                path.display(),
+                env.user,
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Make the service dir + rootfs usable by a non-root podman user when
 /// `RUSSEL_PODMAN_USER` is set (ctrl runs as root via sudo for microVMs).
-///
-/// Rootless podman needs:
-/// - traverse every path component to the rootfs (`faccessat` fails on 0700
-///   parents such as `mktemp -d /tmp/...` created by root)
-/// - own/write the service dir for the k8s-file log under `/var/lib/russel/<id>/`
 fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     let Some(user) = configured_podman_user() else {
         return Ok(());
@@ -617,6 +765,7 @@ impl ContainerRunner {
 
     /// Fail if `podman info` does not indicate rootless.
     pub async fn ensure_rootless() -> anyhow::Result<()> {
+        sanitize_podman_user_runtime_dir()?;
         let output = podman_command()
             .args(["info", "--format", "json"])
             .output()
@@ -1770,5 +1919,38 @@ mod tests {
         with_russel_podman_user_env(Some("  myuser  "), || {
             assert_eq!(configured_podman_user(), Some("myuser".to_string()));
         });
+    }
+
+    #[test]
+    fn resolve_podman_user_explicit_wins() {
+        assert_eq!(
+            resolve_podman_user(Some("alice"), Some("bob"), 0),
+            Some("alice".to_string())
+        );
+        // Even when not root, explicit wins.
+        assert_eq!(
+            resolve_podman_user(Some("alice"), Some("bob"), 1000),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_podman_user_sudo_fallback_when_root() {
+        assert_eq!(
+            resolve_podman_user(None, Some("bob"), 0),
+            Some("bob".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_podman_user_no_sudo_when_not_root() {
+        assert_eq!(resolve_podman_user(None, Some("bob"), 1000), None);
+    }
+
+    #[test]
+    fn resolve_podman_user_rejects_root_and_empty() {
+        assert_eq!(resolve_podman_user(Some("root"), None, 0), None);
+        assert_eq!(resolve_podman_user(Some(""), None, 0), None);
+        assert_eq!(resolve_podman_user(Some("  "), None, 0), None);
     }
 }
