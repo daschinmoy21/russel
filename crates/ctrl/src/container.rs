@@ -76,7 +76,7 @@ impl DebugToolsCache {
             return Ok(path);
         }
 
-        let system = crate::build::current_system().await;
+        let system = crate::build::current_system();
         // Build the package attr (not `.out`): multi-output packages differ —
         // bash puts the binary in `out`, curl in `bin`. `--print-out-paths` may
         // list several paths; `select_nix_tool_store_path` picks the one with
@@ -91,7 +91,7 @@ impl DebugToolsCache {
                 "<nixpkgs>",
                 "--argstr",
                 "system",
-                &system,
+                system,
                 attr,
             ])
             .stderr(std::process::Stdio::inherit())
