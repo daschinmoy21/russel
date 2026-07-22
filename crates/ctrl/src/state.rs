@@ -366,6 +366,7 @@ impl AppState {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut consecutive_failures: u32 = 0;
             loop {
                 interval.tick().await;
                 // Check we still own this generation.
@@ -382,19 +383,34 @@ impl AppState {
                     }
                 }
                 // Poll podman inspect for the container.
+                // Require two consecutive failures before marking failed —
+                // podman inspect can transiently return false even when the
+                // container is healthy (e.g. brief podman state inconsistency).
                 let alive = check_container_running(&container_id).await;
-                if !alive {
+                if alive {
+                    consecutive_failures = 0;
+                    continue;
+                }
+                consecutive_failures += 1;
+                if consecutive_failures < 2 {
                     tracing::warn!(
                         service_id = %service_id,
                         container_id = %container_id,
-                        "container is no longer running — marking failed"
+                        consecutive_failures,
+                        "container appears down — will retry next cycle"
                     );
-                    state.mark_failed(
-                        &service_id,
-                        format!("container {container_id} is not running"),
-                    );
-                    return;
+                    continue;
                 }
+                tracing::warn!(
+                    service_id = %service_id,
+                    container_id = %container_id,
+                    "container is no longer running after {consecutive_failures} checks — marking failed"
+                );
+                state.mark_failed(
+                    &service_id,
+                    format!("container {container_id} is not running"),
+                );
+                return;
             }
         });
     }
