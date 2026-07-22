@@ -217,7 +217,11 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
 }
 
 /// Require `store_path/bin/<bin_name>` and validate script shebangs when present.
-pub fn validate_entrypoint(store_path: &Path, bin_name: &str, debug: bool) -> anyhow::Result<PathBuf> {
+pub fn validate_entrypoint(
+    store_path: &Path,
+    bin_name: &str,
+    debug: bool,
+) -> anyhow::Result<PathBuf> {
     let bin_path = store_path.join("bin").join(bin_name);
     if !bin_path.exists() {
         anyhow::bail!(
@@ -473,7 +477,11 @@ fn resolve_podman_user(
 ) -> Option<String> {
     let normalize = |s: &str| {
         let t = s.trim();
-        if t.is_empty() || t == "root" { None } else { Some(t.to_string()) }
+        if t.is_empty() || t == "root" {
+            None
+        } else {
+            Some(t.to_string())
+        }
     };
     if let Some(u) = explicit.and_then(normalize) {
         return Some(u);
@@ -596,7 +604,12 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
                  (loginctl enable-linger {user}) or log in once"
             );
         }
-        Some(PodmanUserEnv { user, home, xdg_runtime, dbus })
+        Some(PodmanUserEnv {
+            user,
+            home,
+            xdg_runtime,
+            dbus,
+        })
     })
     .as_ref()
 }
@@ -1091,7 +1104,15 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
 
     let name = ContainerRunner::container_name(&spec.service_id);
-    let port_mapping = format!("{}:{}", spec.host_port, spec.guest_port);
+    let bind = crate::network::publish_bind_addr();
+    // Podman -p: HOST:CONTAINER or IP:HOST:CONTAINER. Bracket IPv6 (contains ':').
+    let port_mapping = if bind == "0.0.0.0" || bind == "::" {
+        format!("{}:{}", spec.host_port, spec.guest_port)
+    } else if bind.contains(':') {
+        format!("[{}]:{}:{}", bind, spec.host_port, spec.guest_port)
+    } else {
+        format!("{}:{}:{}", bind, spec.host_port, spec.guest_port)
+    };
     let log_path = log_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 log path: {}", log_path.display()))?;
@@ -1205,6 +1226,7 @@ fn is_missing_container(output: &std::process::Output) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -1465,7 +1487,11 @@ mod tests {
         assert!(args.contains(&"--mount".to_string()));
         assert!(args.contains(&NIX_STORE_MOUNT.to_string()));
         assert!(args.contains(&"-p".to_string()));
-        assert!(args.contains(&"8080:3000".to_string()));
+        // Publish bind may be 127.0.0.1 (default) or 0.0.0.0 (legacy wildcard).
+        let has_port = args
+            .iter()
+            .any(|a| a == "8080:3000" || a.ends_with(":8080:3000") || a == "127.0.0.1:8080:3000");
+        assert!(has_port, "expected host:guest port mapping in {args:?}");
         assert!(args.contains(&"--memory".to_string()));
         assert!(args.contains(&"512m".to_string()));
         assert!(args.contains(&"--workdir".to_string()));
@@ -1483,11 +1509,26 @@ mod tests {
         let has_adjacent = |flag: &str, val: &str| -> bool {
             args.windows(2).any(|w| w[0] == flag && w[1] == val)
         };
-        assert!(has_adjacent("--cap-drop", "ALL"), "--cap-drop ALL must be adjacent");
-        assert!(has_adjacent("--security-opt", "no-new-privileges"), "--security-opt no-new-privileges must be adjacent");
-        assert!(args.contains(&"--read-only".to_string()), "--read-only must be present");
-        assert!(has_adjacent("--tmpfs", "/tmp"), "--tmpfs /tmp must be adjacent");
-        assert!(has_adjacent("--tmpfs", "/run"), "--tmpfs /run must be adjacent");
+        assert!(
+            has_adjacent("--cap-drop", "ALL"),
+            "--cap-drop ALL must be adjacent"
+        );
+        assert!(
+            has_adjacent("--security-opt", "no-new-privileges"),
+            "--security-opt no-new-privileges must be adjacent"
+        );
+        assert!(
+            args.contains(&"--read-only".to_string()),
+            "--read-only must be present"
+        );
+        assert!(
+            has_adjacent("--tmpfs", "/tmp"),
+            "--tmpfs /tmp must be adjacent"
+        );
+        assert!(
+            has_adjacent("--tmpfs", "/run"),
+            "--tmpfs /run must be adjacent"
+        );
 
         // --rootfs PATH must be immediately before COMMAND so flags are not
         // misparsed as the container executable (crun: `--mount` not found).

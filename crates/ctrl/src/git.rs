@@ -353,6 +353,7 @@ pub fn gc_old_checkouts(checkout_root: &Path, max_age: Duration) -> anyhow::Resu
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::collections::HashSet;

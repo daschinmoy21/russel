@@ -419,7 +419,9 @@ impl DeployPipeline {
         };
         let build_ms = t.elapsed().as_millis();
         if runtime == RuntimeKind::Microvm {
-            let ki = kernel.as_ref().unwrap();
+            let ki = kernel
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("kernel not resolved for microvm runtime"))?;
             tracing::info!(
                 service_id,
                 store = %build.store_path.display(),
@@ -517,6 +519,10 @@ impl DeployPipeline {
                 .await;
         }
 
+        // H4: remember the fixed host port the operator requested so we can
+        // try to re-claim it after dual-live cutover destroys the old gen.
+        let fixed_host = request.port.as_ref().map(|p| p.host).filter(|&h| h != 0);
+
         let mut port_reservation = None;
         let deploy_result = async {
             // Port reservations are keyed by the runtime key (gen-scoped on dual-live).
@@ -564,7 +570,9 @@ impl DeployPipeline {
                         &config,
                         &build.store_path,
                         &port,
-                        kernel.as_ref().unwrap(),
+                        kernel
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("kernel not resolved"))?,
                         &merged_env,
                         &tx,
                         Some(generation_id.as_str()),
@@ -617,7 +625,11 @@ impl DeployPipeline {
                             tracing::info!(service_id, "Rollback to previous VM succeeded");
                             port_reservation
                                 .as_mut()
-                                .expect("port reservation exists")
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "port reservation dropped before deploy completed"
+                                    )
+                                })?
                                 .disarm();
                             return Ok(DeployInnerResult::RolledBack {
                                 runtime: prior_runtime.unwrap_or(RuntimeKind::Microvm),
@@ -643,7 +655,11 @@ impl DeployPipeline {
                             tracing::info!(service_id, "Rollback to previous container succeeded");
                             port_reservation
                                 .as_mut()
-                                .expect("port reservation exists")
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "port reservation dropped before deploy completed"
+                                    )
+                                })?
                                 .disarm();
                             return Ok(DeployInnerResult::RolledBack {
                                 runtime: prior_runtime.unwrap_or(RuntimeKind::Container),
@@ -748,6 +764,70 @@ impl DeployPipeline {
                 }
                 self.state.rekey_service(&runtime_key, service_id);
                 self.state.attach_flake_path(service_id, repo_path.clone());
+
+                // H4: After old gen is destroyed, reclaim operator fixed `-p` for
+                // microVMs only (spawn extra socat — never TapForwarder::setup,
+                // which deletes TAP). Containers keep the candidate publish port
+                // (rebind would require podman recreate); Traefik is SoT.
+                if let Some(fixed) = fixed_host
+                    && fixed != workload.port().host
+                    && matches!(runtime, RuntimeKind::Microvm)
+                {
+                    let ephemeral = workload.port().host;
+                    // service_id currently holds ephemeral via claim_existing above.
+                    match PortAllocator::reserve(service_id, fixed) {
+                        Ok(()) => {
+                            tracing::info!(
+                                service_id,
+                                fixed,
+                                ephemeral,
+                                "reclaimed fixed host port after dual-live cutover"
+                            );
+                            if let DeployWorkload::Microvm {
+                                ref alloc,
+                                ref port,
+                                ..
+                            } = workload
+                            {
+                                match TapForwarder::spawn_socat(
+                                    service_id,
+                                    fixed,
+                                    &alloc.vm_ip,
+                                    port.guest,
+                                )
+                                .await
+                                {
+                                    Ok(socat) => {
+                                        let mut inner = self.state.lock_inner();
+                                        if let Some(s) = inner.services.get_mut(service_id) {
+                                            s.aux_processes.push(socat);
+                                            s.host_port = Some(fixed);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            service_id,
+                                            error = %e,
+                                            "dual-live fixed-port socat spawn failed; \
+                                             traffic remains on ephemeral {ephemeral}"
+                                        );
+                                        // Restore ephemeral registration for status/list.
+                                        let _ =
+                                            PortAllocator::claim_existing(service_id, ephemeral);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                service_id,
+                                fixed,
+                                error = %e,
+                                "dual-live fixed port not free — using candidate ephemeral"
+                            );
+                        }
+                    }
+                }
             }
         } else {
             if has_backup {
@@ -774,7 +854,7 @@ impl DeployPipeline {
         }
         port_reservation
             .as_mut()
-            .expect("port reservation exists")
+            .ok_or_else(|| anyhow::anyhow!("port reservation dropped before deploy completed"))?
             .disarm();
 
         Ok(DeployInnerResult::Success(Box::new(DeployOutput {
@@ -976,6 +1056,19 @@ impl DeployPipeline {
             anyhow::bail!("{detail}");
         }
         tracing::info!(service_id, ready_ms, "VM service reachable");
+
+        // H5: Also verify the host-side published port (socat bind may have
+        // failed even when the guest is listening).
+        let host_up = TapForwarder::wait_for_host_port(port.host, Duration::from_secs(2)).await;
+        if !host_up {
+            anyhow::bail!(
+                "microVM guest reachable ({}:{}) but host port {} is not bound — \
+                 socat / publish bind failure",
+                alloc.vm_ip,
+                port.guest,
+                port.host
+            );
+        }
 
         Ok((
             DeployWorkload::Microvm {
@@ -1770,6 +1863,7 @@ fn openat_file_nofollow(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -2066,6 +2160,7 @@ struct DeployOutput {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod deploy_tests {
     use crate::container::validate_podman_args_for_runtime;
     use russel_core::config::RuntimeKind;

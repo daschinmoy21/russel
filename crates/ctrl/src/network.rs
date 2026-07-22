@@ -24,8 +24,21 @@ static PORT_REGISTRY: LazyLock<Mutex<PortRegistry>> = LazyLock::new(|| {
 pub struct PortAllocator;
 
 fn port_is_available(port: u16) -> bool {
-    // socat listens on the wildcard address, so check the same address here.
-    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+    let bind = publish_bind_addr();
+    std::net::TcpListener::bind((bind.as_str(), port)).is_ok()
+}
+
+/// Publish/bind address for socat and port checks.
+/// Default `127.0.0.1` (safer). Set `RUSSEL_PUBLISH_BIND=0.0.0.0` for wildcard.
+pub fn publish_bind_addr() -> String {
+    static BIND: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        std::env::var("RUSSEL_PUBLISH_BIND")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    });
+    BIND.clone()
 }
 
 fn port_registry() -> std::sync::MutexGuard<'static, PortRegistry> {
@@ -278,10 +291,26 @@ impl TapForwarder {
 
         sysctl("net.ipv4.ip_forward", "1").await;
 
-        let listen = format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", host_port);
+        Self::spawn_socat(service_id, host_port, vm_ip, guest_port).await
+    }
+
+    /// Spawn only the host→guest TCP forwarder without touching TAP devices.
+    ///
+    /// Used after dual-live cutover when the VM/TAP already exist and we only
+    /// need a new publish port (e.g. reclaim operator fixed `-p`).
+    pub async fn spawn_socat(
+        service_id: &str,
+        host_port: u16,
+        vm_ip: &str,
+        guest_port: u16,
+    ) -> anyhow::Result<tokio::process::Child> {
+        let listen = format!(
+            "TCP-LISTEN:{},fork,reuseaddr,bind={}",
+            host_port,
+            publish_bind_addr()
+        );
         let connect = format!("TCP:{}:{}", vm_ip, guest_port);
         tracing::info!(
-            tap,
             host_port,
             vm_ip,
             guest_port,
@@ -302,11 +331,11 @@ impl TapForwarder {
             })?;
 
         tracing::info!(
-            tap,
             host_port,
             vm_ip,
             guest_port,
-            "port forwarding active: 0.0.0.0:{host_port} -> {vm_ip}:{guest_port}"
+            "port forwarding active: {}:{host_port} -> {vm_ip}:{guest_port}",
+            publish_bind_addr()
         );
         Ok(child)
     }
@@ -330,9 +359,16 @@ impl TapForwarder {
         wait_for_tcp_addr(&format!("{vm_ip}:{guest_port}"), timeout).await
     }
 
-    /// Poll until a TCP connect to `127.0.0.1:host_port` succeeds (container port publish).
+    /// Poll until a TCP connect to the configured publish bind address succeeds.
     pub async fn wait_for_host_port(host_port: u16, timeout: Duration) -> bool {
-        wait_for_tcp_addr(&format!("127.0.0.1:{host_port}"), timeout).await
+        let bind = publish_bind_addr();
+        // Connect target: loopback for 0.0.0.0 listeners; otherwise the bind IP.
+        let connect_host = if bind == "0.0.0.0" || bind == "::" {
+            "127.0.0.1"
+        } else {
+            bind.as_str()
+        };
+        wait_for_tcp_addr(&format!("{connect_host}:{host_port}"), timeout).await
     }
 }
 
@@ -378,6 +414,7 @@ async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -449,7 +486,11 @@ mod tests {
         let p1 = alloc.next("service-1").unwrap();
         let p2 = alloc.next("service-2").unwrap();
         let p3 = alloc.next("service-3").unwrap();
-        assert_eq!((p1, p2, p3), (3100, 3101, 3102));
+        // ponytail: do not assert absolute 3100 — host may have that port
+        // bound. Just verify distinct, monotonic, and >= 3100.
+        assert!(p1 >= 3100, "p1={p1} must be >= 3100");
+        assert!(p1 < p2, "p1={p1} must be < p2={p2}");
+        assert!(p2 < p3, "p2={p2} must be < p3={p3}");
         PortAllocator::release("service-1");
         PortAllocator::release("service-2");
         PortAllocator::release("service-3");

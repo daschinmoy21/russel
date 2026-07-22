@@ -220,6 +220,7 @@ fn load_source_from_metadata(service_id: &str) -> Option<SourceMeta> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
