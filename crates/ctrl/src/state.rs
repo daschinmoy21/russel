@@ -422,34 +422,7 @@ impl AppState {
         let needs_supervisor = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-
-            // If the prior service had a running VM and processes haven't been
-            // taken yet (prebuild snapshot is still set), the build failed before
-            // take_processes — restore the previous deployment state.
-            if s.prebuild_vm_state.as_deref() == Some("running") {
-                let prev_status = s.prebuild_status.take().unwrap_or_default();
-                let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
-                s.status = prev_status;
-                s.vm_state = prev_vm_state;
-                // Bump generation to restart supervision on the restored deployment.
-                s.process_generation = s.process_generation.wrapping_add(1);
-                let g = s.process_generation;
-                s.logs.push_str(&format!(
-                    "BUILD FAILED (previous deployment preserved): {}\n",
-                    error
-                ));
-                Some(g)
-            } else {
-                // No prior VM to restore — standard failure.
-                s.prebuild_status = None;
-                s.prebuild_vm_state = None;
-                s.status = "failed".to_string();
-                s.vm_state = "failed".to_string();
-                s.vm_pid = None;
-                s.logs.push_str(&error);
-                s.logs.push('\n');
-                None
-            }
+            Self::apply_failure_transition(s, &error)
         };
 
         if let Some(g) = needs_supervisor {
@@ -487,29 +460,7 @@ impl AppState {
             if s.status != "deployed" || s.vm_state != "running" {
                 return false;
             }
-
-            if s.prebuild_vm_state.as_deref() == Some("running") {
-                let prev_status = s.prebuild_status.take().unwrap_or_default();
-                let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
-                s.status = prev_status;
-                s.vm_state = prev_vm_state;
-                s.process_generation = s.process_generation.wrapping_add(1);
-                let g = s.process_generation;
-                s.logs.push_str(&format!(
-                    "BUILD FAILED (previous deployment preserved): {}\n",
-                    error
-                ));
-                Some(g)
-            } else {
-                s.prebuild_status = None;
-                s.prebuild_vm_state = None;
-                s.status = "failed".to_string();
-                s.vm_state = "failed".to_string();
-                s.vm_pid = None;
-                s.logs.push_str(&error);
-                s.logs.push('\n');
-                None
-            }
+            Self::apply_failure_transition(s, &error)
         };
 
         if let Some(g) = needs_supervisor {
@@ -521,6 +472,38 @@ impl AppState {
         }
 
         true
+    }
+
+    /// Apply the failure state transition to a ServiceState in-place.
+    ///
+    /// If a prebuild snapshot exists (previous deployment still running),
+    /// restores that state and returns the new generation for supervisor
+    /// restart. Otherwise sets standard `failed`/`failed` state.
+    fn apply_failure_transition(s: &mut ServiceState, error: &str) -> Option<u64> {
+        if s.prebuild_vm_state.as_deref() == Some("running") {
+            let prev_status = s.prebuild_status.take().unwrap_or_default();
+            let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
+            s.status = prev_status;
+            s.vm_state = prev_vm_state;
+            // Bump generation to restart supervision on the restored deployment.
+            s.process_generation = s.process_generation.wrapping_add(1);
+            let g = s.process_generation;
+            s.logs.push_str(&format!(
+                "BUILD FAILED (previous deployment preserved): {}\n",
+                error
+            ));
+            Some(g)
+        } else {
+            // No prior VM to restore — standard failure.
+            s.prebuild_status = None;
+            s.prebuild_vm_state = None;
+            s.status = "failed".to_string();
+            s.vm_state = "failed".to_string();
+            s.vm_pid = None;
+            s.logs.push_str(error);
+            s.logs.push('\n');
+            None
+        }
     }
 
     /// Ensure a service entry exists with minimal state.

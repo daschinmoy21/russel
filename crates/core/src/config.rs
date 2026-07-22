@@ -96,8 +96,12 @@ pub struct ServiceConfig {
     /// User-defined environment variables injected at deploy time.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// When true, include bash + curl debug tools in the container rootfs.
-    /// Defaults to false for production hardening.
+    /// When true, include bash + curl debug tools and a `/usr/bin/env` wrapper
+    /// in the container rootfs. Required for entrypoints that use
+    /// `#!/usr/bin/env bash` shebangs. Defaults to false for production
+    /// hardening (no debug tools, no env wrapper — entrypoints must be
+    /// statically-linked ELF binaries or use an absolute `/nix/store/…`
+    /// interpreter path).
     #[serde(default)]
     pub debug: bool,
 }
