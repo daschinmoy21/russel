@@ -12,6 +12,7 @@ license = "MIT"
 repository = "https://github.com/daschinmoy21/russel"
 version = "0.1.0"
 
+# Production code must not use unwrap/expect; #[cfg(test)] modules may allow them.
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

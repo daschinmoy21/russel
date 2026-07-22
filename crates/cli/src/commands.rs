@@ -17,13 +17,17 @@ use russel_core::{
 };
 
 /// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
+///
+/// Token handling matches ctrl `normalize_api_token`: trim whitespace; blank → no auth.
 fn http_client() -> reqwest::Client {
     let mut headers = HeaderMap::new();
-    if let Ok(token) = std::env::var("RUSSEL_API_TOKEN")
-        && !token.is_empty()
-        && let Ok(value) = format!("Bearer {}", token).parse()
-    {
-        headers.insert(AUTHORIZATION, value);
+    if let Ok(raw) = std::env::var("RUSSEL_API_TOKEN") {
+        let token = raw.trim();
+        if !token.is_empty()
+            && let Ok(value) = format!("Bearer {token}").parse()
+        {
+            headers.insert(AUTHORIZATION, value);
+        }
     }
     match reqwest::Client::builder().default_headers(headers).build() {
         Ok(c) => c,

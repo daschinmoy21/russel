@@ -1105,8 +1105,11 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
 
     let name = ContainerRunner::container_name(&spec.service_id);
     let bind = crate::network::publish_bind_addr();
-    let port_mapping = if bind == "0.0.0.0" {
+    // Podman -p: HOST:CONTAINER or IP:HOST:CONTAINER. Bracket IPv6 (contains ':').
+    let port_mapping = if bind == "0.0.0.0" || bind == "::" {
         format!("{}:{}", spec.host_port, spec.guest_port)
+    } else if bind.contains(':') {
+        format!("[{}]:{}:{}", bind, spec.host_port, spec.guest_port)
     } else {
         format!("{}:{}:{}", bind, spec.host_port, spec.guest_port)
     };
