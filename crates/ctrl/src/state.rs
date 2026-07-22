@@ -406,8 +406,11 @@ impl AppState {
                     container_id = %container_id,
                     "container is no longer running after {consecutive_failures} checks — marking failed"
                 );
-                state.mark_failed(
+                // Use generation-conditional mark so a concurrent redeploy
+                // that bumps process_generation is not wrongly marked failed.
+                state.mark_failed_if_generation(
                     &service_id,
+                    generation,
                     format!("container {container_id} is not running"),
                 );
                 return;
@@ -457,6 +460,67 @@ impl AppState {
         if let Err(e) = self.write_catalog() {
             tracing::warn!(error = %e, "failed to write catalog after mark_failed");
         }
+    }
+
+    /// Atomically mark a service failed only if the current generation matches
+    /// `expected_generation` and the service is still deployed/running.
+    ///
+    /// Returns `true` if the service was marked failed, `false` if the
+    /// generation, status, or service changed (caller should exit quietly).
+    ///
+    /// Used by the container liveness supervisor to avoid marking a newer
+    /// deployment generation as failed after a slow `podman inspect` await.
+    pub fn mark_failed_if_generation(
+        &self,
+        service_id: &str,
+        expected_generation: u64,
+        error: String,
+    ) -> bool {
+        let needs_supervisor = {
+            let mut inner = self.lock_inner();
+            let Some(s) = inner.services.get_mut(service_id) else {
+                return false;
+            };
+            if s.process_generation != expected_generation {
+                return false;
+            }
+            if s.status != "deployed" || s.vm_state != "running" {
+                return false;
+            }
+
+            if s.prebuild_vm_state.as_deref() == Some("running") {
+                let prev_status = s.prebuild_status.take().unwrap_or_default();
+                let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
+                s.status = prev_status;
+                s.vm_state = prev_vm_state;
+                s.process_generation = s.process_generation.wrapping_add(1);
+                let g = s.process_generation;
+                s.logs.push_str(&format!(
+                    "BUILD FAILED (previous deployment preserved): {}\n",
+                    error
+                ));
+                Some(g)
+            } else {
+                s.prebuild_status = None;
+                s.prebuild_vm_state = None;
+                s.status = "failed".to_string();
+                s.vm_state = "failed".to_string();
+                s.vm_pid = None;
+                s.logs.push_str(&error);
+                s.logs.push('\n');
+                None
+            }
+        };
+
+        if let Some(g) = needs_supervisor {
+            self.spawn_process_supervisor(service_id.to_string(), g);
+        }
+
+        if let Err(e) = self.write_catalog() {
+            tracing::warn!(error = %e, "failed to write catalog after mark_failed_if_generation");
+        }
+
+        true
     }
 
     /// Ensure a service entry exists with minimal state.

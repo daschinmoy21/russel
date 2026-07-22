@@ -351,12 +351,7 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         println!("  \x1b[1;2mPhase timing:\x1b[0m");
         timing_row("resolve", t.resolve_ms, "repo + Russelfile");
 
-        let cache_note = if t.build_ms < 3000 { " (cache hit)" } else { "" };
-        timing_row(
-            "build",
-            t.build_ms,
-            &format!("build (package){}", cache_note),
-        );
+        timing_row("build", t.build_ms, "build (package)");
 
         let is_container = r.runtime.as_ref().map_or(false, |rt| matches!(rt, RuntimeKind::Container));
         if is_container {
