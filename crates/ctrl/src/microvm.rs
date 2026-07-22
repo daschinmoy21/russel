@@ -253,7 +253,7 @@ impl MicrovmRunner {
                 "<nixpkgs>",
                 "--argstr",
                 "system",
-                &system,
+                system,
                 "linux",
             ])
             .stderr(std::process::Stdio::inherit())
@@ -305,7 +305,7 @@ impl MicrovmRunner {
                 "<nixpkgs>",
                 "--argstr",
                 "system",
-                &system,
+                system,
                 "busybox",
             ])
             .stderr(std::process::Stdio::inherit())

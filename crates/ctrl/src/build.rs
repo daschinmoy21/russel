@@ -32,11 +32,23 @@ pub async fn init_current_system() -> Result<()> {
         );
     }
 
-    let sys = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow::anyhow!("nix eval output is not valid UTF-8: {e}"))?;
+    let sys = stdout.trim().to_string();
     if sys.is_empty() {
         anyhow::bail!("nix eval builtins.currentSystem returned empty output");
     }
-
+    // Reject values that don't look like a Nix system triple (e.g. x86_64-linux).
+    if !sys
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || !sys.contains('-')
+    {
+        anyhow::bail!(
+            "nix eval returned unrecognized system triple format: {sys:?} \
+             (expected e.g. x86_64-linux or aarch64-darwin)"
+        );
+    }
     let _ = CURRENT_SYSTEM.set(sys);
     Ok(())
 }

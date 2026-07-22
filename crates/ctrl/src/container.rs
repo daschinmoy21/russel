@@ -91,7 +91,7 @@ impl DebugToolsCache {
                 "<nixpkgs>",
                 "--argstr",
                 "system",
-                &system,
+                system,
                 attr,
             ])
             .stderr(std::process::Stdio::inherit())
