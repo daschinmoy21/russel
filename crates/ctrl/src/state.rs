@@ -12,6 +12,71 @@ use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 use tokio::sync::Notify;
 
+/// Maximum size of in-memory logs per service (64 KiB).
+const MAX_LOG_BYTES: usize = 64 * 1024;
+
+/// Append to a log buffer, truncating from the front at a line boundary
+/// when the buffer exceeds MAX_LOG_BYTES (issue #136).
+fn push_capped(buf: &mut String, s: &str) {
+    buf.push_str(s);
+    if buf.len() > MAX_LOG_BYTES {
+        let excess = buf.len() - MAX_LOG_BYTES;
+        if let Some(pos) = buf[excess..].find('\n') {
+            let cut = excess + pos + 1;
+            buf.drain(..cut);
+        } else {
+            buf.clear();
+        }
+    }
+}
+
+/// Parse RFC3339 timestamp (second precision UTC) to Instant for uptime back-dating.
+/// Returns None if parsing fails or the timestamp is in the future.
+fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
+    // Format: YYYY-MM-DDTHH:MM:SSZ
+    let bytes = rfc3339.as_bytes();
+    if bytes.len() < 20 || bytes[19] != b'Z' {
+        return None;
+    }
+
+    let year: i64 = rfc3339[0..4].parse().ok()?;
+    let month: u32 = rfc3339[5..7].parse().ok()?;
+    let day: u32 = rfc3339[8..10].parse().ok()?;
+    let hour: u32 = rfc3339[11..13].parse().ok()?;
+    let minute: u32 = rfc3339[14..16].parse().ok()?;
+    let second: u32 = rfc3339[17..19].parse().ok()?;
+
+    let days = days_from_civil(year, month, day)?;
+    let unix_secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+
+    let now_sys = std::time::SystemTime::now();
+    let now_secs = now_sys
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+
+    if unix_secs > now_secs {
+        return None;
+    }
+
+    let elapsed_secs = (now_secs - unix_secs) as u64;
+    Some(Instant::now() - Duration::from_secs(elapsed_secs))
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 { month + 9 } else { month - 3 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe as i64 - 719_468;
+    Some(days)
+}
+
 /// Outcome of attempting to claim a service for a lifecycle operation.
 pub enum LifecycleClaim {
     /// Service was claimed; processes are handed off to the caller.
@@ -353,7 +418,7 @@ impl AppState {
             s.vm_pid = None;
             s.status = "failed".to_string();
             s.vm_state = "failed".to_string();
-            s.logs.push_str(&format!("PROCESS EXIT: {reason}\n"));
+            push_capped(&mut s.logs, &format!("PROCESS EXIT: {reason}\n"));
             (vm, aux)
         };
 
@@ -381,8 +446,10 @@ impl AppState {
             s.container_id = Some(container_id.to_string());
             s.runtime = Some(RuntimeKind::Container);
             s.aux_processes.clear();
-            s.logs
-                .push_str(&format!("container running (id: {container_id})\n"));
+            push_capped(
+                &mut s.logs,
+                &format!("container running (id: {container_id})\n"),
+            );
             s.prebuild_status = None;
             s.prebuild_vm_state = None;
             s.process_generation = s.process_generation.wrapping_add(1);
@@ -539,10 +606,10 @@ impl AppState {
             // Bump generation to restart supervision on the restored deployment.
             s.process_generation = s.process_generation.wrapping_add(1);
             let g = s.process_generation;
-            s.logs.push_str(&format!(
-                "BUILD FAILED (previous deployment preserved): {}\n",
-                error
-            ));
+            push_capped(
+                &mut s.logs,
+                &format!("BUILD FAILED (previous deployment preserved): {}\n", error),
+            );
             Some(g)
         } else {
             // No prior VM to restore — standard failure.
@@ -551,8 +618,8 @@ impl AppState {
             s.status = "failed".to_string();
             s.vm_state = "failed".to_string();
             s.vm_pid = None;
-            s.logs.push_str(error);
-            s.logs.push('\n');
+            push_capped(&mut s.logs, error);
+            push_capped(&mut s.logs, "\n");
             None
         }
     }
@@ -588,11 +655,14 @@ impl AppState {
     pub fn attach_flake_path(&self, service_id: &str, flake_path: std::path::PathBuf) {
         let mut inner = self.lock_inner();
         let s = inner.services.entry(service_id.to_string()).or_default();
-        s.logs.push_str(&format!(
-            "using flake at {} (service_id: {})\n",
-            flake_path.display(),
-            service_id
-        ));
+        push_capped(
+            &mut s.logs,
+            &format!(
+                "using flake at {} (service_id: {})\n",
+                flake_path.display(),
+                service_id
+            ),
+        );
         s.flake_path = Some(flake_path);
     }
 
@@ -717,8 +787,7 @@ impl AppState {
         if let Some(mut s) = inner.services.remove(from) {
             // Drop residual entry for `to` (old generation already drained).
             let _ = inner.services.remove(to);
-            s.logs
-                .push_str(&format!("rekeyed generation {from} -> {to}\n"));
+            push_capped(&mut s.logs, &format!("rekeyed generation {from} -> {to}\n"));
             inner.services.insert(to.to_string(), s);
         }
     }
@@ -783,16 +852,24 @@ impl AppState {
     }
 
     pub fn logs(&self, service_id: &str) -> Option<LogsResponse> {
-        let inner = self.lock_inner();
-        let s = inner.services.get(service_id)?;
-        let mut output = s.logs.clone();
-        let runtime = s.runtime.unwrap_or_else(|| {
+        // Snapshot needed fields under the lock, then release before file I/O.
+        let (logs_snapshot, runtime) = {
+            let inner = self.lock_inner();
+            let s = inner.services.get(service_id)?;
+            (s.logs.clone(), s.runtime)
+        };
+
+        let runtime = runtime.unwrap_or_else(|| {
             crate::metadata::prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm)
         });
+
+        let mut output = logs_snapshot;
+        let max_file_read: u64 = 256 * 1024; // 256 KiB cap per file
+
         match runtime {
             RuntimeKind::Microvm => {
                 let console_path = format!("/var/lib/russel/{service_id}/console.log");
-                if let Ok(console) = std::fs::read_to_string(&console_path)
+                if let Some(console) = read_tail_of_file(&console_path, max_file_read)
                     && !console.is_empty()
                 {
                     if !output.is_empty() {
@@ -804,7 +881,7 @@ impl AppState {
             }
             RuntimeKind::Container => {
                 let log_path = crate::container::container_log_path(service_id);
-                if let Ok(container_log) = std::fs::read_to_string(&log_path)
+                if let Some(container_log) = read_tail_of_file(&log_path, max_file_read)
                     && !container_log.is_empty()
                 {
                     if !output.is_empty() {
@@ -852,6 +929,7 @@ impl AppState {
         host_port: u16,
         guest_port: u16,
         vm_pid: Option<u32>,
+        deployed_at: Option<&str>,
     ) {
         let generation = {
             let mut inner = self.lock_inner();
@@ -869,16 +947,21 @@ impl AppState {
             s.vm_pid = vm_pid;
             s.host_port = Some(host_port);
             s.guest_port = Some(guest_port);
-            s.started_at = Instant::now();
+            s.started_at = deployed_at
+                .and_then(parse_rfc3339_to_instant)
+                .unwrap_or_else(Instant::now);
             s.container_id = None;
             s.vm_process = None; // observed-only
             s.aux_processes.clear();
             s.prebuild_status = None;
             s.prebuild_vm_state = None;
             s.process_generation = s.process_generation.wrapping_add(1);
-            s.logs.push_str(&format!(
-                "adopted running microvm from disk (host_port={host_port}, guest_port={guest_port})\n"
-            ));
+            push_capped(
+                &mut s.logs,
+                &format!(
+                    "adopted running microvm from disk (host_port={host_port}, guest_port={guest_port})\n"
+                ),
+            );
             s.process_generation
         };
         // Spawn PID supervisor when we have a known PID.
@@ -897,6 +980,7 @@ impl AppState {
         container_id: &str,
         host_port: u16,
         guest_port: u16,
+        deployed_at: Option<&str>,
     ) {
         let generation = {
             let mut inner = self.lock_inner();
@@ -910,7 +994,9 @@ impl AppState {
             }
             s.status = "deployed".to_string();
             s.vm_state = "running".to_string();
-            s.started_at = Instant::now();
+            s.started_at = deployed_at
+                .and_then(parse_rfc3339_to_instant)
+                .unwrap_or_else(Instant::now);
             s.vm_pid = None;
             s.vm_process = None;
             s.container_id = Some(container_id.to_string());
@@ -918,9 +1004,12 @@ impl AppState {
             s.host_port = Some(host_port);
             s.guest_port = Some(guest_port);
             s.aux_processes.clear();
-            s.logs.push_str(&format!(
-                "adopted running container from disk (id={container_id}, host_port={host_port}, guest_port={guest_port})\n"
-            ));
+            push_capped(
+                &mut s.logs,
+                &format!(
+                    "adopted running container from disk (id={container_id}, host_port={host_port}, guest_port={guest_port})\n"
+                ),
+            );
             s.prebuild_status = None;
             s.prebuild_vm_state = None;
             s.process_generation = s.process_generation.wrapping_add(1);
@@ -1015,8 +1104,12 @@ impl AppState {
     /// deploy task is still creating VMs when we detach processes.
     pub async fn wait_for_deploys(&self) {
         loop {
+            // Register the Notified future BEFORE checking the count so a
+            // notification that fires between the count check and the await
+            // is not lost (F-10 lost-notification race).
             let notified = self.deploy_notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.deploy_count.load(Ordering::SeqCst) == 0 {
                 return;
             }
@@ -1046,6 +1139,26 @@ async fn check_container_running(container_id: &str) -> bool {
 /// Check if a PID is still alive via /proc/{pid}/stat.
 fn pid_is_alive(pid: u32) -> bool {
     std::fs::metadata(format!("/proc/{pid}")).is_ok()
+}
+
+/// Read the last `max_bytes` of a file, seeking from the end to avoid loading
+/// huge log files fully into memory. Returns None on I/O error.
+fn read_tail_of_file(path: impl AsRef<std::path::Path>, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    // If we didn't start at the beginning, skip to the next line boundary
+    // so we don't return a partial first line.
+    if start > 0
+        && let Some(pos) = buf.find('\n')
+    {
+        buf = buf[pos + 1..].to_string();
+    }
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -1487,12 +1600,50 @@ mod tests {
             .expect("task should not panic");
     }
 
+    /// F-10: Stress-test the Notify race. Run many concurrent iterations
+    /// of spawn-with-guard → drop-guard to ensure wait_for_deploys never
+    /// hangs. Each iteration is timeboxed so a missed wakeup is a test
+    /// failure, not a hung test suite.
+    #[tokio::test]
+    async fn test_wait_for_deploys_no_lost_notification_race() {
+        let state = AppState::default();
+        let iterations = 100;
+        for i in 0..iterations {
+            let guard = state.begin_deploy();
+            assert_eq!(state.deploy_count.load(Ordering::SeqCst), 1);
+
+            let state_clone = state.clone();
+            let handle = tokio::spawn(async move {
+                state_clone.wait_for_deploys().await;
+            });
+
+            // Yield to let the spawned task register its Notified future.
+            tokio::task::yield_now().await;
+
+            // Drop the guard while the spawned task may be in the
+            // race window between enable() and count check.
+            drop(guard);
+
+            // Must complete within the timeout — a missed notification
+            // would cause this to hang until timeout expires.
+            let timeout = tokio::time::Duration::from_secs(2);
+            tokio::time::timeout(timeout, handle)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("iteration {i}: wait_for_deploys timed out — lost notification?")
+                })
+                .expect("task should not panic");
+
+            assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
+        }
+    }
+
     // ── adopt / reconcile APIs ────────────────────────────────────────────────
 
     #[test]
     fn test_adopt_running_microvm_sets_deployed() {
         let state = AppState::default();
-        state.adopt_running_microvm("adopted-vm", 3100, 3000, Some(42));
+        state.adopt_running_microvm("adopted-vm", 3100, 3000, Some(42), None);
 
         let status = state.status("adopted-vm").unwrap();
         assert_eq!(status.status, "deployed");
@@ -1513,7 +1664,7 @@ mod tests {
         state.mark_deployed_with_aux("protected", child, vec![]);
 
         // Adopt should not overwrite.
-        state.adopt_running_microvm("protected", 9999, 9999, None);
+        state.adopt_running_microvm("protected", 9999, 9999, None, None);
 
         let inner = state.lock_inner();
         let svc = inner.services.get("protected").unwrap();
@@ -1523,7 +1674,7 @@ mod tests {
     #[test]
     fn test_adopt_running_container_sets_deployed() {
         let state = AppState::default();
-        state.adopt_running_container("adopted-ctr", "abc123", 3100, 3000);
+        state.adopt_running_container("adopted-ctr", "abc123", 3100, 3000, None);
 
         let status = state.status("adopted-ctr").unwrap();
         assert_eq!(status.status, "deployed");
@@ -1543,7 +1694,7 @@ mod tests {
         state.mark_deployed_with_aux("protected-ctr", child, vec![]);
 
         // Adopt should not overwrite.
-        state.adopt_running_container("protected-ctr", "xyz", 9999, 9999);
+        state.adopt_running_container("protected-ctr", "xyz", 9999, 9999, None);
 
         let inner = state.lock_inner();
         let svc = inner.services.get("protected-ctr").unwrap();
@@ -1557,7 +1708,7 @@ mod tests {
     #[test]
     fn test_write_catalog_emits_valid_json() {
         let state = AppState::default();
-        state.adopt_running_microvm("cat-svc", 4000, 3000, None);
+        state.adopt_running_microvm("cat-svc", 4000, 3000, None, None);
 
         // write_catalog writes /var/lib/russel/ctrl-catalog.json —
         // we can't unit-test that path directly without root, but we can

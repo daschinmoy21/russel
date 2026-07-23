@@ -104,10 +104,14 @@ async fn reconcile_service(
         None => return Ok(ReconcileOutcome::Skipped),
     };
 
+    // Parse extra fields (tap_id, deployed_at) that ServiceDiskRecord
+    // does not expose (issue #137 uptime back-dating, F-06 identity).
+    let (tap_id, deployed_at) = parse_extra_metadata_fields(metadata_path);
+
     let runtime = record.runtime.unwrap_or(RuntimeKind::Microvm);
 
     let alive = match runtime {
-        RuntimeKind::Microvm => probe_microvm_alive(&record),
+        RuntimeKind::Microvm => probe_microvm_alive(&record, tap_id.as_deref()),
         RuntimeKind::Container => probe_container_alive(&record).await,
     };
 
@@ -129,11 +133,23 @@ async fn reconcile_service(
 
         match runtime {
             RuntimeKind::Microvm => {
-                state.adopt_running_microvm(service_id, host_port, guest_port, record.vm_pid);
+                state.adopt_running_microvm(
+                    service_id,
+                    host_port,
+                    guest_port,
+                    record.vm_pid,
+                    deployed_at.as_deref(),
+                );
             }
             RuntimeKind::Container => {
-                if let Some(ref container_id) = record.container_id {
-                    state.adopt_running_container(service_id, container_id, host_port, guest_port);
+                if let Some(container_id) = &record.container_id {
+                    state.adopt_running_container(
+                        service_id,
+                        container_id,
+                        host_port,
+                        guest_port,
+                        deployed_at.as_deref(),
+                    );
                 } else {
                     // Container metadata without a container_id — treat as stopped.
                     state.mark_stopped_from_disk(
@@ -156,37 +172,89 @@ async fn reconcile_service(
     }
 }
 
+/// Read `tap_id` and `deployed_at` from the metadata JSON directly, since
+/// `ServiceDiskRecord` does not expose them.
+fn parse_extra_metadata_fields(path: &Path) -> (Option<String>, Option<String>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let tap_id = value
+        .get("tap_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let deployed_at = value
+        .get("deployed_at")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    (tap_id, deployed_at)
+}
+
 // ── Liveness probes ───────────────────────────────────────────────────────────
 
-/// Check whether a microVM's constituent processes are alive *and* match the
-/// expected identity (guards against PID reuse after ctrl restart).
-fn probe_microvm_alive(record: &ServiceDiskRecord) -> bool {
+/// Check whether a microVM's cloud-hypervisor process is alive *and* matches
+/// the expected identity (guards against PID reuse after ctrl restart).
+///
+/// Only the cloud-hypervisor process counts as alive; socat/virtiofsd-only
+/// liveness yields `false` (they are aux processes that outlive VMs).
+fn probe_microvm_alive(record: &ServiceDiskRecord, tap_id: Option<&str>) -> bool {
     let service_id = record.service_id.as_deref().unwrap_or("");
 
+    // F-06: these fields exist on the disk record (deserialized by serde)
+    // but are not used for liveness — only cloud-hypervisor counts.
+    // Touch them here to suppress dead_code warnings; they are meaningful
+    // for debugging / future use but not for identity checks.
+    let _ = (&record.socat_pid, &record.virtiofsd_pids);
+
     if let Some(pid) = record.vm_pid
-        && pid_matches(pid, &["cloud-hypervisor"], service_id)
+        && ch_pid_matches(pid, service_id, tap_id)
     {
         return true;
-    }
-
-    if let Some(pid) = record.socat_pid
-        && pid_matches(pid, &["socat", "socat-russel"], service_id)
-    {
-        return true;
-    }
-
-    for &pid in &record.virtiofsd_pids {
-        if pid_matches(pid, &["virtiofsd"], service_id) {
-            return true;
-        }
     }
 
     false
 }
 
+/// Identity check for cloud-hypervisor PIDs.
+///
+/// Requires `cloud-hypervisor` in cmdline AND either the service_id OR the
+/// exact TAP needle (`tap=rsl-<key>`). Drops the loose `/var/lib/russel/`
+/// or generic `tap=` fallback that previously accepted unrelated VMs (F-06).
+fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
+        Err(_) => return false,
+    };
+    if !cmdline.contains("cloud-hypervisor") {
+        return false;
+    }
+    // Accept if the service_id appears anywhere in the cmdline.
+    if !service_id.is_empty() && cmdline.contains(service_id) {
+        return true;
+    }
+    // Accept if the exact TAP needle `tap=rsl-<key>` appears.
+    if let Some(tap) = tap_id
+        && !tap.is_empty()
+        && cmdline.contains(&format!("tap={tap}"))
+    {
+        return true;
+    }
+    false
+}
+
 /// Check whether a container is still running via `podman inspect`.
 async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
-    if let Some(ref container_id) = record.container_id {
+    if let Some(container_id) = &record.container_id {
         if container_running(container_id).await {
             return true;
         }
@@ -207,6 +275,7 @@ async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
 /// `kill(pid, 0)` alone is subject to PID reuse; we also require that
 /// `/proc/<pid>/cmdline` contains one of `needles` (and, when non-empty,
 /// the service id) before treating the process as our workload.
+#[allow(dead_code)] // used by tests in #[cfg(test)] module
 fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
     if pid == 0 {
         return false;
@@ -225,15 +294,8 @@ fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
     }
     // When we know the service id, require it appear (path, arg0, or similar)
     // so a recycled PID running the same binary for another service is rejected.
+    // Cloud-hypervisor identity is handled separately by `ch_pid_matches`.
     if !service_id.is_empty() && !cmdline.contains(service_id) {
-        // cloud-hypervisor may only embed the TAP name, not the service id;
-        // accept if any needle already matched and service_id is empty-checked above.
-        // For socat/virtiofsd the service id is always in the path or arg0.
-        if needles.contains(&"cloud-hypervisor") {
-            // CH cmdline has tap=rsl-... and path under /var/lib/russel/{id}/
-            // If service_id not present, still require russel path fragment.
-            return cmdline.contains("/var/lib/russel/") || cmdline.contains("tap=");
-        }
         return false;
     }
     true
@@ -340,6 +402,27 @@ mod tests {
         child
     }
 
+    /// Spawn a long-lived shell whose argv contains "cloud-hypervisor" and the
+    /// `service_id`, mimicking a cloud-hypervisor process for F-06 identity checks.
+    fn spawn_fake_cloud_hypervisor(service_id: &str) -> std::process::Child {
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0(format!("cloud-hypervisor-{service_id}"));
+        }
+        let child = command
+            .args(["-c", "sleep 30; wait"])
+            .spawn()
+            .expect("spawn fake cloud-hypervisor");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ch_pid_matches(child.id(), service_id, None) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ch_pid_matches(child.id(), service_id, None));
+        child
+    }
+
     #[test]
     fn pid_matches_rejects_unrelated_live_pid() {
         // Current test process is alive but is not cloud-hypervisor/socat.
@@ -352,10 +435,10 @@ mod tests {
     async fn reconcile_running_microvm_adopted() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let mut fake = spawn_fake_socat("api");
+        let mut fake = spawn_fake_cloud_hypervisor("api");
         let pid = fake.id();
 
-        write_microvm_metadata(base, "api", None, Some(pid), 3100);
+        write_microvm_metadata(base, "api", Some(pid), None, 3100);
 
         let state = AppState::default();
         let report = reconcile_startup_in(&state, base).await;
@@ -461,10 +544,10 @@ mod tests {
     async fn reconcile_running_microvm_claims_port() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let mut fake = spawn_fake_socat("port-svc");
+        let mut fake = spawn_fake_cloud_hypervisor("port-svc");
         let pid = fake.id();
 
-        write_microvm_metadata(base, "port-svc", None, Some(pid), 9000);
+        write_microvm_metadata(base, "port-svc", Some(pid), None, 9000);
 
         let state = AppState::default();
         let _report = reconcile_startup_in(&state, base).await;
@@ -545,11 +628,11 @@ mod tests {
     async fn reconcile_multiple_services() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let mut a = spawn_fake_socat("live-a");
-        let mut b = spawn_fake_socat("live-b");
+        let mut a = spawn_fake_cloud_hypervisor("live-a");
+        let mut b = spawn_fake_cloud_hypervisor("live-b");
 
-        write_microvm_metadata(base, "live-a", None, Some(a.id()), 3110);
-        write_microvm_metadata(base, "live-b", None, Some(b.id()), 3111);
+        write_microvm_metadata(base, "live-a", Some(a.id()), None, 3110);
+        write_microvm_metadata(base, "live-b", Some(b.id()), None, 3111);
         write_microvm_metadata(base, "dead-c", Some(999_999_999), None, 3112);
 
         let state = AppState::default();
@@ -565,7 +648,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_with_socat_or_virtiofsd_pid_alive() {
+    async fn socat_or_virtiofsd_only_is_treated_as_stopped() {
+        // F-06: Only the cloud-hypervisor process counts as alive.
+        // socat/virtiofsd-only liveness must yield Stopped.
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
         let mut fake = spawn_fake_socat("socat-only");
@@ -590,9 +675,121 @@ mod tests {
         let state = AppState::default();
         let report = reconcile_startup_in(&state, base).await;
 
-        assert_eq!(report.adopted_running, 1);
+        // F-06: socat-only must not be adopted as running.
+        assert_eq!(report.adopted_running, 0);
+        assert_eq!(report.stopped, 1);
         let status = state.status("socat-only").unwrap();
-        assert_eq!(status.status, "deployed");
+        assert_eq!(status.status, "stopped");
+        let _ = fake.kill();
+        let _ = fake.wait();
+    }
+
+    #[test]
+    fn ch_pid_matches_rejects_without_service_id_or_tap() {
+        // F-06: ch_pid_matches must require either service_id OR tap_id.
+        // Neither present → reject, even if cloud-hypervisor is in cmdline.
+        // We test with our own process which should not match.
+        let me = std::process::id();
+        assert!(!ch_pid_matches(me, "unknown-svc", None));
+        assert!(!ch_pid_matches(me, "unknown-svc", Some("")));
+    }
+
+    #[test]
+    fn ch_pid_matches_rejects_empty_pid() {
+        assert!(!ch_pid_matches(0, "anything", None));
+    }
+
+    #[test]
+    fn probe_microvm_alive_rejects_without_vm_pid() {
+        // F-06: probe_microvm_alive only checks vm_pid against cloud-hypervisor.
+        // Without a vm_pid, it must return false even if aux PIDs exist.
+        let record = ServiceDiskRecord {
+            service_id: Some("test-svc".into()),
+            vm_pid: None,
+            socat_pid: Some(std::process::id()), // live but not cloud-hypervisor
+            ..Default::default()
+        };
+        assert!(!probe_microvm_alive(&record, None));
+    }
+
+    #[test]
+    fn probe_microvm_alive_rejects_non_ch_pid() {
+        // Our own PID is alive but is not cloud-hypervisor.
+        let record = ServiceDiskRecord {
+            service_id: Some("test-svc".into()),
+            vm_pid: Some(std::process::id()),
+            ..Default::default()
+        };
+        assert!(!probe_microvm_alive(&record, None));
+    }
+
+    #[test]
+    fn ch_pid_matches_with_matching_service_id() {
+        // F-06: ch_pid_matches must return true when service_id appears in
+        // the cloud-hypervisor process cmdline.
+        let mut fake = spawn_fake_cloud_hypervisor("match-svc");
+        assert!(ch_pid_matches(fake.id(), "match-svc", None));
+        let _ = fake.kill();
+        let _ = fake.wait();
+    }
+
+    #[test]
+    fn ch_pid_matches_with_matching_tap_id() {
+        // F-06: ch_pid_matches must return true when the exact tap_id needle
+        // (`tap=rsl-<key>`) is found in the cmdline, even without service_id.
+        let tap = "rsl-abc123";
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0(format!("cloud-hypervisor-tap={tap}"));
+        }
+        let mut fake = command
+            .args(["-c", "sleep 30; wait"])
+            .spawn()
+            .expect("spawn fake cloud-hypervisor with tap");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ch_pid_matches(fake.id(), "", Some(tap)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ch_pid_matches(fake.id(), "", Some(tap)));
+        // Also verify it works when both service_id and tap_id are present
+        // but only the tap matches.
+        assert!(ch_pid_matches(fake.id(), "unknown-svc", Some(tap)));
+        let _ = fake.kill();
+        let _ = fake.wait();
+    }
+
+    #[test]
+    fn ch_pid_matches_rejects_mismatched_service_id() {
+        // F-06: a live CH process for service A must not match service B.
+        let mut fake = spawn_fake_cloud_hypervisor("svc-a");
+        assert!(ch_pid_matches(fake.id(), "svc-a", None));
+        assert!(!ch_pid_matches(fake.id(), "svc-b", None));
+        let _ = fake.kill();
+        let _ = fake.wait();
+    }
+
+    #[tokio::test]
+    async fn reconcile_ch_with_wrong_identity_is_stopped() {
+        // F-06: a live cloud-hypervisor process for one service must not
+        // cause another service to be adopted as running.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut fake = spawn_fake_cloud_hypervisor("svc-a");
+        let pid = fake.id();
+
+        // Write metadata for "svc-b" pointing to svc-a's CH PID.
+        write_microvm_metadata(base, "svc-b", Some(pid), None, 3500);
+
+        let state = AppState::default();
+        let report = reconcile_startup_in(&state, base).await;
+
+        assert_eq!(report.adopted_running, 0);
+        assert_eq!(report.stopped, 1);
+        let status = state.status("svc-b").unwrap();
+        assert_eq!(status.status, "stopped");
+        assert_eq!(status.vm_state, "none");
         let _ = fake.kill();
         let _ = fake.wait();
     }
