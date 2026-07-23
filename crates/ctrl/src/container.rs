@@ -572,30 +572,38 @@ struct PodmanUserEnv {
 
 async fn podman_user_env() -> Option<&'static PodmanUserEnv> {
     use tokio::sync::OnceCell;
+    // OnceCell memoizes for the process lifetime: a successful resolution is
+    // cached as Some(env), and a failure (None) is also cached — subsequent
+    // calls return the same outcome without re-running id/getent.
     static ENV: OnceCell<Option<PodmanUserEnv>> = OnceCell::const_new();
     ENV.get_or_init(|| async {
         let user = configured_podman_user()?;
-        let uid = tokio::process::Command::new("id")
+        let uid_output = tokio::process::Command::new("id")
             .args(["-u", &user])
             .output()
             .await
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+            .ok()?;
+        if !uid_output.status.success() {
+            return None;
+        }
+        let uid = String::from_utf8_lossy(&uid_output.stdout).trim().to_string();
         if uid.is_empty() {
             return None;
         }
-        let home = tokio::process::Command::new("getent")
+        let home_output = tokio::process::Command::new("getent")
             .args(["passwd", &user])
             .output()
             .await
-            .ok()
-            .map(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                out.split(':')
-                    .nth(5)
-                    .unwrap_or(&format!("/home/{user}"))
-                    .to_string()
-            })?;
+            .ok()?;
+        if !home_output.status.success() {
+            return None;
+        }
+        let out = String::from_utf8_lossy(&home_output.stdout);
+        let home = out
+            .split(':')
+            .nth(5)
+            .unwrap_or(&format!("/home/{user}"))
+            .to_string();
         let xdg_runtime = format!("/run/user/{uid}");
         let dbus_path = format!("{xdg_runtime}/bus");
         let dbus = std::path::Path::new(&dbus_path)
@@ -682,7 +690,7 @@ async fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
             "removing root-owned podman runtime dir under user XDG_RUNTIME_DIR \
              (leftover from rootful podman; blocks rootless)"
         );
-        std::fs::remove_dir_all(&path).map_err(|e| {
+        tokio::fs::remove_dir_all(&path).await.map_err(|e| {
             anyhow::anyhow!(
                 "failed to remove root-owned {} (blocks rootless podman for {}): {e}. \
                  Run: sudo rm -rf {}",
@@ -703,8 +711,8 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
     };
 
     // Open path components for traversal (resolve symlinks first).
-    let resolved = rootfs
-        .canonicalize()
+    let resolved = tokio::fs::canonicalize(rootfs)
+        .await
         .unwrap_or_else(|_| rootfs.to_path_buf());
     let mut walk = resolved.as_path();
     loop {
