@@ -17,6 +17,11 @@ set -euo pipefail
 # Run from repo root after `nix develop` or with Rust toolchain on PATH.
 # Use --cold to force cold builds (no layer/nix cache); default is --warm.
 # --warm keeps images and nix store paths for fair warm-vs-warm comparison.
+#
+# MicroVM races REQUIRE the Russel-compiled kernel (flake .#microvm-kernel,
+# virtio drivers built-in). The script builds it and exports RUSSEL_KERNEL_PATH
+# so russel-ctrl never falls back to a stock nixpkgs kernel. You may pre-set
+# RUSSEL_KERNEL_PATH to an existing bzImage; it must exist or microVM is skipped.
 # ──────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -42,6 +47,7 @@ while [[ $# -gt 0 ]]; do
 	-h | --help)
 		echo "Usage: $0 [--cold|--warm]" >&2
 		echo "  Benchmarks Russel microVM, Russel container (rootless podman), and raw docker/podman." >&2
+		echo "  MicroVM path requires flake .#microvm-kernel (sets RUSSEL_KERNEL_PATH)." >&2
 		exit 0
 		;;
 	*)
@@ -511,10 +517,50 @@ else
 	if [ "$RUSSEL_CTRL_NEEDED" -eq 1 ]; then
 		info "Russel paths: microVM=$RUSSEL_MICROVM_CAPABLE container=$RUSSEL_CONTAINER_CAPABLE"
 
-		# Prewarm the flake microvm kernel so first deploy doesn't build it.
-		if [ "$has_nix" -eq 1 ] && [ -f "flake.nix" ]; then
-			info "prewarming microvm kernel (nix build .#microvm-kernel)..."
-			nix build .#microvm-kernel --no-link || warn "kernel prewarm failed; ctrl will fall back"
+		# ── Custom microvm kernel (required for fair microVM bench numbers) ──
+		# Stock nixpkgs kernels load virtio modules slowly / may miss modules.
+		# Always pin RUSSEL_KERNEL_PATH to flake .#microvm-kernel (or a prebuilt
+		# path the user already exported).
+		if [ "$RUSSEL_MICROVM_CAPABLE" -eq 1 ]; then
+			if [ -n "${RUSSEL_KERNEL_PATH:-}" ] && [ -f "$RUSSEL_KERNEL_PATH" ]; then
+				pass "using RUSSEL_KERNEL_PATH=$RUSSEL_KERNEL_PATH"
+			elif [ "$has_nix" -eq 1 ] && [ -f "flake.nix" ]; then
+				info "building required microvm kernel (nix build .#microvm-kernel)..."
+				kernel_out=$(nix build .#microvm-kernel --print-out-paths --no-link 2>/dev/null || true)
+				if [ -z "$kernel_out" ]; then
+					warn "nix build .#microvm-kernel failed"
+				else
+					# Package may be the dir containing bzImage, or the bzImage itself.
+					if [ -f "$kernel_out/bzImage" ]; then
+						RUSSEL_KERNEL_PATH="$kernel_out/bzImage"
+					elif [ -f "$kernel_out" ]; then
+						RUSSEL_KERNEL_PATH="$kernel_out"
+					else
+						RUSSEL_KERNEL_PATH=""
+					fi
+				fi
+				if [ -n "${RUSSEL_KERNEL_PATH:-}" ] && [ -f "$RUSSEL_KERNEL_PATH" ]; then
+					export RUSSEL_KERNEL_PATH
+					pass "RUSSEL_KERNEL_PATH=$RUSSEL_KERNEL_PATH (custom microvm-kernel)"
+				else
+					warn "could not resolve bzImage from .#microvm-kernel (out=${kernel_out:-none})"
+					RUSSEL_KERNEL_PATH=""
+				fi
+			else
+				warn "nix/flake unavailable and RUSSEL_KERNEL_PATH unset"
+				RUSSEL_KERNEL_PATH=""
+			fi
+
+			if [ -z "${RUSSEL_KERNEL_PATH:-}" ] || [ ! -f "$RUSSEL_KERNEL_PATH" ]; then
+				fail "microVM bench requires the compiled kernel (.#microvm-kernel → RUSSEL_KERNEL_PATH)"
+				info "hint: nix build .#microvm-kernel -o result-kernel"
+				info "      export RUSSEL_KERNEL_PATH=\$(readlink -f result-kernel/bzImage)"
+				info "      sudo -E env RUSSEL_KERNEL_PATH=\"\$RUSSEL_KERNEL_PATH\" ./bench.sh"
+				RUSSEL_MICROVM_CAPABLE=0
+				RUSSEL_MICROVM_SKIPPED=1
+			else
+				export RUSSEL_KERNEL_PATH
+			fi
 		fi
 
 		# Build release binaries if missing
@@ -527,6 +573,8 @@ else
 
 		# Pass podman user identity to russel-ctrl (Issue #278598)
 		export RUSSEL_PODMAN_USER
+		# Ensure custom kernel is visible to the control plane process tree.
+		export RUSSEL_KERNEL_PATH="${RUSSEL_KERNEL_PATH:-}"
 
 		RUSSEL_STATE_DIR=$(mktemp -d /tmp/russel-bench-XXXXXX)
 		export RUSSEL_CTRL_ADDR="127.0.0.1:7878"

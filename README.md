@@ -331,8 +331,14 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 ## Benchmark (2026-07-24)
 
 Warm run (`./bench.sh --warm`) on NixOS, podman 5.8.2, rootless containers via
-`SUDO_USER`, microVM via Cloud Hypervisor + custom `.#microvm-kernel`. Total wall
-time ~271s (includes clean debug + release + tests + 7 app races).
+`SUDO_USER`, microVM via Cloud Hypervisor. Total wall time ~271s (includes clean
+debug + release + tests + 7 app races).
+
+**MicroVM path must use the Russel-compiled kernel** (flake package
+`.#microvm-kernel`, virtio drivers built-in). `./bench.sh` builds that package
+and exports `RUSSEL_KERNEL_PATH` so `russel-ctrl` does **not** fall back to a
+stock nixpkgs kernel (slower / wrong module set). Numbers below assume that
+kernel.
 
 ### Systems
 
@@ -400,15 +406,21 @@ isolation. Container memory capped at 256m to match microVM defaults.
 Reproduce:
 
 ```bash
-# typically: root for microVM + SUDO_USER rootless podman
+# Required for microVM: custom kernel (bench builds .#microvm-kernel and sets
+# RUSSEL_KERNEL_PATH automatically). Root for TAP/KVM + SUDO_USER rootless podman:
 sudo -E nix develop -c ./bench.sh --warm
-# optional fixed kernel:
-# sudo -E env RUSSEL_KERNEL_PATH="$(readlink -f result-kernel/bzImage)" nix develop -c ./bench.sh --warm
+
+# Or pin a prebuilt kernel explicitly (same artifact as nix build .#microvm-kernel):
+nix build .#microvm-kernel -o result-kernel
+export RUSSEL_KERNEL_PATH="$(readlink -f result-kernel/bzImage)"
+sudo -E env RUSSEL_KERNEL_PATH="$RUSSEL_KERNEL_PATH" nix develop -c ./bench.sh --warm
 ```
 
-Requires Rust toolchain, nix, KVM + root for microVM, rootless podman for
-Russel containers, and podman/docker for the Dockerfile baseline. Use `--cold`
-to force cold Nix + image rebuilds on both sides.
+Requires Rust toolchain, nix, KVM + root for microVM, the **compiled**
+`.#microvm-kernel` (or a valid `RUSSEL_KERNEL_PATH` to that `bzImage`), rootless
+podman for Russel containers, and podman/docker for the Dockerfile baseline.
+Use `--cold` to force cold Nix + image rebuilds on both sides. Without the
+custom kernel, microVM races are skipped.
 
 ### Known Limitations
 
