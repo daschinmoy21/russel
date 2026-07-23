@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 use russel_core::config::RuntimeKind;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// On-disk path for a service's metadata.json.
@@ -54,9 +57,9 @@ pub struct ServiceDiskRecord {
 /// Parse `runtime` from on-disk metadata JSON.
 ///
 /// Returns the parsed runtime if the `runtime` key is present and valid.
-/// If the JSON is valid but the `runtime` key is missing, defaults to
-/// `Microvm` (legacy metadata). Returns `None` only for unreadable or
-/// invalid JSON.
+/// Returns `None` when the `runtime` key is absent from valid JSON
+/// (callers should warn about legacy metadata missing the runtime field).
+/// Returns `None` only for unreadable or invalid JSON.
 pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
     let value: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
@@ -66,7 +69,6 @@ pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
         .get("runtime")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok())
-        .or(Some(RuntimeKind::Microvm))
 }
 
 /// Read prior runtime from disk, returning None when no metadata exists
@@ -88,11 +90,11 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
         host_port: value
             .get("host_port")
             .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
+            .and_then(|p| u16::try_from(p).ok()),
         guest_port: value
             .get("guest_port")
             .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
+            .and_then(|p| u16::try_from(p).ok()),
         container_id: value
             .get("container_id")
             .and_then(|v| v.as_str())
@@ -117,7 +119,7 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
                 .collect()
         })
         .unwrap_or_else(|| {
@@ -125,7 +127,8 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
             value
                 .get("virtiofsd_pid")
                 .and_then(|v| v.as_u64())
-                .map(|n| vec![n as u32])
+                .and_then(|n| u32::try_from(n).ok())
+                .map(|n| vec![n])
                 .unwrap_or_default()
         });
 
@@ -141,11 +144,11 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
         host_port: value
             .get("host_port")
             .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
+            .and_then(|p| u16::try_from(p).ok()),
         guest_port: value
             .get("guest_port")
             .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
+            .and_then(|p| u16::try_from(p).ok()),
         container_id: value
             .get("container_id")
             .and_then(|v| v.as_str())
@@ -153,11 +156,11 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
         vm_pid: value
             .get("vm_pid")
             .and_then(|v| v.as_u64())
-            .map(|p| p as u32),
+            .and_then(|p| u32::try_from(p).ok()),
         socat_pid: value
             .get("socat_pid")
             .and_then(|v| v.as_u64())
-            .map(|p| p as u32),
+            .and_then(|p| u32::try_from(p).ok()),
         virtiofsd_pids,
     })
 }
@@ -184,22 +187,69 @@ pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow
     let content = serde_json::to_string_pretty(catalog)
         .map_err(|e| anyhow::anyhow!("failed to serialize catalog: {}", e))?;
 
-    std::fs::write(&tmp_path, &content)
-        .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
+    // Write to temp file with mode 0600
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| anyhow::anyhow!("failed to open catalog tmp: {}", e))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
+        file.flush()
+            .map_err(|e| anyhow::anyhow!("failed to flush catalog tmp: {}", e))?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("failed to fsync catalog tmp: {}", e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, &content)
+            .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
+    }
 
     std::fs::rename(&tmp_path, path)
         .map_err(|e| anyhow::anyhow!("failed to rename catalog tmp: {}", e))?;
+
+    // fsync parent directory so the rename is durable
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
 
     Ok(())
 }
 
 /// Resolve lifecycle runtime: prefer in-memory state, else on-disk metadata.
+/// Defaults to `Microvm` only when no metadata file exists at all (first deploy).
+/// Warns when valid metadata JSON is missing the `runtime` key (legacy).
 pub fn resolve_lifecycle_runtime(
     state_runtime: Option<RuntimeKind>,
     service_id: &str,
 ) -> RuntimeKind {
-    state_runtime
-        .unwrap_or_else(|| prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm))
+    if let Some(rt) = state_runtime {
+        return rt;
+    }
+    // Check if metadata file exists at all.
+    let path = metadata_path(service_id);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return RuntimeKind::Microvm, // no metadata → first deploy
+    };
+    match prior_runtime_from_metadata(&content) {
+        Some(rt) => rt,
+        None => {
+            tracing::warn!(
+                service_id,
+                "valid metadata.json missing 'runtime' key — defaulting to microvm"
+            );
+            RuntimeKind::Microvm
+        }
+    }
 }
 
 /// Build versioned metadata JSON for a microVM deployment.
@@ -480,12 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn prior_runtime_defaults_to_microvm_when_missing() {
+    fn prior_runtime_returns_none_when_missing() {
+        // F-17: when `runtime` key is absent from valid JSON, return None
+        // (callers should warn and default via resolve_lifecycle_runtime).
         let json = r#"{"service_id":"api","host_port":3100}"#;
-        assert_eq!(
-            prior_runtime_from_metadata(json),
-            Some(RuntimeKind::Microvm)
-        );
+        assert_eq!(prior_runtime_from_metadata(json), None);
     }
 
     #[test]

@@ -33,8 +33,40 @@ impl Russelfile {
                 "database provisioning is not yet supported (remove [database] from Russelfile)"
             );
         }
+        if config.service.port == 0 {
+            anyhow::bail!("service.port must not be 0");
+        }
+        validate_source_path(&config.service.source)?;
         Ok(config)
     }
+}
+
+/// Validate `service.source` path: must be relative, no `..`, not absolute, not empty.
+/// When source is `"."` it is always valid. Callers must further verify the directory
+/// exists under the repo path at deploy time.
+pub fn validate_source_path(source: &str) -> anyhow::Result<()> {
+    if source.is_empty() {
+        anyhow::bail!("service.source must not be empty");
+    }
+    if source == "." {
+        return Ok(());
+    }
+    let p = Path::new(source);
+    if p.is_absolute() {
+        anyhow::bail!("service.source must be a relative path (got: {source})");
+    }
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("service.source must not contain '..' (got: {source})");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("service.source must be relative (got: {source})");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -132,9 +164,22 @@ pub fn validate_env_key(key: &str) -> anyhow::Result<()> {
 }
 
 /// Reserved env keys that users may not set.
-const RESERVED_ENV_KEYS: &[&str] = &["PORT", "VM_IP", "HOST_IP", "APP"];
+/// Denylist of env vars that would alter guest init behavior or weaken isolation.
+const RESERVED_ENV_KEYS: &[&str] = &[
+    "PORT",
+    "VM_IP",
+    "HOST_IP",
+    "APP",
+    "IFS",
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "BASH_ENV",
+    "ENV",
+    "SHELL",
+];
 
-/// Validate a full env map: keys, reserved keys, value lengths, key count.
+/// Validate a full env map: keys, reserved keys, value length, value content, key count.
 pub fn validate_env_map(env: &std::collections::HashMap<String, String>) -> anyhow::Result<()> {
     if env.len() > 64 {
         anyhow::bail!("too many env keys: {} (max 64)", env.len());
@@ -146,6 +191,12 @@ pub fn validate_env_map(env: &std::collections::HashMap<String, String>) -> anyh
         }
         if value.contains('\0') {
             anyhow::bail!("env key '{}' value contains NUL byte", key);
+        }
+        if value.contains('\n') || value.contains('\r') {
+            anyhow::bail!(
+                "env key '{}' value contains newline or carriage return",
+                key
+            );
         }
         if value.len() > 4096 {
             anyhow::bail!(
@@ -206,12 +257,16 @@ impl<'de> Deserialize<'de> for Memory {
     {
         let value = String::deserialize(deserializer)?;
         let normalized = value.trim().to_ascii_lowercase();
-        let mebibytes = normalized
+        let mebibytes: u16 = normalized
             .strip_suffix("mb")
             .or_else(|| normalized.strip_suffix("mib"))
             .ok_or_else(|| serde::de::Error::custom("memory must end in mb or mib"))?
             .parse()
             .map_err(|_| serde::de::Error::custom("memory must be a number followed by mb"))?;
+
+        if mebibytes < 16 {
+            return Err(serde::de::Error::custom("memory must be at least 16mb"));
+        }
 
         Ok(Self::Mebibytes(mebibytes))
     }
@@ -453,7 +508,19 @@ FEATURE_X = "1"
 
     #[test]
     fn validate_env_map_rejects_reserved_keys() {
-        for key in &["PORT", "VM_IP", "HOST_IP", "APP"] {
+        for key in &[
+            "PORT",
+            "VM_IP",
+            "HOST_IP",
+            "APP",
+            "IFS",
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "BASH_ENV",
+            "ENV",
+            "SHELL",
+        ] {
             let mut map = HashMap::new();
             map.insert(key.to_string(), "val".to_string());
             let err = validate_env_map(&map).unwrap_err();
@@ -483,6 +550,28 @@ FEATURE_X = "1"
     }
 
     #[test]
+    fn validate_env_map_rejects_newline_in_value() {
+        let mut map = HashMap::new();
+        map.insert("FOO".to_string(), "val\nbar".to_string());
+        let err = validate_env_map(&map).unwrap_err();
+        assert!(
+            err.to_string().contains("newline"),
+            "expected newline rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_env_map_rejects_cr_in_value() {
+        let mut map = HashMap::new();
+        map.insert("FOO".to_string(), "val\rbar".to_string());
+        let err = validate_env_map(&map).unwrap_err();
+        assert!(
+            err.to_string().contains("carriage return"),
+            "expected cr rejection: {err}"
+        );
+    }
+
+    #[test]
     fn validate_env_map_rejects_long_value() {
         let mut map = HashMap::new();
         map.insert("FOO".to_string(), "a".repeat(4097));
@@ -502,5 +591,89 @@ FEATURE_X = "1"
         assert_eq!(merged.get("A"), Some(&"overlay".to_string()));
         assert_eq!(merged.get("B"), Some(&"base_b".to_string()));
         assert_eq!(merged.get("C"), Some(&"overlay_c".to_string()));
+    }
+
+    // ── F-34 / #134: port 0 + memory minimum ─────────────────────────
+
+    #[test]
+    fn reject_port_zero() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 0
+memory = "256mb"
+"#;
+        let err = Russelfile::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("port must not be 0"),
+            "expected port 0 rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_memory_below_16mb() {
+        for mem in &["0mb", "1mb", "15mb", "15mib"] {
+            let toml = format!(
+                r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "{mem}"
+"#
+            );
+            let err = toml::from_str::<Russelfile>(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("at least 16mb"),
+                "expected minimum rejection for {mem}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_memory_16mb_min() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "16mb"
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.memory.as_mebibytes(), 16);
+    }
+
+    // ── #135: source validation ──────────────────────────────────────
+
+    #[test]
+    fn validate_source_accepts_dot() {
+        validate_source_path(".").unwrap();
+    }
+
+    #[test]
+    fn validate_source_accepts_relative() {
+        validate_source_path("subdir").unwrap();
+        validate_source_path("sub/dir").unwrap();
+    }
+
+    #[test]
+    fn validate_source_rejects_empty() {
+        let err = validate_source_path("").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_source_rejects_absolute() {
+        let err = validate_source_path("/etc").unwrap_err();
+        assert!(err.to_string().contains("must be a relative path"));
+    }
+
+    #[test]
+    fn validate_source_rejects_parent_dir() {
+        let err = validate_source_path("../escape").unwrap_err();
+        assert!(err.to_string().contains("must not contain '..'"));
+        let err = validate_source_path("sub/../../escape").unwrap_err();
+        assert!(err.to_string().contains("must not contain '..'"));
     }
 }

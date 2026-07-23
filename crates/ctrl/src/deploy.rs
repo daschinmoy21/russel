@@ -25,7 +25,7 @@ use crate::{
     build::NixBuilder,
     container::{
         ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec, default_base_dir,
-        validate_podman_args_for_runtime,
+        validate_podman_args_for_runtime, validate_podman_passthrough_args,
     },
     git::GitClient,
     ingress::{self, Backend, Ingress},
@@ -372,12 +372,54 @@ impl DeployPipeline {
         validate_podman_args_for_runtime(runtime, &request.podman_args)?;
 
         // Merge env: file < request (request wins on key conflict).
-        // Resolve `secret://name` refs from the host secrets store, then
-        // re-validate so expanded values cannot smuggle reserved keys / bad chars.
-        let merged_env = merge_env_maps(&config.service.env, &request.env);
+        // Save pre-resolution env for desired_state; resolve secret:// refs for deploy.
+        let merged_env_pre_resolve = merge_env_maps(&config.service.env, &request.env);
+        validate_env_map(&merged_env_pre_resolve)?;
+        let merged_env = crate::secrets::resolve_env_secrets(&merged_env_pre_resolve)?;
         validate_env_map(&merged_env)?;
-        let merged_env = crate::secrets::resolve_env_secrets(&merged_env)?;
-        validate_env_map(&merged_env)?;
+
+        // Build desired_state for rollback + health restart + update (F-04/08/09).
+        let desired_state = {
+            let mut ds = serde_json::Map::new();
+            // env PRE secret resolution
+            let env_obj: serde_json::Map<String, serde_json::Value> = merged_env_pre_resolve
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            ds.insert("env".into(), serde_json::Value::Object(env_obj));
+            if !request.podman_args.is_empty() {
+                ds.insert(
+                    "podman_args".into(),
+                    serde_json::Value::Array(
+                        request
+                            .podman_args
+                            .iter()
+                            .map(|a| serde_json::Value::String(a.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            ds.insert(
+                "repo_url".into(),
+                serde_json::Value::String(request.repo_url.clone()),
+            );
+            ds.insert(
+                "config_path".into(),
+                serde_json::Value::String(request.config_path.clone()),
+            );
+            ds.insert(
+                "runtime".into(),
+                serde_json::Value::String(runtime.to_string()),
+            );
+            // Fixed port only when user passed -p
+            if let Some(ref p) = request.port {
+                let mut port_obj = serde_json::Map::new();
+                port_obj.insert("host".into(), serde_json::json!(p.host));
+                port_obj.insert("guest".into(), serde_json::json!(p.guest));
+                ds.insert("port".into(), serde_json::Value::Object(port_obj));
+            }
+            Some(serde_json::Value::Object(ds))
+        };
 
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
@@ -465,18 +507,12 @@ impl DeployPipeline {
         // Cold path only: destroy-in-place before boot (no live prior).
         // Dual-live keeps the active generation untouched until cutover.
         if !dual_live {
-            // Order (fixes #120):
-            // 1. take_processes — disarm supervisor first
-            // 2. kill+wait old children so ports are freed
-            // 3. rename dirs to .bak (for rollback)
-            // 4. destroy_prior_runtime — cleans TAP/ports without needing metadata
-            let (old_vm_proc, old_aux_procs) = self
-                .state
-                .take_processes(service_id)
-                .unwrap_or((None, Vec::new()));
-
-            kill_and_wait_children(old_vm_proc, old_aux_procs).await;
-
+            // Order (F-23): rename dirs to .bak FIRST so any failure after this
+            // point is rollback-covered. Then disarm the supervisor + kill children.
+            // 1. Rename dirs to .bak (creates rollback safety net)
+            // 2. take_processes — disarm supervisor
+            // 3. kill+wait old children so ports are freed
+            // 4. destroy_prior_runtime — cleans TAP/ports (rollback will re-create)
             if has_russel_dir {
                 if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
                     anyhow::bail!("failed to backup russel directory: {}", e);
@@ -488,6 +524,13 @@ impl DeployPipeline {
                     anyhow::bail!("failed to backup microvms directory: {}", e);
                 }
             }
+
+            let (old_vm_proc, old_aux_procs) = self
+                .state
+                .take_processes(service_id)
+                .unwrap_or((None, Vec::new()));
+
+            kill_and_wait_children(old_vm_proc, old_aux_procs).await;
 
             if let Some(prior_kind) = prior_runtime
                 && let Err(e) =
@@ -525,8 +568,8 @@ impl DeployPipeline {
 
         let mut port_reservation = None;
         let deploy_result = async {
-            // Port reservations are keyed by the runtime key (gen-scoped on dual-live).
-            port_reservation = Some(PortReservation::new(&runtime_key));
+            // Determine port first, then arm the reservation (F-28: avoid
+            // releasing the old service's port on early allocation failure).
             let port = if dual_live {
                 // Always allocate a fresh backend port for the candidate so the
                 // active generation keeps its listener. Fixed -p is Traefik-facing
@@ -562,6 +605,8 @@ impl DeployPipeline {
                     }
                 }
             };
+            // Arm reservation only after port is secured.
+            port_reservation = Some(PortReservation::new(&runtime_key));
 
             match runtime {
                 RuntimeKind::Microvm => {
@@ -576,6 +621,7 @@ impl DeployPipeline {
                         &merged_env,
                         &tx,
                         Some(generation_id.as_str()),
+                        desired_state.as_ref(),
                     )
                     .await
                 }
@@ -589,6 +635,7 @@ impl DeployPipeline {
                         &merged_env,
                         &tx,
                         Some(generation_id.as_str()),
+                        desired_state.as_ref(),
                     )
                     .await
                 }
@@ -845,7 +892,6 @@ impl DeployPipeline {
             self.state.attach_flake_path(service_id, repo_path.clone());
         }
 
-        self.state.attach_flake_path(service_id, repo_path.clone());
         // Record source so `russel update` / health restart can redeploy.
         if let Err(e) =
             record_source_in_metadata(service_id, &request.repo_url, &request.config_path)
@@ -883,6 +929,7 @@ impl DeployPipeline {
         env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
         generation_id: Option<&str>,
+        desired_state: Option<&serde_json::Value>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         let alloc: SubnetAllocation = subnet_for(service_id);
         tracing::info!(
@@ -974,7 +1021,7 @@ impl DeployPipeline {
         // ── Write metadata via build_microvm_metadata ────────────────
         let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
         let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
-        let meta = build_microvm_metadata_with_gen(
+        let mut meta = build_microvm_metadata_with_gen(
             service_id,
             port.host,
             port.guest,
@@ -992,6 +1039,13 @@ impl DeployPipeline {
             generation_id,
             Some(&alloc.tap_id),
         );
+
+        // Merge desired_state for rollback + health restart (F-04).
+        if let Some(ds) = desired_state
+            && let Some(obj) = meta.as_object_mut()
+        {
+            obj.insert("desired_state".into(), ds.clone());
+        }
         write_metadata(&metadata_path, &meta)?;
 
         // Create marker directory for MicrovmRunner::list() discovery
@@ -1096,6 +1150,7 @@ impl DeployPipeline {
         env: &HashMap<String, String>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
         generation_id: Option<&str>,
+        desired_state: Option<&serde_json::Value>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
             service_id,
@@ -1151,7 +1206,7 @@ impl DeployPipeline {
         tracing::info!(service_id, start_ms, "container started");
 
         let metadata_path = base_dir.join("metadata.json");
-        let metadata = build_container_metadata_with_gen(
+        let mut metadata = build_container_metadata_with_gen(
             service_id,
             port.host,
             port.guest,
@@ -1164,6 +1219,13 @@ impl DeployPipeline {
             podman_args,
             generation_id,
         );
+
+        // Merge desired_state for rollback + health restart (F-04).
+        if let Some(ds) = desired_state
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert("desired_state".into(), ds.clone());
+        }
         write_metadata(&metadata_path, &metadata)?;
 
         let t = Instant::now();
@@ -1244,7 +1306,8 @@ async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKind> {
     None
 }
 
-/// Kill + wait (with timeout, then force) all old children so ports are free.
+/// Kill + wait (with timeout) all old children so ports are free.
+/// tokio `kill()` sends SIGKILL directly on Unix; there is no graceful phase.
 async fn kill_and_wait_children(
     old_vm_proc: Option<tokio::process::Child>,
     old_aux_procs: Vec<tokio::process::Child>,
@@ -1254,9 +1317,8 @@ async fn kill_and_wait_children(
     for mut child in children {
         let _ = child.kill().await;
         let wait = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        if !matches!(wait, Ok(Ok(_))) {
-            // Force kill if still alive after timeout.
-            tracing::warn!("child process did not exit gracefully after SIGKILL");
+        if let Err(_elapsed) = wait {
+            tracing::warn!("child process did not exit within 5s after SIGKILL");
         }
     }
 }
@@ -1316,15 +1378,10 @@ async fn attempt_microvm_rollback(
     runner: &MicrovmRunner,
     state: &AppState,
 ) -> anyhow::Result<()> {
-    // 1. Restore backup dirs
-    tokio::fs::rename(russel_bak, russel_dir).await?;
-    if has_microvms_backup {
-        tokio::fs::rename(microvms_bak, microvms_dir).await?;
-    }
-
-    // 2. Parse metadata fail-closed (no silent defaults for required fields)
-    let old_metadata_path = format!("{}/metadata.json", russel_dir);
-    let content = std::fs::read_to_string(&old_metadata_path)?;
+    // 0. Validate backup metadata BEFORE renaming (F-16: avoid unrecoverable
+    //    half-restore when backup metadata is corrupt/missing).
+    let old_metadata_bak_path = format!("{}/metadata.json", russel_bak);
+    let content = std::fs::read_to_string(&old_metadata_bak_path)?;
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
 
     let host_port = u16::try_from(
@@ -1388,8 +1445,36 @@ async fn attempt_microvm_rollback(
             runner.build_agent_initramfs().await?
         }
     };
+    // Extract desired_state user env for deploy.env restoration (F-04).
+    let user_env: HashMap<String, String> = old_meta
+        .get("desired_state")
+        .and_then(|ds| ds.get("env"))
+        .and_then(|env_obj| {
+            if let serde_json::Value::Object(map) = env_obj {
+                let mut out = HashMap::new();
+                for (k, v) in map {
+                    if let Some(val) = v.as_str() {
+                        out.insert(k.clone(), val.to_string());
+                    }
+                }
+                Some(out)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    // Resolve secret:// refs in restored env
+    let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 
-    // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick
+    // All validations passed — now rename safely.
+    // 1. Restore backup dirs
+    tokio::fs::rename(russel_bak, russel_dir).await?;
+    if has_microvms_backup {
+        tokio::fs::rename(microvms_bak, microvms_dir).await?;
+    }
+
+    // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick.
+    //    Include user env from desired_state (F-04: env restored on rollback).
     let alloc = subnet_for(service_id);
     let cfg_dir = format!("{}/cfg", russel_dir);
     std::fs::create_dir_all(&cfg_dir)?;
@@ -1398,13 +1483,17 @@ async fn attempt_microvm_rollback(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let deploy_env = format!(
+    let mut deploy_env = format!(
         "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
         alloc.vm_ip,
         alloc.host_ip,
         guest_port,
         shell_quote(&app_path)
     );
+    // Append user env vars from desired_state, shell-quoted (secrets resolved above).
+    for (key, value) in &user_env {
+        deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
+    }
     let deploy_env_path = PathBuf::from(format!("{cfg_dir}/deploy.env"));
     crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes(), "deploy.env")?;
 
@@ -1479,7 +1568,7 @@ async fn attempt_microvm_rollback(
     }
 
     // 8. Write metadata + mark deployed only after readiness
-    let meta = build_microvm_metadata(
+    let mut meta = build_microvm_metadata(
         service_id,
         host_port,
         guest_port,
@@ -1495,7 +1584,15 @@ async fn attempt_microvm_rollback(
         Some(&bin_name),
         Some(&initramfs_path.display().to_string()),
     );
-    if let Err(e) = write_metadata(&old_metadata_path, &meta) {
+
+    // Preserve desired_state from old metadata for future rollbacks (F-04).
+    if let Some(ds) = old_meta.get("desired_state")
+        && let Some(obj) = meta.as_object_mut()
+    {
+        obj.insert("desired_state".into(), ds.clone());
+    }
+    let metadata_path = format!("{}/metadata.json", russel_dir);
+    if let Err(e) = write_metadata(&metadata_path, &meta) {
         let mut aux = vec![socat_child];
         aux.extend(virtiofsd_children);
         cleanup_rollback_resources(service_id, &alloc, runner, Some(vm_child), Some(aux)).await;
@@ -1550,34 +1647,98 @@ async fn attempt_container_rollback(
     containers: &ContainerRunner,
     state: &AppState,
 ) -> anyhow::Result<()> {
-    tokio::fs::rename(russel_bak, russel_dir).await?;
-    let old_metadata_path = format!("{}/metadata.json", russel_dir);
-    let content = std::fs::read_to_string(&old_metadata_path)?;
+    // 0. Validate backup metadata BEFORE renaming (F-16).
+    let old_metadata_bak_path = format!("{}/metadata.json", russel_bak);
+    let content = std::fs::read_to_string(&old_metadata_bak_path)?;
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
-    let old_host_port = old_meta["host_port"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))?
-        as u16;
-    let old_guest_port = old_meta["guest_port"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))?
-        as u16;
-    let old_mem_mb = old_meta["mem_mb"].as_u64().unwrap_or(512) as u16;
+
+    let old_host_port = u16::try_from(
+        old_meta["host_port"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("host_port out of u16 range in container metadata"))?;
+    let old_guest_port = u16::try_from(
+        old_meta["guest_port"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("guest_port out of u16 range in container metadata"))?;
+    let old_mem_mb = u16::try_from(old_meta["mem_mb"].as_u64().unwrap_or(512))
+        .map_err(|_| anyhow::anyhow!("mem_mb out of u16 range in container metadata"))?;
     let old_bin_name = old_meta["bin_name"].as_str().unwrap_or("app");
     let old_rootfs_path = old_meta["rootfs_path"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing rootfs_path in container metadata"))?;
-    let old_podman_args: Vec<String> = old_meta
-        .get("podman_args")
+
+    // F-04: restore podman_args from desired_state when present, falling back
+    // to the legacy top-level "podman_args" field for older metadata.
+    let mut old_podman_args: Vec<String> = old_meta
+        .get("desired_state")
+        .and_then(|ds| ds.get("podman_args"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|a| a.as_str().map(str::to_string))
                 .collect()
         })
+        .unwrap_or_else(|| {
+            // Legacy: podman_args at top level
+            old_meta
+                .get("podman_args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    // Re-validate persisted podman_args; on failure drop them + warn.
+    if !old_podman_args.is_empty()
+        && let Err(e) = validate_podman_passthrough_args(&old_podman_args)
+    {
+        tracing::warn!(
+            service_id,
+            error = %e,
+            "persisted podman_args failed re-validation — dropping for rollback"
+        );
+        old_podman_args.clear();
+    }
+
+    // F-04: restore user env from desired_state (resolved secrets).
+    let user_env: HashMap<String, String> = old_meta
+        .get("desired_state")
+        .and_then(|ds| ds.get("env"))
+        .and_then(|env_obj| {
+            if let serde_json::Value::Object(map) = env_obj {
+                let mut out = HashMap::new();
+                for (k, v) in map {
+                    if let Some(val) = v.as_str() {
+                        out.insert(k.clone(), val.to_string());
+                    }
+                }
+                Some(out)
+            } else {
+                None
+            }
+        })
         .unwrap_or_default();
+    // Resolve secret:// refs
+    let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
+
+    // All validations passed — rename safely.
+    tokio::fs::rename(russel_bak, russel_dir).await?;
 
     PortAllocator::reserve(service_id, old_host_port)?;
+
+    // Build container env: PORT first, then user env (PORT filtered out).
+    let mut env: Vec<(String, String)> = vec![("PORT".to_string(), old_guest_port.to_string())];
+    for (key, value) in &user_env {
+        if key != "PORT" {
+            env.push((key.clone(), value.clone()));
+        }
+    }
 
     let start_spec = ContainerStartSpec {
         service_id: service_id.to_string(),
@@ -1588,7 +1749,7 @@ async fn attempt_container_rollback(
         host_port: old_host_port,
         guest_port: old_guest_port,
         memory_mb: old_mem_mb,
-        env: vec![("PORT".to_string(), old_guest_port.to_string())],
+        env,
         extra_args: old_podman_args.clone(),
     };
     let running = containers.start(&start_spec).await?;
@@ -1614,7 +1775,7 @@ async fn attempt_container_rollback(
     let old_store_path = old_meta["store_path"]
         .as_str()
         .unwrap_or("/nix/store/unknown");
-    let new_metadata = build_container_metadata(
+    let mut new_metadata = build_container_metadata(
         service_id,
         old_host_port,
         old_guest_port,
@@ -1626,7 +1787,14 @@ async fn attempt_container_rollback(
         Some(old_bin_name),
         &old_podman_args,
     );
-    write_metadata(&old_metadata_path, &new_metadata)?;
+
+    // Preserve desired_state from old metadata for future rollbacks (F-04).
+    if let Some(ds) = old_meta.get("desired_state")
+        && let Some(obj) = new_metadata.as_object_mut()
+    {
+        obj.insert("desired_state".into(), ds.clone());
+    }
+    write_metadata(format!("{}/metadata.json", russel_dir), &new_metadata)?;
     Ok(())
 }
 
@@ -1634,6 +1802,9 @@ async fn attempt_container_rollback(
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Validate a binary/service name for shell safety: only `[A-Za-z0-9._+-]`.
+/// Additionally rejects `.`, `..`, all-dots names, and names without at least
+/// one alphanumeric character (paths that would resolve to `.` / `..` when
+/// joined as `rootfs/bin/<name>`).
 /// Rejects empty strings, whitespace, shell metacharacters.
 pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
@@ -1642,14 +1813,30 @@ pub fn validate_bin_name(name: &str) -> anyhow::Result<()> {
     if name.len() > 256 {
         anyhow::bail!("bin_name too long (max 256 characters)");
     }
-    let valid = name
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-');
+    // Reject names that are exactly "." or ".." or all dots.
+    if name == "." || name == ".." {
+        anyhow::bail!("bin_name must not be '.' or '..'");
+    }
+    if name.bytes().all(|c| c == b'.') {
+        anyhow::bail!("bin_name must not consist entirely of dots");
+    }
+    let mut has_alnum = false;
+    let valid = name.bytes().all(|c| {
+        if c.is_ascii_alphanumeric() {
+            has_alnum = true;
+            true
+        } else {
+            c == b'.' || c == b'_' || c == b'+' || c == b'-'
+        }
+    });
     if !valid {
         anyhow::bail!(
             "bin_name '{}' contains invalid characters (only A-Za-z0-9._+- allowed)",
             name
         );
+    }
+    if !has_alnum {
+        anyhow::bail!("bin_name must contain at least one alphanumeric character");
     }
     Ok(())
 }
