@@ -308,11 +308,14 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 │   ├── cli/          # russel-cli
 │   ├── core/         # shared types & config
 │   └── ctrl/         # control plane (main logic)
-├── examples/
-│   ├── basic-http/   # Go app with flake.nix + /health
-│   ├── filebrowser/  # Nix wrapper around pkgs.filebrowser
-│   ├── shortlink/    # Shortlink service example
-│   └── static-test/  # Static HTML served via Python http.server
+├── examples/         # see examples/README.md
+│   ├── basic-http/   # Go + /health (container default)
+│   ├── microvm-http/ # same app, type = microvm
+│   ├── hello-rust/   # pure-std Rust HTTP
+│   ├── env-config/   # [service.env] + secret://
+│   ├── shortlink/    # in-memory URL shortener
+│   ├── filebrowser/  # nixpkgs filebrowser wrapper
+│   └── static-test/  # Python static site
 ├── nix/
 │   ├── microvm/      # legacy/reference configs; runtime boots Cloud Hypervisor directly
 │   └── modules/      # host NixOS modules

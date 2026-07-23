@@ -71,6 +71,16 @@ pub(crate) fn shared_runner() -> MicrovmRunner {
     RUNNER.clone()
 }
 
+/// virtiofsd sandbox mode from RUSSEL_VIRTIOFS_SANDBOX (default: chroot).
+/// Set RUSSEL_VIRTIOFS_SANDBOX=none for escape hatch.
+pub(crate) fn virtiofsd_sandbox() -> String {
+    std::env::var("RUSSEL_VIRTIOFS_SANDBOX")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "chroot".to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct MicrovmRunner {
     kernel_cache: Arc<Mutex<Option<KernelInfo>>>,
@@ -980,7 +990,7 @@ exec /bin/sh
         let mut cmd = Command::new("virtiofsd");
         cmd.arg(format!("--socket-path={}", socket.display()))
             .arg(format!("--shared-dir={}", shared_dir.display()))
-            .arg("--sandbox=none")
+            .arg(format!("--sandbox={}", virtiofsd_sandbox()))
             .arg("--cache=always");
 
         if readonly {

@@ -1,6 +1,12 @@
+# filebrowser — nixpkgs filebrowser via writeShellScriptBin.
+# Shell entrypoint uses an absolute /nix/store shebang (works with debug = false).
+# Writes under /tmp (tmpfs is writable even with --read-only rootfs).
+
 [service]
 name = "filebrowser"
 source = "."
 port = 8080
 memory = "256mb"
+type = "container"
 bin = "filebrowser"
+# debug = true

@@ -1,8 +1,10 @@
+# Workspace-level sample; prefer per-app Russelfiles under examples/*/
 [service]
 name = "api"
 source = "."
 port = 3000
 memory = "256mb"
+type = "container"
 
 [database.postgres]
 enabled = false

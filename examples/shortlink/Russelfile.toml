@@ -1,0 +1,9 @@
+# shortlink — tiny in-memory URL shortener (POST / to create, GET /{id} to redirect).
+
+[service]
+name = "shortlink"
+source = "."
+port = 3000
+memory = "128mb"
+type = "container"
+bin = "shortlink"

@@ -1,0 +1,16 @@
+# env-config — demonstrates Russelfile [service.env] and secret:// refs.
+# Deploy after: printf '%s' 's3cret' | russel-cli secrets set DEMO_SECRET
+
+[service]
+name = "env-config"
+source = "."
+port = 3000
+memory = "128mb"
+type = "container"
+bin = "env-config"
+
+[service.env]
+LOG_LEVEL = "info"
+GREETING = "hello from Russelfile"
+# Resolved at deploy time from /var/lib/russel/secrets/DEMO_SECRET (mode 0600):
+DEMO_SECRET = "secret://DEMO_SECRET"

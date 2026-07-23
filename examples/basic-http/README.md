@@ -1,33 +1,41 @@
-# Russel Basic HTTP Test App
+# basic-http
 
-This is the smallest app intended to exercise Russel's MVP deploy pipeline.
+Go stdlib HTTP server with embedded static assets and `GET /health` → `ok`.
 
-It provides:
+| Field | Value |
+|-------|--------|
+| Runtime (default) | `container` |
+| Port | 3000 |
+| Binary | `basic-http` |
 
-- `flake.nix` that builds a package with `/bin/api`
-- `Russelfile.toml` using service name `api`
-- a small Go static-site server using only the standard library
-- static dashboard response on `/`
-- health response on `/health`
-- graceful shutdown on `Ctrl-C` / `SIGTERM`
+## Deploy (container — default)
 
-Build it directly:
+```bash
+# terminal 1
+./target/debug/russel-ctrl
 
-```sh
-nix build path:$PWD
-PORT=3000 ./result/bin/api
+# terminal 2
+./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id basic
+
+curl http://127.0.0.1:8080/health   # ok
+# Traefik (optional): http://basic.russel.local  after Host routing is set up
 ```
 
-Once these example files are tracked by Git, plain `nix build` works too.
+## Deploy (microVM)
 
-Run it through the current Russel scaffold:
-
-```sh
-cargo run -p russel-ctrl
-cargo run -p russel-cli -- deploy -p 3000:3000 --vm-id test-vm examples/basic-http
-cargo run -p russel-cli -- status
-cargo run -p russel-cli -- logs
+```toml
+# temporarily in Russelfile.toml, or use examples/microvm-http
+type = "microvm"
 ```
 
-The current Russel scaffold builds and generates microvm.nix config, but it
-does not boot the microVM yet.
+```bash
+sudo -E ./target/debug/russel-ctrl   # TAP/KVM usually needs privileges
+./target/debug/russel-cli deploy examples/microvm-http -p 8080:3000 --vm-id basic-vm
+```
+
+## Local Nix (no Russel)
+
+```bash
+nix build path:examples/basic-http
+PORT=3000 ./result/bin/basic-http
+```

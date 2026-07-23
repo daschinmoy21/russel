@@ -83,10 +83,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Keep a clone so we can detach workload children after Axum drops the
-    // router state. Child handles are spawned with kill_on_drop(true); without
-    // an explicit detach, dropping AppState would SIGKILL every VM on exit.
-    let state = AppState::default();
+    // Same AppState that reconcile filled — do not re-default.
+    // All subsequent consumers (health loop, router, wait_for_deploys,
+    // detach_all_processes) share this Arc so rehydrated services are visible.
 
     // Periodic TCP health probes; set RUSSEL_HEALTH_RESTART=1 to redeploy
     // after 3 consecutive failures when metadata records repo_url.
@@ -95,9 +94,9 @@ async fn main() -> Result<()> {
     let app: Router = api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
 
-    // Auth + bind policy: if RUSSEL_API_TOKEN is set, require Bearer auth.
-    // If unset, only allow loopback binds (dev mode).
-    let token = std::env::var("RUSSEL_API_TOKEN").ok();
+    // Auth + bind policy: non-empty RUSSEL_API_TOKEN (after trim) enables auth.
+    // Empty/whitespace is treated as unset (dev mode).
+    let token = api::configured_api_token();
     let is_loopback = bind_addr.starts_with("127.0.0.1:") || bind_addr.starts_with("[::1]:");
     if token.is_some() {
         info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
@@ -322,6 +321,7 @@ fn is_russel_tap(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::is_russel_tap;
 

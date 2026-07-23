@@ -255,6 +255,7 @@ async fn container_running(container_id: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::AppState;
@@ -320,24 +321,22 @@ mod tests {
             use std::os::unix::process::CommandExt;
             command.arg0(format!("socat-russel-{service_id}"));
         }
-        command
+        let child = command
             .args(["-c", "sleep 30; wait"])
             .spawn()
-            .map(|child| {
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while !pid_matches(child.id(), &["socat", "socat-russel"], service_id)
-                    && Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                assert!(pid_matches(
-                    child.id(),
-                    &["socat", "socat-russel"],
-                    service_id
-                ));
-                child
-            })
-            .expect("spawn fake socat")
+            .expect("spawn fake socat");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_matches(child.id(), &["socat", "socat-russel"], service_id)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(pid_matches(
+            child.id(),
+            &["socat", "socat-russel"],
+            service_id
+        ));
+        child
     }
 
     #[test]
@@ -368,6 +367,7 @@ mod tests {
         assert_eq!(status.host_port, Some(3100));
         assert_eq!(status.runtime, Some(RuntimeKind::Microvm));
         let _ = fake.kill();
+        let _ = fake.wait();
     }
 
     #[tokio::test]
@@ -476,6 +476,7 @@ mod tests {
 
         PortAllocator::release("port-svc");
         let _ = fake.kill();
+        let _ = fake.wait();
     }
 
     #[tokio::test]
@@ -507,6 +508,7 @@ mod tests {
         assert_eq!(svc.vm_state, "running");
         drop(inner);
         let _ = fake.kill();
+        let _ = fake.wait();
     }
 
     #[tokio::test]
@@ -555,7 +557,9 @@ mod tests {
         assert_eq!(report.adopted_running, 2);
         assert_eq!(report.stopped, 1);
         let _ = a.kill();
+        let _ = a.wait();
         let _ = b.kill();
+        let _ = b.wait();
         assert_eq!(state.list_services().len(), 3);
     }
 
@@ -589,5 +593,6 @@ mod tests {
         let status = state.status("socat-only").unwrap();
         assert_eq!(status.status, "deployed");
         let _ = fake.kill();
+        let _ = fake.wait();
     }
 }

@@ -460,7 +460,11 @@ const LABEL_SERVICE: &str = "russel.service";
 const LABEL_RUNTIME: &str = "russel.runtime";
 const RUNTIME_CONTAINER: &str = "container";
 const NIX_STORE_MOUNT: &str = "type=bind,source=/nix/store,destination=/nix/store,ro=true";
-const PODMAN_STOP_TIMEOUT_SECS: &str = "10";
+/// Grace period passed to `podman stop -t` before Podman sends SIGKILL.
+const PODMAN_STOP_TIMEOUT_SECS: &str = "5";
+/// Hard ceiling for the whole stop attempt (stop + kill). Prevents hung HTTP
+/// handlers when Podman itself stalls in "Stopping".
+const PODMAN_STOP_WALL_SECS: u64 = 20;
 
 // ── RUSSEL_PODMAN_USER env support (Issue #278598) ───────────────────────────
 
@@ -1110,7 +1114,15 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
 
     let name = ContainerRunner::container_name(&spec.service_id);
-    let port_mapping = format!("{}:{}", spec.host_port, spec.guest_port);
+    let bind = crate::network::publish_bind_addr();
+    // Podman -p: HOST:CONTAINER or IP:HOST:CONTAINER. Bracket IPv6 (contains ':').
+    let port_mapping = if bind == "0.0.0.0" || bind == "::" {
+        format!("{}:{}", spec.host_port, spec.guest_port)
+    } else if bind.contains(':') {
+        format!("[{}]:{}:{}", bind, spec.host_port, spec.guest_port)
+    } else {
+        format!("{}:{}:{}", bind, spec.host_port, spec.guest_port)
+    };
     let log_path = log_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 log path: {}", log_path.display()))?;
@@ -1182,19 +1194,72 @@ async fn stop_and_remove_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn stop_container(name: &str) -> anyhow::Result<()> {
-    let output = podman_command().await
+    let stop_fut = podman_command().await
         .args(["stop", "-t", PODMAN_STOP_TIMEOUT_SECS, name])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run podman stop: {e}"))?;
+        .output();
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PODMAN_STOP_WALL_SECS),
+        stop_fut,
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() || is_missing_container(&output) => {
+            return Ok(());
+        }
+        Ok(Ok(output)) => {
+            tracing::warn!(
+                container = %name,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "podman stop failed — forcing kill"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(container = %name, error = %e, "podman stop spawn failed — forcing kill");
+        }
+        Err(_) => {
+            tracing::warn!(
+                container = %name,
+                wall_secs = PODMAN_STOP_WALL_SECS,
+                "podman stop timed out — forcing kill"
+            );
+        }
+    }
+
+    // Force path: SIGKILL via podman, treat missing as success.
+    force_kill_container(name).await
+}
+
+async fn force_kill_container(name: &str) -> anyhow::Result<()> {
+    let kill_fut = podman_command().await.args(["kill", name]).output();
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), kill_fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            anyhow::bail!("failed to run podman kill: {e}");
+        }
+        Err(_) => {
+            anyhow::bail!("podman kill timed out for container {name}");
+        }
+    };
 
     if output.status.success() || is_missing_container(&output) {
         return Ok(());
     }
 
+    // Last resort: rm -f (also kills).
+    let rm = podman_command().await
+        .args(["rm", "-f", name])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run podman rm -f: {e}"))?;
+    if rm.status.success() || is_missing_container(&rm) {
+        return Ok(());
+    }
+
     anyhow::bail!(
-        "podman stop failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "podman kill/rm failed for {name}: kill={} rm={}",
+        String::from_utf8_lossy(&output.stderr).trim(),
+        String::from_utf8_lossy(&rm.stderr).trim()
     )
 }
 
@@ -1224,6 +1289,7 @@ fn is_missing_container(output: &std::process::Output) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -1484,7 +1550,11 @@ mod tests {
         assert!(args.contains(&"--mount".to_string()));
         assert!(args.contains(&NIX_STORE_MOUNT.to_string()));
         assert!(args.contains(&"-p".to_string()));
-        assert!(args.contains(&"8080:3000".to_string()));
+        // Publish bind may be 127.0.0.1 (default) or 0.0.0.0 (legacy wildcard).
+        let has_port = args
+            .iter()
+            .any(|a| a == "8080:3000" || a.ends_with(":8080:3000") || a == "127.0.0.1:8080:3000");
+        assert!(has_port, "expected host:guest port mapping in {args:?}");
         assert!(args.contains(&"--memory".to_string()));
         assert!(args.contains(&"512m".to_string()));
         assert!(args.contains(&"--workdir".to_string()));

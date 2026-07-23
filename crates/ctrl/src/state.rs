@@ -236,6 +236,57 @@ impl AppState {
         });
     }
 
+    /// Lightweight PID liveness supervisor for adopted microVMs.
+    ///
+    /// Polls `/proc/{pid}` every 5s. When the PID disappears, marks the
+    /// service failed if the generation still matches.
+    fn spawn_pid_supervisor(&self, service_id: String, generation: u64) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            // Initial settle delay.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                // Check generation ownership.
+                let pid = {
+                    let inner = state.lock_inner();
+                    let Some(s) = inner.services.get(&service_id) else {
+                        return;
+                    };
+                    if s.process_generation != generation {
+                        return;
+                    }
+                    if s.status != "deployed" || s.vm_state != "running" {
+                        return;
+                    }
+                    s.vm_pid
+                };
+                let Some(pid) = pid else {
+                    return;
+                };
+                if !pid_is_alive(pid) {
+                    tracing::warn!(
+                        service_id = %service_id,
+                        pid,
+                        generation,
+                        "adopted microVM PID disappeared"
+                    );
+                    state.mark_failed_if_generation(
+                        &service_id,
+                        generation,
+                        format!("adopted microVM PID {pid} no longer alive"),
+                    );
+                    return;
+                }
+            }
+        });
+    }
+
     fn poll_supervised_children(&self, service_id: &str, generation: u64) -> SupervisePoll {
         let mut inner = self.lock_inner();
         let Some(s) = inner.services.get_mut(service_id) else {
@@ -574,8 +625,17 @@ impl AppState {
         let Some(s) = inner.services.get_mut(service_id) else {
             return LifecycleClaim::NotFound;
         };
-        // Prevent concurrent lifecycle ops on the same service
-        if s.status == "stopping" || s.status == "destroying" || s.status == "building" {
+        // Prevent concurrent lifecycle ops on a different kind of op.
+        // Same-op re-entry (stop while "stopping", destroy while "destroying")
+        // is allowed so a hung first attempt can be retried/forced. Destroy is
+        // also allowed to supersede a stuck stop.
+        let busy = match s.status.as_str() {
+            "building" => true,
+            "destroying" => status != "destroying",
+            "stopping" => status != "stopping" && status != "destroying",
+            _ => false,
+        };
+        if busy {
             return LifecycleClaim::Busy;
         }
         s.status = status.to_string();
@@ -783,6 +843,9 @@ impl AppState {
     /// No `Child` handles are created — the VM is observed-only.
     /// Stop/destroy already use disk metadata + `MicrovmRunner`.
     /// If the service already has live Child handles, does nothing.
+    ///
+    /// When `vm_pid` is Some, spawns a lightweight PID liveness supervisor
+    /// that marks the service failed if the process disappears.
     pub fn adopt_running_microvm(
         &self,
         service_id: &str,
@@ -790,30 +853,38 @@ impl AppState {
         guest_port: u16,
         vm_pid: Option<u32>,
     ) {
-        let mut inner = self.lock_inner();
-        let s = inner.services.entry(service_id.to_string()).or_default();
-        if s.vm_process.is_some() {
-            tracing::info!(
-                service_id = %service_id,
-                "skipping microvm adoption — already has live Child handle"
-            );
-            return;
+        let generation = {
+            let mut inner = self.lock_inner();
+            let s = inner.services.entry(service_id.to_string()).or_default();
+            if s.vm_process.is_some() {
+                tracing::info!(
+                    service_id = %service_id,
+                    "skipping microvm adoption — already has live Child handle"
+                );
+                return;
+            }
+            s.status = "deployed".to_string();
+            s.vm_state = "running".to_string();
+            s.runtime = Some(RuntimeKind::Microvm);
+            s.vm_pid = vm_pid;
+            s.host_port = Some(host_port);
+            s.guest_port = Some(guest_port);
+            s.started_at = Instant::now();
+            s.container_id = None;
+            s.vm_process = None; // observed-only
+            s.aux_processes.clear();
+            s.prebuild_status = None;
+            s.prebuild_vm_state = None;
+            s.process_generation = s.process_generation.wrapping_add(1);
+            s.logs.push_str(&format!(
+                "adopted running microvm from disk (host_port={host_port}, guest_port={guest_port})\n"
+            ));
+            s.process_generation
+        };
+        // Spawn PID supervisor when we have a known PID.
+        if vm_pid.is_some() {
+            self.spawn_pid_supervisor(service_id.to_string(), generation);
         }
-        s.status = "deployed".to_string();
-        s.vm_state = "running".to_string();
-        s.runtime = Some(RuntimeKind::Microvm);
-        s.vm_pid = vm_pid;
-        s.host_port = Some(host_port);
-        s.guest_port = Some(guest_port);
-        s.started_at = Instant::now();
-        s.container_id = None;
-        s.vm_process = None; // observed-only
-        s.aux_processes.clear();
-        s.prebuild_status = None;
-        s.prebuild_vm_state = None;
-        s.logs.push_str(&format!(
-            "adopted running microvm from disk (host_port={host_port}, guest_port={guest_port})\n"
-        ));
     }
 
     /// Adopt a running container observed from disk metadata.
@@ -971,7 +1042,13 @@ async fn check_container_running(container_id: &str) -> bool {
     stdout.trim() == "true"
 }
 
+/// Check if a PID is still alive via /proc/{pid}/stat.
+fn pid_is_alive(pid: u32) -> bool {
+    std::fs::metadata(format!("/proc/{pid}")).is_ok()
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1121,6 +1198,32 @@ mod tests {
         assert!(matches!(
             state.begin_lifecycle_operation("nope", "stopping", "pending"),
             LifecycleClaim::NotFound
+        ));
+    }
+
+    #[test]
+    fn test_begin_lifecycle_allows_stop_reentry_when_stuck_stopping() {
+        let state = AppState::default();
+        state.mark_building("svc-1").unwrap();
+        state.set_status("svc-1", "deployed", "running");
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Claimed(_, _)
+        ));
+        // Second stop while already stopping — recovery / force path.
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Claimed(_, _)
+        ));
+        // Destroy may supersede stuck stop.
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
+            LifecycleClaim::Claimed(_, _)
+        ));
+        // Stop cannot run while destroying.
+        assert!(matches!(
+            state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+            LifecycleClaim::Busy
         ));
     }
 
