@@ -1,6 +1,8 @@
 # basic-http
 
-Go stdlib HTTP server with embedded static assets and `GET /health` → `ok`.
+Go stdlib HTTP server with embedded static **service dashboard** and
+`GET /health` → `ok`. The UI probes `/health` live and documents container vs
+microVM deploy paths.
 
 | Field | Value |
 |-------|--------|
