@@ -19,23 +19,71 @@ use russel_core::{
 /// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
 ///
 /// Token handling matches ctrl `normalize_api_token`: trim whitespace; blank → no auth.
-fn http_client() -> reqwest::Client {
+///
+/// When a token is present and the control-plane URL is plain `http://` with a
+/// non-loopback host, prints a one-time warning to stderr (F-05).
+///
+/// Returns an error when the token value cannot be parsed into a valid HTTP
+/// header value (F-47).
+fn http_client(control_plane: &str) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     if let Ok(raw) = std::env::var("RUSSEL_API_TOKEN") {
         let token = raw.trim();
-        if !token.is_empty()
-            && let Ok(value) = format!("Bearer {token}").parse()
-        {
-            headers.insert(AUTHORIZATION, value);
+        if !token.is_empty() {
+            let header_value = format!("Bearer {token}").parse().map_err(|_| {
+                anyhow!("RUSSEL_API_TOKEN contains characters invalid in an HTTP header")
+            })?;
+            headers.insert(AUTHORIZATION, header_value);
+            // F-05: warn once when token is sent over cleartext to a non-loopback host.
+            warn_cleartext_token(control_plane);
         }
     }
-    match reqwest::Client::builder().default_headers(headers).build() {
-        Ok(c) => c,
-        Err(e) => {
-            // Builder only fails on TLS backend issues — treat as fatal init.
-            panic!("failed to build HTTP client: {e}")
-        }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(|e| anyhow!("failed to build HTTP client: {e}"))
+}
+
+// ── F-05: cleartext token warning ──────────────────────────────────────────
+
+static CLEARTEXT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_cleartext_token(control_plane: &str) {
+    // Issue once per process invocation.
+    if CLEARTEXT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
     }
+    // Only warn for plain http:// (not https://).
+    let rest = match control_plane.strip_prefix("http://") {
+        Some(r) => r,
+        None => return,
+    };
+    // Extract host: everything before the first '/' or ':' or end-of-string.
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if is_loopback_host(host) {
+        return;
+    }
+    eprintln!(
+        "\x1b[1;33mwarning:\x1b[0m RUSSEL_API_TOKEN is sent in cleartext to \
+         non-loopback host \x1b[1m{host}\x1b[0m over plain HTTP"
+    );
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    // Check 127.0.0.0/8.
+    if let Some(rest) = host.strip_prefix("127.") {
+        return rest.split('.').all(|octet| octet.parse::<u8>().is_ok());
+    }
+    false
 }
 
 /// Map a reqwest error into a user-friendly message when the control plane is unreachable.
@@ -234,11 +282,9 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     // Validate CLI env before sending.
     validate_env_map(&cli_env)?;
 
-    // ── Send deploy request ────────────────────────────────────────────────
-    let client = http_client();
+    let client = http_client(control_plane)?;
     let mut response = client
         .post(format!("{control_plane}/deploy"))
-        .timeout(Duration::from_secs(300))
         .json(&DeployRequest {
             repo_url,
             config_path: args.config,
@@ -280,7 +326,11 @@ fn step(label: &str, value: &str, suffix: &str) {
 }
 
 fn phase(label: &str, desc: &str) {
-    println!("  \x1b[2m{label:>10}\x1b[0m  \x1b[2m· {desc}\x1b[0m");
+    println!(
+        "  \x1b[2m{:>10}\x1b[0m  \x1b[2m· {}\x1b[0m",
+        sanitize_terminal(label),
+        sanitize_terminal(desc)
+    );
 }
 
 fn ms(v: u128) -> String {
@@ -289,6 +339,49 @@ fn ms(v: u128) -> String {
     } else {
         format!("{v}ms")
     }
+}
+
+// ── Security: truncate raw NDJSON in error contexts (F-50) ──────────────
+
+/// Truncate an embedded NDJSON line to 256 chars + length suffix for error
+/// messages, so a hostile or buggy control plane cannot flood the terminal.
+fn truncate_for_error(s: &str) -> String {
+    const LIMIT: usize = 256;
+    if s.len() <= LIMIT {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(LIMIT + 64);
+    // Try to truncate at a valid char boundary.
+    let trunc = if let Some((idx, _)) = s.char_indices().nth(LIMIT) {
+        &s[..idx]
+    } else {
+        s
+    };
+    out.push_str(trunc);
+    out.push_str(&format!("…[{} bytes total]", s.len()));
+    out
+}
+
+// ── Security: strip terminal control sequences (F-51) ───────────────────
+
+/// Strip C0 and C1 control characters (except `\t`, `\n`, `\r`) from
+/// server-supplied strings before printing.  This prevents terminal escape
+/// injection when the control plane (or a MITM on plain HTTP) is hostile.
+fn sanitize_terminal(s: &str) -> String {
+    s.chars().filter(|&c| !is_terminal_control(c)).collect()
+}
+
+fn is_terminal_control(c: char) -> bool {
+    let u = c as u32;
+    // C0: 0x00-0x1F (keep \t=0x09, \n=0x0A, \r=0x0D)
+    if u <= 0x1F && u != 0x09 && u != 0x0A && u != 0x0D {
+        return true;
+    }
+    // C1: 0x7F (DEL) and 0x80-0x9F
+    if u == 0x7F || (0x80..=0x9F).contains(&u) {
+        return true;
+    }
+    false
 }
 
 fn print_deploy_response(r: DeployResponse, wall: Duration) {
@@ -316,14 +409,15 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     );
     println!();
 
-    step("vm-id", &r.vm_id, "");
+    step("vm-id", &sanitize_terminal(&r.vm_id), "");
     step("status", &r.status, "");
 
     // ── Traefik route (primary ingress) ──────────────────────────────────
     if let Some(route_host) = &r.route_host {
         println!(
             "  \x1b[2m{:>10}\x1b[0m  \x1b[1mhttp://{}\x1b[0m  \x1b[2m(Traefik Host rule)\x1b[0m",
-            "route", route_host
+            "route",
+            sanitize_terminal(route_host)
         );
     }
 
@@ -348,12 +442,20 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
             .unwrap_or_default();
         step(
             "vm-ip",
-            &format!("\x1b[2m{ip}\x1b[0m"),
-            &format!("  \x1b[2m(direct: curl {ip}:{gp})\x1b[0m"),
+            &format!("\x1b[2m{}\x1b[0m", sanitize_terminal(ip)),
+            &format!(
+                "  \x1b[2m(direct: curl {}:{})\x1b[0m",
+                sanitize_terminal(ip),
+                gp
+            ),
         );
     }
     if let Some(store) = &r.store_path {
-        step("store", &format!("\x1b[2m{store}\x1b[0m"), "");
+        step(
+            "store",
+            &format!("\x1b[2m{}\x1b[0m", sanitize_terminal(store)),
+            "",
+        );
     }
     if let Some(artifact) = &r.microvm_config_path {
         let label = if r
@@ -365,7 +467,11 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         } else {
             "initramfs"
         };
-        step(label, &format!("\x1b[2m{artifact}\x1b[0m"), "");
+        step(
+            label,
+            &format!("\x1b[2m{}\x1b[0m", sanitize_terminal(artifact)),
+            "",
+        );
     }
 
     // ── Timing breakdown ───────────────────────────────────────────────────
@@ -405,7 +511,7 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     }
 
     println!();
-    println!("  \x1b[2mnote: {}\x1b[0m", r.message);
+    println!("  \x1b[2mnote: {}\x1b[0m", sanitize_terminal(&r.message));
 
     if ok && let Some(p) = &r.port {
         println!();
@@ -451,15 +557,39 @@ fn resolve_deploy_runtime(
 }
 
 fn normalize_repo_arg(repo: &str) -> Result<String> {
-    let path = PathBuf::from(repo);
-    if path.exists() {
+    // Expand leading '~' via $HOME.
+    let repo = if let Some(rest) = repo.strip_prefix('~') {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            anyhow::bail!("cannot expand '~' in repo path: $HOME is not set");
+        }
+        format!("{home}{rest}")
+    } else {
+        repo.to_string()
+    };
+    // Path-like: starts with '.', '~', '/', or contains a path separator.
+    // Exclude URLs (http://, https://, ssh://, git@) from path-like detection.
+    let is_url_like = repo.starts_with("http://")
+        || repo.starts_with("https://")
+        || repo.starts_with("ssh://")
+        || repo.starts_with("git@");
+    let is_path_like = !is_url_like
+        && (repo.starts_with('.')
+            || repo.starts_with('~')
+            || repo.starts_with('/')
+            || repo.contains(std::path::MAIN_SEPARATOR));
+    if is_path_like {
+        let path = PathBuf::from(&repo);
+        if !path.exists() {
+            anyhow::bail!("repo path does not exist: {repo}");
+        }
         return Ok(path
             .canonicalize()
-            .with_context(|| format!("failed to canonicalize local repo path {repo}"))?
+            .with_context(|| format!("failed to canonicalize local repo path {}", repo))?
             .display()
             .to_string());
     }
-    Ok(repo.to_string())
+    Ok(repo)
 }
 
 /// Parse a single `KEY=VALUE` string into a (key, value) pair.
@@ -468,26 +598,70 @@ fn parse_env_kv(raw: &str) -> Result<(String, String)> {
         .split_once('=')
         .ok_or_else(|| anyhow!("env must be KEY=VALUE, got: {raw}"))?;
     if key.is_empty() {
-        anyhow::bail!("env key must not be empty in: {raw}");
+        anyhow::bail!("env key must not be empty (argument starts with =)");
     }
     Ok((key.to_string(), value.to_string()))
 }
 
-/// Parse a `--env-file` path: each non-empty line is KEY=VALUE, `#` starts a comment.
+/// Parse a `--env-file` path.
+///
+/// Each non-empty line is KEY=VALUE.  Rules:
+/// - UTF-8 BOM at the start of the file is stripped.
+/// - Lines are trimmed; blank lines and `#`-only comments are skipped.
+/// - Inline comments (` # …`) are stripped from the value *outside* quotes.
+/// - Single- and double-quoted values are supported; the matching quote pair is
+///   removed and inner `#` is kept.
+/// - CRLF line endings are handled.
+/// - `=` inside a quoted value is kept.
 fn parse_env_file(path: &str) -> Result<HashMap<String, String>> {
-    let contents = std::fs::read_to_string(path)
+    let mut contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read env file: {path}"))?;
+    // Strip UTF-8 BOM if present.
+    if contents.starts_with('\u{FEFF}') {
+        contents = contents[3..].to_string();
+    }
     let mut map = HashMap::new();
     for (i, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let (key, value) = parse_env_kv(trimmed)
-            .with_context(|| format!("{}:{}: invalid env line", path, i + 1))?;
-        map.insert(key, value);
+        let (key, rest) = trimmed
+            .split_once('=')
+            .ok_or_else(|| anyhow!("{}:{}: env line missing '=' separator", path, i + 1))?;
+        if key.is_empty() {
+            anyhow::bail!(
+                "{}:{}: env key must not be empty (argument starts with =)",
+                path,
+                i + 1
+            );
+        }
+        let value = parse_env_value(rest);
+        map.insert(key.to_string(), value);
     }
     Ok(map)
+}
+
+/// Strip surrounding quotes and inline comments from a raw RHS value.
+fn parse_env_value(raw: &str) -> String {
+    let raw = raw.trim();
+    // Check for quoted value.
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return inner.to_string();
+    }
+    if let Some(inner) = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return inner.to_string();
+    }
+    // Strip inline comment: find first ` #` that is preceded by whitespace
+    // (or at start of value after trimming).
+    if let Some(pos) = raw.find(" #") {
+        // Only strip if the space before # is preceded by a non-hash char
+        // or is at position 0 (for values like `#comment`).
+        // Actually: standard convention is ` # ` at word boundary.
+        // We're already outside quotes, so any ` #` starts a comment.
+        return raw[..pos].trim_end().to_string();
+    }
+    raw.to_string()
 }
 
 fn parse_port_mapping(value: &str) -> Result<PortMapping> {
@@ -514,7 +688,7 @@ pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
         Some(id) => format!("{control_plane}/vm/{id}/status"),
         None => format!("{control_plane}/status"),
     };
-    let r = http_client()
+    let r = http_client(control_plane)?
         .get(&url)
         .send()
         .await
@@ -543,7 +717,7 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
         Some(id) => format!("{control_plane}/vm/{id}/logs"),
         None => format!("{control_plane}/logs"),
     };
-    let r = http_client()
+    let r = http_client(control_plane)?
         .get(&url)
         .send()
         .await
@@ -556,7 +730,7 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
 }
 
 pub async fn vms(control_plane: &str) -> Result<()> {
-    let r = http_client()
+    let r = http_client(control_plane)?
         .get(format!("{control_plane}/vms"))
         .send()
         .await
@@ -587,7 +761,7 @@ pub async fn vms(control_plane: &str) -> Result<()> {
 }
 
 pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
-    let r = http_client()
+    let r = http_client(control_plane)?
         .post(format!("{control_plane}/vm/{id}/stop"))
         .send()
         .await
@@ -614,10 +788,9 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
         body.insert("config_path".into(), serde_json::json!(config));
     }
 
-    let client = http_client();
+    let client = http_client(control_plane)?;
     let mut response = client
         .post(format!("{control_plane}/vm/{}/update", args.id))
-        .timeout(Duration::from_secs(300))
         .json(&body)
         .send()
         .await
@@ -654,8 +827,12 @@ async fn stream_deploy_events(
             }
             let line = std::str::from_utf8(line_bytes)
                 .context("control plane sent non-UTF-8 NDJSON line")?;
-            let event: DeployEvent = serde_json::from_str(line)
-                .with_context(|| format!("failed to parse event from control plane: {line}"))?;
+            let event: DeployEvent = serde_json::from_str(line).with_context(|| {
+                format!(
+                    "failed to parse event from control plane: {}",
+                    truncate_for_error(line)
+                )
+            })?;
             handle_deploy_event(event, operation, &mut final_response)?;
         }
         if buffer.len() > MAX_NDJSON_LINE {
@@ -676,7 +853,10 @@ async fn stream_deploy_events(
             .trim();
         if !line.is_empty() {
             let event: DeployEvent = serde_json::from_str(line).with_context(|| {
-                format!("failed to parse final event from control plane: {line}")
+                format!(
+                    "failed to parse final event from control plane: {}",
+                    truncate_for_error(line)
+                )
             })?;
             handle_deploy_event(event, operation, &mut final_response)?;
         }
@@ -704,7 +884,7 @@ fn handle_deploy_event(
 }
 
 pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
-    let resp = http_client()
+    let resp = http_client(control_plane)?
         .delete(format!("{control_plane}/vm/{id}"))
         .send()
         .await
@@ -740,7 +920,7 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             if value.is_empty() {
                 anyhow::bail!("secret value is empty (read value from stdin)");
             }
-            let resp = http_client()
+            let resp = http_client(control_plane)?
                 .post(format!("{control_plane}/secrets/{name}"))
                 .json(&serde_json::json!({ "value": value }))
                 .send()
@@ -754,7 +934,7 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             println!("secret {name} stored");
         }
         SecretsCommand::List => {
-            let resp = http_client()
+            let resp = http_client(control_plane)?
                 .get(format!("{control_plane}/secrets"))
                 .send()
                 .await
@@ -776,7 +956,7 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             }
         }
         SecretsCommand::Delete { name } => {
-            let resp = http_client()
+            let resp = http_client(control_plane)?
                 .delete(format!("{control_plane}/secrets/{name}"))
                 .send()
                 .await
@@ -865,9 +1045,16 @@ mod tests {
     }
 
     #[test]
-    fn normalize_repo_arg_nonexistent_returns_asis() {
-        let name = "some-nonexistent-repo-name";
-        assert_eq!(normalize_repo_arg(name).unwrap(), name);
+    fn normalize_repo_arg_pathlike_nonexistent_errors() {
+        // Path-like arg that doesn't exist → error (F-52).
+        let err = normalize_repo_arg("./nonexistent-dir-xyz").unwrap_err();
+        assert!(
+            err.to_string().contains("repo path does not exist"),
+            "got: {err}"
+        );
+        // Non-pathlike names still pass through.
+        let url = "https://github.com/user/repo.git";
+        assert_eq!(normalize_repo_arg(url).unwrap(), url);
     }
 
     #[test]
@@ -919,7 +1106,12 @@ mod tests {
 
     #[test]
     fn parse_env_kv_empty_key() {
-        assert!(parse_env_kv("=value").is_err());
+        let err = parse_env_kv("=value").unwrap_err();
+        assert!(
+            err.to_string().contains("argument starts with ="),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -931,6 +1123,124 @@ mod tests {
         assert_eq!(map.get("LOG_LEVEL"), Some(&"info".to_string()));
         assert_eq!(map.get("FEATURE_X"), Some(&"1".to_string()));
         assert_eq!(map.len(), 2);
+    }
+
+    // ── F-49: parse_env_file with BOM, quotes, inline comments, CRLF ──────
+
+    #[test]
+    fn parse_env_file_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        let bom = "\u{FEFF}";
+        std::fs::write(&path, format!("{bom}KEY=val\n")).unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"val".to_string()));
+    }
+
+    #[test]
+    fn parse_env_file_double_quoted_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "KEY=\"value with spaces\"\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"value with spaces".to_string()));
+    }
+
+    #[test]
+    fn parse_env_file_single_quoted_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "KEY='value with spaces'\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"value with spaces".to_string()));
+    }
+
+    #[test]
+    fn parse_env_file_inline_comment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "KEY=value # this is a comment\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn parse_env_file_quoted_value_preserves_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "KEY=\"value # not a comment\"\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"value # not a comment".to_string()));
+    }
+
+    #[test]
+    fn parse_env_file_crlf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "KEY=val\r\nOTHER=foo\r\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"val".to_string()));
+        assert_eq!(map.get("OTHER"), Some(&"foo".to_string()));
+    }
+
+    #[test]
+    fn parse_env_file_equals_in_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("env.txt");
+        std::fs::write(&path, "KEY=val=ue\n").unwrap();
+        let map = parse_env_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(map.get("KEY"), Some(&"val=ue".to_string()));
+    }
+
+    // ── F-51: sanitize_terminal ───────────────────────────────────────────
+
+    #[test]
+    fn sanitize_terminal_strips_c0_controls() {
+        assert_eq!(sanitize_terminal("hello\x00world"), "helloworld");
+        assert_eq!(sanitize_terminal("a\x1b[31mred\x1b[0mb"), "a[31mred[0mb");
+        // Tab, newline, carriage-return are kept.
+        assert_eq!(sanitize_terminal("a\tb\nc\r"), "a\tb\nc\r");
+    }
+
+    #[test]
+    fn sanitize_terminal_strips_c1_controls() {
+        // DEL (0x7F) and 0x80-0x9F are stripped.
+        assert_eq!(sanitize_terminal("x\x7fy"), "xy");
+        assert_eq!(sanitize_terminal("a\u{0090}b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_terminal_passes_normal_text() {
+        let normal = "Hello, world! 123 / path/to/file";
+        assert_eq!(sanitize_terminal(normal), normal);
+    }
+
+    // ── F-50: truncate_for_error ──────────────────────────────────────────
+
+    #[test]
+    fn truncate_for_error_short() {
+        assert_eq!(truncate_for_error("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_for_error_long() {
+        let long = "x".repeat(300);
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.contains("…[300 bytes total]"));
+        assert!(truncated.len() < 300);
+    }
+
+    // ── F-05: loopback detection ──────────────────────────────────────────
+
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.255.255.255"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host("127")); // not a full octet
     }
 
     #[tokio::test]

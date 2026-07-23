@@ -135,6 +135,8 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 
 Binaries are `russel-cli` and `russel-ctrl` (debug: `./target/debug/...`). Clap program name is `russel`.
 
+**Global option:** `--control-plane URL` (env: `RUSSEL_CONTROL_PLANE`, default `http://127.0.0.1:7878`). All subcommands honour it.
+
 ```bash
 russel-cli deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
   [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] \
@@ -157,10 +159,6 @@ russel-cli secrets delete <name>
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
-
-### Repo URLs
-
-- **Local deploys** must use **absolute** paths (the CLI canonicalizes relative paths before sending). The control plane rejects relative paths, `file://` URLs, and `..` components.
 - **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local metadata hosts (`169.254.169.254`) are blocked.
 
 ### Config Path & Bin Name
