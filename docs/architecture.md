@@ -152,7 +152,7 @@ flowchart TB
     VFD1 <-->|virtiofs tag=nixstore| CH
     VFD2 <-->|virtiofs tag=russelcfg| CH
     CH --> INIT --> MODS --> APP
-    INIT -.reads.-> |/config/deploy.env| VFD2
+    INIT -.->|reads /config/deploy.env| VFD2
 ```
 
 Design decisions:
