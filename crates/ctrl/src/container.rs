@@ -317,19 +317,29 @@ fn validate_interpreter_path(
     context: &str,
 ) -> anyhow::Result<()> {
     if interpreter.is_absolute() {
-        if interpreter.exists() {
-            return Ok(());
-        }
+        // /nix/store paths are bind-mounted into the container — require they exist
+        // on the host so the mount resolves.
         if interpreter.starts_with("/nix/store/") {
+            if interpreter.exists() {
+                return Ok(());
+            }
             anyhow::bail!(
                 "{context} does not exist on host: {} (required for bind-mounted /nix/store)",
                 interpreter.display()
             );
         }
+        // Absolute paths within the package store_path are trusted (they resolve
+        // via the store bind-mount at runtime).
         if interpreter.starts_with(store_path) {
             return Ok(());
         }
-        anyhow::bail!("{context} does not exist: {}", interpreter.display());
+        // Any other absolute path (e.g. /usr/bin/python3) does not exist inside
+        // the container — only /nix/store is mounted.
+        anyhow::bail!(
+            "{context} is not under /nix/store/ and will not be available \
+             inside the container: {}",
+            interpreter.display()
+        );
     }
 
     let resolved = store_path.join(interpreter);
@@ -736,9 +746,11 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
         }
     }
 
-    // Hand the service dir to the podman user so rootless can write logs + mount.
-    // Use numeric uid:gid — NixOS (and others) often have no group named like the user
-    // (e.g. user crimxnhaze, group users), so `chown user:user` fails with "invalid group".
+    // Only the rootfs + the service directory itself are given to the podman
+    // user.  The service dir (non-recursive) lets podman create container.log;
+    // rootfs (recursive) provides the container filesystem.  metadata.json and
+    // other files under the service dir stay root-owned — container workloads
+    // cannot tamper with them.
     let base = rootfs
         .parent()
         .map(|p| p.to_path_buf())
@@ -767,8 +779,11 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
     }
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
     let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
+
+    // Service dir: non-recursive — podman needs to write container.log here;
+    // metadata.json (written later by root) remains root-owned.
     let output = tokio::process::Command::new("chown")
-        .args(["-R", &format!("{uid}:{gid}"), &base.display().to_string()])
+        .args([&format!("{uid}:{gid}"), &base.display().to_string()])
         .output()
         .await?;
     if !output.status.success() {
@@ -777,6 +792,20 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+
+    // Rootfs: recursive — the container filesystem must be readable/writable
+    // by the podman user.
+    let output = tokio::process::Command::new("chown")
+        .args(["-R", &format!("{uid}:{gid}"), &rootfs.display().to_string()])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chown rootfs to {user} ({uid}:{gid}) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     Ok(())
 }
 
@@ -880,6 +909,13 @@ impl ContainerRunner {
             anyhow::bail!("podman run returned empty container id");
         }
 
+        // Container env values are visible via `podman inspect`; prefer microvm
+        // for secret-heavy workloads (its deploy.env is 0600 in a 0700 dir).
+        tracing::info!(
+            service_id = %spec.service_id,
+            "note: container env values are visible via podman inspect; \
+             prefer microvm runtime for secret-heavy workloads"
+        );
         tracing::info!(
             service_id = %spec.service_id,
             container_name = %name,
@@ -1045,20 +1081,40 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
         if arg.starts_with("--pid=") {
             anyhow::bail!("podman passthrough arg denied for security: --pid=...");
         }
-
-        // --network/--net/-net with host
-        if (arg == "--network" || arg == "--net" || arg == "-net")
-            && let Some(val) = next
-            && val == "host"
-        {
-            anyhow::bail!("podman passthrough arg denied for security: {arg} host");
+        // --network/--net/-net: allow only known safe network modes.
+        // Deny host (already), ns:/…, and anything outside the allowlist.
+        const ALLOWED_NETWORKS: &[&str] = &["bridge", "none", "slirp4netns", "pasta"];
+        if arg == "--network" || arg == "--net" || arg == "-net" {
+            let val = match next {
+                Some(v) => v,
+                None => anyhow::bail!("podman passthrough arg {arg} requires a value"),
+            };
+            if val == "host" {
+                anyhow::bail!("podman passthrough arg denied for security: {arg} host");
+            }
+            if !ALLOWED_NETWORKS.contains(&val.as_str()) {
+                anyhow::bail!(
+                    "podman passthrough arg denied for security: {arg} {val} \
+                     (only bridge, none, slirp4netns, pasta are permitted)"
+                );
+            }
         }
-        if arg == "--network=host" || arg == "--net=host" {
-            anyhow::bail!("podman passthrough arg denied for security: {arg}");
+        for eq_form in &["--network=", "--net="] {
+            if let Some(val) = arg.strip_prefix(eq_form) {
+                if val == "host" {
+                    anyhow::bail!("podman passthrough arg denied for security: --network=host");
+                }
+                if !ALLOWED_NETWORKS.contains(&val) {
+                    anyhow::bail!(
+                        "podman passthrough arg denied for security: --network={val} \
+                         (only bridge, none, slirp4netns, pasta are permitted)"
+                    );
+                }
+            }
         }
 
-        // --ipc/--uts/--cgroupns/--userns with host
-        for flag in &["--ipc", "--uts", "--cgroupns", "--userns"] {
+        // --ipc/--uts/--cgroupns with host
+        for flag in &["--ipc", "--uts", "--cgroupns"] {
             if arg == *flag
                 && let Some(val) = next
                 && val == "host"
@@ -1068,6 +1124,74 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             if arg.starts_with(&format!("{}={}", flag, "host")) {
                 anyhow::bail!("podman passthrough arg denied for security: {arg}");
             }
+        }
+
+        // --userns: deny everything except keep-id
+        if arg == "--userns" {
+            if let Some(val) = next {
+                if val != "keep-id" {
+                    anyhow::bail!(
+                        "podman passthrough arg denied for security: --userns {val} \
+                         (only keep-id is permitted)"
+                    );
+                }
+            } else {
+                anyhow::bail!("podman passthrough arg --userns requires a value");
+            }
+        }
+        if let Some(val) = arg.strip_prefix("--userns=")
+            && val != "keep-id"
+        {
+            anyhow::bail!(
+                "podman passthrough arg denied for security: --userns={val} \
+                 (only keep-id is permitted)"
+            );
+        }
+
+        // --user / -u: deny all forms (container must run as its own user)
+        if arg == "--user" || arg == "-u" {
+            anyhow::bail!("podman passthrough arg denied for security: --user/-u");
+        }
+        if arg.starts_with("--user=") || arg.starts_with("-u=") {
+            anyhow::bail!("podman passthrough arg denied for security: --user/-u");
+        }
+
+        // --entrypoint: deny all forms (container entrypoint is managed by Russel)
+        if arg == "--entrypoint" || arg.starts_with("--entrypoint=") {
+            anyhow::bail!("podman passthrough arg denied for security: --entrypoint");
+        }
+
+        // --env-file: deny all forms (bypasses PORT guard, reads host files)
+        if arg == "--env-file" || arg.starts_with("--env-file=") {
+            anyhow::bail!("podman passthrough arg denied for security: --env-file");
+        }
+
+        // --volume / -v / --mount: only allow bind mounts from /nix/store/ with :ro
+        if arg == "-v" || arg == "--volume" {
+            let val = match next {
+                Some(v) => v,
+                None => anyhow::bail!("podman passthrough arg {arg} requires a value"),
+            };
+            validate_passthrough_volume(val)?;
+        }
+        if let Some(val) = arg.strip_prefix("-v") {
+            // Compact form: -vSOURCE:DEST:OPTIONS (only if -vX, not plain -v)
+            if !val.is_empty() {
+                validate_passthrough_volume(val)?;
+            }
+        }
+        if let Some(val) = arg.strip_prefix("--volume=") {
+            validate_passthrough_volume(val)?;
+        }
+        if arg == "--mount" {
+            let val = match next {
+                Some(v) => v,
+                None => anyhow::bail!("podman passthrough arg --mount requires a value"),
+            };
+            validate_passthrough_mount(val)?;
+        }
+        if let Some(val) = arg.strip_prefix("--mount=") {
+            validate_passthrough_mount(val)?;
         }
 
         // --security-opt (any form)
@@ -1104,6 +1228,95 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Validate a `-v` / `--volume` value: only bind mounts from /nix/store/ with
+/// `:ro` are permitted.  Format: `SOURCE:DESTINATION[:OPTIONS]`.
+fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
+    // Split on first colon to get source; the rest are dest+options.
+    let (source, rest) = val.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("podman passthrough arg -v/--volume value missing ':' separator: {val}")
+    })?;
+
+    if source.is_empty() {
+        anyhow::bail!("podman passthrough arg -v/--volume has empty source: {val}");
+    }
+
+    if !source.starts_with("/nix/store/") {
+        anyhow::bail!(
+            "podman passthrough arg -v/--volume denied for security: \
+             source {source} is not under /nix/store/"
+        );
+    }
+
+    // The rest contains DESTINATION[:OPTIONS] where OPTIONS is a
+    // comma-separated list (e.g. "z,ro" or just "ro").
+    let (_dest, options) = rest.split_once(':').unwrap_or((rest, ""));
+    let ro_present = options.split(',').any(|opt| opt == "ro");
+
+    if !ro_present {
+        anyhow::bail!(
+            "podman passthrough arg -v/--volume denied for security: \
+             {val} is not read-only (missing :ro)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Validate a `--mount` value: only bind mounts from /nix/store/ with
+/// `ro=true` or `readonly` are permitted.
+/// Format: `type=TYPE,src=SOURCE,dst=DEST[,OPTIONS]`.
+fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
+    let mut mount_type = None;
+    let mut source = None;
+    let mut readonly = false;
+
+    for kv in val.split(',') {
+        let (key, value) = match kv.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (kv.trim(), ""),
+        };
+        match key {
+            "type" => mount_type = Some(value),
+            "src" | "source" => source = Some(value),
+            "ro" | "readonly" if value.is_empty() || value == "true" || value == "1" => {
+                readonly = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mount_type = mount_type.unwrap_or("bind");
+    if mount_type != "bind" {
+        anyhow::bail!(
+            "podman passthrough arg --mount denied for security: \
+             only type=bind is permitted, got type={mount_type}"
+        );
+    }
+
+    let source = source.ok_or_else(|| {
+        anyhow::anyhow!("podman passthrough arg --mount missing source/src: {val}")
+    })?;
+
+    if source.is_empty() {
+        anyhow::bail!("podman passthrough arg --mount has empty source: {val}");
+    }
+
+    if !source.starts_with("/nix/store/") {
+        anyhow::bail!(
+            "podman passthrough arg --mount denied for security: \
+             source {source} is not under /nix/store/"
+        );
+    }
+
+    if !readonly {
+        anyhow::bail!(
+            "podman passthrough arg --mount denied for security: \
+             {val} is not read-only (missing ro=true or readonly)"
+        );
+    }
+
+    Ok(())
+}
 
 /// Ensure podman passthrough args are only used with the container runtime.
 pub fn validate_podman_args_for_runtime(
@@ -1122,6 +1335,11 @@ pub fn validate_podman_args_for_runtime(
 }
 
 /// Build `podman run` arguments for unit testing and runtime use.
+///
+/// **Security note:** Environment variables (including values resolved from
+/// `secret://` references) are passed via `-e KEY=value` and are visible to
+/// anyone who can run `podman inspect` on the host. Prefer the microvm runtime
+/// for secret-heavy workloads; its deploy.env is written to a 0700 directory.
 pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Result<Vec<String>> {
     crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
 
@@ -1260,13 +1478,18 @@ async fn force_kill_container(name: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Last resort: rm -f (also kills).
-    let rm = podman_command()
-        .await
-        .args(["rm", "-f", name])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run podman rm -f: {e}"))?;
+    // Last resort: rm -f (also kills). Bound with a 15 s timeout — a hung
+    // podman must not wedge stop/destroy/redeploy handlers indefinitely.
+    let rm_fut = podman_command().await.args(["rm", "-f", name]).output();
+    let rm = match tokio::time::timeout(std::time::Duration::from_secs(15), rm_fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            anyhow::bail!("failed to run podman rm -f: {e}");
+        }
+        Err(_) => {
+            anyhow::bail!("podman rm -f timed out for container {name}");
+        }
+    };
     if rm.status.success() || is_missing_container(&rm) {
         return Ok(());
     }
@@ -1481,11 +1704,14 @@ mod tests {
     #[test]
     fn validate_entrypoint_checks_shebang_interpreter() {
         let tmp = tempfile::tempdir().unwrap();
-        let interpreter = fake_nix_tool(tmp.path(), "bash");
         let store = tmp.path().join("app-store");
         let bin_dir = store.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let script = format!("#!{}/bin/bash\necho hi\n", interpreter.display());
+        // Place interpreter under the store path so starts_with(store_path) matches.
+        let bash = bin_dir.join("bash");
+        std::fs::write(&bash, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!("#!{}/bin/bash\necho hi\n", store.display());
         let bin_path = bin_dir.join("runner");
         std::fs::write(&bin_path, script).unwrap();
 
@@ -1671,9 +1897,9 @@ mod tests {
     fn validate_podman_passthrough_accepts_common_flags() {
         let args = vec![
             "-v".into(),
-            "/data:/data:ro".into(),
+            "/nix/store/abc123:/dest:ro".into(),
             "--mount".into(),
-            "type=bind,source=/tmp/x,destination=/data".into(),
+            "type=bind,src=/nix/store/abc123,dst=/dest,readonly".into(),
             "--network".into(),
             "bridge".into(),
             "--cap-drop".into(),
@@ -1824,6 +2050,292 @@ mod tests {
         }
     }
 
+    // ── Volume / mount denials ────────────────────────────────────────────
+
+    #[test]
+    fn reject_volume_non_nix_store_source() {
+        for val in [
+            "/data:/dest:ro",
+            "/etc/passwd:/dest:ro",
+            "relative:/dest:ro",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["-v".into(), val.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("not under /nix/store/"),
+                "expected rejection for -v {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_volume_missing_ro() {
+        let err =
+            validate_podman_passthrough_args(&["-v".into(), "/nix/store/abc123:/dest".into()])
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("not read-only"),
+            "expected ro rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn accept_volume_nix_store_with_ro() {
+        validate_podman_passthrough_args(&["-v".into(), "/nix/store/abc123:/dest:ro".into()])
+            .unwrap();
+        // :ro anywhere in options is accepted.
+        validate_podman_passthrough_args(&["-v".into(), "/nix/store/abc123:/dest:z,ro".into()])
+            .unwrap();
+    }
+
+    #[test]
+    fn reject_volume_compact_form_non_nix_store() {
+        let err = validate_podman_passthrough_args(&["-v/data:/dest:ro".into()]).unwrap_err();
+        assert!(err.to_string().contains("not under /nix/store/"), "{err}");
+    }
+
+    #[test]
+    fn accept_volume_compact_form_valid() {
+        validate_podman_passthrough_args(&["-v/nix/store/abc123:/dest:ro".into()]).unwrap();
+    }
+
+    #[test]
+    fn reject_volume_equals_form_non_nix_store() {
+        let err =
+            validate_podman_passthrough_args(&["--volume=/data:/dest:ro".into()]).unwrap_err();
+        assert!(err.to_string().contains("not under /nix/store/"), "{err}");
+    }
+
+    #[test]
+    fn accept_volume_equals_form_valid() {
+        validate_podman_passthrough_args(&["--volume=/nix/store/abc123:/dest:ro".into()]).unwrap();
+    }
+
+    #[test]
+    fn accept_volume_space_form_valid() {
+        // --volume (space form) should work identically to -v
+        validate_podman_passthrough_args(&["--volume".into(), "/nix/store/abc123:/dest:ro".into()])
+            .unwrap();
+        validate_podman_passthrough_args(&[
+            "--volume".into(),
+            "/nix/store/abc123:/dest:z,ro".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn reject_volume_space_form_non_nix_store() {
+        let err = validate_podman_passthrough_args(&["--volume".into(), "/data:/dest:ro".into()])
+            .unwrap_err();
+        assert!(err.to_string().contains("not under /nix/store/"), "{err}");
+    }
+
+    #[test]
+    fn reject_volume_empty_source() {
+        let err = validate_podman_passthrough_args(&["-v".into(), ":/dest:ro".into()]).unwrap_err();
+        assert!(err.to_string().contains("empty source"), "{err}");
+    }
+
+    #[test]
+    fn reject_volume_missing_colon() {
+        let err = validate_podman_passthrough_args(&["-v".into(), "justapath".into()]).unwrap_err();
+        assert!(err.to_string().contains("missing ':' separator"), "{err}");
+    }
+
+    #[test]
+    fn reject_mount_non_bind_type() {
+        for val in [
+            "type=volume,src=/nix/store/x,dst=/dest,ro=true",
+            "type=tmpfs,dst=/dest",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["--mount".into(), val.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("only type=bind"),
+                "expected rejection for {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_mount_non_nix_store_source() {
+        let err = validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,src=/data,dst=/dest,ro=true".into(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("not under /nix/store/"), "{err}");
+    }
+
+    #[test]
+    fn reject_mount_missing_readonly() {
+        let err = validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,src=/nix/store/x,dst=/dest".into(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("not read-only"), "{err}");
+    }
+
+    #[test]
+    fn accept_mount_nix_store_with_readonly() {
+        // ro=true form
+        validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,src=/nix/store/x,dst=/dest,ro=true".into(),
+        ])
+        .unwrap();
+        // readonly (bare) form
+        validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,source=/nix/store/x,dst=/dest,readonly".into(),
+        ])
+        .unwrap();
+        // ro=1 form
+        validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,src=/nix/store/x,dst=/dest,ro=1".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn accept_mount_compact_form_valid() {
+        validate_podman_passthrough_args(&[
+            "--mount=type=bind,src=/nix/store/x,dst=/dest,ro=true".into()
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn reject_mount_missing_source() {
+        let err = validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,dst=/dest,ro=true".into(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("missing source"), "{err}");
+    }
+
+    // ── --env-file denial ─────────────────────────────────────────────────
+
+    #[test]
+    fn reject_env_file() {
+        for arg in ["--env-file", "--env-file=/etc/host-env"] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("env-file"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    // ── --entrypoint denial ───────────────────────────────────────────────
+
+    #[test]
+    fn reject_entrypoint() {
+        for arg in ["--entrypoint", "--entrypoint=/bin/sh"] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("entrypoint"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    // ── --user / -u denial ────────────────────────────────────────────────
+
+    #[test]
+    fn reject_user() {
+        for (arg, next) in [
+            ("--user", Some("root")),
+            ("-u", Some("0")),
+            ("--user=root", None),
+            ("-u=0", None),
+        ] {
+            let mut args = vec![arg.to_string()];
+            if let Some(v) = next {
+                args.push(v.to_string());
+            }
+            let err = validate_podman_passthrough_args(&args).unwrap_err();
+            assert!(
+                err.to_string().contains("user"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    // ── --network allowlist ───────────────────────────────────────────────
+
+    #[test]
+    fn reject_network_disallowed() {
+        for val in ["ns:/proc/1/ns/net", "container:foo", "private"] {
+            let err = validate_podman_passthrough_args(&["--network".into(), val.to_string()])
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("only bridge, none, slirp4netns, pasta"),
+                "expected rejection for --network {val}: {err}"
+            );
+        }
+        for eq in ["--network=ns:/proc/1/ns/net", "--net=container:foo"] {
+            let err = validate_podman_passthrough_args(&[eq.to_string()]).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("only bridge, none, slirp4netns, pasta"),
+                "expected rejection for {eq}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_network_allowed_modes() {
+        for mode in ["bridge", "none", "slirp4netns", "pasta"] {
+            validate_podman_passthrough_args(&["--network".into(), mode.to_string()]).unwrap();
+            validate_podman_passthrough_args(&[format!("--network={mode}")]).unwrap();
+        }
+    }
+
+    // ── --userns allowlist ────────────────────────────────────────────────
+
+    #[test]
+    fn reject_userns_disallowed() {
+        for val in ["host", "auto", "nomap"] {
+            let err = validate_podman_passthrough_args(&["--userns".into(), val.to_string()])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("only keep-id"),
+                "expected rejection for --userns {val}: {err}"
+            );
+        }
+        for eq in ["--userns=host", "--userns=auto"] {
+            let err = validate_podman_passthrough_args(&[eq.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("only keep-id"),
+                "expected rejection for {eq}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_userns_keep_id() {
+        validate_podman_passthrough_args(&["--userns".into(), "keep-id".into()]).unwrap();
+        validate_podman_passthrough_args(&["--userns=keep-id".into()]).unwrap();
+    }
+
+    #[test]
+    fn reject_userns_no_value() {
+        let err = validate_podman_passthrough_args(&["--userns".into()]).unwrap_err();
+        assert!(err.to_string().contains("requires a value"), "{err}");
+    }
+
+    // ── --secret is allowed ───────────────────────────────────────────────
+
+    #[test]
+    fn accept_secret() {
+        validate_podman_passthrough_args(&["--secret".into(), "mysecret".into()]).unwrap();
+        validate_podman_passthrough_args(&["--secret=mysecret".into()]).unwrap();
+    }
     // ── Issue #4: env wrapper in rootfs ─────────────────────────────────────
 
     #[tokio::test]
@@ -1904,6 +2416,39 @@ mod tests {
     }
 
     #[test]
+    fn validate_entrypoint_rejects_env_without_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("env-no-debug-store");
+        let bin_dir = store.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("runner"), "#!/usr/bin/env bash\necho hi\n").unwrap();
+        let err = validate_entrypoint(&store, "runner", false).unwrap_err();
+        assert!(err.to_string().contains("debug mode is disabled"), "{err}");
+    }
+
+    #[test]
+    fn validate_entrypoint_rejects_bin_env_without_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("bin-env-no-debug-store");
+        let bin_dir = store.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("runner"), "#!/bin/env bash\necho hi\n").unwrap();
+        let err = validate_entrypoint(&store, "runner", false).unwrap_err();
+        assert!(err.to_string().contains("debug mode is disabled"), "{err}");
+    }
+
+    #[test]
+    fn validate_entrypoint_rejects_non_nix_store_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("bad-interp-store");
+        let bin_dir = store.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("runner"), "#!/usr/bin/python3\necho hi\n").unwrap();
+        let err = validate_entrypoint(&store, "runner", false).unwrap_err();
+        assert!(err.to_string().contains("not under /nix/store/"), "{err}");
+    }
+
+    #[test]
     fn reject_port_bare_via_e_flag() {
         let err = validate_podman_passthrough_args(&["-e".into(), "PORT".into()]).unwrap_err();
         assert!(
@@ -1964,7 +2509,7 @@ mod tests {
             env: vec![("PORT".into(), "3000".into())],
             extra_args: vec![
                 "-v".into(),
-                "/data:/data:ro".into(),
+                "/nix/store/abc123:/dest:ro".into(),
                 "--network".into(),
                 "bridge".into(),
             ],
