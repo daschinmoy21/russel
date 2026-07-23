@@ -586,7 +586,9 @@ async fn podman_user_env() -> Option<&'static PodmanUserEnv> {
         if !uid_output.status.success() {
             return None;
         }
-        let uid = String::from_utf8_lossy(&uid_output.stdout).trim().to_string();
+        let uid = String::from_utf8_lossy(&uid_output.stdout)
+            .trim()
+            .to_string();
         if uid.is_empty() {
             return None;
         }
@@ -818,7 +820,8 @@ impl ContainerRunner {
     /// Fail if `podman info` does not indicate rootless.
     pub async fn ensure_rootless() -> anyhow::Result<()> {
         sanitize_podman_user_runtime_dir().await?;
-        let output = podman_command().await
+        let output = podman_command()
+            .await
             .args(["info", "--format", "json"])
             .output()
             .await
@@ -921,7 +924,8 @@ impl ContainerRunner {
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);
-        let output = podman_command().await
+        let output = podman_command()
+            .await
             .args([
                 "inspect",
                 &name,
@@ -1189,7 +1193,8 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
 }
 
 async fn run_podman(args: &[String]) -> anyhow::Result<std::process::Output> {
-    podman_command().await
+    podman_command()
+        .await
         .args(args)
         .output()
         .await
@@ -1202,7 +1207,8 @@ async fn stop_and_remove_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn stop_container(name: &str) -> anyhow::Result<()> {
-    let stop_fut = podman_command().await
+    let stop_fut = podman_command()
+        .await
         .args(["stop", "-t", PODMAN_STOP_TIMEOUT_SECS, name])
         .output();
 
@@ -1255,7 +1261,8 @@ async fn force_kill_container(name: &str) -> anyhow::Result<()> {
     }
 
     // Last resort: rm -f (also kills).
-    let rm = podman_command().await
+    let rm = podman_command()
+        .await
         .args(["rm", "-f", name])
         .output()
         .await
@@ -1272,7 +1279,8 @@ async fn force_kill_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn remove_container(name: &str) -> anyhow::Result<()> {
-    let output = podman_command().await
+    let output = podman_command()
+        .await
         .args(["rm", "-f", name])
         .output()
         .await

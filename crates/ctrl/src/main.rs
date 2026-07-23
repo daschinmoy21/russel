@@ -52,6 +52,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Single-instance guard (F-30): /var/lib/russel state (service dirs, port
+    // registry, TAP names) is not safe for concurrent controllers. Held for
+    // the lifetime of main; process exit releases the flock.
+    let _instance_lock = acquire_instance_lock()?;
+
     // Detect Nix system triple once at startup — cached for all builds/deploys.
     crate::build::init_current_system().await?;
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
@@ -94,30 +99,34 @@ async fn main() -> Result<()> {
     let app: Router = api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
 
+    // Bind first, then decide auth from the *actual* bound address (F-36).
+    // Resolving via to_socket_addrs() and binding separately can disagree when
+    // the host has multiple A/AAAA records (loopback first, non-loopback bind).
+    let listener = TcpListener::bind(&bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+    let is_loopback = ip_is_loopback_for_auth(local_addr.ip());
+
     // Auth + bind policy: non-empty RUSSEL_API_TOKEN (after trim) enables auth.
     // Empty/whitespace is treated as unset (dev mode).
     let token = api::configured_api_token();
-    let is_loopback = bind_addr.starts_with("127.0.0.1:") || bind_addr.starts_with("[::1]:");
     if token.is_some() {
         info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
     } else if is_loopback {
+        // F-35: loopback is not an isolation boundary — any local user and
+        // any SSH/Docker port-forward into the host reaches this socket.
         tracing::warn!(
-            "RUSSEL_API_TOKEN is not set — running in dev mode (loopback-only). \
-             Set RUSSEL_API_TOKEN for production."
+            "dev mode: no auth — any local user or forwarded port can control the API; \
+             set RUSSEL_API_TOKEN"
         );
     } else {
         anyhow::bail!(
-            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}'",
-            bind_addr
+            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}' (bound {})",
+            bind_addr,
+            local_addr
         );
     }
 
-    let listener = TcpListener::bind(&bind_addr).await?;
-
-    info!(
-        "russel control plane listening on {}",
-        listener.local_addr()?
-    );
+    info!("russel control plane listening on {}", local_addr);
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
@@ -166,6 +175,47 @@ async fn shutdown_signal() {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("received SIGINT, shutting down control plane...");
     }
+}
+
+/// F-30: single-instance guard. All russel-ctrl state (service directories,
+/// port registry, TAP name allocation) under /var/lib/russel assumes one
+/// writer, so refuse to start a second controller.
+///
+/// Opens /var/lib/russel/ctrl.lock and takes an exclusive non-blocking
+/// `flock`. The returned fd must be held for the process lifetime; exiting
+/// releases the lock automatically, so no unlock path is needed.
+fn acquire_instance_lock() -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    const LOCK_PATH: &str = "/var/lib/russel/ctrl.lock";
+    std::fs::create_dir_all("/var/lib/russel")?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // Never written to — the fd exists only to carry the flock.
+        .truncate(false)
+        .open(LOCK_PATH)?;
+    // Safety: `file` is a valid open fd; flock does not retain it beyond the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // Only EWOULDBLOCK/EAGAIN means another holder; surface other errno
+        // (permissions, NFS, interrupted) with their real cause.
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!("another russel-ctrl instance is running (lock: {LOCK_PATH})");
+        }
+        return Err(anyhow::Error::new(err)
+            .context(format!("failed to acquire exclusive lock on {LOCK_PATH}")));
+    }
+    Ok(OwnedFd::from(file))
+}
+
+/// F-36: true when the *bound* IP is loopback (used for auth policy).
+///
+/// Uses `to_canonical()` so IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`)
+/// is treated as loopback the same as `127.0.0.1` / `::1`.
+fn ip_is_loopback_for_auth(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
 }
 
 /// Clean up stale Russel-owned resources from previous controller sessions.
@@ -323,7 +373,34 @@ fn is_russel_tap(name: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::is_russel_tap;
+    use super::{ip_is_loopback_for_auth, is_russel_tap};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn loopback_ips_are_detected() {
+        assert!(ip_is_loopback_for_auth(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(ip_is_loopback_for_auth(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 255
+        ))));
+        assert!(ip_is_loopback_for_auth(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // IPv4-mapped IPv6 loopback must count as loopback (to_canonical).
+        assert!(ip_is_loopback_for_auth(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0xffff, 0x7f00, 1
+        ))));
+    }
+
+    #[test]
+    fn non_loopback_ips_are_detected() {
+        assert!(!ip_is_loopback_for_auth(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!ip_is_loopback_for_auth(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!ip_is_loopback_for_auth(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 10
+        ))));
+        // IPv4-mapped non-loopback must NOT count as loopback.
+        assert!(!ip_is_loopback_for_auth(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0xffff, 0xc0a8, 0x010a
+        ))));
+    }
 
     #[test]
     fn russel_tap_names_match_hash_scheme() {

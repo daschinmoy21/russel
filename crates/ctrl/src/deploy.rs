@@ -1213,7 +1213,8 @@ async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKind> {
 
     // Probe podman for a running/stopped container with the russel label.
     let container_name = format!("russel-{}", service_id);
-    let probe = crate::container::podman_command().await
+    let probe = crate::container::podman_command()
+        .await
         .args(["container", "exists", &container_name])
         .output()
         .await;
