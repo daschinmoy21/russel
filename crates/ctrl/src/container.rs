@@ -45,7 +45,6 @@ impl DebugToolsCache {
         Self::default()
     }
 
-    /// Resolve or build bash and curl from nixpkgs; results are cached in-memory.
     #[allow(dead_code)] // optional debug helper for container shells; not on deploy path
     pub async fn ensure_debug_tools(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
         let bash = self.ensure_bash(None).await?;
@@ -571,30 +570,40 @@ struct PodmanUserEnv {
     dbus: Option<String>,
 }
 
-fn podman_user_env() -> Option<&'static PodmanUserEnv> {
-    use std::sync::OnceLock;
-    static ENV: OnceLock<Option<PodmanUserEnv>> = OnceLock::new();
-    ENV.get_or_init(|| {
+async fn podman_user_env() -> Option<&'static PodmanUserEnv> {
+    use tokio::sync::OnceCell;
+    // OnceCell memoizes for the process lifetime: a successful resolution is
+    // cached as Some(env), and a failure (None) is also cached — subsequent
+    // calls return the same outcome without re-running id/getent.
+    static ENV: OnceCell<Option<PodmanUserEnv>> = OnceCell::const_new();
+    ENV.get_or_init(|| async {
         let user = configured_podman_user()?;
-        let uid = std::process::Command::new("id")
+        let uid_output = tokio::process::Command::new("id")
             .args(["-u", &user])
             .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+            .await
+            .ok()?;
+        if !uid_output.status.success() {
+            return None;
+        }
+        let uid = String::from_utf8_lossy(&uid_output.stdout).trim().to_string();
         if uid.is_empty() {
             return None;
         }
-        let home = std::process::Command::new("getent")
+        let home_output = tokio::process::Command::new("getent")
             .args(["passwd", &user])
             .output()
-            .ok()
-            .map(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                out.split(':')
-                    .nth(5)
-                    .unwrap_or(&format!("/home/{user}"))
-                    .to_string()
-            })?;
+            .await
+            .ok()?;
+        if !home_output.status.success() {
+            return None;
+        }
+        let out = String::from_utf8_lossy(&home_output.stdout);
+        let home = out
+            .split(':')
+            .nth(5)
+            .unwrap_or(&format!("/home/{user}"))
+            .to_string();
         let xdg_runtime = format!("/run/user/{uid}");
         let dbus_path = format!("{xdg_runtime}/bus");
         let dbus = std::path::Path::new(&dbus_path)
@@ -615,13 +624,14 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
             dbus,
         })
     })
+    .await
     .as_ref()
 }
 
 /// Build a `Command` that runs `podman <args>` as the configured user when
 /// ctrl is root and a non-root podman user was resolved (env or SUDO_USER).
-pub(crate) fn podman_command() -> Command {
-    if let Some(env) = podman_user_env() {
+pub(crate) async fn podman_command() -> Command {
+    if let Some(env) = podman_user_env().await {
         let mut cmd = Command::new("sudo");
         cmd.args(["-u", &env.user, "-H", "env"]);
         cmd.arg(format!("HOME={}", env.home));
@@ -650,8 +660,8 @@ pub(crate) fn podman_command() -> Command {
 /// A prior rootful `podman` that inherited `XDG_RUNTIME_DIR=/run/user/UID`
 /// (common with `sudo -E`) leaves `crun/` owned by root:root mode 0700. Rootless
 /// podman then cannot open its own runtime dir.
-fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
-    let Some(env) = podman_user_env() else {
+async fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
+    let Some(env) = podman_user_env().await else {
         return Ok(());
     };
     if unsafe { libc::geteuid() } != 0 {
@@ -680,7 +690,7 @@ fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
             "removing root-owned podman runtime dir under user XDG_RUNTIME_DIR \
              (leftover from rootful podman; blocks rootless)"
         );
-        std::fs::remove_dir_all(&path).map_err(|e| {
+        tokio::fs::remove_dir_all(&path).await.map_err(|e| {
             anyhow::anyhow!(
                 "failed to remove root-owned {} (blocks rootless podman for {}): {e}. \
                  Run: sudo rm -rf {}",
@@ -695,20 +705,21 @@ fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
 
 /// Make the service dir + rootfs usable by a non-root podman user when
 /// `RUSSEL_PODMAN_USER` is set (ctrl runs as root via sudo for microVMs).
-fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
+async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     let Some(user) = configured_podman_user() else {
         return Ok(());
     };
 
     // Open path components for traversal (resolve symlinks first).
-    let resolved = rootfs
-        .canonicalize()
+    let resolved = tokio::fs::canonicalize(rootfs)
+        .await
         .unwrap_or_else(|_| rootfs.to_path_buf());
     let mut walk = resolved.as_path();
     loop {
-        let output = std::process::Command::new("chmod")
+        let output = tokio::process::Command::new("chmod")
             .args(["a+rx", &walk.display().to_string()])
-            .output()?;
+            .output()
+            .await?;
         if !output.status.success() {
             // Best-effort on parents we may not own (e.g. /); rootfs/base are critical.
             tracing::debug!(
@@ -730,9 +741,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| rootfs.to_path_buf());
-    let uid = std::process::Command::new("id")
+    let uid = tokio::process::Command::new("id")
         .args(["-u", &user])
         .output()
+        .await
         .map_err(|e| anyhow::anyhow!("id -u {user}: {e}"))?;
     if !uid.status.success() {
         anyhow::bail!(
@@ -740,9 +752,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
             String::from_utf8_lossy(&uid.stderr).trim()
         );
     }
-    let gid = std::process::Command::new("id")
+    let gid = tokio::process::Command::new("id")
         .args(["-g", &user])
         .output()
+        .await
         .map_err(|e| anyhow::anyhow!("id -g {user}: {e}"))?;
     if !gid.status.success() {
         anyhow::bail!(
@@ -752,9 +765,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     }
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
     let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
-    let output = std::process::Command::new("chown")
+    let output = tokio::process::Command::new("chown")
         .args(["-R", &format!("{uid}:{gid}"), &base.display().to_string()])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         anyhow::bail!(
             "chown service dir to {user} ({uid}:{gid}) failed: {}",
@@ -803,8 +817,8 @@ impl ContainerRunner {
 
     /// Fail if `podman info` does not indicate rootless.
     pub async fn ensure_rootless() -> anyhow::Result<()> {
-        sanitize_podman_user_runtime_dir()?;
-        let output = podman_command()
+        sanitize_podman_user_runtime_dir().await?;
+        let output = podman_command().await
             .args(["info", "--format", "json"])
             .output()
             .await
@@ -849,7 +863,7 @@ impl ContainerRunner {
         }
 
         // ponytail: make rootfs readable for configured podman user when running via sudo
-        ensure_rootfs_readable_for_podman_user(&spec.rootfs.rootfs_path)?;
+        ensure_rootfs_readable_for_podman_user(&spec.rootfs.rootfs_path).await?;
         let output = run_podman(&args).await?;
         if !output.status.success() {
             anyhow::bail!(
@@ -907,7 +921,7 @@ impl ContainerRunner {
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);
-        let output = podman_command()
+        let output = podman_command().await
             .args([
                 "inspect",
                 &name,
@@ -1175,7 +1189,7 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
 }
 
 async fn run_podman(args: &[String]) -> anyhow::Result<std::process::Output> {
-    podman_command()
+    podman_command().await
         .args(args)
         .output()
         .await
@@ -1188,7 +1202,7 @@ async fn stop_and_remove_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn stop_container(name: &str) -> anyhow::Result<()> {
-    let stop_fut = podman_command()
+    let stop_fut = podman_command().await
         .args(["stop", "-t", PODMAN_STOP_TIMEOUT_SECS, name])
         .output();
 
@@ -1225,7 +1239,7 @@ async fn stop_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn force_kill_container(name: &str) -> anyhow::Result<()> {
-    let kill_fut = podman_command().args(["kill", name]).output();
+    let kill_fut = podman_command().await.args(["kill", name]).output();
     let output = match tokio::time::timeout(std::time::Duration::from_secs(10), kill_fut).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
@@ -1241,7 +1255,7 @@ async fn force_kill_container(name: &str) -> anyhow::Result<()> {
     }
 
     // Last resort: rm -f (also kills).
-    let rm = podman_command()
+    let rm = podman_command().await
         .args(["rm", "-f", name])
         .output()
         .await
@@ -1258,7 +1272,7 @@ async fn force_kill_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn remove_container(name: &str) -> anyhow::Result<()> {
-    let output = podman_command()
+    let output = podman_command().await
         .args(["rm", "-f", name])
         .output()
         .await
