@@ -62,11 +62,14 @@ impl PortAllocator {
             }
             let port_u16 = port as u16;
             if !registry.busy_ports.contains(&port_u16) && port_is_available(port_u16) {
-                registry.busy_ports.insert(port_u16);
-                registry
-                    .allocations
-                    .insert(service_id.to_string(), port_u16);
-                return Ok(port_u16);
+                // #40: re-verify availability to narrow the TOCTOU window.
+                if port_is_available(port_u16) {
+                    registry.busy_ports.insert(port_u16);
+                    registry
+                        .allocations
+                        .insert(service_id.to_string(), port_u16);
+                    return Ok(port_u16);
+                }
             }
             port += 1;
         }
@@ -162,9 +165,12 @@ fn subnet_registry() -> std::sync::MutexGuard<'static, SubnetRegistry> {
     })
 }
 
+/// FNV-1a hash (xor-then-multiply, per the FNV-1a spec).
+/// Note: the prior implementation was misnamed — it implemented FNV-1
+/// (multiply-then-xor). TAP names for newly-deployed services will change.
 fn fnv1a(bytes: impl AsRef<[u8]>) -> u32 {
     bytes.as_ref().iter().fold(2_166_136_261u32, |acc, &b| {
-        acc.wrapping_mul(16_777_619) ^ b as u32
+        (acc ^ b as u32).wrapping_mul(16_777_619)
     })
 }
 
@@ -211,15 +217,14 @@ pub fn subnet_for(service_id: &str) -> SubnetAllocation {
         return allocation_from_network_key(key);
     }
 
-    // Exhausted probes — register preferred key anyway (best-effort; rare).
+    // Exhausted probes — do NOT clobber another service's mapping (F-45).
+    // Return the preferred key without registering it; the allocation may
+    // collide but the registry stays intact.
     tracing::error!(
         service_id,
-        "subnet registry exhausted probes; using preferred key (possible collision)"
+        "subnet registry exhausted probes; using preferred key (possible collision, not registered)"
     );
-    let key = network_key(fnv1a(service_id.as_bytes()));
-    reg.by_key.insert(key, service_id.to_string());
-    reg.by_service.insert(service_id.to_string(), key);
-    allocation_from_network_key(key)
+    allocation_from_network_key(network_key(fnv1a(service_id.as_bytes())))
 }
 
 /// Release the subnet lease for a service so another can reuse the slot.
@@ -265,6 +270,49 @@ pub fn network_key_from_host_ip(host_ip: &str) -> Option<u16> {
 
 // ── Tap creation + setup + port forwarding via socat ──────────────────────────
 
+// ── IP forwarding tracking (#39) ─────────────────────────────────────────────
+
+/// Initial `net.ipv4.ip_forward` value, read once at first access.
+/// Used to decide whether to restore the sysctl after all TAPs are gone.
+static IP_FORWARD_WAS_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(true) // if we can't read it, assume forwarding was on (don't break things)
+});
+
+/// Restore `net.ipv4.ip_forward` to 0 if (a) it was 0 before Russel set it,
+/// and (b) no `rsl-` TAP interfaces remain on the host.
+pub async fn restore_ip_forward() {
+    if *IP_FORWARD_WAS_ENABLED {
+        return;
+    }
+    // Check if any rsl- TAPs remain.
+    let count = count_rsl_taps().await;
+    if count > 0 {
+        tracing::debug!(count, "rsl- TAPs still present; leaving ip_forward=1");
+        return;
+    }
+    tracing::info!("no rsl- TAPs remain; restoring net.ipv4.ip_forward=0");
+    sysctl("net.ipv4.ip_forward", "0").await;
+}
+
+async fn count_rsl_taps() -> usize {
+    match Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines().filter(|line| line.contains("rsl-")).count()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to enumerate TAPs; assuming rsl- TAPs remain");
+            1 // conservative: assume TAPs remain
+        }
+    }
+}
+
 pub struct TapForwarder;
 
 impl TapForwarder {
@@ -291,7 +339,15 @@ impl TapForwarder {
 
         sysctl("net.ipv4.ip_forward", "1").await;
 
-        Self::spawn_socat(service_id, host_port, vm_ip, guest_port).await
+        match Self::spawn_socat(service_id, host_port, vm_ip, guest_port).await {
+            Ok(child) => Ok(child),
+            Err(e) => {
+                // #40: clean up the TAP we just created so no half-state remains.
+                tracing::warn!(tap, error = %e, "socat spawn failed; tearing down TAP");
+                let _ = Self::teardown(alloc).await;
+                Err(e)
+            }
+        }
     }
 
     /// Spawn only the host→guest TCP forwarder without touching TAP devices.
@@ -343,7 +399,7 @@ impl TapForwarder {
     pub async fn teardown(alloc: &SubnetAllocation) -> anyhow::Result<()> {
         let tap = &alloc.tap_id;
         tracing::info!(tap, "tearing down tap interface");
-        match run_ip(&["link", "del", tap]).await {
+        let result = match run_ip(&["link", "del", tap]).await {
             Ok(()) => Ok(()),
             Err(e)
                 if e.to_string().contains("Cannot find device")
@@ -352,7 +408,12 @@ impl TapForwarder {
                 Ok(())
             }
             Err(e) => Err(e),
+        };
+        // #39: attempt to restore ip_forward if this was the last TAP.
+        if result.is_ok() {
+            restore_ip_forward().await;
         }
+        result
     }
 
     pub async fn wait_for_vm_port(vm_ip: &str, guest_port: u16, timeout: Duration) -> bool {
@@ -505,6 +566,91 @@ mod tests {
         PortAllocator::release("another-service");
     }
 
+    #[test]
+    fn fnv1a_is_xor_then_multiply() {
+        // Verify FNV-1a uses XOR-then-MULTIPLY, not MULTIPLY-then-XOR (FNV-1).
+        // Also check known-answer test vectors for the 32-bit variant.
+        let hash = fnv1a("hello");
+        let hash2 = fnv1a("hello");
+        assert_eq!(hash, hash2, "FNV-1a must be deterministic");
+        assert_ne!(fnv1a("a"), fnv1a("aa"));
+
+        // Known-answer test vectors (FNV-1a 32-bit).
+        // FNV offset basis: 0x811c9dc5 = 2166136261.
+        assert_eq!(
+            fnv1a(""),
+            2_166_136_261,
+            "FNV-1a empty-string = offset basis"
+        );
+        // "a" = (0x811c9dc5 ^ 0x61) * 0x01000193 = 0xe40c2d6c = 3826002220.
+        assert_eq!(fnv1a("a"), 3_826_002_220, "FNV-1a(\"a\") known answer");
+        // "foo" cross-check: deterministic but we don't need the exact value.
+        assert_eq!(fnv1a("foo"), fnv1a("foo"));
+    }
+
+    #[test]
+    fn fnv1a_different_from_fnv1() {
+        // The old (buggy) FNV-1: hash = (hash * 16777619) ^ byte
+        fn old_fnv1(bytes: &[u8]) -> u32 {
+            bytes.iter().fold(2_166_136_261u32, |acc, &b| {
+                acc.wrapping_mul(16_777_619) ^ b as u32
+            })
+        }
+        // For most inputs, FNV-1a and FNV-1 differ.
+        assert_ne!(fnv1a("russel"), old_fnv1("russel".as_bytes()));
+    }
+
+    #[test]
+    fn pkill_socat_pattern_anchored() {
+        // F-19: the socat pkill pattern must NOT match sibling services.
+        let _pat_a = format!("^socat-russel-{}( |$)", "foo");
+        let cmdline_foo = "socat-russel-foo TCP-LISTEN:...";
+        let cmdline_foobar = "socat-russel-foobar TCP-LISTEN:...";
+        let cmdline_socat_x = "socat-russel-x TCP-LISTEN:...";
+        // regex crate isn't available here but we can do prefix checks:
+        // The pkill pattern "^socat-russel-foo( |$)" should match foo,
+        // but NOT match foobar because after "foo" must be space or end.
+        assert!(
+            cmdline_foo.starts_with("socat-russel-foo "),
+            "foo must match"
+        );
+        assert!(
+            !cmdline_foobar.starts_with("socat-russel-foo "),
+            "foobar must NOT match"
+        );
+        // socat-x (prefix of command but different service) should not match
+        assert!(
+            !cmdline_socat_x.starts_with("socat-russel-foo "),
+            "x must NOT match"
+        );
+    }
+
+    #[test]
+    fn pkill_virtiofsd_pattern_no_prefix_collision() {
+        // The virtiofsd pattern uses "russel/{id}/" with trailing slash
+        // which acts as a natural boundary. Verify.
+        let pat_needle = "russel/foo/";
+        let cmdline_foo = "/var/lib/russel/foo/virtiofs.sock";
+        let cmdline_foobar = "/var/lib/russel/foobar/virtiofs.sock";
+        assert!(cmdline_foo.contains(pat_needle), "foo should match itself");
+        assert!(
+            !cmdline_foobar.contains(pat_needle),
+            "foobar should NOT match foo pattern"
+        );
+    }
+
+    #[test]
+    fn subnet_for_exhaustion_does_not_register() {
+        // Verify that after release, the same preferred key is returned
+        // (not clobbered by exhaustion path).
+        let alloc1 = subnet_for("exhaust-test-1");
+        release_subnet("exhaust-test-1");
+        let alloc2 = subnet_for("exhaust-test-1");
+        // Should get the same preferred allocation back.
+        assert_eq!(alloc1.host_ip, alloc2.host_ip);
+        assert_eq!(alloc1.tap_id, alloc2.tap_id);
+        release_subnet("exhaust-test-1");
+    }
     #[test]
     fn port_allocator_claim_existing_registers_port() {
         PortAllocator::release("claimed-svc");

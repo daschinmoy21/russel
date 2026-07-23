@@ -6,7 +6,7 @@ use std::{
 
 use tokio::process::Command;
 
-use crate::{ch_api, network::SubnetAllocation};
+use crate::ch_api;
 
 // ── VmSpec: centralized, hotplug-ready Cloud Hypervisor spawn config ────────
 
@@ -87,6 +87,9 @@ pub struct MicrovmRunner {
     busybox_cache: Arc<Mutex<Option<PathBuf>>>,
     modules_cache: Arc<Mutex<Option<PathBuf>>>,
     agent_initramfs_cache: Arc<Mutex<Option<PathBuf>>>,
+    /// Serializes agent initramfs builds so concurrent cold deploys
+    /// don't race on the shared work directory (F-18).
+    build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for MicrovmRunner {
@@ -96,6 +99,7 @@ impl Default for MicrovmRunner {
             busybox_cache: Arc::new(Mutex::new(None)),
             modules_cache: Arc::new(Mutex::new(None)),
             agent_initramfs_cache: Arc::new(Mutex::new(None)),
+            build_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -415,6 +419,15 @@ impl MicrovmRunner {
     ///
     /// No app binary is baked in — it is resolved at deploy time via `deploy.env`.
     pub async fn build_agent_initramfs(&self) -> anyhow::Result<PathBuf> {
+        // Fast path: cache hit without lock.
+        if let Some(path) = self.check_path_cache(&self.agent_initramfs_cache) {
+            return Ok(path);
+        }
+
+        // Serialize concurrent builds (F-18).
+        let _guard = self.build_lock.lock().await;
+
+        // Double-check cache after acquiring lock.
         if let Some(path) = self.check_path_cache(&self.agent_initramfs_cache) {
             return Ok(path);
         }
@@ -424,16 +437,34 @@ impl MicrovmRunner {
         let pool_dir = PathBuf::from("/var/lib/russel/_pool");
         std::fs::create_dir_all(&pool_dir)?;
 
+        // Unique temp dir so concurrent deploys never share a work dir (F-18).
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let work = pool_dir.join(format!("agent-initramfs.d.{pid}.{nanos}"));
+
+        // Guard always removes the temp dir on any exit path (#44).
+        struct TempDirGuard(PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                if self.0.exists()
+                    && let Err(e) = std::fs::remove_dir_all(&self.0)
+                {
+                    tracing::warn!(
+                        dir = %self.0.display(),
+                        error = %e,
+                        "failed to remove agent initramfs work dir"
+                    );
+                }
+            }
+        }
+        let _cleanup = TempDirGuard(work.clone());
+        std::fs::create_dir_all(&work)?;
+
         // Bump filename when AGENT_INIT_SCRIPT changes so disk cache cannot serve a stale CPIO.
         let initramfs_file = pool_dir.join("agent-initramfs-v2.cpio");
-        let work = pool_dir.join("agent-initramfs.d");
-
-        if let Err(e) = std::fs::remove_dir_all(&work)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous agent initramfs work dir");
-        }
-        std::fs::create_dir_all(&work)?;
 
         // Copy kernel modules when using stock kernel (drivers not built-in).
         // ponytail: same virtio/fuse list as legacy per-service initramfs.
@@ -463,11 +494,10 @@ impl MicrovmRunner {
 
         self.create_busybox_symlinks(&work, &bb_bin)?;
         self.copy_closure_to(&busybox_path, &work).await?;
-        self.pack_cpio(&work, &initramfs_file, &bb_bin).await?;
-
-        if let Err(e) = std::fs::remove_dir_all(&work) {
-            tracing::warn!(dir = %work.display(), error = %e, "failed to remove agent initramfs work dir");
-        }
+        // Build to a temp file, then atomic rename (F-18).
+        let tmp_cpio = pool_dir.join(format!(".agent-initramfs-v2.{pid}.{nanos}.cpio.tmp"));
+        self.pack_cpio(&work, &tmp_cpio, &bb_bin).await?;
+        std::fs::rename(&tmp_cpio, &initramfs_file)?;
 
         self.store_path_cache(&self.agent_initramfs_cache, initramfs_file.clone());
 
@@ -475,82 +505,6 @@ impl MicrovmRunner {
             initramfs = %initramfs_file.display(),
             "agent initramfs built (config-driven, no app baked in)"
         );
-        Ok(initramfs_file)
-    }
-
-    // ── Legacy per-service initramfs (kept for backward compat) ──────────
-
-    /// Build a minimal CPIO initramfs for a specific service.
-    ///
-    /// Only used on the cold-boot fallback path when the microvm kernel is
-    /// NOT available (stock kernel, modules =m).
-    ///
-    /// When the microvm kernel is in use, prefer the agent initramfs +
-    /// deploy.env path instead — it avoids per-deploy CPIO rebuilds.
-    #[allow(dead_code)] // cold-boot fallback; agent initramfs path is preferred
-    pub async fn build_initramfs(
-        &self,
-        service_id: &str,
-        alloc: &SubnetAllocation,
-        guest_port: u16,
-        app_store_path: &Path,
-        bin_name: &str,
-        busybox_path: &Path,
-        kernel_modules_path: Option<&Path>,
-    ) -> anyhow::Result<PathBuf> {
-        let deploy_dir = PathBuf::from(format!("/var/lib/russel/{}", service_id));
-        let initramfs_file = deploy_dir.join("initramfs.cpio");
-        let work = deploy_dir.join("initramfs.d");
-
-        if let Err(e) = std::fs::remove_dir_all(&work)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %work.display(), error = %e, "failed to remove previous initramfs work dir");
-        }
-        std::fs::create_dir_all(&work)?;
-
-        // Copy modules only when using stock kernel.
-        let needed_modules: &[&str] = if let Some(mod_path) = kernel_modules_path {
-            let mods = &[
-                "drivers/virtio/virtio_ring.ko.xz",
-                "drivers/virtio/virtio.ko.xz",
-                "drivers/virtio/virtio_pci_modern_dev.ko.xz",
-                "drivers/virtio/virtio_pci_legacy_dev.ko.xz",
-                "drivers/virtio/virtio_pci.ko.xz",
-                "net/core/failover.ko.xz",
-                "drivers/net/net_failover.ko.xz",
-                "drivers/net/virtio_net.ko.xz",
-                "fs/fuse/fuse.ko.xz",
-                "fs/fuse/virtiofs.ko.xz",
-            ];
-            self.copy_kernel_modules(mod_path, &work, mods)?;
-            mods
-        } else {
-            &[]
-        };
-
-        let bb_bin = format!("{}/bin/busybox", busybox_path.display());
-        let init =
-            self.generate_init_script(alloc, guest_port, app_store_path, bin_name, needed_modules);
-        use std::os::unix::fs::PermissionsExt;
-        let init_path = work.join("init");
-        std::fs::write(&init_path, &init)?;
-        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))?;
-
-        self.create_busybox_symlinks(&work, &bb_bin)?;
-        self.copy_closure_to(busybox_path, &work).await?;
-        self.pack_cpio(&work, &initramfs_file, &bb_bin).await?;
-
-        if let Err(e) = std::fs::remove_dir_all(&work) {
-            tracing::warn!(dir = %work.display(), error = %e, "failed to remove initramfs work dir");
-        }
-
-        tracing::info!(
-            initramfs = %initramfs_file.display(),
-            size_bytes = std::fs::metadata(&initramfs_file).map(|m| m.len()).unwrap_or(0),
-            "initramfs built (minimal: busybox + virtio modules, app via virtiofs)"
-        );
-
         Ok(initramfs_file)
     }
 
@@ -569,6 +523,7 @@ impl MicrovmRunner {
             .join(&kver)
             .join("kernel");
 
+        let mut missing: Vec<&str> = Vec::new();
         for module_rel in needed_modules {
             let src = kmod_base.join(module_rel);
             let name = Path::new(module_rel)
@@ -580,85 +535,20 @@ impl MicrovmRunner {
                 std::fs::copy(&src, &dest)?;
                 tracing::debug!(module = %name, "copied kernel module to initramfs");
             } else {
-                tracing::warn!(module = %module_rel, "kernel module not found, skipping");
+                tracing::warn!(module = %module_rel, "kernel module not found");
+                missing.push(module_rel);
             }
         }
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "kernel modules not found in {} (kver={kver}): {}. \
+                 The guest would boot without virtio_net and be unreachable. \
+                 Check that your kernel provides these modules or use a microvm-kernel with drivers built-in.",
+                kmod_base.display(),
+                missing.join(", ")
+            );
+        }
         Ok(())
-    }
-
-    #[allow(dead_code)] // only used by cold-boot build_initramfs
-    fn generate_init_script(
-        &self,
-        alloc: &SubnetAllocation,
-        guest_port: u16,
-        app_store_path: &Path,
-        bin_name: &str,
-        needed_modules: &[&str],
-    ) -> String {
-        let app = app_store_path.display();
-        let insmod_cmds: String = needed_modules
-            .iter()
-            .map(|m| {
-                let xz_name = Path::new(m)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(m);
-                let ko_name = xz_name.trim_end_matches(".xz");
-                format!(
-                    "if [ -f /modules/{xz_name} ]; then /bin/xzcat /modules/{xz_name} > /tmp/{ko_name} && /bin/insmod /tmp/{ko_name} || exit 1; fi"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            r#"#!/bin/sh
-/bin/mkdir -p /proc /sys /dev /nix/store /tmp
-/bin/mount -t proc proc /proc
-/bin/mount -t sysfs sysfs /sys
-/bin/mount -t devtmpfs devtmpfs /dev
-
-# Load the small set of virtio modules needed by this guest.
-{insmod_cmds}
-
-# Mount the host Nix store before configuring the network.
-/bin/mount -t virtiofs nixstore /nix/store
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to mount /nix/store via virtiofs"
-  echo "Spawning emergency shell..."
-  exec /bin/sh
-fi
-
-echo "=== Configuring networking ==="
-/bin/ip addr add {vm_ip}/30 dev eth0
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to assign IP {vm_ip}/30 to eth0"
-fi
-
-/bin/ip link set eth0 up
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to bring eth0 UP"
-fi
-
-/bin/ip route add default via {host_ip}
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to set default gateway {host_ip}"
-fi
-
-export PORT={port}
-cd /
-echo "exec {app}/bin/{bin_name}"
-exec {app}/bin/{bin_name}
-echo "ERROR: exec failed! Spawning emergency shell..."
-exec /bin/sh
-"#,
-            insmod_cmds = insmod_cmds,
-            vm_ip = alloc.vm_ip,
-            host_ip = alloc.host_ip,
-            port = guest_port,
-            app = app,
-            bin_name = bin_name,
-        )
     }
 
     fn create_busybox_symlinks(&self, work: &Path, bb_bin: &str) -> anyhow::Result<()> {
@@ -679,49 +569,82 @@ exec /bin/sh
         Ok(())
     }
 
+    /// Pack the work directory into a newc-format CPIO via busybox.
+    /// Spawns `find` and `cpio` directly — no shell (F-27).
     async fn pack_cpio(
         &self,
         work: &Path,
         initramfs_file: &Path,
         bb_bin: &str,
     ) -> anyhow::Result<()> {
-        let script = format!(
-            "cd '{}' && '{}' find . | '{}' cpio -o -H newc > '{}'",
-            work.display(),
-            bb_bin,
-            bb_bin,
-            initramfs_file.display(),
-        );
-        let status = Command::new(bb_bin)
-            .arg("sh")
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .await?;
+        let work = work.to_path_buf();
+        let initramfs_file = initramfs_file.to_path_buf();
+        let bb_bin = bb_bin.to_string();
 
-        if !status.status.success() {
-            anyhow::bail!(
-                "cpio failed to create initramfs: {}",
-                String::from_utf8_lossy(&status.stderr).trim()
-            );
-        }
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let out_file = std::fs::File::create(&initramfs_file)?;
+
+            let mut find = std::process::Command::new(&bb_bin)
+                .arg("find")
+                .arg(".")
+                .current_dir(&work)
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+
+            let find_stdout = find
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed to capture find stdout"))?;
+
+            let cpio = std::process::Command::new(&bb_bin)
+                .arg("cpio")
+                .arg("-o")
+                .arg("-H")
+                .arg("newc")
+                .stdin(find_stdout)
+                .stdout(out_file)
+                .output()?;
+
+            let find_status = find.wait()?;
+            if !find_status.success() {
+                anyhow::bail!("find failed: exit code {:?}", find_status.code());
+            }
+            if !cpio.status.success() {
+                anyhow::bail!(
+                    "cpio failed: {}",
+                    String::from_utf8_lossy(&cpio.stderr).trim()
+                );
+            }
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 
     fn find_kver(&self, modules_path: &Path) -> anyhow::Result<String> {
         let mods_dir = modules_path.join("lib/modules");
+        let mut versions: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&mods_dir)? {
             let entry = entry?;
             if entry.file_type()?.is_dir()
                 && let Some(name) = entry.file_name().to_str()
             {
-                return Ok(name.to_string());
+                versions.push(name.to_string());
             }
         }
-        anyhow::bail!(
-            "no kernel version directory found in {}",
-            mods_dir.display()
-        )
+        if versions.is_empty() {
+            anyhow::bail!(
+                "no kernel version directory found in {}",
+                mods_dir.display()
+            );
+        }
+        if versions.len() > 1 {
+            tracing::warn!(
+                versions = ?versions,
+                "multiple kernel version directories found; selecting greatest (last by version sort)"
+            );
+        }
+        select_kernel_version(&mut versions)
     }
 
     async fn copy_closure_to(&self, store_path: &Path, dest_root: &Path) -> anyhow::Result<()> {
@@ -813,6 +736,11 @@ exec /bin/sh
             .unwrap_or_else(|| PathBuf::from("/var/lib/russel"));
 
         std::fs::create_dir_all(&sock_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
 
         // ── Spawn virtiofsd for each fs mount ──────────────────────────
         let mut virtiofsd_children: Vec<tokio::process::Child> = Vec::new();
@@ -899,68 +827,38 @@ exec /bin/sh
 
         tracing::info!(pid = vm_child.id(), "cloud-hypervisor started");
 
+        // F-02: wait for the API socket to appear, then lock it down.
+        {
+            let api_socket = &spec.api_socket;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+            while !api_socket.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if api_socket.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) =
+                        std::fs::set_permissions(api_socket, std::fs::Permissions::from_mode(0o600))
+                    {
+                        tracing::warn!(
+                            socket = %api_socket.display(),
+                            error = %e,
+                            "failed to chmod cloud-hypervisor API socket"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    socket = %api_socket.display(),
+                    "cloud-hypervisor API socket did not appear within 2s"
+                );
+            }
+        }
         Ok(BootOutput {
             vm_child,
             virtiofsd_children,
         })
-    }
-
-    /// Legacy boot wrapper — kept for backward compat.
-    ///
-    /// Prefer `boot_vm(spec)` for new code.
-    // legacy cold-boot helper retained for warm-pool/future
-    #[allow(dead_code)]
-    pub async fn boot(
-        &self,
-        service_id: &str,
-        kernel_path: &Path,
-        initramfs_path: &Path,
-        alloc: &SubnetAllocation,
-        memory_mb: u16,
-    ) -> anyhow::Result<BootOutput> {
-        let sock_dir = format!("/var/lib/russel/{service_id}");
-        std::fs::create_dir_all(&sock_dir)?;
-
-        let virtiofs_sock = format!("{sock_dir}/virtiofs.sock");
-        let api_sock = format!("{sock_dir}/cloud-hypervisor.sock");
-
-        // Remove stale sockets
-        for s in &[&virtiofs_sock, &api_sock] {
-            if let Err(e) = std::fs::remove_file(s)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(file = %s, error = %e, "failed to remove stale socket");
-            }
-        }
-
-        let spec = VmSpec {
-            kernel: kernel_path.to_path_buf(),
-            initramfs: initramfs_path.to_path_buf(),
-            cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
-            cpus_boot: 1,
-            cpus_max: std::env::var("RUSSEL_CPU_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
-            memory_mb,
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
-            tap: alloc.tap_id.clone(),
-            mac: alloc.mac.clone(),
-            api_socket: PathBuf::from(&api_sock),
-            fs: vec![FsMount {
-                tag: "nixstore".into(),
-                socket: PathBuf::from(&virtiofs_sock),
-                shared_dir: PathBuf::from("/nix/store"),
-                readonly: true,
-            }],
-            console: "null".into(),
-            restore_url: None,
-        };
-
-        self.boot_vm(&spec).await
     }
 
     /// Spawn virtiofsd for a socket/shared_dir pair and wait for readiness.
@@ -988,10 +886,11 @@ exec /bin/sh
         );
 
         let mut cmd = Command::new("virtiofsd");
+        let cache_policy = if readonly { "always" } else { "none" };
         cmd.arg(format!("--socket-path={}", socket.display()))
             .arg(format!("--shared-dir={}", shared_dir.display()))
             .arg(format!("--sandbox={}", virtiofsd_sandbox()))
-            .arg("--cache=always");
+            .arg(format!("--cache={cache_policy}"));
 
         if readonly {
             cmd.arg("--readonly");
@@ -1064,7 +963,7 @@ exec /bin/sh
             self.pkill_service_process(
                 service_id,
                 "cloud-hypervisor",
-                &format!("cloud-hypervisor.*tap={tap}(,|$)",),
+                &format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)",),
             )
             .await?;
             if let Some(pid) = vm_pid {
@@ -1073,7 +972,7 @@ exec /bin/sh
         }
 
         // Kill virtiofsd processes (plural — deploy writes an array).
-        let virtiofsd_pattern = format!("virtiofsd.*russel/{service_id}/");
+        let virtiofsd_pattern = format!("(^|[[:space:]])virtiofsd .*russel/{service_id}/");
         let mut virtiofsd_killed = false;
         if let Some(ref meta) = metadata {
             for &pid in &meta.virtiofsd_pids {
@@ -1091,7 +990,7 @@ exec /bin/sh
         }
 
         // Kill socat
-        let socat_pattern = format!("socat-russel-{service_id}");
+        let socat_pattern = format!("^socat-russel-{service_id}( |$)");
         if let Some(pid) = metadata.as_ref().and_then(|m| m.socat_pid)
             && terminate_owned_process(pid, service_id).await?
         {
@@ -1162,12 +1061,9 @@ exec /bin/sh
         ] {
             let path = std::path::Path::new(dir);
             if path.exists() {
-                let out = Command::new("rm").args(["-rf", dir]).output().await?;
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "failed to remove directory {dir}: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
+                // F-46: use std::fs::remove_dir_all instead of subprocess rm -rf.
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    anyhow::bail!("failed to remove directory {dir}: {e}");
                 }
             }
         }
@@ -1176,14 +1072,10 @@ exec /bin/sh
             format!("/nix/var/nix/gcroots/microvm/booted-{service_id}"),
         ] {
             let path = std::path::Path::new(file);
-            if path.exists() {
-                let out = Command::new("rm").args(["-f", file]).output().await?;
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "failed to remove gcroot {file}: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
+            if path.exists()
+                && let Err(e) = std::fs::remove_file(path)
+            {
+                anyhow::bail!("failed to remove gcroot {file}: {e}");
             }
         }
         Ok(())
@@ -1455,4 +1347,70 @@ async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     !process_is_alive(pid)
+}
+
+/// Select the greatest kernel version from a list of version strings.
+/// Sorts lexicographically (natural version sort) and returns the last.
+/// Exported for unit testing.
+fn select_kernel_version(versions: &mut [String]) -> anyhow::Result<String> {
+    if versions.is_empty() {
+        anyhow::bail!("no kernel versions provided");
+    }
+    versions.sort();
+    // Safe: we bail above if versions is empty.
+    versions
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unreachable: versions is empty"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_kernel_version_single() {
+        let mut versions = vec!["6.1.0".to_string()];
+        let result = select_kernel_version(&mut versions).unwrap();
+        assert_eq!(result, "6.1.0");
+    }
+
+    #[test]
+    fn select_kernel_version_lexicographic_selects_greatest() {
+        // Lexicographic sort: "6.1.0" < "6.10.0" < "6.2.0"
+        // (NOT numeric: 6.10.0 would be between 6.1.0 and 6.2.0 numerically,
+        //  but lexicographically "6.10.0" < "6.2.0" because '1' < '2')
+        let mut versions = vec![
+            "6.1.0".to_string(),
+            "6.10.0".to_string(),
+            "6.2.0".to_string(),
+        ];
+        let result = select_kernel_version(&mut versions).unwrap();
+        // Lexicographic sort: "6.1.0", "6.10.0", "6.2.0" → last is "6.2.0"
+        assert_eq!(result, "6.2.0");
+    }
+
+    #[test]
+    fn select_kernel_version_with_dash_suffixes() {
+        // Versions like "6.6.60-rt" vs "6.6.60".
+        // Shorter string sorts first: "6.6.60" < "6.6.60-rt".
+        let mut versions = vec!["6.6.60-rt".to_string(), "6.6.60".to_string()];
+        let result = select_kernel_version(&mut versions).unwrap();
+        // After sort: "6.6.60", "6.6.60-rt" → last is "6.6.60-rt"
+        assert_eq!(result, "6.6.60-rt");
+    }
+
+    #[test]
+    fn select_kernel_version_empty_is_error() {
+        let mut versions: Vec<String> = vec![];
+        let result = select_kernel_version(&mut versions);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no kernel versions")
+        );
+    }
 }
