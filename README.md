@@ -328,61 +328,87 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 └── README.md
 ```
 
-## Benchmark (2026-07-12)
+## Benchmark (2026-07-24)
+
+Warm run (`./bench.sh --warm`) on NixOS, podman 5.8.2, rootless containers via
+`SUDO_USER`, microVM via Cloud Hypervisor + custom `.#microvm-kernel`. Total wall
+time ~271s (includes clean debug + release + tests + 7 app races).
+
+### Systems
 
 | Metric | Value |
 |--------|-------|
-| Clean build (debug) | 12.3s |
-| Release build | 24.4s |
-| Incremental build | 0.8s |
-| Tests | 43 passing, 0.7s |
-| Binary size (cli) | 6.7MB |
-| Binary size (ctrl) | 4.5MB |
-| Rust LOC | 3,994 (16 files) |
-| Direct deps | 332 |
-| Dockerfiles | 3 (examples/basic-http, static-test, filebrowser) |
+| Clean build (debug) | 21.7s |
+| Release build | 70.2s |
+| Tests | ~301 unit tests, 45.9s (workspace) |
+| Binary size (cli) | 7.1MB (~5.5MB stripped) |
+| Binary size (ctrl) | 5.9MB (~4.5MB stripped) |
+| Rust LOC | 17,241 (22 files) |
+| Direct deps | 340 |
+| Dockerfiles | 7 (all examples) |
+| Clippy warnings | 0 |
 
-### Russel vs Container: Application Boot Race
+### App boot race — End-to-End (build/deploy + first HTTP)
 
-The benchmark races Russel (microVM via cloud-hypervisor) against the detected
-container runtime (podman or docker) for each example application — end to end:
-build → spawn → first HTTP response. The table reports end-to-end times.
-A second "Spawn-to-Ready" table (excluding build time) is printed below it.
+Three paths per example: **Russel microVM**, **Russel container** (rootless
+podman `--rootfs`), **raw podman** (Dockerfile build + run). Winner = lowest E2E.
 
-| Example | Russel (deploy+curl) | Docker/Podman (build+run+curl) | Winner |
-|---------|---------------------|--------------------------------|--------|
-| basic-http | 3.9s | 8.6s | Russel |
-| static-test | 1.7s | 2.7s | Russel |
-| filebrowser | 1.9s | 10.1s | Russel |
+| App | Russel microVM | Russel container | Podman baseline | Winner |
+|-----|----------------|------------------|-----------------|--------|
+| basic-http | 3.24s (3.21+0.04) | **1.37s** (1.35+0.02) | 7.81s (7.28+0.53) | Russel-ctr |
+| microvm-http | 1.27s (1.26+0.01) | **1.09s** (1.07+0.02) | 9.24s (8.88+0.37) | Russel-ctr |
+| hello-rust | 1.53s (1.48+0.05) | **1.14s** (1.11+0.03) | 9.17s (8.61+0.56) | Russel-ctr |
+| env-config | 1.26s (1.24+0.02) | **0.95s** (0.94+0.01) | 10.23s (9.79+0.44) | Russel-ctr |
+| shortlink | 1.53s (1.50+0.03) | **1.19s** (1.16+0.02) | 10.09s (9.58+0.51) | Russel-ctr |
+| static-test | 1.99s (1.96+0.03) | **1.27s** (1.10+0.17) | 2.60s (1.32+1.28) | Russel-ctr |
+| filebrowser | 2.68s (2.64+0.04) | **1.74s** (1.60+0.14) | 9.04s (8.28+0.77) | Russel-ctr |
 
-Times are end-to-end: build + spawn + first HTTP 200. The runtime label
-(podman/docker) is auto-detected. Russel phase breakdown
-(resolve, nix build, initramfs, network, boot, ready) is printed after the
-race by `./bench.sh`.
+`(deploy+curl)` for Russel; `(image build + run→HTTP)` for podman baseline.
 
-Run `./bench.sh [--cold|--warm]` to reproduce. Requires Rust toolchain, nix,
-and optionally podman/docker for the comparison.
+### Spawn-to-Ready (excluding build)
 
-### Container Boot Comparison (legacy, for reference)
+Strips Nix / Dockerfile build time. Best apples-to-apples “how fast after the
+package exists.”
 
-| Example | Container ready | Build time |
-|---------|----------------|------------|
-| basic-http | 176ms | 19.1s |
-| static-test | 519ms | 1.2s |
-| filebrowser | 292ms | 8.3s |
+| App | Russel microVM | Russel container | Podman baseline |
+|-----|----------------|------------------|-----------------|
+| basic-http | 1892ms | 669ms | **528ms** |
+| microvm-http | 919ms | 655ms | **366ms** |
+| hello-rust | 880ms | 659ms | **562ms** |
+| env-config | 851ms | 639ms | **443ms** |
+| shortlink | 1046ms | 847ms | **509ms** |
+| static-test | 1371ms | **795ms** | 1279ms |
+| filebrowser | 1261ms | 840ms | **766ms** |
 
-Container startup (spawn→ready) is faster than microVM boot (which includes
-kernel init, initramfs extraction, and module loading), but microVMs provide
-stronger isolation via hardware virtualization. Container resources are capped
-to `--memory=256m` to match the microVM memory limit. Container run time
-includes port-resolution polling (`sleep 0.5` up to 5×) while Russel's port is
-pre-allocated.
+**Reading the tables:** E2E favors Russel on warm runs (Nix store cache vs image
+build). Spawn-to-Ready is usually raw podman ≤ Russel container &lt; microVM —
+microVM pays for Cloud Hypervisor + virtiofs + guest init in exchange for stronger
+isolation. Container memory capped at 256m to match microVM defaults.
 
-> **Fair comparison note:** The main End-to-End table conflates build and spawn
-> into one number, which favors Russel (its Nix cache persists; Docker images
-> were previously destroyed each run via `rmi`). The Spawn-to-Ready table
-> (printed by `./bench.sh`) strips build time. `--warm` (default) now keeps both
-> caches warm; `--cold` forces cold builds on both sides.
+### Last container deploy phases (example)
+
+| Phase | Time | Detail |
+|-------|------|--------|
+| resolve | 0ms | repo + Russelfile |
+| build | 897ms | nix build (package) |
+| create | 0ms | rootfs adapter |
+| network | 0ms | n/a for container |
+| start | 643ms | rootless podman run --rootfs |
+| ready | 0ms | host TCP/HTTP ready |
+| **total** | **1540ms** | sum of phases |
+
+Reproduce:
+
+```bash
+# typically: root for microVM + SUDO_USER rootless podman
+sudo -E nix develop -c ./bench.sh --warm
+# optional fixed kernel:
+# sudo -E env RUSSEL_KERNEL_PATH="$(readlink -f result-kernel/bzImage)" nix develop -c ./bench.sh --warm
+```
+
+Requires Rust toolchain, nix, KVM + root for microVM, rootless podman for
+Russel containers, and podman/docker for the Dockerfile baseline. Use `--cold`
+to force cold Nix + image rebuilds on both sides.
 
 ### Known Limitations
 

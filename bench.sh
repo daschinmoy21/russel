@@ -9,7 +9,10 @@ set -euo pipefail
 #
 #   1. Russel microVM   — Cloud Hypervisor (service.type / runtime microvm)
 #   2. Russel container — rootless Podman --rootfs (runtime container)
-#   3. Raw podman/docker — Dockerfile build + run (baseline)
+#   3. Raw podman/docker — Dockerfile build + run (baseline; skipped if no Dockerfile)
+#
+# All examples/*/Russelfile.toml are raced. Temp Russelfiles inject type for the
+# race (file type is ignored for fairness). Apps without Dockerfile skip path 3.
 #
 # Run from repo root after `nix develop` or with Rust toolchain on PATH.
 # Use --cold to force cold builds (no layer/nix cache); default is --warm.
@@ -86,6 +89,8 @@ cleanup() {
 	# Destroy any lingering bench VMs first. Cleanup must never hang the
 	# benchmark (for example if a VMM is already wedged).
 	for vm in "${RUSSEL_VMS_CREATED[@]:-}"; do
+		# Skip empty slots left when the array is cleared with "${arr[@]:-}"
+		[ -n "$vm" ] || continue
 		if command -v russel-cli &>/dev/null; then
 			info "cleaning up VM: $vm"
 			if command -v timeout &>/dev/null; then
@@ -362,9 +367,26 @@ else
 
 	get_ready_path() {
 		case "$1" in
-		basic-http) echo "/health" ;;
+		basic-http | hello-rust | env-config | shortlink | microvm-http) echo "/health" ;;
 		*) echo "/" ;;
 		esac
+	}
+
+	# Ensure env-config can resolve secret://DEMO_SECRET at deploy time.
+	ensure_bench_secrets() {
+		local example="$1"
+		if [ "$example" != "env-config" ]; then
+			return 0
+		fi
+		if ! command -v russel-cli &>/dev/null; then
+			warn "env-config: russel-cli missing; DEMO_SECRET not set"
+			return 0
+		fi
+		if printf '%s' 'bench-secret' | russel-cli secrets set DEMO_SECRET &>/dev/null; then
+			info "env-config: set DEMO_SECRET for secret:// resolution"
+		else
+			warn "env-config: failed to set DEMO_SECRET (deploy may fail)"
+		fi
 	}
 
 	# Deploy one Russel service (microvm|container).
@@ -384,6 +406,7 @@ else
 		out_status="failed"
 
 		russel-cli destroy "$vm_id" &>/dev/null || true
+		ensure_bench_secrets "$example"
 
 		if [ "$COLD" -eq 1 ]; then
 			local_result="examples/$example/result"
@@ -394,8 +417,8 @@ else
 			fi
 		fi
 
-		# File is source of truth for runtime: temp Russelfile with type under [service]
-		# (examples omit type → default microvm).
+		# Inject type under [service] so each race path is forced (microvm|container),
+		# independent of the example's committed type default.
 		cfg_name="Russelfile.bench-${runtime_kind}.toml"
 		cfg_path="$repo_path/$cfg_name"
 		awk -v rt="$runtime_kind" '
@@ -441,6 +464,7 @@ else
 			[ -z "$russel_build_phase" ] && russel_build_phase=0
 			LAST_RUSSEL_COMPLETE="$complete_line"
 			LAST_RUSSEL_RUNTIME="$runtime_kind"
+			# Track for EXIT trap; removed again after successful per-race destroy.
 			RUSSEL_VMS_CREATED+=("$vm_id")
 
 			curl_start=$(date +%s%N)
@@ -575,12 +599,60 @@ else
 	fi
 
 	# ── 10b. Benchmark each example ─────────────────────────────────────────────
+	# Prefer a stable explicit order covering all shipped demos; also pick up any
+	# future examples/*/Russelfile.toml not in the list.
 	EXAMPLE_APPS=()
-	for ex in basic-http static-test filebrowser; do
-		if [ -f "examples/$ex/Russelfile.toml" ] && [ -f "examples/$ex/Dockerfile" ]; then
+	for ex in basic-http microvm-http hello-rust env-config shortlink static-test filebrowser; do
+		if [ -f "examples/$ex/Russelfile.toml" ]; then
 			EXAMPLE_APPS+=("$ex")
 		fi
 	done
+	for rf in examples/*/Russelfile.toml; do
+		[ -f "$rf" ] || continue
+		ex=$(basename "$(dirname "$rf")")
+		already=0
+		for a in "${EXAMPLE_APPS[@]:-}"; do
+			if [ "$a" = "$ex" ]; then already=1; break; fi
+		done
+		if [ "$already" -eq 0 ]; then
+			EXAMPLE_APPS+=("$ex")
+		fi
+	done
+	info "racing ${#EXAMPLE_APPS[@]} examples: ${EXAMPLE_APPS[*]}"
+
+	# Pick winner among successful e2e totals for the current example (last array slots).
+	pick_winner() {
+		local best_name="—"
+		local best_ms=999999999
+		local t d_total
+		if [ "${RUSSEL_MICROVM_DEPLOY_MS[-1]}" != "skipped" ] && [ "${RUSSEL_MICROVM_DEPLOY_MS[-1]}" != "failed" ] &&
+			[ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "timeout" ] && [ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "failed" ] &&
+			[ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "skipped" ]; then
+			t=$((RUSSEL_MICROVM_DEPLOY_MS[-1] + RUSSEL_MICROVM_CURL_MS[-1]))
+			if [ "$t" -lt "$best_ms" ]; then
+				best_ms=$t
+				best_name="Russel-mVM"
+			fi
+		fi
+		if [ "${RUSSEL_CONTAINER_DEPLOY_MS[-1]}" != "skipped" ] && [ "${RUSSEL_CONTAINER_DEPLOY_MS[-1]}" != "failed" ] &&
+			[ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "timeout" ] && [ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "failed" ] &&
+			[ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "skipped" ]; then
+			t=$((RUSSEL_CONTAINER_DEPLOY_MS[-1] + RUSSEL_CONTAINER_CURL_MS[-1]))
+			if [ "$t" -lt "$best_ms" ]; then
+				best_ms=$t
+				best_name="Russel-ctr"
+			fi
+		fi
+		if [ "${DOCKER_BUILD_MS[-1]}" != "skipped" ] && [ "${DOCKER_BUILD_MS[-1]}" != "failed" ] &&
+			[ "${DOCKER_BOOT_MS[-1]}" != "skipped" ] && [ "${DOCKER_BOOT_MS[-1]}" != "failed" ] &&
+			[ "${DOCKER_BOOT_MS[-1]}" != "timeout" ]; then
+			d_total=$((DOCKER_BUILD_MS[-1] + DOCKER_BOOT_MS[-1]))
+			if [ "$d_total" -lt "$best_ms" ]; then
+				best_name="${RUNTIME^}"
+			fi
+		fi
+		echo "$best_name"
+	}
 
 	# Port base: Russel microVM and container each get distinct host ports
 	PORT_BASE=18080
@@ -590,7 +662,13 @@ else
 
 		repo_path="$(realpath "examples/$example")"
 		guest_port=$(grep -oP '(?<=^port = )\d+' "examples/$example/Russelfile.toml" | head -1)
+		if [ -z "$guest_port" ]; then
+			warn "no port = N in Russelfile; skipping $example"
+			continue
+		fi
 		ready_path=$(get_ready_path "$example")
+		has_dockerfile=0
+		[ -f "examples/$example/Dockerfile" ] && has_dockerfile=1
 		EXAMPLES+=("$example")
 
 		# ── Russel microVM ──────────────────────────────────────────────────
@@ -621,6 +699,15 @@ else
 				;;
 			esac
 			russel-cli destroy "$vm_id" &>/dev/null || true
+			# Already destroyed; drop from EXIT cleanup list so trap does not re-destroy.
+			_kept=()
+			for _v in "${RUSSEL_VMS_CREATED[@]:-}"; do
+				[ -n "$_v" ] && [ "$_v" != "$vm_id" ] && _kept+=("$_v")
+			done
+			RUSSEL_VMS_CREATED=()
+			if [ "${#_kept[@]}" -gt 0 ]; then
+				RUSSEL_VMS_CREATED=("${_kept[@]}")
+			fi
 		else
 			RUSSEL_MICROVM_DEPLOY_MS+=("skipped")
 			RUSSEL_MICROVM_CURL_MS+=("skipped")
@@ -655,16 +742,24 @@ else
 				;;
 			esac
 			russel-cli destroy "$vm_id" &>/dev/null || true
+			_kept=()
+			for _v in "${RUSSEL_VMS_CREATED[@]:-}"; do
+				[ -n "$_v" ] && [ "$_v" != "$vm_id" ] && _kept+=("$_v")
+			done
+			RUSSEL_VMS_CREATED=()
+			if [ "${#_kept[@]}" -gt 0 ]; then
+				RUSSEL_VMS_CREATED=("${_kept[@]}")
+			fi
 		else
 			RUSSEL_CONTAINER_DEPLOY_MS+=("skipped")
 			RUSSEL_CONTAINER_CURL_MS+=("skipped")
 			RUSSEL_CONTAINER_SPAWN_MS+=("skipped")
 		fi
 
-		# ── Raw Docker/podman baseline ──────────────────────────────────────
+		# ── Raw Docker/podman baseline (Dockerfile required) ────────────────
 		docker_boot_ms=0
 
-		if [ -n "$RUNTIME" ]; then
+		if [ -n "$RUNTIME" ] && [ "$has_dockerfile" -eq 1 ]; then
 			image_tag="russel-bench-$example"
 			container_name="russel-bench-$example"
 
@@ -679,7 +774,6 @@ else
 				build_err=$(echo "$build_out" | grep -i 'error:' | head -1 || echo "unknown error")
 				DOCKER_BUILD_MS+=("failed")
 				DOCKER_BOOT_MS+=("failed")
-				WINNER+=("—")
 				fail "$RUNTIME: build failed (${build_ms}ms): $build_err"
 			else
 				pass "$RUNTIME: image built in ${build_ms}ms"
@@ -691,7 +785,6 @@ else
 				cid=$("$RUNTIME" run -d --name "$container_name" -P --memory=256m "$image_tag" 2>/dev/null || echo "")
 				if [ -z "$cid" ]; then
 					DOCKER_BOOT_MS+=("failed")
-					WINNER+=("—")
 					fail "$RUNTIME: failed to start container"
 				else
 					dhp=""
@@ -702,7 +795,6 @@ else
 					done
 					if [ -z "$dhp" ]; then
 						DOCKER_BOOT_MS+=("failed")
-						WINNER+=("—")
 						warn "$RUNTIME: could not determine host port"
 					else
 						boot_ok=0
@@ -718,34 +810,8 @@ else
 							docker_boot_ms=$(((boot_end - boot_start) / 1000000))
 							DOCKER_BOOT_MS+=("$docker_boot_ms")
 							pass "$RUNTIME: container ready in ${docker_boot_ms}ms"
-
-							# Winner among successful e2e totals (deploy+curl or build+boot)
-							best_name="—"
-							best_ms=999999999
-							if [ "${RUSSEL_MICROVM_DEPLOY_MS[-1]}" != "skipped" ] && [ "${RUSSEL_MICROVM_DEPLOY_MS[-1]}" != "failed" ] &&
-								[ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "timeout" ] && [ "${RUSSEL_MICROVM_CURL_MS[-1]}" != "failed" ]; then
-								t=$((RUSSEL_MICROVM_DEPLOY_MS[-1] + RUSSEL_MICROVM_CURL_MS[-1]))
-								if [ "$t" -lt "$best_ms" ]; then
-									best_ms=$t
-									best_name="Russel-mVM"
-								fi
-							fi
-							if [ "${RUSSEL_CONTAINER_DEPLOY_MS[-1]}" != "skipped" ] && [ "${RUSSEL_CONTAINER_DEPLOY_MS[-1]}" != "failed" ] &&
-								[ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "timeout" ] && [ "${RUSSEL_CONTAINER_CURL_MS[-1]}" != "failed" ]; then
-								t=$((RUSSEL_CONTAINER_DEPLOY_MS[-1] + RUSSEL_CONTAINER_CURL_MS[-1]))
-								if [ "$t" -lt "$best_ms" ]; then
-									best_ms=$t
-									best_name="Russel-ctr"
-								fi
-							fi
-							d_total=$((build_ms + docker_boot_ms))
-							if [ "$d_total" -lt "$best_ms" ]; then
-								best_name="${RUNTIME^}"
-							fi
-							WINNER+=("$best_name")
 						else
 							DOCKER_BOOT_MS+=("timeout")
-							WINNER+=("—")
 							warn "$RUNTIME: container started but HTTP never ready"
 						fi
 					fi
@@ -758,10 +824,14 @@ else
 			fi
 			set -euo pipefail
 		else
+			if [ -n "$RUNTIME" ] && [ "$has_dockerfile" -eq 0 ]; then
+				info "baseline $RUNTIME: skipped (no Dockerfile)"
+			fi
 			DOCKER_BUILD_MS+=("skipped")
 			DOCKER_BOOT_MS+=("skipped")
-			WINNER+=("—")
 		fi
+
+		WINNER+=("$(pick_winner)")
 
 		echo ""
 	done
@@ -828,9 +898,10 @@ else
 		echo -e "  ${DIM}Note:${NC}"
 		echo -e "  ${DIM}  Russel microVM:  nix build → initramfs → TAP/socat → cloud-hypervisor → curl${NC}"
 		echo -e "  ${DIM}  Russel container: nix build → rootfs adapter → rootless podman --rootfs → curl${NC}"
-		echo -e "  ${DIM}  ${runtime_label} baseline: Dockerfile build + run → curl (not Russel)${NC}"
+		echo -e "  ${DIM}  ${runtime_label} baseline: Dockerfile build + run → curl (not Russel; skipped if no Dockerfile)${NC}"
 		echo -e "  ${DIM}  Russel deploy API sets runtime=microvm|container; ports via -p style host/guest.${NC}"
 		echo -e "  ${DIM}  Warm runs reuse nix/store and image layers; use --cold for cold builds.${NC}"
+		echo -e "  ${DIM}  Examples raced: all examples/*/Russelfile.toml (new apps included).${NC}"
 		echo ""
 		[ "$RUSSEL_MICROVM_SKIPPED" -eq 1 ] && echo -e "  ${YELLOW}  ⚠ Russel microVM skipped — see prereqs above.${NC}"
 		[ "$RUSSEL_CONTAINER_SKIPPED" -eq 1 ] && echo -e "  ${YELLOW}  ⚠ Russel container skipped — need rootless podman + root for this script.${NC}"

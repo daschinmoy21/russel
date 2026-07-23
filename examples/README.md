@@ -4,13 +4,15 @@ Self-contained apps for trying **container** (default) and **microVM** deploys.
 
 | Example | Runtime default | Stack | Port | Notes |
 |---------|-----------------|-------|------|--------|
-| [basic-http](basic-http/) | container | Go + embedded static | 3000 | Main demo; `/health` |
-| [microvm-http](microvm-http/) | microVM | same binary as basic-http | 3000 | Needs KVM/TAP |
-| [hello-rust](hello-rust/) | container | pure-std Rust | 3000 | No crates.io deps |
-| [env-config](env-config/) | container | Go + `[service.env]` | 3000 | `secret://` demo |
-| [shortlink](shortlink/) | container | Go in-memory shortener | 3000 | POST / + GET /{id} |
-| [filebrowser](filebrowser/) | container | nixpkgs filebrowser | 8080 | Shell wrapper; uses `/tmp` |
-| [static-test](static-test/) | container | Python http.server | 8000 | Static HTML |
+| [basic-http](basic-http/) | container | Go + embedded static | 3000 | Main demo; `/health`; Dockerfile |
+| [microvm-http](microvm-http/) | microVM | same binary as basic-http | 3000 | Needs KVM/TAP; Dockerfile for baseline |
+| [hello-rust](hello-rust/) | container | pure-std Rust | 3000 | No crates.io deps; Dockerfile |
+| [env-config](env-config/) | container | Go + `[service.env]` | 3000 | `secret://` demo; Dockerfile |
+| [shortlink](shortlink/) | container | Go in-memory shortener | 3000 | POST / + GET /{id}; Dockerfile |
+| [filebrowser](filebrowser/) | container | nixpkgs filebrowser | 8080 | Shell wrapper; uses `/tmp`; Dockerfile |
+| [static-test](static-test/) | container | Python http.server | 8000 | Static HTML; Dockerfile |
+
+All examples ship a `Dockerfile` so `./bench.sh` can race Russel against raw podman/docker.
 
 ## Prerequisites
 

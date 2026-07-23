@@ -1,6 +1,6 @@
 # microvm-http — same Go app as basic-http, but type = "microvm".
-# Requires KVM + TAP (often: sudo -E russel-ctrl). Shares sources via relative path
-# is awkward; this example re-exports basic-http via flake path.
+# Requires KVM + TAP (often: sudo -E russel-ctrl). Sources live in this directory
+# (copied from basic-http; keep in sync if you change the demo app).
 
 [service]
 name = "microvm-http"

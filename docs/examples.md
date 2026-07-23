@@ -56,7 +56,7 @@ Hardened containers (`debug = false`): no bash/curl; this app is a static ELF so
 | Field | Value |
 |-------|--------|
 | Runtime | `type = "microvm"` |
-| Binary | `basic-http` (flake reuses `examples/basic-http` sources) |
+| Binary | `basic-http` (self-contained copy of the basic-http Go app) |
 
 ```bash
 sudo -E ./target/debug/russel-ctrl

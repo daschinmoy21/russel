@@ -5,17 +5,22 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 func main() {
@@ -65,9 +70,36 @@ func main() {
 		}
 	})
 
-	addr := fmt.Sprintf(":%d", port)
-	log.Printf("shortlink listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		log.Printf("shortlink listening on %s", server.Addr)
+		errs <- server.ListenAndServe()
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-signals:
+		log.Printf("received %s, shutting down", sig)
+	case err := <-errs:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func randomID() string {

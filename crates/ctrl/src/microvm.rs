@@ -571,6 +571,11 @@ impl MicrovmRunner {
 
     /// Pack the work directory into a newc-format CPIO via busybox.
     /// Spawns `find` and `cpio` directly — no shell (F-27).
+    ///
+    /// Both sides must use `current_dir(work)`: find emits relative paths like
+    /// `./bin/...`, and busybox cpio opens them relative to its own cwd.
+    /// Do **not** use `Command::output()` for cpio — it forces stdout to a pipe
+    /// and discards the file we create for the archive.
     async fn pack_cpio(
         &self,
         work: &Path,
@@ -581,43 +586,8 @@ impl MicrovmRunner {
         let initramfs_file = initramfs_file.to_path_buf();
         let bb_bin = bb_bin.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let out_file = std::fs::File::create(&initramfs_file)?;
-
-            let mut find = std::process::Command::new(&bb_bin)
-                .arg("find")
-                .arg(".")
-                .current_dir(&work)
-                .stdout(std::process::Stdio::piped())
-                .spawn()?;
-
-            let find_stdout = find
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("failed to capture find stdout"))?;
-
-            let cpio = std::process::Command::new(&bb_bin)
-                .arg("cpio")
-                .arg("-o")
-                .arg("-H")
-                .arg("newc")
-                .stdin(find_stdout)
-                .stdout(out_file)
-                .output()?;
-
-            let find_status = find.wait()?;
-            if !find_status.success() {
-                anyhow::bail!("find failed: exit code {:?}", find_status.code());
-            }
-            if !cpio.status.success() {
-                anyhow::bail!(
-                    "cpio failed: {}",
-                    String::from_utf8_lossy(&cpio.stderr).trim()
-                );
-            }
-            Ok(())
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || pack_cpio_blocking(&work, &initramfs_file, &bb_bin))
+            .await??;
         Ok(())
     }
 
@@ -886,7 +856,9 @@ impl MicrovmRunner {
         );
 
         let mut cmd = Command::new("virtiofsd");
-        let cache_policy = if readonly { "always" } else { "none" };
+        // virtiofsd --cache accepts: auto | always | never | metadata (not "none").
+        // readonly nixstore: always cache; rw cfg: never cache so guest sees host writes promptly.
+        let cache_policy = if readonly { "always" } else { "never" };
         cmd.arg(format!("--socket-path={}", socket.display()))
             .arg(format!("--shared-dir={}", shared_dir.display()))
             .arg(format!("--sandbox={}", virtiofsd_sandbox()))
@@ -1349,6 +1321,74 @@ async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     !process_is_alive(pid)
 }
 
+/// Pack `work` into a newc CPIO at `initramfs_file` using busybox multi-call
+/// `find` + `cpio`. Both processes share `current_dir(work)` so relative paths
+/// from find resolve correctly for cpio. Used by agent initramfs builds.
+fn pack_cpio_blocking(work: &Path, initramfs_file: &Path, bb_bin: &str) -> anyhow::Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let out_file = std::fs::File::create(initramfs_file)?;
+
+    let mut find = std::process::Command::new(bb_bin)
+        .arg("find")
+        .arg(".")
+        .current_dir(work)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn busybox find: {e}"))?;
+
+    let find_stdout = find
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture find stdout"))?;
+
+    // cpio must run with the same cwd as find: find emits paths like `./bin/sh`
+    // which cpio opens relative to its cwd. Also use spawn+wait — not
+    // Command::output() — so stdout stays the archive file (output() forces a pipe).
+    let cpio = std::process::Command::new(bb_bin)
+        .arg("cpio")
+        .arg("-o")
+        .arg("-H")
+        .arg("newc")
+        .current_dir(work)
+        .stdin(find_stdout)
+        .stdout(out_file)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn busybox cpio: {e}"))?;
+
+    // Wait consumer first so the pipe drains; then the producer.
+    let cpio_out = cpio
+        .wait_with_output()
+        .map_err(|e| anyhow::anyhow!("wait cpio: {e}"))?;
+    let find_status = find
+        .wait()
+        .map_err(|e| anyhow::anyhow!("wait find: {e}"))?;
+
+    if !cpio_out.status.success() {
+        anyhow::bail!(
+            "cpio failed: exit {:?} — {}",
+            cpio_out.status.code(),
+            String::from_utf8_lossy(&cpio_out.stderr).trim()
+        );
+    }
+    if !find_status.success() {
+        anyhow::bail!(
+            "find failed: exit code {:?} signal {:?}",
+            find_status.code(),
+            find_status.signal()
+        );
+    }
+
+    let meta = std::fs::metadata(initramfs_file)?;
+    if meta.len() == 0 {
+        anyhow::bail!("cpio produced empty initramfs at {}", initramfs_file.display());
+    }
+    Ok(())
+}
+
 /// Select the greatest kernel version from a list of version strings.
 /// Sorts lexicographically (natural version sort) and returns the last.
 /// Exported for unit testing.
@@ -1412,5 +1452,47 @@ mod tests {
                 .to_string()
                 .contains("no kernel versions")
         );
+    }
+
+    /// Regression: F-27 pack_cpio must set cwd on cpio and must not use
+    /// Command::output() (which would discard the archive file and SIGPIPE find).
+    #[test]
+    fn pack_cpio_blocking_writes_nonempty_archive() {
+        let bb = std::env::var_os("RUSSEL_TEST_BUSYBOX")
+            .map(PathBuf::from)
+            .or_else(|| {
+                // Prefer a nix-built busybox if present on PATH as multi-call.
+                which_busybox()
+            });
+        let Some(bb) = bb else {
+            eprintln!("skip pack_cpio_blocking test: no busybox (set RUSSEL_TEST_BUSYBOX)");
+            return;
+        };
+
+        let work = tempfile::tempdir().unwrap();
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hello"), b"hi").unwrap();
+        std::fs::write(work.path().join("init"), b"#!/bin/sh\n").unwrap();
+
+        let out = work.path().join("out.cpio");
+        pack_cpio_blocking(work.path(), &out, bb.to_str().unwrap()).unwrap();
+        let size = std::fs::metadata(&out).unwrap().len();
+        assert!(size > 64, "expected non-trivial cpio, got {size} bytes");
+    }
+
+    fn which_busybox() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("busybox");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        // Known store path from recent deploys (optional local convenience).
+        let store = PathBuf::from(
+            "/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0/bin/busybox",
+        );
+        store.is_file().then_some(store)
     }
 }
