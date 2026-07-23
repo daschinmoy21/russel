@@ -1,176 +1,529 @@
-# Control Plane Architecture
+# Russel Architecture
 
-The Russel control plane (`russel-ctrl`) orchestrates builds, **microVM and container**
-lifecycles, and host-side networking.
+Russel is a self-hosted deployment platform: it takes a source repository, builds it
+with Nix, and runs the resulting store path as either a **Cloud Hypervisor microVM**
+or a **rootless Podman container**, with Traefik as the HTTP ingress gateway.
+
+This document is the canonical architecture reference. For API/CLI details see
+[README.md](../README.md); for config schema see [russelfile.md](russelfile.md).
 
 ---
 
-## Ingress Trait
+## 1. Overall Architecture
 
-Deploy uses the `Ingress` trait (defined in `crates/ctrl/src/ingress.rs`) to advertise service backends to a reverse proxy. `TraefikFileIngress` (in `crates/ctrl/src/traefik.rs`) is the default implementation, writing Traefik dynamic configuration files. Future proxies (Caddy, Envoy, NGINX) implement the same trait — deploy, stop, and destroy never import Traefik types directly.
+```mermaid
+flowchart LR
+    subgraph User
+        CLI[russel-cli]
+    end
 
-## Traefik Gateway
+    subgraph Host["Linux host"]
+        subgraph CP["russel-ctrl (Axum control plane)"]
+            API[HTTP API<br/>:7878]
+            PIPE[Deploy pipeline]
+            STATE[(In-memory state<br/>+ metadata.json)]
+            HEALTH[Health loop]
+            REC[Startup reconcile]
+        end
 
-Russel integrates with [Traefik](https://traefik.io/) as the primary HTTP reverse proxy. The control plane writes dynamic configuration files (JSON) into a watched directory. Traefik picks up changes automatically — no reload signal needed.
+        subgraph Build["Build"]
+            GIT[git clone<br/>/tmp/russel/checkouts]
+            NIX[nix build<br/>→ /nix/store/&lt;hash&gt;]
+        end
 
-### Flow
+        subgraph RT["Runtimes"]
+            CH[Cloud Hypervisor<br/>microVMs]
+            POD[Rootless Podman<br/>containers]
+        end
 
-```text
-Client → Traefik (:80) → 127.0.0.1:<host_port> (socat/podman) → guest:<guest_port>
-          ↑                        ↑
-     Host(`svc.russel.local`)   dynamic file written by russel-ctrl
+        subgraph Net["Networking"]
+            TAP[TAP rsl-&lt;key&gt;]
+            SOC[socat forwarder]
+            VFD[virtiofsd]
+        end
+
+        TRAEFIK[Traefik<br/>file provider]
+    end
+
+    CLI -->|HTTP/JSON + Bearer| API
+    API --> PIPE
+    PIPE --> GIT --> NIX
+    PIPE --> CH
+    PIPE --> POD
+    CH --- TAP & VFD
+    SOC --> TAP
+    PIPE --> STATE
+    CP -.writes dynamic config.-> TRAEFIK
+    TRAEFIK -->|127.0.0.1:port| SOC
+    TRAEFIK -->|127.0.0.1:port| POD
 ```
 
-1. On deploy success, russel-ctrl writes `{service_id}.json` to the dynamic config directory.
-2. Traefik's file provider watches the directory and applies the new router + service.
-3. On stop/destroy, russel-ctrl removes the file; Traefik stops routing.
+Key properties:
 
-### Environment Variables
+- **Single host, single control plane.** No clustering, no scheduler.
+- **Nix is the only build system.** The deployable artifact is always a
+  `/nix/store` path; both runtimes consume it directly (no image builds).
+- **Two runtimes, one pipeline.** `service.type` in the Russelfile selects
+  microVM (default) or container after the shared resolve/build phase.
+- **Traefik is the primary ingress**; published host ports (`-p`) are an escape hatch.
+- **Control-plane restarts are non-destructive**: workloads are detached children
+  (or podman containers) that keep running; startup reconcile re-adopts them.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `/var/lib/russel/traefik/dynamic` | Directory for dynamic config files |
-| `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Domain suffix for Host rules |
+### Crate layout
 
-### Router / Service Naming
-
-- Router: `russel-{service_id}`
-- Service: `russel-{service_id}`
-- Rule: `Host(\`{service_id}.{domain}\`)`
-- EntryPoints: `web`
-- Backend: `http://127.0.0.1:{host_port}`
-
-See [docs/traefik.md](traefik.md) for a complete static Traefik configuration example.
+| Crate | Role | Notable modules |
+|-------|------|-----------------|
+| `russel-core` | Shared types | `config.rs` (Russelfile schema + validation), `api.rs` (wire types) |
+| `russel-cli` | CLI client | `commands.rs` (deploy/status/logs/vms/stop/destroy/update/secrets) |
+| `russel-ctrl` | Control plane | `api.rs`, `deploy.rs`, `state.rs`, `microvm.rs`, `container.rs`, `network.rs`, `git.rs`, `build.rs`, `metadata.rs`, `reconcile.rs`, `health.rs`, `secrets.rs`, `traefik.rs`, `ingress.rs`, `warm_pool.rs`, `ch_api.rs` |
 
 ---
 
-## Deployment Pipeline
+## 2. Deployment Pipeline
 
-Shared steps:
+```mermaid
+sequenceDiagram
+    participant U as russel-cli
+    participant A as /deploy (axum)
+    participant P as DeployPipeline
+    participant G as GitClient
+    participant B as NixBuilder
+    participant R as Runtime (CH/Podman)
+    participant I as Ingress (Traefik)
 
-1. **Resolve**: Clone or locate the source repository, parse `Russelfile.toml` (including `service.type`).
-   - Local repos must be absolute paths; remote repos restricted to `https://`, `http://`, `ssh://`, `git@host:path`.
-   - Config file opened via `openat` + `O_NOFOLLOW` under repo root; 1 MiB size cap; binary name validated against `[A-Za-z0-9._+-]`.
-2. **Build**: Auto-generate a `flake.nix` if none exists, then `nix build` → store path.
-
-Then branch on `RuntimeKind` (`microvm` default, or `container`):
-
-### MicroVM path
-
-3. **Initramfs**: Minimal CPIO with BusyBox + VirtIO kernel modules.
-4. **Network + Boot**: TAP, `socat` host→guest, `virtiofsd` for `/nix/store`, Cloud Hypervisor boot.
-5. **Metadata**: `/var/lib/russel/<id>/metadata.json` (`schema_version`, `runtime: microvm`, ports, PIDs, …).
-
-### Container path (Russel containers)
-
-3. **Rootfs**: Docker-like tree under `/var/lib/russel/<id>/rootfs` (bash/curl, `/tmp`, `/var`, app symlinks).
-4. **Start**: Rootless Podman `--rootfs` + bind-mount host `/nix/store:ro`, publish `-p HOST:GUEST`. Old container is stopped only **after** podman args are validated (fail-closed).
-5. **Metadata**: same directory with `runtime: container`, `container_id`, `rootfs_path`, …
-
-CLI `--runtime` must match Russelfile `type` when provided; the file is source of truth.
-
-### Redeploy & Rollback
-
-On redeploy, the pipeline:
-1. Takes ownership of old child processes from the supervisor (`take_processes`).
-2. Kills and waits for old children (up to 5 s, then force-kill) so ports are freed.
-3. Renames existing service directories to `.bak` for rollback.
-4. Tears down prior runtime resources (TAP, ports).
-5. Proceeds with the new deploy.
-
-If the new deploy fails and a backup exists, Russel attempts automatic rollback: `.bak` directories are restored, the previous VM or container is re-spawned, metadata is re-written, and a readiness check confirms the rollback before reporting `rolled_back`.
-
-### Auth & Bind Policy
-
-All API routes pass through a Bearer-auth middleware:
-- When `RUSSEL_API_TOKEN` is set, every request must include `Authorization: Bearer <token>` (constant-time comparison).
-- When unset on loopback, the control plane runs in dev mode with a warning.
-- Binding to a non-loopback address **requires** `RUSSEL_API_TOKEN`; otherwise the control plane refuses to start.
-
-### Control Plane Shutdown
-
-On `SIGINT`/`SIGTERM`, the control plane:
-1. Waits for in-flight deploy tasks to complete.
-2. Detaches all workload child processes (they keep running).
-3. On next startup, removes only **orphan** TAP interfaces (`rsl-<hex>`) that have no corresponding live service directory under `/var/lib/russel/<id>/metadata.json`. Host iptables chains are never flushed.
-
-### Container Lifecycle
-
-- Rootless Podman is verified (`podman info`) before any container operation.
-- Old containers are stopped only after new args are fully validated.
-- Readiness is confirmed by TCP-polling the published host port for up to 10 s.
-
-### Durable State & Startup Reconcile
-
-On startup, the control plane scans `/var/lib/russel` for service metadata
-and rehydrates in-memory state before the HTTP router starts:
-
-- **Live processes** (VM PIDs, socat, virtiofsd, or running containers) are
-  adopted as `deployed`/`running` with their ports claimed in the allocator.
-  No fake `Child` handles are created — microVMs are observed-only.
-- **Dead/stopped services** are registered as `stopped` so status endpoints
-  return accurate data without waiting for `GET /vms` lazy discovery.
-- A lightweight catalog (`/var/lib/russel/ctrl-catalog.json`) is written
-  atomically after reconcile and on key lifecycle transitions (deploy, stop,
-  destroy, failure). This is informational; `metadata.json` remains the
-  authoritative source of truth.
-
-This closes the biggest operational gap (AUDIT BUG-07 / GitHub #10): after a
-control plane restart, `GET /vm/{id}/status` immediately reflects the
-observed state of running workloads.
-
----
-
-## Cloud Hypervisor Integration
-
-Initially, Russel planned to manage VMs via `microvm.nix` (a systemd-based NixOS microVM manager). We bypassed this layer in favor of **direct Cloud Hypervisor orchestration** to eliminate guest systemd overhead and achieve faster boot times.
-
-Because we spawn the `cloud-hypervisor` binary directly in the Rust control plane, we have native access to its complete API.
-
-### Current Command-Line Configuration
-
-The VM process is spawned using the following key parameters:
-
-```rust
-Command::new("cloud-hypervisor")
-    .arg("--kernel").arg(kernel_path)
-    .arg("--initramfs").arg(initramfs_path)
-    .arg("--cmdline").arg("console=ttyS0 panic=-1 random.trust_cpu=on")
-    .arg("--cpus").arg("boot=1")
-    .arg("--memory").arg(format!("size={}M,shared=on", mem_mb))
-    .arg("--net").arg(format!("tap={},mac={}", tap, mac))
-    .arg("--fs").arg(format!("tag=nixstore,socket={},num_queues=1,queue_size=512", virtiofs_sock))
-    .arg("--console").arg("null")
-    .arg("--serial").arg(format!("file=/var/lib/russel/{}/console.log", service_id))
+    U->>A: POST /deploy (repo, config, port, env)
+    A->>A: auth, semaphore (max 4), validate service_id
+    A-->>U: NDJSON stream opens
+    A->>P: spawn deploy task
+    P->>G: clone_or_use_local (leases + GC)
+    G-->>P: checkout path
+    P->>P: load Russelfile (openat + O_NOFOLLOW, 1 MiB cap)
+    P->>P: merge env (file < request), resolve secret:// refs
+    P->>B: nix build path:repo#packages.<sys>.default
+    B-->>P: /nix/store/<hash>
+    alt microvm (default)
+        P->>R: TAP + socat + virtiofsd×2 + CH boot
+        R-->>P: reachable (TCP poll guest 10s)
+    else container
+        P->>R: prepare rootfs, podman run --rootfs
+        R-->>P: reachable (TCP poll host port 10s)
+    end
+    P->>I: register backend (or swap on redeploy)
+    P->>P: write metadata.json + desired_state
+    P-->>U: Complete{status: deployed}
 ```
 
-| Parameter | Function | Why it is critical |
-|-----------|----------|-------------------|
-| `--kernel` & `--initramfs` | Direct boot | Boots the standard NixOS kernel and our custom Busybox initrd immediately, bypassing virtual BIOS/UEFI stages. |
-| `--memory size=X,shared=on` | Shared memory | The `shared=on` attribute is required to permit the host's `virtiofsd` daemon to map memory directly into the guest address space. |
-| `--fs` | Virtiofs share | Attaches the Unix socket of `virtiofsd`. Inside the guest, `/init` mounts this as a high-performance `virtiofs` filesystem at `/nix/store`. |
-| `--net tap=X,mac=Y` | Bridged networking | Binds the guest directly to the host-provisioned TAP interface, creating `eth0` in the guest. |
-| `--serial file=X` | Logging | Redirects console log outputs to `/var/lib/russel/<service-id>/console.log` for debugging and telemetry. |
+Pipeline stages emit NDJSON progress events (`resolve → build → create → start →
+ready → complete`). Failure at any stage triggers candidate cleanup; on redeploy
+with a prior generation it triggers **rollback** (§9).
+
+Notable hardening on this path:
+
+- `service_id` is restricted to `[A-Za-z0-9-_]` (max 128) before any filesystem use.
+- The Russelfile is opened via an `openat(2)` descriptor chain with `O_NOFOLLOW`
+  on every component — no validate-then-reopen TOCTOU window.
+- Env values are validated (reserved keys, length, NUL/newline), then `secret://`
+  refs are resolved from the host secret store, then re-validated.
+- Concurrent deploys are bounded by a semaphore (default 4) and per-service by
+  the `mark_building` guard.
 
 ---
 
-## Future Cloud Hypervisor Features
+## 3. MicroVM Runtime (Cloud Hypervisor)
 
-Direct orchestration gives us access to Cloud Hypervisor capabilities that can be added as needed:
+```mermaid
+flowchart TB
+    subgraph Host
+        VFD1[virtiofsd<br/>/nix/store ro]
+        VFD2[virtiofsd<br/>cfg dir rw]
+        SOC[socat<br/>127.0.0.1:host_port]
+        TAP[TAP rsl-&lt;key&gt;<br/>10.x.y.1/30]
+        CH[cloud-hypervisor<br/>--api-socket --kernel --initramfs]
+    end
 
-### 1. Dynamic VM Management (`--api-socket`)
+    subgraph Guest["microVM guest (no systemd)"]
+        INIT[/init<br/>busybox script/]
+        MODS[insmod virtio chain<br/>if modules =m]
+        APP[app binary<br/>from /nix/store]
+    end
 
-By adding `--api-socket /var/lib/russel/<service-id>/api.sock`, Cloud Hypervisor exposes an HTTP REST API over a Unix Domain Socket for dynamic VM interaction:
+    SOC <-->|TCP host_port ↔ 10.x.y.2:guest_port| TAP
+    TAP <-->|virtio-net| CH
+    VFD1 <-->|virtiofs tag=nixstore| CH
+    VFD2 <-->|virtiofs tag=russelcfg| CH
+    CH --> INIT --> MODS --> APP
+    INIT -.reads.-> |/config/deploy.env| VFD2
+```
 
-- **Hotplug CPUs**: Add more virtual cores under heavy loads.
-- **Hotplug Memory**: Scale RAM limits dynamically without restarting the VM.
-- **Query Telemetry**: Retrieve virtual machine statistics (CPU usage, network packets, etc.).
-- **Lifecycle Control**: Pause, resume, or cleanly shut down the guest.
+Design decisions:
 
-### 2. High-Performance Storage (`--disk`)
+- **Direct CH orchestration**, no microvm.nix / systemd in the guest. Boot is
+  kernel → busybox `/init` → app, which is how cold boot got under ~2 s.
+- **Virtiofs, not initrd packaging**: the host `/nix/store` is mounted read-only
+  in the guest, so the app closure never gets copied into an image.
+- **Generic agent initramfs**: one cached CPIO for all services. Per-service
+  config (`VM_IP`, `HOST_IP`, `PORT`, `APP`, user env) is delivered through a
+  second virtiofs share (`russelcfg`) as a shell-quoted `deploy.env` that `/init`
+  sources. Nothing app-specific is baked into the initramfs.
+- **Kernel strategy**: prefer the repo's `microvm-kernel` flake attr (virtio/fuse
+  built-in `=y`); fall back to stock nixpkgs kernel + module loading in init.
+- **Readiness is a TCP poll** of the guest IP across the TAP (10 s), then a
+  host-port check (2 s) to catch socat bind failures.
+- **Lifecycle**: graceful stop via the CH REST API socket
+  (`vm.shutdown` + `vmm.shutdown`), falling back to PID-ownership-verified
+  signals, then pattern-anchored `pkill`. Destroy tears down TAP, socat,
+  virtiofsd, ports, and the service directory.
+- Each VM gets `--memory size=XM,shared=on` (shared is required for virtiofs),
+  1 vCPU, a serial log at `/var/lib/russel/<id>/console.log`, and an API socket
+  for lifecycle operations.
 
-For database services or stateful workloads, we can attach block devices via `--disk path=disk.img,readonly=off`.
+### Warm pool (experimental)
 
-### 3. Entropy Generation (`--rng`)
+`RUSSEL_WARM_POOL=1` enables a snapshot/restore path: a golden paused VM is
+prepared at ctrl startup and `restore_or_boot` clones it per deploy. Off by
+default; known races (issue #101). See §12 — removal candidate.
 
-For cryptographic applications (HTTPS servers), `--rng` can attach a virtio-rng hardware random number generator device to the guest.
+---
+
+## 4. Container Runtime (Rootless Podman)
+
+```mermaid
+flowchart TB
+    subgraph Host
+        direction TB
+        ROOTFS["/var/lib/russel/&lt;id&gt;/rootfs<br/>(read-only, no shell by default)"]
+        STORE[/nix/store<br/>bind ro/]
+        POD[podman run --rootfs<br/>rootless]
+        C[container<br/>cap-drop ALL, no-new-privs,<br/>ro rootfs, tmpfs /tmp+/run]
+    end
+
+    TRAEFIK[Traefik / -p] -->|127.0.0.1:host_port| C
+    POD --> C
+    ROOTFS --> POD
+    STORE --> C
+```
+
+Design decisions:
+
+- **`--rootfs`, not images.** Russel prepares a minimal Docker-like tree
+  (etc files, `/bin/<app>` symlink into the store closure) and bind-mounts the
+  host `/nix/store` read-only. No registry, no image pulls, no Dockerfile.
+- **Rootless only.** When ctrl runs as root (needed for microVM TAP/KVM),
+  podman commands run as `RUSSEL_PODMAN_USER` or `SUDO_USER` via
+  `sudo -u <user> -H env podman …`; rootless mode is verified via `podman info`.
+- **Hardened defaults**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
+  `--read-only`, tmpfs `/tmp` and `/run`, `--memory` from the Russelfile.
+  `debug = true` opts into bash/curl + `/usr/bin/env` for troubleshooting.
+- **Passthrough args** (CLI `-- …`) are validated against an allowlist posture:
+  Russel-owned flags (`--rootfs`, `--name`, `-d`, `-p`) and isolation-weakening
+  flags (`--privileged`, `--cap-add`, `--device`, host namespaces, non-store
+  bind mounts, `--env-file`, `--entrypoint`) are rejected.
+- **Fail-closed redeploy**: the old container is stopped only after the new
+  podman argv is fully validated.
+- Logs via the `k8s-file` driver at `<service>/container.log`, falling back to
+  `podman logs`.
+
+Caveat: env vars (including resolved `secret://` values) are passed as
+`podman -e` and are visible via `podman inspect`. Prefer the microVM runtime
+for secret-heavy workloads (its `deploy.env` is `0600` in a `0700` dir).
+
+---
+
+## 5. Networking Model
+
+```mermaid
+flowchart LR
+    subgraph Allocation
+        SID[service_id] -->|FNV-1a → 16-bit key| KEY[network key<br/>collision → salted rehash]
+        KEY --> IP[10.x.y.1/30 host<br/>10.x.y.2/30 guest]
+        KEY --> TAPN[rsl-&lt;8 hex&gt;]
+        KEY --> MAC[02:00:00:00:x:y]
+    end
+
+    subgraph DataPlane["Data plane (microVM)"]
+        CLIENT[Client] --> T[Traefik :80]
+        T -->|127.0.0.1:host_port| S[socat fork per conn]
+        S -->|10.x.y.2:guest_port| G[Guest app]
+    end
+
+    subgraph DataPlaneC["Data plane (container)"]
+        CLIENT2[Client] --> T2[Traefik :80]
+        T2 -->|127.0.0.1:host_port| P[podman port publish<br/>rootlessport/slirp]
+        P --> G2[Container app]
+    end
+```
+
+- **Deterministic /30 per service** from a 16-bit FNV-1a key; collisions rehash
+  with a salt and the result is persisted in metadata (`tap_id`, `host_ip`) so
+  it survives restarts (`claim_subnet_key` on startup).
+- **Port allocator**: in-memory registry, linear scan from 3100, availability
+  probe by binding the publish address. Published binds default to `127.0.0.1`
+  (`RUSSEL_PUBLISH_BIND` overrides).
+- **socat arg0 tagging**: forwarders are spawned as `socat-russel-<id>` so
+  lifecycle code can find and kill exactly one service's forwarder.
+- Startup cleanup removes only **orphan** `rsl-*` TAPs with no live service
+  directory — host iptables/Docker/VPN rules are never touched.
+- No iptables NAT is used on the microVM path: forwarding is userspace (socat),
+  so Russel's firewall footprint is zero (only `ip_forward=1` sysctl, restored
+  when the last TAP disappears).
+
+---
+
+## 6. Traefik Ingress Architecture
+
+```mermaid
+flowchart TB
+    subgraph CP["russel-ctrl"]
+        REG[Ingress trait<br/>register / swap / deregister]
+        W[TraefikFileIngress<br/>atomic JSON write]
+    end
+
+    subgraph TD["/var/lib/russel/traefik/dynamic"]
+        F1[api.json]
+        F2[web.json]
+    end
+
+    TRAEFIK[Traefik<br/>providers.file.watch] 
+
+    REG --> W --> TD
+    TD -.watch.-> TRAEFIK
+    TRAEFIK -->|Host\`api.russel.local\`| B1[127.0.0.1:3100]
+    TRAEFIK -->|Host\`web.russel.local\`| B2[127.0.0.1:3101]
+```
+
+- The `Ingress` trait (`ingress.rs`) decouples deploy/stop/destroy from Traefik;
+  `TraefikFileIngress` is the default provider. Future providers (Caddy, NGINX)
+  implement the same trait.
+- Each service gets `Host(\`<service_id>.<domain>\`)` → `http://127.0.0.1:<host_port>`;
+  domain defaults to `russel.local` (`RUSSEL_TRAEFIK_DOMAIN`, validated as a DNS name).
+- **Zero-downtime redeploy** uses `Ingress::swap`: the candidate generation boots
+  under `<id>_g<gen>` with a fresh backend port, the Traefik file is rewritten to
+  point at the candidate, and only then is the old generation drained and the
+  candidate promoted to the stable id.
+- Writes are atomic (temp file + rename) so Traefik's watcher never reads a
+  partial config. Deregistration on stop/destroy removes the file.
+- Optional TLS: `RUSSEL_TRAEFIK_TLS=1` adds a `websecure` entrypoint +
+  `tls.certResolver` to each router.
+
+---
+
+## 7. State, Metadata & Reconcile
+
+```mermaid
+flowchart TB
+    subgraph Sources["State sources (trust order)"]
+        M[In-memory AppState<br/>Arc&lt;Mutex&lt;StateInner&gt;&gt;]
+        META[metadata.json<br/>per service — source of truth]
+        CAT[ctrl-catalog.json<br/>informational snapshot]
+        PODL[podman ps labels<br/>container discovery]
+    end
+
+    STARTUP[Startup reconcile] --> META
+    STARTUP -->|live pid + cmdline identity| ADOPT[adopt as deployed/running]
+    STARTUP -->|dead| STOPPED[register as stopped]
+    ADOPT --> M
+    STOPPED --> M
+    M --> CAT
+```
+
+- **`metadata.json` is the source of truth**: schema version, runtime, ports,
+  PIDs, TAP identity, store/bin paths, generation id, `repo_url`/`config_path`,
+  and `desired_state` (env refs, podman args, fixed port) so rollback, update,
+  and health-restart can rebuild the exact original deployment.
+- **Reconcile at startup** verifies PID identity via `/proc/<pid>/cmdline`
+  (guards against PID reuse) before adopting a process as alive; containers are
+  probed via `podman inspect` and by the `russel-<id>` naming convention.
+- **Supervisor**: each deployed service has a generation-tagged supervisor task;
+  child exit marks the service failed (bumped `process_generation` invalidates
+  stale supervisors after redeploy).
+- In-memory logs are capped (last 64 KiB); full history lives on disk
+  (`console.log` / `container.log`).
+- The catalog is written atomically (temp + fsync + rename, `0600`) after
+  lifecycle transitions; it is informational and never consulted for decisions.
+
+---
+
+## 8. Security Architecture
+
+| Layer | Mechanism |
+|-------|-----------|
+| API auth | Bearer token on every route when `RUSSEL_API_TOKEN` set; constant-time compare; non-loopback bind **refuses to start** without a token; loopback-no-token is dev mode with warnings |
+| Transport | HTTP only today — terminate TLS at a proxy or use an SSH tunnel; the CLI warns when the token would cross the network in cleartext |
+| Input validation | `service_id` charset/length; `bin_name` charset (no `.`/`..`); config path `openat`+`O_NOFOLLOW` chain; env key/value rules (reserved keys incl. `IFS`/`PATH`/`LD_*`, no newlines); secret name charset; podman passthrough allowlist posture |
+| SSRF guard | Repo URLs restricted to `https/http/ssh/git@`; literal-IP hosts checked against link-local + cloud-metadata ranges for all schemes |
+| Secrets | Host store `0600`/`0700`, atomic writes, names never values over the API, resolved at deploy time, never in argv; microVM delivery via `deploy.env` (`0600`) |
+| Workload isolation | microVM: KVM boundary, ro store share, no guest shell; container: rootless, cap-drop ALL, no-new-privs, ro rootfs |
+| Host integrity | Orphan-only TAP cleanup; no iptables mutation; CH API socket + service dirs `0700`; PID ownership verified via `/proc` before signals |
+| Process hygiene | kill+wait with timeout on redeploy; supervisor generations; deploy semaphore; panic isolation per deploy task |
+
+Residual risks documented in `AUDIT-2026-07-23.md`: DNS-rebinding around the
+SSRF guard (no DNS resolution), metadata-IP redirects during clone, and
+`podman inspect` env visibility on the container runtime.
+
+---
+
+## 9. Lifecycle: Redeploy, Rollback, Update, Health
+
+```mermaid
+stateDiagram-v2
+    [*] --> building: deploy (mark_building)
+    building --> deployed: readiness OK
+    building --> failed: error (no prior gen)
+    building --> rolled_back: error + prior gen restored
+    deployed --> stopping: stop
+    stopping --> stopped: OK
+    deployed --> destroying: destroy
+    stopped --> destroying: destroy
+    destroying --> [*]
+    deployed --> building: redeploy/update (dual-live candidate)
+    failed --> building: retry
+    rolled_back --> deployed: old gen live again
+```
+
+- **Cold redeploy** (no live prior): backup dirs → kill+wait old children →
+  teardown → boot new. **Dual-live redeploy** (live prior): candidate boots
+  under a generation key, `Ingress::swap` cutover, old gen drained, promote.
+- **Rollback** validates the `.bak` metadata *before* restoring directories,
+  re-reserves ports with checked `u16::try_from`, restores the persisted
+  `desired_state` env, re-boots, and only reports `rolled_back` after a
+  readiness check. CLI exits non-zero so CI notices.
+- **`update`** redeploys from the recorded `repo_url`/`config_path`
+  (+ optional overrides), preserving the original env/podman args.
+- **Health**: TCP probe per service every `RUSSEL_HEALTH_INTERVAL_SECS`
+  (default 30, bind-aware); 3 consecutive failures → `failed`;
+  `RUSSEL_HEALTH_RESTART=1` redeploys from `desired_state` through the same
+  semaphore + shutdown guards as API deploys.
+- **Shutdown**: SIGINT/SIGTERM → stop accepting, wait for in-flight deploys,
+  detach children (workloads keep running). A flock on
+  `/var/lib/russel/ctrl.lock` prevents two control planes from fighting.
+
+---
+
+## 10. Redundancy Review — Candidates for Removal
+
+Things that exist but no longer pull their weight. Recommendation in **bold**.
+
+| Feature | Status | Assessment |
+|---------|--------|------------|
+| `[database]` Russelfile section | **Vestigial** — parsed, then *rejected* when enabled (`config.rs`); provisioning was never implemented and is a SPEC non-goal | **Remove** `DatabaseConfig`/`PostgresConfig`/`RedisConfig` entirely. External DBs (user-managed) are the documented story; keeping a reject-only stub only buys schema churn |
+| Warm pool (`warm_pool.rs`, snapshot/restore) | Experimental, `RUSSEL_WARM_POOL=1` opt-in, known races (#101), ~560 LoC | **Remove or quarantine.** Cold boot is already ~2 s via the agent initramfs; the pool's complexity buys little. If boot time matters again, rebuild it on CH's snapshot API from scratch |
+| Legacy `/var/lib/microvms` marker dirs + gcroots cleanup | Migration shim for pre-ctrl-state installs | **Remove after one release** with a note; destroy already handles absence |
+| Legacy dead initramfs stack (`build_initramfs`, `generate_init_script`, `boot()`) | `#[allow(dead_code)]` cold-boot fallback superseded by the agent initramfs | **Remove** (in progress in the audit-fix PRs) |
+| Flat `/status` + `/logs` endpoints | CLI-compat shims that 400 when >1 service exists (#54) | **Remove** once CLI drops usage, or make them aggregate all services |
+| `nix/modules/russel-host.nix`, `nix/microvm/README.md` | Host NixOS module docs | **Keep** if anyone installs the host via NixOS; otherwise move to docs/ |
+| `bench.sh` (38 KB) + `docs/plans/` | Dev scaffolding | **Move** to `scripts/` + `docs/archive/`; not part of the product surface |
+| `container debug = true` | Adds bash/curl/env wrapper to rootfs | **Keep** — genuinely useful, one config flag |
+| `Memory` enum (single variant), unit structs (`GitClient`, `NixBuilder`, `PortAllocator`) | Over-abstraction (#50, #53) | **Simplify** opportunistically; low value churn |
+| `SPEC.md` / `FINAL.md` / `AUDIT.md` at repo root | Historical artifacts | **Move** to `docs/archive/` |
+
+The one-line answer on **database**: yes, remove it — it is schema without a
+feature. If managed DBs ever return, they belong in a separate orchestrator
+(or just `russel deploy` of a Postgres container), not in the core config.
+
+---
+
+## 11. Russelfile: TOML vs YAML
+
+Current: `Russelfile.toml`, parsed with the `toml` crate into serde structs
+(`deny_unknown_fields`), hand-rolled validators on top.
+
+**Arguments for YAML**
+
+- Multi-service files (`services:` list) read more naturally; anchors/aliases
+  reduce repetition across similar services.
+- Ecosystem familiarity for Kubernetes-adjacent users.
+
+**Arguments for keeping TOML**
+
+- The current schema is flat and small — YAML's advantages don't activate yet.
+- YAML footguns are real config bugs: the Norway problem (`no:` → `false`),
+  unquoted `on`/`off`/`y`/`n`, octal-ish numbers, tabs, duplicate keys accepted
+  silently by some parsers, and a much larger grammar (bigger parser attack
+  surface for a file consumed by a privileged daemon).
+- TOML is unambiguous by design and already wired, tested, and documented.
+- Migration cost: dual-format support (by extension) means two parsers, two
+  error surfaces, and docs drift forever; hard cutover breaks every example.
+
+**Recommendation: stay on TOML for v1.** If multi-service support lands and
+repetition becomes painful, evaluate YAML (or TOML's own array-of-tables, which
+already handles `[services.api]`-style repetition without a new parser). If a
+move ever happens: support both by file extension for one release, validate
+with the *same* serde structs via `serde_yaml`, and lint for YAML's implicit
+typing traps (quote all scalars in docs, reject duplicate keys).
+
+---
+
+## 12. Learning Topics — What You Need to Build & Master This Project
+
+### Linux (the deepest pillar)
+
+- **KVM & virtualization**: `/dev/kvm`, VMM concepts, virtio device model
+  (virtio-net, virtio-fs, virtio-pci legacy vs modern), Cloud Hypervisor's
+  CLI + REST API socket, snapshot/restore semantics.
+- **Kernel boot**: kernel cmdline, initramfs/initrd, busybox userland, kernel
+  modules (`insmod`, `.ko.xz`, module dependency chains), `panic=` semantics.
+- **Networking**: network namespaces, TAP/TUN, `/30` subnets, MAC addressing
+  (locally administered `02:`), `ip link/addr/route`, `ip_forward`, iptables
+  vs userspace forwarding tradeoffs, slirp4netns/rootlessport (how rootless
+  podman publishes ports).
+- **Containers**: mount/pid/user namespaces, cgroups v2 (memory limits),
+  capabilities (`cap-drop`), seccomp, `no-new-privileges`, rootless Podman
+  (subuid/subgid, `sudo -u` identity plumbing).
+- **Filesystems & FDs**: `openat(2)`, `O_NOFOLLOW`/`O_DIRECTORY`/`O_CLOEXEC`,
+  symlink/TOCTOU attacks, atomic rename, fsync durability, umask, hard links,
+  FUSE (virtiofsd is a FUSE server), unix domain sockets and their permissions.
+- **Processes**: fork/exec, signals and zombie reaping, PID reuse and why
+  `/proc/<pid>/cmdline` identity checks are needed, `pkill -f` regex semantics,
+  `flock` for single-instance guards, process arg0 spoofing.
+
+### Rust
+
+- **Async**: tokio (tasks, channels, `Notify` subtleties, semaphores,
+  `JoinSet`, timeouts, `spawn_blocking`, process management), and when
+  `std::sync::Mutex` is acceptable in async code (never across `.await`).
+- **Error handling**: anyhow vs thiserror, context chains, fail-closed parsing
+  (`try_from` over `as` casts — the #36 lesson).
+- **Serde/TOML**: `deny_unknown_fields`, custom deserializers, defaults for
+  wire-compat, `serde_json::Value` for schema-tolerant metadata.
+- **Unsafe & FFI**: raw fd ownership (`OwnedFd`, `FromRawFd`), libc calls
+  (`openat`, `flock`, `kill`), why each `unsafe` block needs a written proof.
+- **API design**: axum routers/middleware/extractors, streaming bodies
+  (NDJSON), graceful shutdown; reqwest client semantics (per-request timeout
+  covers streaming!); clippy as an enforced style guide (unwrap bans).
+- **Ownership patterns for systems code**: RAII guards (port reservations,
+  deploy guards, checkout leases), `Arc<Mutex>` vs `OnceCell`, kill-on-drop
+  child management.
+
+### Nix
+
+- Flakes (`packages.<system>.default`), the store and closures
+  (`nix path-info -r`), purity (why auto-generated flakes must live in the
+  checkout), `builtins.path` constraints, kernel package customization.
+
+### Security engineering
+
+- Threat modeling a privileged daemon: SSRF (URL parsing is *not* string
+  splitting; userinfo/redirects/DNS rebinding), command/argument injection vs
+  shell interpolation, secret lifecycle (at-rest perms, in-env visibility,
+  `podman inspect` exposure), constant-time comparison, allowlist > denylist
+  for security boundaries, TOCTOU classes of bug.
+
+### Distributed/systems design
+
+- Desired-state vs observed-state reconciliation (the Kubernetes lesson,
+  applied to `metadata.json` + `AppState`), rollback design (validate before
+  mutate, readiness before success), graceful degradation (dev mode, warm-pool
+  fallback), backpressure (semaphores, bounded channels), idempotency of
+  lifecycle operations.
+
+### General programming practice
+
+- Reading and auditing large diffs; writing findings with file:line evidence;
+  designing fix slices that don't conflict; when to delete code (dead stacks,
+  vestigial schema) instead of maintaining it; docs-as-contract (README drift
+  is a bug); property-style unit tests for validators and allocators.
+
+A pragmatic path: Linux namespaces + networking first (they explain *why* the
+code looks like this), then tokio deeply (most subtle bugs in this codebase
+were async-lifecycle bugs), then Nix (to extend the build side), then the
+security topics (to review it with the right adversarial eye).
