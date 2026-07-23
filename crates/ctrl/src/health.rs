@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use russel_core::api::DeployRequest;
 
+use crate::api::deploy_semaphore;
 use crate::deploy::DeployPipeline;
 use crate::metadata::load_metadata_from_disk;
+use crate::network::publish_bind_addr;
 use crate::state::AppState;
 
 /// Health checker — TCP reachability probe + background loop.
@@ -54,6 +56,22 @@ fn probe_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Build a TCP connect target for the health probe.
+///
+/// Wildcards map to loopback; IPv6 literals are bracketed so
+/// `TcpStream::connect` can parse them.
+fn health_probe_addr(bind: &str, port: u16) -> String {
+    let connect_host = if bind == "0.0.0.0" || bind == "::" {
+        "127.0.0.1"
+    } else {
+        bind
+    };
+    if let Ok(ip) = connect_host.parse::<std::net::IpAddr>() {
+        return std::net::SocketAddr::new(ip, port).to_string();
+    }
+    format!("{connect_host}:{port}")
+}
+
 /// Spawn the background health loop. Failures never take down the control plane.
 pub fn spawn_health_loop(state: AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
@@ -86,7 +104,11 @@ pub fn spawn_health_loop(state: AppState) {
                 let Some(port) = host_port else {
                     continue;
                 };
-                let addr = format!("127.0.0.1:{port}");
+                let bind = publish_bind_addr();
+                // Mirror network::wait_for_host_port: probe 127.0.0.1 when the
+                // publish bind is wildcard / loopback; otherwise probe the bind IP.
+                // Bracket IPv6 literals so `TcpStream::connect` parses correctly.
+                let addr = health_probe_addr(&bind, port);
                 checks.spawn(async move {
                     let reachable = HealthChecker.check(&addr).await;
                     (id, addr, port, reachable)
@@ -159,6 +181,22 @@ async fn try_auto_restart(state: &AppState, service_id: &str) {
         );
         return;
     };
+
+    // F-07: acquire the deploy semaphore so a health-driven restart does not
+    // overwhelm the control plane when many services fail at once.
+    let _permit = match deploy_semaphore().try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                service_id,
+                "health restart skipped — deploy semaphore exhausted"
+            );
+            return;
+        }
+    };
+
+    let _guard = state.begin_deploy();
+
     tracing::info!(
         service_id,
         repo = %meta.repo_url,
@@ -174,8 +212,8 @@ async fn try_auto_restart(state: &AppState, service_id: &str) {
             guest: meta.guest_port.unwrap_or(3000),
         }),
         runtime: meta.runtime,
-        env: Default::default(),
-        podman_args: vec![],
+        env: meta.env,
+        podman_args: meta.podman_args,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     // Drain events so the channel never fills.
@@ -189,33 +227,83 @@ struct SourceMeta {
     host_port: Option<u16>,
     guest_port: Option<u16>,
     runtime: Option<russel_core::config::RuntimeKind>,
+    env: HashMap<String, String>,
+    podman_args: Vec<String>,
 }
 
 fn load_source_from_metadata(service_id: &str) -> Option<SourceMeta> {
     let path = format!("/var/lib/russel/{service_id}/metadata.json");
     let content = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let repo_url = value.get("repo_url")?.as_str()?.to_string();
-    let config_path = value
+
+    // Legacy top-level fields (fallback).
+    let top_repo_url = value
+        .get("repo_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let top_config_path = value
         .get("config_path")
         .and_then(|v| v.as_str())
-        .unwrap_or("Russelfile.toml")
-        .to_string();
+        .map(str::to_string);
+    let top_host_port: Option<u16> = value
+        .get("host_port")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok());
+    let top_guest_port: Option<u16> = value
+        .get("guest_port")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok());
+    let top_runtime: Option<russel_core::config::RuntimeKind> = value
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    // desired_state block (SHARED CONTRACT). All fields are optional;
+    // when absent we fall back to legacy top-level fields.
+    let desired = value.get("desired_state").and_then(|v| v.as_object());
+    let ds_repo_url = desired
+        .and_then(|d| d.get("repo_url"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ds_config_path = desired
+        .and_then(|d| d.get("config_path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ds_runtime = desired
+        .and_then(|d| d.get("runtime"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let ds_env: HashMap<String, String> = desired
+        .and_then(|d| d.get("env"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ds_podman_args: Vec<String> = desired
+        .and_then(|d| d.get("podman_args"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ds_port = desired.and_then(|d| d.get("port").and_then(|p| p.as_object()));
+    let ds_host_port: Option<u16> = ds_port
+        .and_then(|p| p.get("host"))
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok());
+    let ds_guest_port: Option<u16> = ds_port
+        .and_then(|p| p.get("guest"))
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok());
+
+    // Precedence: desired_state > legacy top-level.
+    let repo_url = ds_repo_url.or(top_repo_url)?;
+
     Some(SourceMeta {
         repo_url,
-        config_path,
-        host_port: value
-            .get("host_port")
-            .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
-        guest_port: value
-            .get("guest_port")
-            .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
-        runtime: value
-            .get("runtime")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok()),
+        config_path: ds_config_path
+            .or(top_config_path)
+            .unwrap_or_else(|| "Russelfile.toml".into()),
+        host_port: ds_host_port.or(top_host_port),
+        guest_port: ds_guest_port.or(top_guest_port),
+        runtime: ds_runtime.or(top_runtime),
+        env: ds_env,
+        podman_args: ds_podman_args,
     })
 }
 
@@ -234,5 +322,13 @@ mod tests {
     #[test]
     fn load_source_missing_is_none() {
         assert!(load_source_from_metadata("definitely-missing-svc-xyz").is_none());
+    }
+
+    #[test]
+    fn health_probe_addr_brackets_ipv6() {
+        assert_eq!(health_probe_addr("2001:db8::1", 8080), "[2001:db8::1]:8080");
+        assert_eq!(health_probe_addr("10.0.0.5", 3000), "10.0.0.5:3000");
+        assert_eq!(health_probe_addr("::", 7878), "127.0.0.1:7878");
+        assert_eq!(health_probe_addr("0.0.0.0", 7878), "127.0.0.1:7878");
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::{
@@ -55,7 +56,7 @@ fn max_concurrent_deploys() -> usize {
 }
 
 /// Global semaphore bounding in-flight deploy/update tasks.
-fn deploy_semaphore() -> &'static tokio::sync::Semaphore {
+pub(crate) fn deploy_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
         std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(max_concurrent_deploys()));
     &SEM
@@ -79,12 +80,18 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Constant-time token comparison to avoid timing side-channels.
+///
+/// Always walks `max(a.len(), b.len())` bytes so the result does not leak the
+/// input lengths. A length mismatch is folded into the accumulator as a
+/// non-zero delta rather than returned early.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let max_len = a.len().max(b.len());
+    // Length mismatch must always contribute a nonzero delta. Narrowing
+    // `(a.len() ^ b.len()) as u8` drops high bits (e.g. len 1 vs 257 → 0).
+    let mut diff: u8 = u8::from(a.len() != b.len());
+    for i in 0..max_len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
         diff |= x ^ y;
     }
     diff == 0
@@ -115,51 +122,55 @@ async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-async fn deploy(
-    State(state): State<AppState>,
-    Json(request): Json<DeployRequest>,
-) -> axum::response::Response {
-    let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
+/// Build an `application/x-ndjson` streaming response from a deploy-event
+/// receiver. The receiver is drained by the HTTP client; if serialization
+/// fails mid-stream the connection closes cleanly.
+fn ndjson_response(rx: tokio::sync::mpsc::Receiver<DeployEvent>) -> axum::response::Response {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|msg| {
+        let json = serde_json::to_string(&msg).map_err(std::io::Error::other)?;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
+    });
+    axum::response::Response::builder()
+        .header("Content-Type", "application/x-ndjson")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to build NDJSON stream response");
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from(e.to_string()))
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new(axum::body::Body::from("internal server error"))
+                })
+        })
+}
 
-    tracing::info!(
-        repo = %request.repo_url,
-        service_id = %service_id,
-        port = ?request.port.as_ref().map(|p| format!("{}:{}", p.host, p.guest)),
-        "POST /deploy"
-    );
-
-    // Bound concurrent deploys: if all slots are busy, return 503 immediately.
+/// Spawn an NDJSON-streamed deploy/update task, enforcing the deploy semaphore
+/// and in-flight deploy guard (so graceful shutdown can wait). Returns the
+/// streaming response on success, or a structured 503 when all deploy slots are
+/// busy. Shared by `deploy` and `vm_update` (issue #54-lite).
+fn spawn_deploy_stream(
+    state: AppState,
+    request: DeployRequest,
+    service_id: String,
+    task_label: &'static str,
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let permit = match deploy_semaphore().try_acquire() {
         Ok(p) => p,
         Err(_) => {
             let max = max_concurrent_deploys();
-            return axum::response::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Content-Type", "text/plain")
-                .body(axum::body::Body::from(format!(
-                    "too many concurrent deploys (max {max}); retry later"
-                )))
-                .unwrap_or_else(|e| {
-                    axum::response::Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(axum::body::Body::from(e.to_string()))
-                        .unwrap_or_else(|_| {
-                            axum::response::Response::new(axum::body::Body::from(
-                                "internal server error",
-                            ))
-                        })
-                });
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("too many concurrent deploys (max {max}); retry later"),
+            ));
         }
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
     let monitor_state = state.clone();
+    let deploy_guard = state.begin_deploy();
     let sid = service_id.clone();
     let sid2 = service_id.clone();
-
-    // Track in-flight deploy so shutdown can wait before detaching processes
-    let deploy_guard = state.begin_deploy();
 
     let deploy_handle = tokio::spawn(async move {
         let _permit = permit;
@@ -172,7 +183,7 @@ async fn deploy(
             service_id = %sid,
             status = %status,
             elapsed_ms = elapsed_ms,
-            "POST /deploy -> {}", status
+            "{task_label} deploy finished"
         );
         let _ = deploy_tx
             .send(DeployEvent::Complete(Box::new(response)))
@@ -188,47 +199,55 @@ async fn deploy(
                 .downcast_ref::<&'static str>()
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "deploy task panicked".to_string());
+                .unwrap_or_else(|| format!("{task_label} deploy task panicked"));
             tracing::error!(
                 service_id = %sid2,
                 panic = %detail,
-                "deploy task panicked"
+                "{task_label} deploy task panicked"
             );
             monitor_state.mark_failed(&sid2, detail);
             let _ = tx
-                .send(DeployEvent::Error("deploy task failed".to_string()))
+                .send(DeployEvent::Error(format!(
+                    "{task_label} deploy task failed"
+                )))
                 .await;
         }
-        // Cancelled join errors (runtime shutdown) are intentionally dropped
-        // so the client falls back to the generic closed-connection message.
     });
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|msg| {
-        let json = serde_json::to_string(&msg).map_err(|e| {
-            tracing::error!(error = %e, "failed to serialize deploy event");
-            std::io::Error::other(e)
-        })?;
-        Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
-    });
+    Ok(ndjson_response(rx))
+}
 
-    axum::response::Response::builder()
-        .header("Content-Type", "application/x-ndjson")
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to build NDJSON stream response");
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from(e.to_string()))
-                .unwrap_or_else(|_| {
-                    axum::response::Response::new(axum::body::Body::from("internal server error"))
-                })
-        })
+async fn deploy(
+    State(state): State<AppState>,
+    Json(request): Json<DeployRequest>,
+) -> axum::response::Response {
+    let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
+
+    tracing::info!(
+        repo = %request.repo_url,
+        service_id = %service_id,
+        port = ?request.port.as_ref().map(|p| format!("{}:{}", p.host, p.guest)),
+        "POST /deploy"
+    );
+
+    match spawn_deploy_stream(state, request, service_id, "deploy") {
+        Ok(response) => response,
+        Err((status, message)) => axum::response::Response::builder()
+            .status(status)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(message))
+            .unwrap_or_else(|_| {
+                axum::response::Response::new(axum::body::Body::from("internal server error"))
+            }),
+    }
 }
 
 async fn vm_status(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/status", service_id);
     state.status(&service_id).map(Json).ok_or((
         StatusCode::NOT_FOUND,
@@ -240,6 +259,8 @@ async fn vm_logs(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<LogsResponse>, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/logs", service_id);
     let mut resp = state.logs(&service_id).ok_or((
         StatusCode::NOT_FOUND,
@@ -324,20 +345,26 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
     let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
     for base in &["/var/lib/russel", "/var/lib/microvms"] {
-        if let Ok(entries) = std::fs::read_dir(base) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type()
-                    && file_type.is_dir()
-                    && let Some(name) = entry.file_name().to_str()
-                {
-                    if name.ends_with(".bak") {
-                        continue;
-                    }
-                    if seen.insert(name.to_string()) {
-                        state.ensure_service(name);
-                        vms.push(name.to_string());
-                    }
-                }
+        let mut entries = match tokio::fs::read_dir(base).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.ends_with(".bak") {
+                continue;
+            }
+            if seen.insert(name.clone()) {
+                state.ensure_service(&name);
+                vms.push(name);
             }
         }
     }
@@ -349,12 +376,12 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
     let services: Vec<ServiceSummary> = vms
         .iter()
         .map(|id| {
-            let status = state
-                .status(id)
-                .map(|s| s.status)
+            let cached = state.status(id);
+            let status = cached
+                .as_ref()
+                .map(|s| s.status.clone())
                 .unwrap_or_else(|| "stopped".to_string());
-            let runtime = state
-                .status(id)
+            let runtime = cached
                 .and_then(|s| s.runtime)
                 .or_else(|| prior_runtime_from_disk(id));
             ServiceSummary {
@@ -441,6 +468,8 @@ async fn vm_stop(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<String>, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
     let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
@@ -496,30 +525,116 @@ async fn vm_update(
 
     let body = body.map(|j| j.0).unwrap_or_default();
     let path = format!("/var/lib/russel/{service_id}/metadata.json");
-    let meta: serde_json::Value = if std::path::Path::new(&path).exists() {
-        let content = std::fs::read_to_string(&path).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read metadata: {e}"),
-            )
-        })?;
-        serde_json::from_str(&content).map_err(|e| {
+
+    // Async metadata read (F-25-api): tokio::fs on the async hot path, no std::fs blocking.
+    let meta: serde_json::Value = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => serde_json::from_str(&content).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("parse metadata: {e}"),
             )
-        })?
-    } else {
-        serde_json::json!({})
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read metadata: {e}"),
+            ));
+        }
     };
 
+    // ── Legacy top-level metadata fields (fallback) ────────────────────────
+    let top_repo_url = meta
+        .get("repo_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let top_config_path = meta
+        .get("config_path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let top_host_port: Option<u16> = meta
+        .get("host_port")
+        .and_then(|v| v.as_u64())
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid host_port in metadata: {e}"),
+            )
+        })?;
+    let top_guest_port: Option<u16> = meta
+        .get("guest_port")
+        .and_then(|v| v.as_u64())
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid guest_port in metadata: {e}"),
+            )
+        })?;
+    let top_runtime: Option<RuntimeKind> = meta
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    // ── desired_state block (SHARED CONTRACT with deploy-desired-state agent)
+    //
+    // All fields are optional; when absent we fall back to the legacy
+    // top-level metadata. The writer persists the user's original (pre-secret
+    // resolution) env plus the podman_args / runtime / port that the deploy
+    // ran with, so a later update can reproduce the request verbatim.
+    let desired = meta.get("desired_state").and_then(|v| v.as_object());
+    let ds_repo_url = desired
+        .and_then(|d| d.get("repo_url"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ds_config_path = desired
+        .and_then(|d| d.get("config_path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ds_runtime: Option<RuntimeKind> = desired
+        .and_then(|d| d.get("runtime"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let ds_env: HashMap<String, String> = desired
+        .and_then(|d| d.get("env"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ds_podman_args: Vec<String> = desired
+        .and_then(|d| d.get("podman_args"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ds_port = desired.and_then(|d| d.get("port").and_then(|p| p.as_object()));
+    let ds_host_port: Option<u16> = ds_port
+        .and_then(|p| p.get("host"))
+        .and_then(|v| v.as_u64())
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid desired_state.port.host: {e}"),
+            )
+        })?;
+    let ds_guest_port: Option<u16> = ds_port
+        .and_then(|p| p.get("guest"))
+        .and_then(|v| v.as_u64())
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid desired_state.port.guest: {e}"),
+            )
+        })?;
+
+    // Precedence: request body > desired_state > legacy top-level.
     let repo_url = body
         .repo_url
-        .or_else(|| {
-            meta.get("repo_url")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
+        .or(ds_repo_url)
+        .or(top_repo_url)
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -528,26 +643,13 @@ async fn vm_update(
         })?;
     let config_path = body
         .config_path
-        .or_else(|| {
-            meta.get("config_path")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
+        .or(ds_config_path)
+        .or(top_config_path)
         .unwrap_or_else(|| "Russelfile.toml".into());
 
-    let host_port = meta
-        .get("host_port")
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16);
-    let guest_port = meta
-        .get("guest_port")
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16)
-        .unwrap_or(3000);
-    let runtime = meta
-        .get("runtime")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
+    let host_port = ds_host_port.or(top_host_port);
+    let guest_port = ds_guest_port.or(top_guest_port).unwrap_or(3000);
+    let runtime = ds_runtime.or(top_runtime);
 
     let request = DeployRequest {
         repo_url,
@@ -558,84 +660,21 @@ async fn vm_update(
             guest: guest_port,
         }),
         runtime,
-        env: Default::default(),
-        podman_args: vec![],
+        env: ds_env,
+        podman_args: ds_podman_args,
     };
 
     tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);
 
-    // Bound concurrent deploys (same semaphore as POST /deploy).
-    let permit = match deploy_semaphore().try_acquire() {
-        Ok(p) => p,
-        Err(_) => {
-            let max = max_concurrent_deploys();
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("too many concurrent deploys (max {max}); retry later"),
-            ));
-        }
-    };
-
-    // Same NDJSON stream as POST /deploy so CLI reuses event parsing.
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-    let deploy_tx = tx.clone();
-    let monitor_state = state.clone();
-    let deploy_guard = state.begin_deploy();
-    let sid = service_id.clone();
-    let sid2 = service_id.clone();
-    let deploy_handle = tokio::spawn(async move {
-        let _permit = permit;
-        let _guard = deploy_guard;
-        let pipeline = DeployPipeline::new(state);
-        let response = pipeline.deploy(request, deploy_tx.clone()).await;
-        let _ = deploy_tx
-            .send(DeployEvent::Complete(Box::new(response)))
-            .await;
-        tracing::info!(service_id = %sid, "update deploy finished");
-    });
-
-    tokio::spawn(async move {
-        if let Err(e) = deploy_handle.await
-            && e.is_panic()
-        {
-            let panic = e.into_panic();
-            let detail = panic
-                .downcast_ref::<&'static str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "update deploy task panicked".to_string());
-            tracing::error!(
-                service_id = %sid2,
-                panic = %detail,
-                "update deploy task panicked"
-            );
-            monitor_state.mark_failed(&sid2, detail);
-            let _ = tx
-                .send(DeployEvent::Error("update deploy task failed".to_string()))
-                .await;
-        }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|msg| {
-        let json = serde_json::to_string(&msg).map_err(std::io::Error::other)?;
-        Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
-    });
-
-    axum::response::Response::builder()
-        .header("Content-Type", "application/x-ndjson")
-        .body(axum::body::Body::from_stream(stream))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("build update stream: {e}"),
-            )
-        })
+    spawn_deploy_stream(state, request, service_id, "update")
 }
 
 async fn vm_destroy(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<String>, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
     let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
@@ -778,14 +817,23 @@ async fn secrets_set(
     Path(name): Path<String>,
     Json(body): Json<SecretSetBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    crate::secrets::set_secret(&name, &body.value)
+    let result = crate::secrets::set_secret(&name, &body.value)
         .map(|_| StatusCode::NO_CONTENT)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()));
+    if result.is_ok() {
+        // Audit log — name only, never the secret value.
+        tracing::info!(secret = %name, "secret set via API");
+    }
+    result
 }
 
 async fn secrets_delete(Path(name): Path<String>) -> Result<StatusCode, (StatusCode, String)> {
     match crate::secrets::delete_secret(&name) {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(true) => {
+            // Audit log — name only, never the secret value.
+            tracing::info!(secret = %name, "secret deleted via API");
+            Ok(StatusCode::NO_CONTENT)
+        }
         Ok(false) => Err((StatusCode::NOT_FOUND, format!("secret {name:?} not found"))),
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
@@ -845,5 +893,42 @@ mod tests {
     fn runtime_label_matches_kind() {
         assert_eq!(runtime_label(RuntimeKind::Microvm), "microvm");
         assert_eq!(runtime_label(RuntimeKind::Container), "container");
+    }
+
+    // ── constant_time_eq ───────────────────────────────────────────────
+
+    #[test]
+    fn constant_time_eq_identical() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_different_same_length() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"\x00\x01", b"\x00\x00"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        // Same prefix, different lengths — MUST return false.
+        assert!(!constant_time_eq(b"hello", b"hello!"));
+        // Completely different lengths
+        assert!(!constant_time_eq(b"a", b""));
+        assert!(!constant_time_eq(b"", b"a"));
+        // Long vs short with shared prefix
+        assert!(!constant_time_eq(b"abcdefghij", b"abcde"));
+    }
+
+    #[test]
+    fn constant_time_eq_zeroed_suffix_matches() {
+        // A shorter slice that is a prefix of the longer one, where the
+        // longer slice has zero-padding after the shared prefix — NOT equal
+        // because the length mismatch is folded into the diff.
+        assert!(!constant_time_eq(b"abc", b"abc\0\0"));
+        // Len XOR truncated to u8 would be 0 for 1 vs 257; still must reject.
+        let short = [0u8; 1];
+        let long = [0u8; 257];
+        assert!(!constant_time_eq(&short, &long));
     }
 }
