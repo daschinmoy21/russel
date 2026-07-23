@@ -91,17 +91,16 @@ pub(crate) fn secure_write(path: &Path, content: &[u8], kind: &str) -> anyhow::R
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            // Apply at open(2) time — not after write — so there is no umask
+            // window (0o600), no fd inheritance to children (O_CLOEXEC), and
+            // no symlink-replace race on the tmp path (O_NOFOLLOW).
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         }
         let mut f = options
             .open(&tmp)
             .map_err(|e| anyhow::anyhow!("create {kind} tmp: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| anyhow::anyhow!("chmod {kind} tmp: {e}"))?;
-        }
         f.write_all(content)
             .map_err(|e| anyhow::anyhow!("write {kind} tmp: {e}"))?;
         f.sync_all()
@@ -245,6 +244,19 @@ mod tests {
             let resolved = resolve_env_secrets(&env).unwrap();
             assert_eq!(resolved.get("PASSWORD").unwrap(), "s3cret");
             assert_eq!(resolved.get("PLAIN").unwrap(), "hello");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secret_file_is_created_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        with_secrets_dir(tmp.path(), || {
+            set_secret("key", "value").unwrap();
+            let path = tmp.path().join("key");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
         });
     }
 }

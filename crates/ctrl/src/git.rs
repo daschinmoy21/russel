@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
+    str::FromStr as _,
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -113,16 +115,16 @@ impl GitClient {
             );
         }
 
-        // Remote: validate URL scheme.
-        let (scheme, rest) = if let Some(rest) = repo.strip_prefix("https://") {
-            ("https", rest)
-        } else if let Some(rest) = repo.strip_prefix("http://") {
-            ("http", rest)
-        } else if let Some(rest) = repo.strip_prefix("ssh://") {
-            ("ssh", rest)
+        // Remote: validate URL scheme and extract the host for SSRF checks.
+        let scheme = if repo.starts_with("https://") {
+            "https"
+        } else if repo.starts_with("http://") {
+            "http"
+        } else if repo.starts_with("ssh://") {
+            "ssh"
         } else if repo.starts_with("git@") {
             // git@host:path — allowed, no scheme prefix to strip.
-            ("git-scp", repo)
+            "git-scp"
         } else if repo.starts_with("file://") {
             anyhow::bail!("file:// URLs are not allowed for security");
         } else {
@@ -131,17 +133,16 @@ impl GitClient {
             );
         };
 
-        // Reject link-local/metadata hosts (169.254.169.254) for http(s).
-        if scheme == "https" || scheme == "http" {
-            let host = rest.split('/').next().unwrap_or("");
-            let host = host.split(':').next().unwrap_or(host); // strip port
-            if host == "169.254.169.254" {
-                anyhow::bail!("repository URL host is a link-local metadata service");
-            }
-            if host.is_empty() {
-                anyhow::bail!("repository URL has empty host");
-            }
-        }
+        // Block metadata/link-local/loopback hosts for all remote schemes.
+        //
+        // Residual risks we cannot fully mitigate without external DNS:
+        // - DNS rebinding: a hostname that resolves to a blocked IP after
+        //   this check is performed is not caught here. Keep this gap noted.
+        // - HTTP redirects: git follows 302s by default; an allowed host may
+        //   redirect to a blocked one. We do not set http.followRedirects=false
+        //   because it breaks legitimate GitHub redirects.
+        let host = extract_url_host(repo, scheme)?;
+        validate_remote_host(&host)?;
 
         let checkout_root = PathBuf::from("/tmp/russel/checkouts");
         fs::create_dir_all(&checkout_root).context("failed to create checkout directory")?;
@@ -190,6 +191,219 @@ impl GitClient {
     pub fn hold_checkout(&self, path: &Path) -> CheckoutLease {
         CheckoutLease::active(path.to_path_buf())
     }
+}
+
+/// Extract the host part of a remote repository URL.
+///
+/// Supported forms:
+/// - `http://[user[:pass]@]host[:port]/path`
+/// - `https://[user[:pass]@]host[:port]/path`
+/// - `ssh://[user@]host[:port]/path`
+/// - `git@host:path` (scp-like syntax; port is not supported)
+///
+/// The returned host is lowercased. IPv6 addresses are returned without
+/// brackets so they can be parsed with `Ipv6Addr::from_str`.
+fn extract_url_host(repo: &str, scheme: &str) -> anyhow::Result<String> {
+    let host = match scheme {
+        "http" | "https" | "ssh" => {
+            let prefix = format!("{scheme}://");
+            let rest = repo
+                .strip_prefix(&prefix)
+                .ok_or_else(|| anyhow::anyhow!("missing {scheme}:// prefix"))?;
+            let authority = rest.split('/').next().unwrap_or(rest);
+            if authority.is_empty() {
+                anyhow::bail!("repository URL has empty host");
+            }
+            // Strip `[user[:pass]@]`; the host is after the final '@'.
+            let host_port = authority
+                .rsplit_once('@')
+                .map(|(_, hp)| hp)
+                .unwrap_or(authority);
+            parse_authority_host(host_port)?
+        }
+        "git-scp" => {
+            // SCP syntax: [user@]host:path.  We keep only the host part.
+            let after_user = repo.rsplit_once('@').map(|(_, rest)| rest).unwrap_or(repo);
+            let host = after_user
+                .split(':')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("repository URL has empty host"))?;
+            if host.is_empty() {
+                anyhow::bail!("repository URL has empty host");
+            }
+            host.to_string()
+        }
+        _ => anyhow::bail!("unsupported URL scheme for host extraction: {scheme}"),
+    };
+    Ok(host.to_lowercase())
+}
+
+/// Parse `host[:port]` and return the host.
+///
+/// Bracketed IPv6 (`[::1]:22`) is supported.  A non-bracketed address with
+/// more than one colon is rejected as ambiguous because it could be an IPv6
+/// address with an indistinguishable port.
+fn parse_authority_host(host_port: &str) -> anyhow::Result<String> {
+    if let Some(inside_bracket) = host_port.strip_prefix('[') {
+        let (host, after) = inside_bracket
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("unclosed IPv6 bracket in URL"))?;
+        if !after.is_empty() && !after.starts_with(':') {
+            anyhow::bail!("unexpected characters after IPv6 bracket in URL");
+        }
+        return Ok(host.to_string());
+    }
+
+    if let Some((host, _port)) = host_port.rsplit_once(':') {
+        if host.contains(':') {
+            // Ambiguous: looks like an unbracketed IPv6 address.  Reject it
+            // rather than misclassifying a port.
+            anyhow::bail!("non-bracketed IPv6 address is ambiguous: {host_port}");
+        }
+        if host.is_empty() {
+            anyhow::bail!("repository URL has empty host");
+        }
+        return Ok(host.to_string());
+    }
+
+    Ok(host_port.to_string())
+}
+
+/// Validate that a remote clone host is not a metadata/link-local/loopback address.
+///
+/// For hostnames we do not perform DNS resolution (no external dependency and
+/// no synchronous resolver), so DNS-rebinding to a blocked IP remains a
+/// residual risk.  That gap is intentional and documented at the call site.
+fn validate_remote_host(host: &str) -> anyhow::Result<()> {
+    if host.eq_ignore_ascii_case("localhost") {
+        anyhow::bail!("repository URL host 'localhost' is not allowed for remote clones");
+    }
+
+    // IPv4: parse and also reject non-canonical forms (hex, octal, decimal).
+    if let Ok(ipv4) = Ipv4Addr::from_str(host) {
+        if !is_canonical_ipv4(host) {
+            anyhow::bail!("non-canonical IPv4 address form: {host}");
+        }
+        return reject_blocked_ipv4(host, ipv4);
+    }
+
+    // IPv6: unspecified, IPv4-mapped (via IPv4 blocklist), loopback, link-local, EC2 meta.
+    if let Ok(ipv6) = Ipv6Addr::from_str(host) {
+        match ipv6.to_canonical() {
+            IpAddr::V4(ipv4) => {
+                // ::ffff:169.254.169.254 / ::ffff:127.0.0.1 etc. must not bypass the
+                // IPv4 blocklist.
+                return reject_blocked_ipv4(host, ipv4);
+            }
+            IpAddr::V6(ipv6) => {
+                if ipv6.is_unspecified() {
+                    anyhow::bail!("repository URL host {host} (::) is unspecified");
+                }
+                if ipv6.is_loopback() {
+                    anyhow::bail!("repository URL host {host} (::1) is loopback");
+                }
+                if is_link_local_ipv6(ipv6) {
+                    anyhow::bail!("repository URL host {host} is link-local");
+                }
+                if is_ec2_metadata_ipv6(ipv6) {
+                    anyhow::bail!("repository URL host {host} is EC2 metadata");
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // Reject hostnames containing '%' — percent-encoding may be decoded by
+    // the HTTP layer (libcurl) and used to smuggle IPv6 scope IDs or other
+    // characters past this check.
+    if host.contains('%') {
+        anyhow::bail!("repository URL host contains percent-encoded characters: {host}");
+    }
+
+    // Reject hostnames that look like non-canonical numeric IP addresses (e.g.
+    // the decimal form `2130706433` or a trailing-dotted `127.0.0.1.`). These
+    // are not valid DNS names and may be interpreted as an IP by git or libc.
+    if host
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == ':')
+    {
+        anyhow::bail!("non-canonical numeric host is not allowed: {host}");
+    }
+
+    // Reject dotted forms with hex/octal octets that libc resolvers may
+    // interpret as IP addresses (e.g. 0x7f.0.0.1 → 127.0.0.1).
+    if host.contains('.') {
+        for part in host.split('.') {
+            if part.starts_with("0x") || part.starts_with("0X") {
+                anyhow::bail!("non-canonical numeric host is not allowed: {host}");
+            }
+            if part.starts_with('0') && part.len() > 1 && part.chars().all(|c| c.is_ascii_digit()) {
+                anyhow::bail!("non-canonical numeric host is not allowed: {host}");
+            }
+        }
+    }
+
+    // Hostname: cannot resolve without an external dependency; accept and let
+    // the documented DNS-rebinding gap remain.
+    Ok(())
+}
+
+/// Return true if `s` is the canonical dotted-decimal form of an IPv4 address.
+///
+/// This rejects hex/octal/decimal variants that git (or the OS resolver) may
+/// interpret differently, e.g. `0x7f.0.0.1`, `0177.0.0.1`, `2130706433`.
+fn is_canonical_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    for part in parts {
+        match part.parse::<u8>() {
+            Ok(n) if part == format!("{n}") => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_link_local_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 169 && octets[1] == 254
+}
+
+fn is_metadata_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // GCP (100.100.2.0/24), Azure/DO/Oracle (100.100.100.0/24), etc.
+    octets[0] == 100 && octets[1] == 100
+}
+
+/// Shared IPv4 blocklist (also used for IPv4-mapped IPv6 hosts).
+fn reject_blocked_ipv4(host: &str, ipv4: Ipv4Addr) -> anyhow::Result<()> {
+    if ipv4.is_unspecified() {
+        anyhow::bail!("repository URL host {host} is unspecified (0.0.0.0)");
+    }
+    if ipv4.is_loopback() {
+        anyhow::bail!("repository URL host {host} is loopback");
+    }
+    if is_link_local_ipv4(ipv4) {
+        anyhow::bail!("repository URL host {host} is link-local");
+    }
+    if is_metadata_ipv4(ipv4) {
+        anyhow::bail!("repository URL host {host} is a cloud metadata service");
+    }
+    Ok(())
+}
+
+fn is_link_local_ipv6(ip: Ipv6Addr) -> bool {
+    // fe80::/10
+    let segments = ip.segments();
+    (segments[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ec2_metadata_ipv6(ip: Ipv6Addr) -> bool {
+    // fd00:ec2::/32
+    let segments = ip.segments();
+    segments[0] == 0xfd00 && segments[1] == 0x0ec2
 }
 
 fn fnv1a_u64(bytes: impl AsRef<[u8]>) -> u64 {
@@ -485,5 +699,170 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.is_dir());
         assert!(b.is_dir());
+    }
+
+    #[test]
+    fn extract_url_host_handles_userinfo_ipv6_and_ports() {
+        assert_eq!(
+            extract_url_host("https://x@169.254.169.254/repo.git", "https").unwrap(),
+            "169.254.169.254"
+        );
+        assert_eq!(
+            extract_url_host("https://user:pass@github.com:8443/repo.git", "https").unwrap(),
+            "github.com"
+        );
+        assert_eq!(
+            extract_url_host("http://[fe80::1]:8080/repo.git", "http").unwrap(),
+            "fe80::1"
+        );
+        assert_eq!(
+            extract_url_host("http://[::1]/repo.git", "http").unwrap(),
+            "::1"
+        );
+        assert_eq!(
+            extract_url_host("ssh://git@github.com/user/repo.git", "ssh").unwrap(),
+            "github.com"
+        );
+        assert_eq!(
+            extract_url_host("ssh://git@github.com:22/user/repo.git", "ssh").unwrap(),
+            "github.com"
+        );
+        assert_eq!(
+            extract_url_host("git@github.com:user/repo.git", "git-scp").unwrap(),
+            "github.com"
+        );
+    }
+
+    #[test]
+    fn userinfo_metadata_bypass_is_rejected() {
+        let repo = "https://x@169.254.169.254/repo.git";
+        let err = extract_url_host(repo, "https")
+            .and_then(|h| validate_remote_host(&h))
+            .unwrap_err();
+        assert!(err.to_string().contains("link-local"));
+    }
+
+    #[test]
+    fn ipv6_link_local_and_loopback_rejected() {
+        for repo in [
+            "http://[fe80::1]/repo.git",
+            "http://[fe80::1%25eth0]/repo.git",
+            "http://[::1]/repo.git",
+            "http://[fd00:ec2::254]/repo.git",
+        ] {
+            let err = extract_url_host(repo, "http")
+                .and_then(|h| validate_remote_host(&h))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("link-local")
+                    || err.to_string().contains("loopback")
+                    || err.to_string().contains("EC2 metadata")
+                    || err.to_string().contains("percent-encoded"),
+                "unexpected error for {repo}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_metadata_ipv4_ranges_rejected() {
+        for repo in [
+            "https://169.254.169.254/repo.git",
+            "https://169.254.0.1/repo.git",
+            "https://100.100.100.100/repo.git",
+            "https://100.100.2.34/repo.git",
+            "https://0.0.0.0/repo.git",
+        ] {
+            assert!(
+                extract_url_host(repo, "https")
+                    .and_then(|h| validate_remote_host(&h))
+                    .is_err(),
+                "expected rejection for {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_hosts_rejected_for_remote_schemes() {
+        for repo in [
+            "https://127.0.0.1/repo.git",
+            "https://localhost/repo.git",
+            "https://127.1.0.1/repo.git",
+            "ssh://127.0.0.1/repo.git",
+            "git@127.0.0.1:repo.git",
+            "git@localhost:repo.git",
+        ] {
+            assert!(
+                extract_url_host(
+                    repo,
+                    if repo.starts_with("https://") {
+                        "https"
+                    } else if repo.starts_with("ssh://") {
+                        "ssh"
+                    } else {
+                        "git-scp"
+                    }
+                )
+                .and_then(|h| validate_remote_host(&h))
+                .is_err(),
+                "expected rejection for {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_remote_hosts_accepted() {
+        for repo in [
+            "https://github.com/org/repo.git",
+            "https://git.example.com:8443/org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+            "git@github.com:org/repo.git",
+        ] {
+            assert!(
+                extract_url_host(
+                    repo,
+                    if repo.starts_with("https://") {
+                        "https"
+                    } else if repo.starts_with("ssh://") {
+                        "ssh"
+                    } else {
+                        "git-scp"
+                    }
+                )
+                .and_then(|h| validate_remote_host(&h))
+                .is_ok(),
+                "expected acceptance for {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_ipv4_forms_rejected() {
+        for host in [
+            "0177.0.0.1",
+            "0x7f.0.0.1",
+            "127.0.0.01",
+            "2130706433",
+            "127.0.0.1.",
+        ] {
+            assert!(
+                validate_remote_host(host).is_err(),
+                "expected rejection for {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_and_unspecified_ipv6_rejected() {
+        for host in [
+            "::ffff:169.254.169.254",
+            "::ffff:127.0.0.1",
+            "::",
+            "0:0:0:0:0:0:0:0",
+        ] {
+            assert!(
+                validate_remote_host(host).is_err(),
+                "expected rejection for {host}"
+            );
+        }
     }
 }

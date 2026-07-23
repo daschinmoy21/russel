@@ -1,6 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ingress::{Backend, HostRule, Ingress};
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const DEFAULT_DOMAIN: &str = "russel.local";
 
 /// Writes Traefik dynamic configuration files (file provider, JSON format).
 ///
@@ -34,8 +40,18 @@ impl TraefikFileIngress {
         let dynamic_dir = std::env::var("RUSSEL_TRAEFIK_DYNAMIC_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/var/lib/russel/traefik/dynamic"));
-        let domain =
-            std::env::var("RUSSEL_TRAEFIK_DOMAIN").unwrap_or_else(|_| "russel.local".to_string());
+        let domain = std::env::var("RUSSEL_TRAEFIK_DOMAIN")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| DEFAULT_DOMAIN.to_string());
+        let domain = if is_valid_domain(&domain) {
+            domain
+        } else {
+            tracing::error!(
+                domain = %domain,
+                "RUSSEL_TRAEFIK_DOMAIN is invalid; falling back to {DEFAULT_DOMAIN}"
+            );
+            DEFAULT_DOMAIN.to_string()
+        };
         let tls_enabled = matches!(
             std::env::var("RUSSEL_TRAEFIK_TLS")
                 .unwrap_or_default()
@@ -66,6 +82,93 @@ impl TraefikFileIngress {
     pub fn public_host(&self, service_id: &str) -> String {
         format!("{}.{}", service_id, self.domain)
     }
+}
+
+/// Validate that `domain` is a sane DNS-style domain name.
+///
+/// Rules: labels contain only `[A-Za-z0-9-]`, each label is 1..=63 chars,
+/// no leading/trailing hyphen in a label, total length <= 253, and there is
+/// at least one label. This rejects backticks, spaces, and empty values.
+fn is_valid_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 {
+        return false;
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Atomically write a Traefik dynamic config file with `mode 0644`.
+///
+/// Writes `{service_id}.json.<nonce>.tmp` in the same directory, fsyncs,
+/// then renames it into place. On failure the temporary file is removed.
+async fn atomic_write_dynamic_config(
+    path: &Path,
+    content: &[u8],
+    service_id: &str,
+) -> anyhow::Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("traefik config path has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.json");
+    let tmp = parent.join(format!("{file_name}.{nonce:x}.tmp"));
+
+    let write_result = async {
+        #[allow(unused_imports)]
+        use std::os::unix::fs::OpenOptionsExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o644)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .await
+            .map_err(|e| anyhow::anyhow!("create tmp traefik config for {service_id}: {e}"))?;
+        f.write_all(content)
+            .await
+            .map_err(|e| anyhow::anyhow!("write tmp traefik config for {service_id}: {e}"))?;
+        f.sync_all()
+            .await
+            .map_err(|e| anyhow::anyhow!("fsync tmp traefik config for {service_id}: {e}"))?;
+        anyhow::Result::<()>::Ok(())
+    }
+    .await;
+
+    if let Err(e) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(anyhow::anyhow!(
+            "rename tmp traefik config for {service_id}: {e}"
+        ));
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -130,12 +233,7 @@ impl Ingress for TraefikFileIngress {
         let content = serde_json::to_string_pretty(&config).map_err(|e| {
             anyhow::anyhow!("failed to serialize Traefik config for {service_id}: {e}")
         })?;
-        tokio::fs::write(&file_path, &content).await.map_err(|e| {
-            anyhow::anyhow!(
-                "failed to write Traefik config {}: {e}",
-                file_path.display()
-            )
-        })?;
+        atomic_write_dynamic_config(&file_path, content.as_bytes(), service_id).await?;
 
         tracing::info!(
             service_id = %service_id,
@@ -438,5 +536,42 @@ mod tests {
             port: 9000,
         };
         assert_eq!(b.url(), "http://10.0.0.5:9000");
+    }
+
+    #[test]
+    fn valid_domains_accepted() {
+        assert!(is_valid_domain("russel.local"));
+        assert!(is_valid_domain("example.com"));
+        assert!(is_valid_domain("sub.example.com"));
+        assert!(is_valid_domain("a-b.c-123.local"));
+        assert!(is_valid_domain("Example.COM"));
+    }
+
+    #[test]
+    fn invalid_domains_rejected() {
+        assert!(!is_valid_domain(""));
+        assert!(!is_valid_domain("russel local"));
+        assert!(!is_valid_domain("russel`local"));
+        assert!(!is_valid_domain("-russel.local"));
+        assert!(!is_valid_domain("russel-.local"));
+        assert!(!is_valid_domain("russel..local"));
+        assert!(!is_valid_domain(".russel.local"));
+        assert!(!is_valid_domain("russel.local."));
+        assert!(!is_valid_domain("russel_local"));
+    }
+
+    #[test]
+    fn from_env_falls_back_to_default_for_bad_domain() {
+        let _lock = env_lock();
+        let prev = std::env::var_os("RUSSEL_TRAEFIK_DOMAIN");
+        unsafe { std::env::set_var("RUSSEL_TRAEFIK_DOMAIN", "bad ` domain") };
+        let ing = TraefikFileIngress::from_env();
+        assert_eq!(ing.domain, "russel.local");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RUSSEL_TRAEFIK_DOMAIN", v),
+                None => std::env::remove_var("RUSSEL_TRAEFIK_DOMAIN"),
+            }
+        }
     }
 }
