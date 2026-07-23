@@ -201,7 +201,7 @@ async fn append_podman_logs(service_id: &str, output: &mut String) {
         return;
     }
 
-    let result = crate::container::podman_command()
+    let result = crate::container::podman_command().await
         .args(["logs", "--tail", "200", &name])
         .output()
         .await;
@@ -318,7 +318,7 @@ async fn discover_podman_containers(
     seen: &mut std::collections::HashSet<String>,
 ) {
     // Format: "name\tstate" so we can claim ports only for running containers.
-    let output = crate::container::podman_command()
+    let output = crate::container::podman_command().await
         .args([
             "ps",
             "-a",

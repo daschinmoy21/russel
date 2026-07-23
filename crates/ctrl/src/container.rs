@@ -45,7 +45,6 @@ impl DebugToolsCache {
         Self::default()
     }
 
-    /// Resolve or build bash and curl from nixpkgs; results are cached in-memory.
     #[allow(dead_code)] // optional debug helper for container shells; not on deploy path
     pub async fn ensure_debug_tools(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
         let bash = self.ensure_bash(None).await?;
@@ -217,7 +216,11 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
 }
 
 /// Require `store_path/bin/<bin_name>` and validate script shebangs when present.
-pub fn validate_entrypoint(store_path: &Path, bin_name: &str, debug: bool) -> anyhow::Result<PathBuf> {
+pub fn validate_entrypoint(
+    store_path: &Path,
+    bin_name: &str,
+    debug: bool,
+) -> anyhow::Result<PathBuf> {
     let bin_path = store_path.join("bin").join(bin_name);
     if !bin_path.exists() {
         anyhow::bail!(
@@ -473,7 +476,11 @@ fn resolve_podman_user(
 ) -> Option<String> {
     let normalize = |s: &str| {
         let t = s.trim();
-        if t.is_empty() || t == "root" { None } else { Some(t.to_string()) }
+        if t.is_empty() || t == "root" {
+            None
+        } else {
+            Some(t.to_string())
+        }
     };
     if let Some(u) = explicit.and_then(normalize) {
         return Some(u);
@@ -559,22 +566,24 @@ struct PodmanUserEnv {
     dbus: Option<String>,
 }
 
-fn podman_user_env() -> Option<&'static PodmanUserEnv> {
-    use std::sync::OnceLock;
-    static ENV: OnceLock<Option<PodmanUserEnv>> = OnceLock::new();
-    ENV.get_or_init(|| {
+async fn podman_user_env() -> Option<&'static PodmanUserEnv> {
+    use tokio::sync::OnceCell;
+    static ENV: OnceCell<Option<PodmanUserEnv>> = OnceCell::const_new();
+    ENV.get_or_init(|| async {
         let user = configured_podman_user()?;
-        let uid = std::process::Command::new("id")
+        let uid = tokio::process::Command::new("id")
             .args(["-u", &user])
             .output()
+            .await
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
         if uid.is_empty() {
             return None;
         }
-        let home = std::process::Command::new("getent")
+        let home = tokio::process::Command::new("getent")
             .args(["passwd", &user])
             .output()
+            .await
             .ok()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
@@ -596,15 +605,21 @@ fn podman_user_env() -> Option<&'static PodmanUserEnv> {
                  (loginctl enable-linger {user}) or log in once"
             );
         }
-        Some(PodmanUserEnv { user, home, xdg_runtime, dbus })
+        Some(PodmanUserEnv {
+            user,
+            home,
+            xdg_runtime,
+            dbus,
+        })
     })
+    .await
     .as_ref()
 }
 
 /// Build a `Command` that runs `podman <args>` as the configured user when
 /// ctrl is root and a non-root podman user was resolved (env or SUDO_USER).
-pub(crate) fn podman_command() -> Command {
-    if let Some(env) = podman_user_env() {
+pub(crate) async fn podman_command() -> Command {
+    if let Some(env) = podman_user_env().await {
         let mut cmd = Command::new("sudo");
         cmd.args(["-u", &env.user, "-H", "env"]);
         cmd.arg(format!("HOME={}", env.home));
@@ -633,8 +648,8 @@ pub(crate) fn podman_command() -> Command {
 /// A prior rootful `podman` that inherited `XDG_RUNTIME_DIR=/run/user/UID`
 /// (common with `sudo -E`) leaves `crun/` owned by root:root mode 0700. Rootless
 /// podman then cannot open its own runtime dir.
-fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
-    let Some(env) = podman_user_env() else {
+async fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
+    let Some(env) = podman_user_env().await else {
         return Ok(());
     };
     if unsafe { libc::geteuid() } != 0 {
@@ -678,7 +693,7 @@ fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
 
 /// Make the service dir + rootfs usable by a non-root podman user when
 /// `RUSSEL_PODMAN_USER` is set (ctrl runs as root via sudo for microVMs).
-fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
+async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     let Some(user) = configured_podman_user() else {
         return Ok(());
     };
@@ -689,9 +704,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
         .unwrap_or_else(|_| rootfs.to_path_buf());
     let mut walk = resolved.as_path();
     loop {
-        let output = std::process::Command::new("chmod")
+        let output = tokio::process::Command::new("chmod")
             .args(["a+rx", &walk.display().to_string()])
-            .output()?;
+            .output()
+            .await?;
         if !output.status.success() {
             // Best-effort on parents we may not own (e.g. /); rootfs/base are critical.
             tracing::debug!(
@@ -713,9 +729,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| rootfs.to_path_buf());
-    let uid = std::process::Command::new("id")
+    let uid = tokio::process::Command::new("id")
         .args(["-u", &user])
         .output()
+        .await
         .map_err(|e| anyhow::anyhow!("id -u {user}: {e}"))?;
     if !uid.status.success() {
         anyhow::bail!(
@@ -723,9 +740,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
             String::from_utf8_lossy(&uid.stderr).trim()
         );
     }
-    let gid = std::process::Command::new("id")
+    let gid = tokio::process::Command::new("id")
         .args(["-g", &user])
         .output()
+        .await
         .map_err(|e| anyhow::anyhow!("id -g {user}: {e}"))?;
     if !gid.status.success() {
         anyhow::bail!(
@@ -735,9 +753,10 @@ fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     }
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
     let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
-    let output = std::process::Command::new("chown")
+    let output = tokio::process::Command::new("chown")
         .args(["-R", &format!("{uid}:{gid}"), &base.display().to_string()])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         anyhow::bail!(
             "chown service dir to {user} ({uid}:{gid}) failed: {}",
@@ -786,8 +805,8 @@ impl ContainerRunner {
 
     /// Fail if `podman info` does not indicate rootless.
     pub async fn ensure_rootless() -> anyhow::Result<()> {
-        sanitize_podman_user_runtime_dir()?;
-        let output = podman_command()
+        sanitize_podman_user_runtime_dir().await?;
+        let output = podman_command().await
             .args(["info", "--format", "json"])
             .output()
             .await
@@ -832,7 +851,7 @@ impl ContainerRunner {
         }
 
         // ponytail: make rootfs readable for configured podman user when running via sudo
-        ensure_rootfs_readable_for_podman_user(&spec.rootfs.rootfs_path)?;
+        ensure_rootfs_readable_for_podman_user(&spec.rootfs.rootfs_path).await?;
         let output = run_podman(&args).await?;
         if !output.status.success() {
             anyhow::bail!(
@@ -890,7 +909,7 @@ impl ContainerRunner {
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);
-        let output = podman_command()
+        let output = podman_command().await
             .args([
                 "inspect",
                 &name,
@@ -1150,7 +1169,7 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
 }
 
 async fn run_podman(args: &[String]) -> anyhow::Result<std::process::Output> {
-    podman_command()
+    podman_command().await
         .args(args)
         .output()
         .await
@@ -1163,7 +1182,7 @@ async fn stop_and_remove_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn stop_container(name: &str) -> anyhow::Result<()> {
-    let output = podman_command()
+    let output = podman_command().await
         .args(["stop", "-t", PODMAN_STOP_TIMEOUT_SECS, name])
         .output()
         .await
@@ -1180,7 +1199,7 @@ async fn stop_container(name: &str) -> anyhow::Result<()> {
 }
 
 async fn remove_container(name: &str) -> anyhow::Result<()> {
-    let output = podman_command()
+    let output = podman_command().await
         .args(["rm", "-f", name])
         .output()
         .await
@@ -1483,11 +1502,26 @@ mod tests {
         let has_adjacent = |flag: &str, val: &str| -> bool {
             args.windows(2).any(|w| w[0] == flag && w[1] == val)
         };
-        assert!(has_adjacent("--cap-drop", "ALL"), "--cap-drop ALL must be adjacent");
-        assert!(has_adjacent("--security-opt", "no-new-privileges"), "--security-opt no-new-privileges must be adjacent");
-        assert!(args.contains(&"--read-only".to_string()), "--read-only must be present");
-        assert!(has_adjacent("--tmpfs", "/tmp"), "--tmpfs /tmp must be adjacent");
-        assert!(has_adjacent("--tmpfs", "/run"), "--tmpfs /run must be adjacent");
+        assert!(
+            has_adjacent("--cap-drop", "ALL"),
+            "--cap-drop ALL must be adjacent"
+        );
+        assert!(
+            has_adjacent("--security-opt", "no-new-privileges"),
+            "--security-opt no-new-privileges must be adjacent"
+        );
+        assert!(
+            args.contains(&"--read-only".to_string()),
+            "--read-only must be present"
+        );
+        assert!(
+            has_adjacent("--tmpfs", "/tmp"),
+            "--tmpfs /tmp must be adjacent"
+        );
+        assert!(
+            has_adjacent("--tmpfs", "/run"),
+            "--tmpfs /run must be adjacent"
+        );
 
         // --rootfs PATH must be immediately before COMMAND so flags are not
         // misparsed as the container executable (crun: `--mount` not found).
