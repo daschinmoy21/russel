@@ -1014,6 +1014,7 @@ impl DeployPipeline {
                 &initramfs_path,
                 &alloc,
                 mem_mb,
+                config.service.cpus,
                 &cfg_dir_path,
             )
             .await?;
@@ -1033,6 +1034,7 @@ impl DeployPipeline {
             &kernel_info.path.display().to_string(),
             &store_path.display().to_string(),
             mem_mb,
+            config.service.cpus,
             Some(&app_path),
             Some(&bin_name),
             Some(&initramfs_path.display().to_string()),
@@ -1517,6 +1519,12 @@ async fn attempt_microvm_rollback(
         PortAllocator::release(service_id);
     }
 
+    let rollback_cpus: u8 = old_meta["cpus"]
+        .as_u64()
+        .and_then(|n| u8::try_from(n).ok())
+        .unwrap_or(1)
+        .clamp(1, 32);
+
     // 5–6. Network + boot; clean up on any failure after reservation
     let cfg_dir_path = PathBuf::from(&cfg_dir);
     let boot_result: anyhow::Result<(
@@ -1536,6 +1544,7 @@ async fn attempt_microvm_rollback(
                 &initramfs_path,
                 &alloc,
                 mem_mb,
+                rollback_cpus,
                 &cfg_dir_path,
             )
             .await?;
@@ -1580,6 +1589,7 @@ async fn attempt_microvm_rollback(
         kernel_path_str,
         &store_path,
         mem_mb,
+        rollback_cpus,
         Some(&app_path),
         Some(&bin_name),
         Some(&initramfs_path.display().to_string()),
@@ -2085,6 +2095,7 @@ mod tests {
             "/k",
             "/s",
             512,
+            1,
             None,
             None,
             None,

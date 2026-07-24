@@ -333,6 +333,8 @@ bin = "api"
 # Optional: "microvm" (default) or "container". Source of truth for runtime.
 # CLI --runtime must match this value if provided.
 type = "microvm"
+# Optional: guest vCPUs for microVM (1..=32, default 1). Ignored for containers.
+cpus = 1
 
 # Optional: user-defined environment variables (deploy-time injection).
 # Keys: ^[A-Za-z_][A-Za-z0-9_]*$. Reserved: PORT, VM_IP, HOST_IP, APP.
@@ -355,7 +357,6 @@ russel build
 russel deploy .                    # microVM by default
 russel deploy . --runtime container  # requires type = "container" in Russelfile
 ```
-
 
 The user does not need to run `nix develop` or `nix build` directly.
 

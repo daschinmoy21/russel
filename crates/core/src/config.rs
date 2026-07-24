@@ -36,6 +36,12 @@ impl Russelfile {
         if config.service.port == 0 {
             anyhow::bail!("service.port must not be 0");
         }
+        if config.service.cpus < 1 || config.service.cpus > 32 {
+            anyhow::bail!(
+                "service.cpus must be 1..=32 (got {})",
+                config.service.cpus
+            );
+        }
         validate_source_path(&config.service.source)?;
         Ok(config)
     }
@@ -136,6 +142,14 @@ pub struct ServiceConfig {
     /// interpreter path).
     #[serde(default)]
     pub debug: bool,
+    /// Guest vCPUs for microVM runtime (1..=32). Ignored for containers.
+    /// Defaults to 1 when omitted.
+    #[serde(default = "default_cpus")]
+    pub cpus: u8,
+}
+
+pub fn default_cpus() -> u8 {
+    1
 }
 
 impl ServiceConfig {
@@ -675,5 +689,68 @@ memory = "16mb"
         assert!(err.to_string().contains("must not contain '..'"));
         let err = validate_source_path("sub/../../escape").unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
+    }
+
+    // ── cpus ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cpus_defaults_to_1() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.cpus, 1);
+    }
+
+    #[test]
+    fn cpus_parses_custom() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+cpus = 2
+"#;
+        let config: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(config.service.cpus, 2);
+    }
+
+    #[test]
+    fn cpus_rejects_zero() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+cpus = 0
+"#;
+        let err = Russelfile::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("cpus"),
+            "expected cpus rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn cpus_rejects_33() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+cpus = 33
+"#;
+        let err = Russelfile::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("cpus"),
+            "expected cpus rejection: {err}"
+        );
     }
 }

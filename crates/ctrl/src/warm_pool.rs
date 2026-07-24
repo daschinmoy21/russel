@@ -296,6 +296,7 @@ impl WarmPool {
         initramfs_path: &Path,
         alloc: &SubnetAllocation,
         memory_mb: u16,
+        cpus_boot: u8,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
         if !self.is_ready() {
@@ -307,6 +308,26 @@ impl WarmPool {
                     initramfs_path,
                     alloc,
                     memory_mb,
+                    cpus_boot,
+                    config_dir,
+                )
+                .await;
+        }
+
+        if cpus_boot != 1 {
+            tracing::info!(
+                service_id,
+                cpus_boot,
+                "cpus mismatch with template (template=1) — cold booting"
+            );
+            return self
+                .cold_boot(
+                    service_id,
+                    kernel_path,
+                    initramfs_path,
+                    alloc,
+                    memory_mb,
+                    cpus_boot,
                     config_dir,
                 )
                 .await;
@@ -328,6 +349,7 @@ impl WarmPool {
                     initramfs_path,
                     alloc,
                     memory_mb,
+                    cpus_boot,
                     config_dir,
                 )
                 .await
@@ -343,6 +365,7 @@ impl WarmPool {
         initramfs_path: &Path,
         alloc: &SubnetAllocation,
         memory_mb: u16,
+        cpus_boot: u8,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
         let sock_dir = format!("/var/lib/russel/{service_id}");
@@ -352,15 +375,18 @@ impl WarmPool {
         let cfg_sock = PathBuf::from(format!("{sock_dir}/virtiofs-cfg.sock"));
         let api_socket = PathBuf::from(format!("{sock_dir}/cloud-hypervisor.sock"));
 
+        let cpus_max: u8 = std::env::var("RUSSEL_CPU_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+            .max(cpus_boot);
+
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
             initramfs: initramfs_path.to_path_buf(),
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
-            cpus_boot: 1,
-            cpus_max: std::env::var("RUSSEL_CPU_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+            cpus_boot,
+            cpus_max,
             memory_mb,
             memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
                 .ok()
