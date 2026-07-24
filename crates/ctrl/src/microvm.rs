@@ -463,8 +463,8 @@ impl MicrovmRunner {
         let _cleanup = TempDirGuard(work.clone());
         std::fs::create_dir_all(&work)?;
 
-        // Bump filename when AGENT_INIT_SCRIPT changes so disk cache cannot serve a stale CPIO.
-        let initramfs_file = pool_dir.join("agent-initramfs-v2.cpio");
+        // Bump AGENT_INITRAMFS_BASENAME when AGENT_INIT_SCRIPT changes so disk cache cannot serve a stale CPIO.
+        let initramfs_file = pool_dir.join(AGENT_INITRAMFS_BASENAME);
 
         // Copy kernel modules when using stock kernel (drivers not built-in).
         // ponytail: same virtio/fuse list as legacy per-service initramfs.
@@ -495,7 +495,7 @@ impl MicrovmRunner {
         self.create_busybox_symlinks(&work, &bb_bin)?;
         self.copy_closure_to(&busybox_path, &work).await?;
         // Build to a temp file, then atomic rename (F-18).
-        let tmp_cpio = pool_dir.join(format!(".agent-initramfs-v2.{pid}.{nanos}.cpio.tmp"));
+        let tmp_cpio = pool_dir.join(format!(".agent-initramfs-v3.{pid}.{nanos}.cpio.tmp"));
         self.pack_cpio(&work, &tmp_cpio, &bb_bin).await?;
         std::fs::rename(&tmp_cpio, &initramfs_file)?;
 
@@ -555,9 +555,7 @@ impl MicrovmRunner {
         let bin_dir = work.join("bin");
         std::fs::create_dir_all(&bin_dir)?;
         // Agent init needs `cat` + `sleep` in addition to basic tools.
-        for name in &[
-            "sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat", "sleep", "usleep", "ls",
-        ] {
+        for name in AGENT_BUSYBOX_APPLETS {
             let dest = bin_dir.join(name);
             if let Err(e) = std::fs::remove_file(&dest)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -714,11 +712,30 @@ impl MicrovmRunner {
 
         // ── Spawn virtiofsd for each fs mount ──────────────────────────
         let mut virtiofsd_children: Vec<tokio::process::Child> = Vec::new();
-        for fs in &spec.fs {
-            let child = self
-                .spawn_virtiofsd(&fs.socket, &fs.shared_dir, fs.readonly)
-                .await?;
-            virtiofsd_children.push(child);
+        match spec.fs.as_slice() {
+            [] => {}
+            [a] => {
+                let child = self
+                    .spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly)
+                    .await?;
+                virtiofsd_children.push(child);
+            }
+            [a, b] => {
+                let (ra, rb) = tokio::join!(
+                    self.spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly),
+                    self.spawn_virtiofsd(&b.socket, &b.shared_dir, b.readonly),
+                );
+                virtiofsd_children.push(ra?);
+                virtiofsd_children.push(rb?);
+            }
+            _ => {
+                for fs in &spec.fs {
+                    let child = self
+                        .spawn_virtiofsd(&fs.socket, &fs.shared_dir, fs.readonly)
+                        .await?;
+                    virtiofsd_children.push(child);
+                }
+            }
         }
 
         // ── Build CH command line ──────────────────────────────────────
@@ -1100,6 +1117,15 @@ impl MicrovmRunner {
 
 // ── Agent init script (config-driven guest, no app baked in) ────────────────
 
+/// Basename for the agent initramfs CPIO file. Bump when `AGENT_INIT_SCRIPT` changes
+/// so stale disk caches cannot serve an old init.
+const AGENT_INITRAMFS_BASENAME: &str = "agent-initramfs-v3.cpio";
+
+/// Busybox applets symlinked into the agent initramfs.
+const AGENT_BUSYBOX_APPLETS: &[&str] = &[
+    "sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat", "sleep", "usleep", "ls",
+];
+
 const AGENT_INIT_SCRIPT: &str = r#"#!/bin/sh
 /bin/mkdir -p /proc /sys /dev /nix/store /config /tmp
 /bin/mount -t proc proc /proc
@@ -1138,7 +1164,7 @@ while [ $i -lt 30 ]; do
     break
   fi
   i=$((i + 1))
-  /bin/usleep 100000 2>/dev/null || /bin/sleep 1
+  /bin/usleep 5000
 done
 if [ "$mounted" -ne 1 ]; then
   echo "ERROR: Failed to mount /nix/store via virtiofs after retries"
@@ -1157,7 +1183,7 @@ while [ $i -lt 30 ]; do
     break
   fi
   i=$((i + 1))
-  /bin/usleep 100000 2>/dev/null || /bin/sleep 1
+  /bin/usleep 5000
 done
 if [ "$mounted" -ne 1 ]; then
   echo "ERROR: Failed to mount /config via virtiofs after retries"
@@ -1170,7 +1196,7 @@ echo "ready" > /config/.agent_ready
 # Wait for deploy.env to be written by the host.
 echo "Waiting for /config/deploy.env..."
 while [ ! -f /config/deploy.env ]; do
-  /bin/sleep 0.01 2>/dev/null || /bin/sleep 1
+  /bin/usleep 10000
 done
 
 # Source deployment config.
@@ -1452,6 +1478,38 @@ mod tests {
                 .to_string()
                 .contains("no kernel versions")
         );
+    }
+
+    #[test]
+    fn agent_init_script_uses_short_usleep_retries() {
+        // Mount retries use 5ms.
+        assert!(AGENT_INIT_SCRIPT.contains("/bin/usleep 5000"));
+        // Deploy.env wait uses 10ms.
+        assert!(AGENT_INIT_SCRIPT.contains("/bin/usleep 10000"));
+
+        // Old 100ms sleep must not be present.
+        assert!(!AGENT_INIT_SCRIPT.contains("usleep 100000"));
+        // Old sleep 0.01 must not be present.
+        assert!(!AGENT_INIT_SCRIPT.contains("sleep 0.01"));
+
+        // Old fallback pattern must not be present.
+        assert!(!AGENT_INIT_SCRIPT.contains("/bin/sleep 0.01 2>/dev/null || /bin/sleep 1"));
+        assert!(!AGENT_INIT_SCRIPT.contains("/bin/usleep 100000 2>/dev/null || /bin/sleep 1"));
+    }
+
+    #[test]
+    fn agent_initramfs_cache_version_is_v3() {
+        assert_eq!(AGENT_INITRAMFS_BASENAME, "agent-initramfs-v3.cpio");
+    }
+
+    #[test]
+    fn busybox_agent_symlinks_include_usleep() {
+        assert!(AGENT_BUSYBOX_APPLETS.contains(&"usleep"));
+        // Spot-check a few other expected applets.
+        assert!(AGENT_BUSYBOX_APPLETS.contains(&"sh"));
+        assert!(AGENT_BUSYBOX_APPLETS.contains(&"mount"));
+        assert!(AGENT_BUSYBOX_APPLETS.contains(&"ip"));
+        assert!(AGENT_BUSYBOX_APPLETS.contains(&"sleep"));
     }
 
     /// Regression: F-27 pack_cpio must set cwd on cpio and must not use
