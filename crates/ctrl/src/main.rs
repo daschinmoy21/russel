@@ -310,7 +310,7 @@ fn live_service_tap_ids() -> std::collections::HashSet<String> {
                 && ft.is_dir()
                 && let Some(name) = entry.file_name().to_str()
             {
-                if name.ends_with(".bak") || name == "traefik" || name == "secrets" {
+                if crate::metadata::is_reserved_service_dir(name) {
                     continue;
                 }
                 let meta_path = entry.path().join("metadata.json");

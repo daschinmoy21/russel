@@ -1,0 +1,337 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import { isDemoMode } from '../lib/api';
+---
+
+<Layout title="Settings" activePath="/settings">
+  <Header
+    title="Control Plane Settings"
+    subtitle="Configure API connection, tokens, and demo mode."
+    isDemo={isDemoMode()}
+  />
+
+  <div class="settings-grid">
+    <!-- API Connection Card -->
+    <div class="card-panel settings-panel">
+      <h2 class="section-title mb-4">Russel API Connection</h2>
+
+      <form id="settingsForm">
+        <div class="form-group">
+          <label class="form-label" for="apiUrl">Control Plane HTTP API Base URL</label>
+          <input
+            type="text"
+            id="apiUrl"
+            class="form-input"
+            placeholder="/api"
+            required
+          />
+          <span class="field-hint">Default <code>/api</code> uses the dev proxy. Set to absolute URL for production.</span>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="apiToken">API Bearer Token (RUSSEL_API_TOKEN)</label>
+          <input
+            type="password"
+            id="apiToken"
+            class="form-input"
+            placeholder="Leave empty if unconfigured"
+          />
+          <span class="field-hint">Passed as <code>Authorization: Bearer &lt;token&gt;</code> on HTTP calls.</span>
+        </div>
+
+        <div class="demo-toggle-section">
+          <div class="demo-toggle-row">
+            <div class="demo-toggle-info">
+              <span class="demo-toggle-label">Demo Mode</span>
+              <span class="demo-toggle-desc">
+                Demo mode loads mock services without contacting russel-ctrl. When off, the dashboard uses the live API; if the daemon is down you will see Offline/empty state.
+              </span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="demoModeToggle" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-actions-row">
+          <button type="button" id="btnTestConn" class="btn btn-secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+            Test Connection
+          </button>
+          
+          <button type="submit" class="btn btn-primary">
+            Save API Settings
+          </button>
+        </div>
+
+        <div id="settingsToast" class="toast hidden"></div>
+      </form>
+    </div>
+
+    <!-- Reference & Docs -->
+    <div class="card-panel info-panel" id="faq">
+      <h2 class="section-title mb-4">Reference & FAQ</h2>
+
+      <div class="faq-list">
+        <div class="faq-item">
+          <h3 class="faq-q">How does Russel connect to microVMs vs containers?</h3>
+          <p class="faq-a">
+            Russel manages Cloud-Hypervisor microVMs using tap network devices and Linux kernel images. Container workloads run rootless via Podman socket invocations.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3 class="faq-q">Where are settings stored?</h3>
+          <p class="faq-a">
+            Dashboard settings are saved in browser <code>localStorage</code> (keys: <code>RUSSEL_API_URL</code>, <code>RUSSEL_API_TOKEN</code>, <code>RUSSEL_DEMO_MODE</code>).
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3 class="faq-q">What endpoints does the API expose?</h3>
+          <p class="faq-a">
+            <code>GET /vms</code>, <code>GET /vm/{'{id}'}/status</code>, <code>GET /vm/{'{id}'}/logs</code>, <code>POST /deploy</code>, <code>POST /vm/{'{id}'}/stop</code>, <code>POST /vm/{'{id}'}/update</code>, <code>DELETE /vm/{'{id}'}</code>.
+            See <a href="/docs/">docs/</a> for full API mapping.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3 class="faq-q">What is the /api proxy?</h3>
+          <p class="faq-a">
+            In development (<code>bun run dev</code>), Vite proxies <code>/api/*</code> -> <code>http://127.0.0.1:7878/*</code> so the browser avoids CORS issues. Set <code>RUSSEL_API_PROXY</code> env var to override the target.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</Layout>
+
+<script>
+  import { getApiBase, getApiToken, setApiBase, setApiToken, setDemoMode, isDemoMode } from '../lib/api';
+
+  const apiUrlInput = document.getElementById('apiUrl') as HTMLInputElement | null;
+  const apiTokenInput = document.getElementById('apiToken') as HTMLInputElement | null;
+  const demoModeToggle = document.getElementById('demoModeToggle') as HTMLInputElement | null;
+  const form = document.getElementById('settingsForm');
+  const btnTest = document.getElementById('btnTestConn');
+  const toast = document.getElementById('settingsToast');
+
+  if (apiUrlInput) apiUrlInput.value = getApiBase();
+  if (apiTokenInput) apiTokenInput.value = getApiToken() || '';
+  if (demoModeToggle) demoModeToggle.checked = isDemoMode();
+
+  function showToast(msg: string, isError = false) {
+    if (!toast) return;
+    toast.classList.remove('hidden', 'success', 'error');
+    toast.classList.add(isError ? 'error' : 'success');
+    toast.textContent = msg;
+    setTimeout(() => toast.classList.add('hidden'), 8000);
+  }
+
+  // Demo toggle: apply immediately on change
+  demoModeToggle?.addEventListener('change', () => {
+    setDemoMode(demoModeToggle.checked);
+    location.reload();
+  });
+
+  form?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (apiUrlInput) setApiBase(apiUrlInput.value.trim());
+    if (apiTokenInput) setApiToken(apiTokenInput.value.trim());
+    showToast('API settings saved! Reload page to apply.');
+  });
+
+  btnTest?.addEventListener('click', async () => {
+    btnTest.setAttribute('disabled', 'true');
+    try {
+      const res = await fetch(`${getApiBase()}/vms`, {
+        headers: getApiToken() ? { Authorization: `Bearer ${getApiToken()}` } : {},
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const count = data.services?.length ?? data.vms?.length ?? 0;
+        showToast(`Connected! Found ${count} services on the control plane.`);
+      } else {
+        showToast(`Connection failed: HTTP ${res.status}`, true);
+      }
+    } catch (e: any) {
+      showToast(`Connection error: ${e.message || 'network unreachable'}`, true);
+    }
+    btnTest.removeAttribute('disabled');
+  });
+</script>
+
+<style>
+  .settings-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+  }
+
+  @media (max-width: 960px) {
+    .settings-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .field-hint {
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    margin-top: 0.2rem;
+  }
+
+  .field-hint code {
+    font-family: var(--font-mono);
+    color: var(--accent-primary);
+  }
+
+  .demo-toggle-section {
+    margin-bottom: 1rem;
+    padding: 1rem;
+    background: var(--bg-card-hover);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-md);
+  }
+
+  .demo-toggle-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  .demo-toggle-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .demo-toggle-label {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .demo-toggle-desc {
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  /* Switch toggle */
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    flex-shrink: 0;
+  }
+
+  .switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .switch-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--border-input);
+    border-radius: 24px;
+    transition: 0.2s ease;
+  }
+
+  .switch-slider::before {
+    content: "";
+    position: absolute;
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background-color: #ffffff;
+    border-radius: 50%;
+    transition: 0.2s ease;
+  }
+
+  .switch input:checked + .switch-slider {
+    background-color: var(--accent-primary);
+  }
+
+  .switch input:checked + .switch-slider::before {
+    transform: translateX(20px);
+  }
+
+  .form-actions-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 1.5rem;
+  }
+
+  .toast {
+    margin-top: 1rem;
+    padding: 0.65rem 1rem;
+    border-radius: var(--radius-md);
+    font-size: 0.85rem;
+  }
+
+  .toast.success {
+    background-color: var(--bg-badge-success);
+    color: var(--accent-green);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+  }
+
+  .toast.error {
+    background-color: var(--bg-badge-danger);
+    color: var(--accent-red);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+  }
+
+  .faq-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .faq-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .faq-q {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .faq-a {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  .faq-a code {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--accent-primary);
+  }
+
+  .faq-a a {
+    color: var(--accent-primary);
+    text-decoration: none;
+  }
+
+  .faq-a a:hover {
+    text-decoration: underline;
+  }
+</style>

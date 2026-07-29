@@ -1,0 +1,597 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import MetricCard from '../components/MetricCard.astro';
+import ActivityChart from '../components/ActivityChart.astro';
+import ServicesTable from '../components/ServicesTable.astro';
+import { api, formatUptime, isServiceRunning } from '../lib/api';
+import type { ConnectionState } from '../lib/api';
+
+const { status, connection } = await api.getFleetStatus();
+const { services, connection: svcConn } = await api.getServices();
+const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === 'demo' ? 'demo' : connection;
+---
+
+<Layout title="Dashboard" activePath="/">
+  <Header
+    title="Overview"
+    subtitle="Self-hosted control plane for microVMs and container workloads."
+    connection={pageConn}
+  />
+
+  <div class="metrics-grid" id="metricsGrid">
+    <MetricCard
+      title="Fleet Health"
+      value={`${status.running_vms} / ${status.total_vms}`}
+      subtext={status.online ? 'All systems operational' : connection === 'offline' ? 'Control plane offline' : 'API unreachable'}
+      progressPercent={status.total_vms > 0 ? Math.round((status.running_vms / status.total_vms) * 100) : 0}
+      accentColor="var(--accent-green)"
+      trend={status.running_vms > 0 ? 'up' : 'down'}
+    />
+    <MetricCard
+      title="Longest Uptime"
+      value={status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '—'}
+      subtext="Across all services"
+      accentColor="var(--accent-primary)"
+    />
+    <MetricCard
+      title="API Latency"
+      value={status.online ? `${status.api_latency_ms} ms` : 'Offline'}
+      subtext={status.online ? 'Control plane reachable' : 'Unreachable'}
+      accentColor={status.online ? 'var(--accent-green)' : 'var(--accent-red)'}
+      trend={status.online ? 'up' : 'down'}
+    />
+    <MetricCard
+      title="Services"
+      value={`${services.length}`}
+      subtext={`${services.filter(s => isServiceRunning(s)).length} running`}
+      accentColor="var(--accent-primary)"
+    />
+  </div>
+
+  <ActivityChart status={status} services={services} />
+
+  <section class="recent-services-section" id="servicesSection">
+    <div class="section-header">
+      <div>
+        <h2 class="section-title">Active Fleet Status</h2>
+        <p class="subtitle">Recently deployed services and their current state.</p>
+      </div>
+      <a href="/services" class="btn btn-secondary btn-sm">View all</a>
+    </div>
+    {services.length > 0 ? (
+      <ServicesTable services={services.slice(0, 4)} />
+    ) : connection === 'offline' ? (
+      <div class="card-panel empty-state">
+        <p>Control plane offline.</p>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p>
+        <a href="/settings" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem">Open Settings</a>
+      </div>
+    ) : (
+      <div class="card-panel empty-state">
+        <p>No services configured.</p>
+        <a href="/deploy" class="btn btn-primary" style="margin-top: 0.75rem">Deploy your first service</a>
+      </div>
+    )}
+  </section>
+</Layout>
+
+<script>
+  import { api, formatUptime, isServiceRunning, probeEndpointPort } from '../lib/api';
+
+  const SAMPLE_KEY = 'RUSSEL_FLEET_SAMPLES';
+  const MAX_SAMPLES = 48;
+  const MIN_SAMPLE_INTERVAL_MS = 30_000;
+  const POLL_INTERVAL_MS = 10_000;
+
+  function escapeHtml(s: string): string {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function getHostPort(svc: any): number | null {
+    if (typeof svc.host_port === 'number') return svc.host_port;
+    const m = typeof svc.ports === 'string' ? svc.ports.match(/^\d+/) : null;
+    return m ? parseInt(m[0], 10) : null;
+  }
+
+  function renderPortCell(svc: any): string {
+    const hp = getHostPort(svc);
+    if (!hp) return `<span class="mono-text">\u2014</span>`;
+    return `<div class="port-cell"><span class="mono-text">${escapeHtml(svc.ports || '\u2014')}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
+  }
+
+  // ---- localStorage sampling ----
+
+  interface FleetSample {
+    t: number;
+    running: number;
+    stopped: number;
+    failed: number;
+    total: number;
+    api_ms: number;
+    ep_up: number;
+    ep_total: number;
+    ep_avg_ms: number | null;
+  }
+
+  function loadSamples(): FleetSample[] {
+    try {
+      const raw = localStorage.getItem(SAMPLE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      // Filter out old-format samples (pre-endpoint-probe migration)
+      if (Array.isArray(parsed)) return parsed.filter((s: any) => typeof s.ep_total === 'number');
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveSamples(samples: FleetSample[]): void {
+    try {
+      localStorage.setItem(SAMPLE_KEY, JSON.stringify(samples.slice(-MAX_SAMPLES)));
+    } catch { /* storage full — oldest samples already trimmed */ }
+  }
+
+  function appendSample(
+    status: { running_vms: number; stopped_vms: number; failed_vms: number; total_vms: number },
+    apiMs: number,
+    epUp: number,
+    epTotal: number,
+    epAvgMs: number | null,
+  ): void {
+    const samples = loadSamples();
+    const now = Date.now();
+    if (samples.length > 0 && now - samples[samples.length - 1].t < MIN_SAMPLE_INTERVAL_MS) return;
+    samples.push({
+      t: now,
+      running: status.running_vms,
+      stopped: status.stopped_vms,
+      failed: status.failed_vms,
+      total: status.total_vms,
+      api_ms: apiMs,
+      ep_up: epUp,
+      ep_total: epTotal,
+      ep_avg_ms: epAvgMs,
+    });
+    saveSamples(samples);
+  }
+
+  // ---- Endpoint probing ----
+
+  async function probeEndpoints(services: any[]): Promise<{ up: number; total: number; avgMs: number | null }> {
+    const probeable = services.filter((s: any) =>
+      (s.status === 'deployed' || s.status === 'running' || s.vm_state === 'running') &&
+      typeof s.host_port === 'number'
+    );
+    if (probeable.length === 0) return { up: 0, total: 0, avgMs: null };
+
+    const CONCURRENCY = 4;
+    const results: { up: boolean; ms: number | null }[] = [];
+
+    for (let i = 0; i < probeable.length; i += CONCURRENCY) {
+      const batch = probeable.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.allSettled(
+        batch.map((s: any) => probeEndpointPort(s.host_port as number))
+      );
+      for (const r of batchResults) {
+        if (r.status === 'fulfilled') {
+          results.push(r.value);
+        } else {
+          results.push({ up: false, ms: null });
+        }
+      }
+    }
+
+    const up = results.filter(r => r.up).length;
+    const upResults = results.filter(r => r.up && r.ms != null);
+    const avgMs = upResults.length > 0
+      ? Math.round(upResults.reduce((sum, r) => sum + r.ms!, 0) / upResults.length)
+      : null;
+
+    return { up, total: results.length, avgMs };
+  }
+
+  // ---- Endpoint health: stacked sparklines (independent Y scales) ----
+
+  function niceCeil(n: number): number {
+    if (n <= 0) return 1;
+    const exp = Math.floor(Math.log10(n));
+    const base = Math.pow(10, exp);
+    const frac = n / base;
+    const nice = frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 5 ? 5 : 10;
+    return nice * base;
+  }
+
+  function formatMs(v: number): string {
+    if (v >= 100) return `${Math.round(v)} ms`;
+    if (v >= 10) return `${Math.round(v)} ms`;
+    return `${Math.round(v * 10) / 10} ms`;
+  }
+
+  function seriesPaths(
+    vals: Array<number | null>,
+    w: number,
+    h: number,
+    yMin: number,
+    yMax: number,
+  ): { linePath: string; areaPath: string } {
+    const padX = 2;
+    const padT = 4;
+    const padB = 4;
+    const plotW = w - padX * 2;
+    const plotH = h - padT - padB;
+    const span = Math.max(yMax - yMin, 1e-6);
+    const n = vals.length;
+    const xs: number[] = [];
+    const ys: Array<number | null> = [];
+
+    for (let i = 0; i < n; i++) {
+      xs.push(padX + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW));
+      const v = vals[i];
+      if (v == null || !Number.isFinite(v)) {
+        ys.push(null);
+        continue;
+      }
+      const t = (Math.max(yMin, Math.min(yMax, v)) - yMin) / span;
+      ys.push(padT + plotH - t * plotH);
+    }
+
+    const baseY = (padT + plotH).toFixed(1);
+    const lineParts: string[] = [];
+    const areaParts: string[] = [];
+    let segStart = -1;
+    for (let i = 0; i <= n; i++) {
+      const valid = i < n && ys[i] != null;
+      if (valid && segStart < 0) segStart = i;
+      if ((!valid || i === n) && segStart >= 0) {
+        const end = i - 1;
+        if (end >= segStart) {
+          let lineD = `M ${xs[segStart].toFixed(1)} ${(ys[segStart] as number).toFixed(1)}`;
+          let areaD = `M ${xs[segStart].toFixed(1)} ${baseY} L ${xs[segStart].toFixed(1)} ${(ys[segStart] as number).toFixed(1)}`;
+          for (let j = segStart + 1; j <= end; j++) {
+            const pt = ` L ${xs[j].toFixed(1)} ${(ys[j] as number).toFixed(1)}`;
+            lineD += pt;
+            areaD += pt;
+          }
+          areaD += ` L ${xs[end].toFixed(1)} ${baseY} Z`;
+          lineParts.push(lineD);
+          areaParts.push(areaD);
+        }
+        segStart = -1;
+      }
+    }
+
+    return { linePath: lineParts.join(' '), areaPath: areaParts.join(' ') };
+  }
+
+  function lastFinite(vals: Array<number | null>): number | null {
+    for (let i = vals.length - 1; i >= 0; i--) {
+      if (vals[i] != null && Number.isFinite(vals[i]!)) return vals[i]!;
+    }
+    return null;
+  }
+
+  function paintSpark(
+    rowId: string,
+    lineId: string,
+    areaId: string,
+    valId: string,
+    subId: string,
+    rangeId: string,
+    vals: Array<number | null>,
+    opts: {
+      valueText: string;
+      subText: string;
+      unit: 'ms' | 'count';
+      floorZero?: boolean;
+    },
+  ): boolean {
+    const row = document.getElementById(rowId);
+    const line = document.getElementById(lineId);
+    const area = document.getElementById(areaId);
+    const valEl = document.getElementById(valId);
+    const subEl = document.getElementById(subId);
+    const rangeEl = document.getElementById(rangeId);
+    if (!row || !line || !area) return false;
+
+    const nums = vals.filter((v): v is number => v != null && Number.isFinite(v));
+    if (nums.length < 2) {
+      row.style.display = 'none';
+      return false;
+    }
+
+    const rawMin = Math.min(...nums);
+    const rawMax = Math.max(...nums);
+    let yMin: number;
+    let yMax: number;
+    if (opts.unit === 'count') {
+      yMin = Math.max(0, Math.floor(rawMin) - (rawMin === rawMax ? 1 : 0));
+      yMax = Math.max(rawMax + (rawMin === rawMax ? 1 : 0), yMin + 1);
+    } else {
+      // Latency: use own scale with small headroom so flat lines still read
+      yMin = opts.floorZero !== false ? 0 : Math.max(0, rawMin * 0.85);
+      if (rawMax - rawMin < 1) {
+        // Nearly flat — zoom in a bit so variance shows when present
+        yMin = opts.floorZero !== false ? 0 : Math.max(0, rawMin - 2);
+        yMax = niceCeil(Math.max(rawMax + 2, rawMin + 4, 5));
+      } else {
+        yMax = niceCeil(rawMax * 1.2);
+      }
+      if (yMax <= yMin) yMax = yMin + 1;
+    }
+
+    const w = 400;
+    const h = 48;
+    const paths = seriesPaths(vals, w, h, yMin, yMax);
+    line.setAttribute('d', paths.linePath);
+    area.setAttribute('d', paths.areaPath);
+
+    if (valEl) valEl.textContent = opts.valueText;
+    if (subEl) subEl.textContent = opts.subText;
+    if (rangeEl) {
+      if (opts.unit === 'ms') {
+        rangeEl.textContent = rawMin === rawMax
+          ? formatMs(rawMax)
+          : `${Math.round(rawMin)}–${Math.round(rawMax)} ms`;
+      } else {
+        rangeEl.textContent = rawMin === rawMax ? String(rawMax) : `${rawMin}–${rawMax}`;
+      }
+    }
+
+    row.style.display = '';
+    return true;
+  }
+
+  function renderEndpointChart(): void {
+    const samples = loadSamples();
+    const empty = document.getElementById('epChartEmpty');
+    const rows = document.getElementById('sparkRows');
+
+    const hideAll = () => {
+      for (const id of ['sparkRowEp', 'sparkRowApi', 'sparkRowRun']) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+      }
+      if (rows) rows.style.display = 'none';
+      if (empty) empty.style.display = '';
+    };
+
+    if (samples.length < 2) {
+      hideAll();
+      return;
+    }
+
+    const epVals: Array<number | null> = samples.map(s =>
+      s.ep_total > 0 && s.ep_avg_ms != null ? s.ep_avg_ms : null
+    );
+    const apiVals: Array<number | null> = samples.map(s =>
+      s.api_ms > 0 ? s.api_ms : null
+    );
+    const runningVals: Array<number | null> = samples.map(s => s.running);
+
+    const latest = samples[samples.length - 1];
+    const epLatest = lastFinite(epVals);
+    const apiLatest = lastFinite(apiVals);
+    const runLatest = lastFinite(runningVals);
+
+    const showedEp = paintSpark(
+      'sparkRowEp', 'sparkLineEp', 'sparkAreaEp', 'sparkValEp', 'sparkSubEp', 'sparkRangeEp',
+      epVals,
+      {
+        valueText: epLatest != null ? formatMs(epLatest) : '—',
+        subText: latest.ep_total > 0 ? `${latest.ep_up}/${latest.ep_total} up` : '',
+        unit: 'ms',
+      },
+    );
+
+    const showedApi = paintSpark(
+      'sparkRowApi', 'sparkLineApi', 'sparkAreaApi', 'sparkValApi', 'sparkSubApi', 'sparkRangeApi',
+      apiVals,
+      {
+        valueText: apiLatest != null ? formatMs(apiLatest) : '—',
+        subText: 'API latency',
+        unit: 'ms',
+      },
+    );
+
+    // Running count only when neither latency series is available
+    let showedRun = false;
+    if (!showedEp && !showedApi) {
+      showedRun = paintSpark(
+        'sparkRowRun', 'sparkLineRun', 'sparkAreaRun', 'sparkValRun', 'sparkSubRun', 'sparkRangeRun',
+        runningVals,
+        {
+          valueText: runLatest != null ? String(runLatest) : '—',
+          subText: 'fleet size',
+          unit: 'count',
+        },
+      );
+    } else {
+      const runRow = document.getElementById('sparkRowRun');
+      if (runRow) runRow.style.display = 'none';
+    }
+
+    const any = showedEp || showedApi || showedRun;
+    if (rows) rows.style.display = any ? '' : 'none';
+    if (empty) empty.style.display = any ? 'none' : '';
+  }
+
+  function updateLiveSummary(): void {
+    // Values live on each spark row now; keep as no-op for call sites
+  }
+
+  // ---- Bar updater ----
+
+  function updateBar(id: string, count: number, max: number): void {
+    const barRow = document.getElementById(id);
+    if (!barRow) return;
+    const fill = barRow.querySelector('.bar-fill') as HTMLElement | null;
+    const countEl = barRow.querySelector('.bar-count');
+    if (fill) fill.style.width = `${Math.max(0, (count / Math.max(max, 1)) * 100)}%`;
+    if (countEl) countEl.textContent = String(count);
+  }
+
+  function updateComposition(status: any, services: any[]): void {
+    const microvmCount = services.filter((s: any) => s.runtime === 'microvm').length;
+    const containerCount = services.filter((s: any) => s.runtime === 'container').length;
+    const barMax = Math.max(status.running_vms, status.stopped_vms, status.failed_vms, 1);
+    const runtimeMax = Math.max(microvmCount, containerCount, 1);
+    const hasFleet = (status.total_vms ?? services.length) > 0;
+
+    updateBar('barRunning', status.running_vms, barMax);
+    updateBar('barStopped', status.stopped_vms, barMax);
+    updateBar('barFailed', status.failed_vms, barMax);
+    updateBar('barMicrovm', microvmCount, runtimeMax);
+    updateBar('barContainer', containerCount, runtimeMax);
+
+    // Update fleet stats row values
+    const byId = (id: string, v: string) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    byId('statRunning', String(status.running_vms));
+    byId('statStopped', String(status.stopped_vms));
+    byId('statFailed', String(status.failed_vms));
+    byId('statMicrovm', String(microvmCount));
+    byId('statContainer', String(containerCount));
+    byId('statMaxUptime', status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '\u2014');
+
+    // Toggle empty callout + header CTA (bars stay mounted for live updates)
+    const empty = document.querySelector('#fleetComposition .fleet-empty') as HTMLElement | null;
+    if (empty) empty.style.display = hasFleet ? 'none' : '';
+    const cta = document.querySelector('#fleetComposition .panel-cta') as HTMLElement | null;
+    if (cta) cta.style.display = hasFleet ? 'none' : '';
+  }
+
+  // ---- Main hydrate ----
+
+  async function hydrate() {
+    const { status, connection } = await api.getFleetStatus();
+    const { services } = await api.getServices();
+
+    // Probe endpoints and collect sample
+    const apiMs = status.api_latency_ms;
+    let epUp = 0;
+    let epTotal = 0;
+    let epAvgMs: number | null = null;
+
+    if (connection === 'live') {
+      const probeResults = await probeEndpoints(services);
+      epUp = probeResults.up;
+      epTotal = probeResults.total;
+      epAvgMs = probeResults.avgMs;
+    } else if (connection === 'demo') {
+      // Synthesize mild demo endpoint samples (real probes would be CORS noise)
+      const probeable = services.filter((s: any) =>
+        (s.status === 'deployed' || s.status === 'running' || s.vm_state === 'running') &&
+        typeof s.host_port === 'number'
+      );
+      epTotal = probeable.length;
+      if (epTotal > 0) {
+        epUp = Math.max(0, epTotal - Math.floor(Math.random() * 2));
+        epAvgMs = Math.round(8 + Math.random() * 40);
+      }
+    }
+
+    appendSample(status, apiMs, epUp, epTotal, epAvgMs);
+    renderEndpointChart();
+    updateLiveSummary();
+
+    // Update composition bars
+    if (connection === 'live' || connection === 'demo') {
+      updateComposition(status, services);
+    }
+
+    // Update metrics
+    const grid = document.getElementById('metricsGrid');
+    if (grid && (connection === 'demo' || connection === 'live')) {
+      const active = services.filter((s: any) => isServiceRunning(s)).length;
+      const uptime = status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '\u2014';
+      const latency = status.online ? `${status.api_latency_ms} ms` : 'Offline';
+      const healthPct = status.total_vms > 0 ? Math.round((status.running_vms / status.total_vms) * 100) : 0;
+
+      grid.innerHTML = `
+        <div class="metric-card card-panel">
+          <span class="metric-title">Fleet Health</span>
+          <div class="metric-value-row"><span class="metric-value">${status.running_vms} / ${status.total_vms}</span></div>
+          <span class="metric-subtext">${status.online ? 'All systems operational' : 'API unreachable'}</span>
+          ${healthPct > 0 ? `<div class="metric-progress-track"><div class="metric-progress-fill" style="width:${healthPct}%;background-color:var(--accent-green)"></div></div>` : ''}
+        </div>
+        <div class="metric-card card-panel">
+          <span class="metric-title">Longest Uptime</span>
+          <div class="metric-value-row"><span class="metric-value">${uptime}</span></div>
+          <span class="metric-subtext">Across all services</span>
+        </div>
+        <div class="metric-card card-panel">
+          <span class="metric-title">API Latency</span>
+          <div class="metric-value-row"><span class="metric-value">${latency}</span></div>
+          <span class="metric-subtext">${status.online ? 'Control plane reachable' : 'Unreachable'}</span>
+        </div>
+        <div class="metric-card card-panel">
+          <span class="metric-title">Services</span>
+          <div class="metric-value-row"><span class="metric-value">${services.length}</span></div>
+          <span class="metric-subtext">${active} running</span>
+        </div>`;
+    }
+
+    // Update services table
+    const section = document.getElementById('servicesSection');
+    if (section) {
+      const headerRow = section.querySelector('.section-header');
+      if (services.length > 0) {
+        const rows = services.slice(0, 4).map((svc: any) => {
+          const statusClass = isServiceRunning(svc) ? 'badge-running' : 'badge-stopped';
+          const label = escapeHtml(svc.name || svc.id);
+          const secondaryId = (svc.name && svc.name !== svc.id) ? `<span class="service-id">${escapeHtml(svc.id)}</span>` : '';
+          return `<tr>
+            <td><div class="service-name-cell"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="service-link">${label}</a>${secondaryId}</div></td>
+            <td><span class="runtime-tag ${escapeHtml(svc.runtime)}">${svc.runtime === 'microvm' ? 'MicroVM' : 'Container'}</span></td>
+            <td><span class="badge ${statusClass}"><span class="badge-dot"></span>${escapeHtml(svc.status)}</span></td>
+            <td>${renderPortCell(svc)}</td>
+            <td style="text-align:right"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="btn btn-secondary btn-sm">Details</a></td>
+          </tr>`;
+        }).join('');
+        const tableHtml = `<div class="data-table-container"><table class="data-table"><thead><tr><th>Service / ID</th><th>Runtime</th><th>Status</th><th>Ports</th><th style="text-align:right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        // Replace everything after the header row
+        const afterHeader = section.querySelector('.data-table-container, .empty-state');
+        if (afterHeader) afterHeader.remove();
+        if (headerRow) headerRow.insertAdjacentHTML('afterend', tableHtml);
+      } else if (connection === 'offline') {
+        const afterHeader = section.querySelector('.data-table-container, .empty-state');
+        if (afterHeader) afterHeader.remove();
+        if (headerRow) {
+          headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>Control plane offline.</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`);
+        }
+      }
+    }
+  }
+
+  // Paint cached samples immediately; hydrate refreshes after probes
+  renderEndpointChart();
+  updateLiveSummary();
+  hydrate();
+  setInterval(hydrate, POLL_INTERVAL_MS);
+</script>
+
+<style>
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .recent-services-section {
+    margin-top: 2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+  }
+
+  .section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+</style>

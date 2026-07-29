@@ -1,0 +1,885 @@
+// ---- Real API types (mirroring crates/core/src/api.rs) ----
+
+export interface PortMapping {
+	host: number;
+	guest: number;
+}
+
+export interface DeployRequest {
+	repo_url: string;
+	config_path: string;
+	vm_id?: string;
+	port?: PortMapping;
+	runtime?: "microvm" | "container";
+	podman_args?: string[];
+	env?: Record<string, string>;
+}
+
+export interface DeployTiming {
+	resolve_ms: number;
+	build_ms: number;
+	create_ms: number;
+	start_ms: number;
+	network_ms: number;
+	ready_ms: number;
+}
+
+export interface DeployResponse {
+	service_id: string;
+	vm_id: string;
+	status: string;
+	store_path?: string;
+	microvm_config_path?: string;
+	runner_path?: string;
+	port?: PortMapping;
+	elapsed_ms: number;
+	message: string;
+	timing?: DeployTiming;
+	vm_ip?: string;
+	runtime?: "microvm" | "container";
+	route_host?: string;
+	backend_port?: number;
+}
+
+export type DeployEvent =
+	| { type: "Progress"; payload: { phase: string; description: string } }
+	| { type: "Complete"; payload: DeployResponse }
+	| { type: "Error"; payload: string };
+
+export interface ServiceSummary {
+	service_id: string;
+	runtime?: "microvm" | "container";
+	status: string;
+}
+
+export interface VmsResponse {
+	vms: string[];
+	services: ServiceSummary[];
+}
+
+export interface StatusResponse {
+	service_id: string;
+	status: string;
+	vm_state: string;
+	uptime_seconds: number;
+	runtime?: "microvm" | "container";
+	host_port?: number;
+	guest_port?: number;
+}
+
+export interface LogsResponse {
+	output: string;
+}
+
+export interface DeploymentRecord {
+	version: number;
+	generation_id?: string;
+	status: string; // active | previous | superseded | failed | rolled_back
+	runtime?: "microvm" | "container";
+	deployed_at: string;
+	store_path?: string;
+	repo_url?: string;
+	config_path?: string;
+	host_port?: number;
+	guest_port?: number;
+	message?: string;
+	rollback_ready?: boolean;
+}
+
+export interface DeploymentsResponse {
+	service_id: string;
+	active_version?: number;
+	deployments: DeploymentRecord[];
+}
+
+// ---- UI model (flattened for components) ----
+
+export interface ServiceVM {
+	id: string;
+	name?: string;
+	runtime: "microvm" | "container";
+	status: string;
+	vm_state?: string;
+	uptime_seconds?: number;
+	host_port?: number;
+	guest_port?: number;
+	ports?: string; // "host:guest" display string
+}
+
+export interface FleetStatus {
+	online: boolean;
+	total_vms: number;
+	running_vms: number;
+	stopped_vms: number;
+	failed_vms: number;
+	api_latency_ms: number;
+	max_uptime_seconds: number;
+}
+
+/** True only when the workload process is live — not generation/journal "active". */
+export function isServiceRunning(svc: {
+	status?: string;
+	vm_state?: string;
+}): boolean {
+	if (svc.vm_state === "running") return true;
+	if (
+		svc.vm_state === "none" ||
+		svc.vm_state === "stopped" ||
+		svc.vm_state === "failed" ||
+		svc.vm_state === "orphaned" ||
+		svc.vm_state === "pending"
+	) {
+		return false;
+	}
+	// Fallback when vm_state is missing (list summary only).
+	return svc.status === "deployed" || svc.status === "running";
+}
+
+export function isServiceFailed(svc: {
+	status?: string;
+	vm_state?: string;
+}): boolean {
+	return svc.vm_state === "failed" || svc.status === "failed";
+}
+
+// ---- Connection state ----
+
+export type ConnectionState = "live" | "demo" | "offline";
+
+export function getConnectionLabel(c: ConnectionState): string {
+	switch (c) {
+		case "live":
+			return "Live";
+		case "demo":
+			return "Demo";
+		case "offline":
+			return "Offline";
+	}
+}
+
+// ---- Demo mode / settings ----
+
+export function isDemoMode(): boolean {
+	if (typeof window === "undefined") return false;
+	return localStorage.getItem("RUSSEL_DEMO_MODE") === "1";
+}
+
+export function setDemoMode(on: boolean): void {
+	if (typeof window === "undefined") return;
+	localStorage.setItem("RUSSEL_DEMO_MODE", on ? "1" : "0");
+}
+
+export function getApiBase(): string {
+	if (typeof window !== "undefined") {
+		return localStorage.getItem("RUSSEL_API_URL") || "/api";
+	}
+	return (import.meta as any).env?.PUBLIC_RUSSEL_API || "/api";
+}
+
+export function getApiToken(): string | null {
+	if (typeof window !== "undefined") {
+		return localStorage.getItem("RUSSEL_API_TOKEN") || null;
+	}
+	return (import.meta as any).env?.PUBLIC_RUSSEL_API_TOKEN || null;
+}
+
+export function setApiBase(url: string): void {
+	if (typeof window === "undefined") return;
+	localStorage.setItem("RUSSEL_API_URL", url);
+}
+
+export function setApiToken(token: string): void {
+	if (typeof window === "undefined") return;
+	localStorage.setItem("RUSSEL_API_TOKEN", token);
+}
+
+// ---- Helpers ----
+
+export function formatUptime(seconds?: number): string {
+	if (!seconds || seconds <= 0) return "—";
+	const d = Math.floor(seconds / 86400);
+	const h = Math.floor((seconds % 86400) / 3600);
+	const m = Math.floor((seconds % 3600) / 60);
+	if (d > 0) return `${d}d ${h}h`;
+	if (h > 0) return `${h}h ${m}m`;
+	return `${m}m ${seconds % 60}s`;
+}
+
+/** Probe a host port via no-cors fetch. Returns up/down and latency in ms. */
+export async function probeEndpointPort(
+	hostPort: number,
+): Promise<{ up: boolean; ms: number | null }> {
+	const url = `http://127.0.0.1:${hostPort}/`;
+	const t0 = performance.now();
+	try {
+		await fetch(url, {
+			mode: "no-cors",
+			cache: "no-store",
+			signal: AbortSignal.timeout(2000),
+		});
+		return { up: true, ms: Math.round(performance.now() - t0) };
+	} catch {
+		return { up: false, ms: null };
+	}
+}
+
+function portDisplay(host?: number, guest?: number): string {
+	if (host != null && guest != null) return `${host}:${guest}`;
+	if (host != null) return `${host}`;
+	if (guest != null) return `:${guest}`;
+	return "—";
+}
+
+// ---- Mock data (demo mode only) ----
+
+const MOCK_DEPLOYMENTS: DeploymentRecord[] = [
+	{
+		version: 3,
+		generation_id: "gen-c3d2e1",
+		status: "active",
+		runtime: "container",
+		deployed_at: new Date(Date.now() - 3600_000).toISOString(),
+		store_path: "/var/lib/russel/vms/vm-gw-89a1",
+		repo_url: "https://github.com/org/api-gateway",
+		config_path: "russel.toml",
+		host_port: 8080,
+		guest_port: 80,
+		message: "Zero-downtime cutover: container gen promoted via ingress swap",
+	},
+	{
+		version: 2,
+		generation_id: "gen-b2a1f0",
+		status: "previous",
+		runtime: "microvm",
+		deployed_at: new Date(Date.now() - 86_400_000).toISOString(),
+		store_path: "/var/lib/russel/vms/vm-gw-89a1-v2",
+		repo_url: "https://github.com/org/api-gateway",
+		config_path: "russel.toml",
+		host_port: 8080,
+		guest_port: 80,
+		message: "Dual-live microVM generation (previous)",
+		rollback_ready: true,
+	},
+	{
+		version: 1,
+		generation_id: "gen-a0b9c8",
+		status: "superseded",
+		runtime: "container",
+		deployed_at: new Date(Date.now() - 604_800_000).toISOString(),
+		store_path: "/var/lib/russel/vms/vm-gw-89a1-v1",
+		repo_url: "https://github.com/org/api-gateway",
+		config_path: "russel.toml",
+		host_port: 8080,
+		guest_port: 80,
+		message: "Initial container deploy",
+	},
+];
+
+const MOCK_SERVICES: ServiceVM[] = [
+	{
+		id: "vm-gw-89a1",
+		name: "api-gateway",
+		runtime: "microvm",
+		status: "deployed",
+		vm_state: "running",
+		uptime_seconds: 367200,
+		host_port: 8080,
+		guest_port: 80,
+		ports: "8080:80",
+	},
+	{
+		id: "vm-auth-44b2",
+		name: "auth-service",
+		runtime: "container",
+		status: "deployed",
+		vm_state: "running",
+		uptime_seconds: 172800,
+		host_port: 8081,
+		guest_port: 8080,
+		ports: "8081:8080",
+	},
+	{
+		id: "vm-db-11c9",
+		name: "postgres-primary",
+		runtime: "container",
+		status: "deployed",
+		vm_state: "running",
+		uptime_seconds: 864000,
+		host_port: 5432,
+		guest_port: 5432,
+		ports: "5432:5432",
+	},
+	{
+		id: "vm-wrk-99x5",
+		name: "async-worker-pool",
+		runtime: "microvm",
+		status: "stopped",
+		vm_state: "stopped",
+		uptime_seconds: 0,
+		ports: "—",
+	},
+	{
+		id: "vm-rd-33d7",
+		name: "redis-cache",
+		runtime: "container",
+		status: "deployed",
+		vm_state: "running",
+		uptime_seconds: 259200,
+		host_port: 6379,
+		guest_port: 6379,
+		ports: "6379:6379",
+	},
+];
+
+// ---- Client ----
+
+export class RusselClient {
+	private getHeaders(): Record<string, string> {
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+		};
+		const token = getApiToken();
+		if (token) headers["Authorization"] = `Bearer ${token}`;
+		return headers;
+	}
+
+	// ponyail: shared concurrency-4 batched status fetcher, used by getServices + getFleetStatus
+	private async fetchStatuses(
+		ids: string[],
+	): Promise<Map<string, StatusResponse>> {
+		const map = new Map<string, StatusResponse>();
+		const concurrency = 4;
+		for (let i = 0; i < ids.length; i += concurrency) {
+			const batch = ids.slice(i, i + concurrency);
+			const results = await Promise.allSettled(
+				batch.map((id) =>
+					fetch(`${getApiBase()}/vm/${encodeURIComponent(id)}/status`, {
+						headers: this.getHeaders(),
+						signal: AbortSignal.timeout(3000),
+					}).then((r) => (r.ok ? (r.json() as Promise<StatusResponse>) : null)),
+				),
+			);
+			for (const r of results) {
+				if (r.status === "fulfilled" && r.value) {
+					map.set(r.value.service_id, r.value);
+				}
+			}
+		}
+		return map;
+	}
+
+	async getServices(): Promise<{
+		services: ServiceVM[];
+		connection: ConnectionState;
+		isDemo: boolean;
+	}> {
+		if (isDemoMode())
+			return { services: MOCK_SERVICES, connection: "demo", isDemo: true };
+		try {
+			const res = await fetch(`${getApiBase()}/vms`, {
+				headers: this.getHeaders(),
+				signal: AbortSignal.timeout(3000),
+			});
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data: VmsResponse = await res.json();
+			const summaries = data.services || [];
+			const statuses = await this.fetchStatuses(
+				summaries.map((s) => s.service_id),
+			);
+			const services: ServiceVM[] = summaries.map((s) => {
+				const st = statuses.get(s.service_id);
+				if (st) {
+					return {
+						id: s.service_id,
+						runtime: st.runtime || s.runtime || "microvm",
+						status: st.status,
+						vm_state: st.vm_state,
+						uptime_seconds: st.uptime_seconds,
+						host_port: st.host_port,
+						guest_port: st.guest_port,
+						ports: portDisplay(st.host_port, st.guest_port),
+					};
+				}
+				return {
+					id: s.service_id,
+					runtime: s.runtime || "microvm",
+					status: s.status,
+					ports: "—",
+				};
+			});
+			return { services, connection: "live", isDemo: false };
+		} catch {
+			return { services: [], connection: "offline", isDemo: false };
+		}
+	}
+
+	async getFleetStatus(): Promise<{
+		status: FleetStatus;
+		connection: ConnectionState;
+		isDemo: boolean;
+	}> {
+		if (isDemoMode()) {
+			return {
+				status: {
+					online: true,
+					total_vms: MOCK_SERVICES.length,
+					running_vms: MOCK_SERVICES.filter((s) => isServiceRunning(s)).length,
+					stopped_vms: MOCK_SERVICES.filter(
+						(s) => !isServiceRunning(s) && !isServiceFailed(s),
+					).length,
+					failed_vms: 0,
+					api_latency_ms: 0,
+					max_uptime_seconds: Math.max(
+						...MOCK_SERVICES.map((s) => s.uptime_seconds || 0),
+					),
+				},
+				connection: "demo",
+				isDemo: true,
+			};
+		}
+
+		const start = performance.now();
+		try {
+			const res = await fetch(`${getApiBase()}/vms`, {
+				headers: this.getHeaders(),
+				signal: AbortSignal.timeout(3000),
+			});
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data: VmsResponse = await res.json();
+			const latency = Math.round(performance.now() - start);
+
+			const summaries = data.services || [];
+			let running = 0;
+			let stopped = 0;
+			let failed = 0;
+			let maxUptime = 0;
+
+			// Fetch per-service status in parallel with concurrency ~4
+			const statuses = await this.fetchStatuses(
+				summaries.map((s) => s.service_id),
+			);
+
+			for (const s of statuses.values()) {
+				if (isServiceRunning(s)) running++;
+				else if (isServiceFailed(s)) failed++;
+				else stopped++;
+				if (isServiceRunning(s) && s.uptime_seconds > maxUptime) {
+					maxUptime = s.uptime_seconds;
+				}
+			}
+
+			// Fallback: use summary statuses if no per-service statuses fetched
+			if (statuses.size === 0) {
+				for (const s of summaries) {
+					if (isServiceRunning(s)) running++;
+					else if (isServiceFailed(s)) failed++;
+					else stopped++;
+				}
+			}
+
+			return {
+				status: {
+					online: true,
+					total_vms: summaries.length,
+					running_vms: running,
+					stopped_vms: stopped,
+					failed_vms: failed,
+					api_latency_ms: latency,
+					max_uptime_seconds: maxUptime,
+				},
+				connection: "live",
+				isDemo: false,
+			};
+		} catch {
+			return {
+				status: {
+					online: false,
+					total_vms: 0,
+					running_vms: 0,
+					stopped_vms: 0,
+					failed_vms: 0,
+					api_latency_ms: 0,
+					max_uptime_seconds: 0,
+				},
+				connection: "offline",
+				isDemo: false,
+			};
+		}
+	}
+
+	// Legacy alias for pages that call getStatus()
+	async getStatus(): Promise<{
+		status: FleetStatus;
+		connection: ConnectionState;
+		isDemo: boolean;
+	}> {
+		return this.getFleetStatus();
+	}
+
+	async getServiceDetail(id: string): Promise<{
+		service: ServiceVM | null;
+		connection: ConnectionState;
+		isDemo: boolean;
+	}> {
+		if (isDemoMode()) {
+			const found =
+				MOCK_SERVICES.find((s) => s.id === id || s.name === id) ||
+				MOCK_SERVICES[0];
+			return { service: found, connection: "demo", isDemo: true };
+		}
+		try {
+			const res = await fetch(
+				`${getApiBase()}/vm/${encodeURIComponent(id)}/status`,
+				{
+					headers: this.getHeaders(),
+					signal: AbortSignal.timeout(3000),
+				},
+			);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data: StatusResponse = await res.json();
+			const svc: ServiceVM = {
+				id: data.service_id,
+				runtime: data.runtime || "microvm",
+				status: data.status,
+				vm_state: data.vm_state,
+				uptime_seconds: data.uptime_seconds,
+				host_port: data.host_port,
+				guest_port: data.guest_port,
+				ports: portDisplay(data.host_port, data.guest_port),
+			};
+			return { service: svc, connection: "live", isDemo: false };
+		} catch {
+			return { service: null, connection: "offline", isDemo: false };
+		}
+	}
+
+	async getDeployments(id: string): Promise<{
+		data: DeploymentsResponse | null;
+		connection: ConnectionState;
+		supported: boolean;
+	}> {
+		if (isDemoMode()) {
+			// Return mock history for any known mock service id
+			const known = MOCK_SERVICES.some((s) => s.id === id || s.name === id);
+			if (known) {
+				return {
+					data: {
+						service_id: id,
+						active_version: 3,
+						deployments: MOCK_DEPLOYMENTS,
+					},
+					connection: "demo",
+					supported: true,
+				};
+			}
+			return { data: null, connection: "demo", supported: false };
+		}
+		try {
+			const res = await fetch(
+				`${getApiBase()}/vm/${encodeURIComponent(id)}/deployments`,
+				{ headers: this.getHeaders(), signal: AbortSignal.timeout(5000) },
+			);
+			if (res.status === 404) {
+				return { data: null, connection: "live", supported: false };
+			}
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data: DeploymentsResponse = await res.json();
+			return { data, connection: "live", supported: true };
+		} catch {
+			return { data: null, connection: "offline", supported: false };
+		}
+	}
+
+	async rollbackService(
+		id: string,
+		version?: number,
+	): Promise<{ success: boolean; message: string; supported: boolean }> {
+		if (isDemoMode()) {
+			return {
+				success: true,
+				message: `[Demo] Rolled back service ${id} to version ${version || "previous"}.`,
+				supported: true,
+			};
+		}
+		try {
+			const body = version != null ? JSON.stringify({ version }) : "{}";
+			const res = await fetch(
+				`${getApiBase()}/vm/${encodeURIComponent(id)}/rollback`,
+				{
+					method: "POST",
+					headers: this.getHeaders(),
+					body,
+					signal: AbortSignal.timeout(10_000),
+				},
+			);
+			if (res.status === 404) {
+				return { success: false, message: "", supported: false };
+			}
+			if (!res.ok) {
+				const text = await res.text().catch(() => "");
+				return {
+					success: false,
+					message: `Rollback failed: HTTP ${res.status}${text ? ` — ${text}` : ""}`,
+					supported: true,
+				};
+			}
+			let msg = `Service ${id} rollback initiated.`;
+			const json = await res.json().catch(() => null);
+			if (json?.message) msg = json.message;
+			return { success: true, message: msg, supported: true };
+		} catch (e: any) {
+			return {
+				success: false,
+				message: `Rollback request failed: ${e.message || "network error"}`,
+				supported: true,
+			};
+		}
+	}
+
+	async getServiceLogs(id: string): Promise<string> {
+		if (isDemoMode()) {
+			const ts = new Date().toISOString();
+			return `[${ts}] [INFO] Starting service ${id}...
+[${ts}] [INFO] Attached guest tap interface tap0 (192.168.127.2/24)
+[${ts}] [INFO] Cloud-Hypervisor booted kernel vmlinux-6.6 in 142ms
+[${ts}] [INFO] Init process spawned PID 1 (russel-guest-init)
+[${ts}] [INFO] Service listening on 0.0.0.0:8080 (forwarded from host 8080)
+[${ts}] [DEBUG] Health check GET /health HTTP/1.1 -> 200 OK (0.8ms)
+[${ts}] [INFO] Memory RSS: 142 MB, CPU usage: 1.4%
+[${ts}] [INFO] Received 1420 HTTP requests in last 60s (0 errors)`;
+		}
+		try {
+			const res = await fetch(
+				`${getApiBase()}/vm/${encodeURIComponent(id)}/logs`,
+				{
+					headers: this.getHeaders(),
+					signal: AbortSignal.timeout(5000),
+				},
+			);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const text = await res.text();
+			try {
+				const json: LogsResponse = JSON.parse(text);
+				return json.output;
+			} catch {
+				return text; // text fallback
+			}
+		} catch {
+			return `[Error] Could not fetch logs for ${id}.`;
+		}
+	}
+
+	async stopService(
+		id: string,
+	): Promise<{ success: boolean; message: string }> {
+		if (isDemoMode()) {
+			return {
+				success: true,
+				message: `[Demo] Service ${id} stop signal sent.`,
+			};
+		}
+		try {
+			const res = await fetch(
+				`${getApiBase()}/vm/${encodeURIComponent(id)}/stop`,
+				{
+					method: "POST",
+					headers: this.getHeaders(),
+				},
+			);
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				return {
+					success: false,
+					message: `Stop failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`,
+				};
+			}
+			return { success: true, message: `Service ${id} stopped.` };
+		} catch (e: any) {
+			return {
+				success: false,
+				message: `Stop request failed: ${e.message || "network error"}`,
+			};
+		}
+	}
+
+	async updateService(
+		id: string,
+	): Promise<{ success: boolean; message: string }> {
+		if (isDemoMode()) {
+			return {
+				success: true,
+				message: `[Demo] Service ${id} update initiated.`,
+			};
+		}
+		try {
+			const res = await fetch(
+				`${getApiBase()}/vm/${encodeURIComponent(id)}/update`,
+				{
+					method: "POST",
+					headers: this.getHeaders(),
+					body: "{}",
+				},
+			);
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				return {
+					success: false,
+					message: `Update failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`,
+				};
+			}
+			return { success: true, message: `Service ${id} updated.` };
+		} catch (e: any) {
+			return {
+				success: false,
+				message: `Update request failed: ${e.message || "network error"}`,
+			};
+		}
+	}
+
+	async destroyService(
+		id: string,
+	): Promise<{ success: boolean; message: string }> {
+		if (isDemoMode()) {
+			return { success: true, message: `[Demo] Service ${id} destroyed.` };
+		}
+		try {
+			const res = await fetch(`${getApiBase()}/vm/${encodeURIComponent(id)}`, {
+				method: "DELETE",
+				headers: this.getHeaders(),
+			});
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				return {
+					success: false,
+					message: `Destroy failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`,
+				};
+			}
+			return { success: true, message: `Service ${id} destroyed.` };
+		} catch (e: any) {
+			return {
+				success: false,
+				message: `Destroy request failed: ${e.message || "network error"}`,
+			};
+		}
+	}
+
+	async deployService(
+		payload: DeployRequest,
+		onEvent?: (event: DeployEvent) => void,
+	): Promise<{ success: boolean }> {
+		if (isDemoMode()) {
+			const demoEvents: DeployEvent[] = [
+				{
+					type: "Progress",
+					payload: { phase: "resolve", description: "Resolving repository..." },
+				},
+				{
+					type: "Progress",
+					payload: {
+						phase: "build",
+						description: "Building image / downloading rootfs...",
+					},
+				},
+				{
+					type: "Progress",
+					payload: {
+						phase: "create",
+						description: "Configuring network bridge & tap interface...",
+					},
+				},
+				{
+					type: "Progress",
+					payload: {
+						phase: "start",
+						description: "Launching Cloud-Hypervisor instance...",
+					},
+				},
+				{
+					type: "Complete",
+					payload: {
+						service_id: payload.vm_id || "demo-svc",
+						vm_id: payload.vm_id || "demo-vm",
+						status: "deployed",
+						elapsed_ms: 2400,
+						port: payload.port,
+						message: "Deployment complete!",
+						runtime: payload.runtime || "microvm",
+					},
+				},
+			];
+			for (const ev of demoEvents) {
+				if (onEvent) onEvent(ev);
+				await new Promise((r) => setTimeout(r, 400));
+			}
+			return { success: true };
+		}
+
+		try {
+			const res = await fetch(`${getApiBase()}/deploy`, {
+				method: "POST",
+				headers: this.getHeaders(),
+				body: JSON.stringify(payload),
+			});
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				if (onEvent)
+					onEvent({ type: "Error", payload: `HTTP ${res.status}: ${body}` });
+				return { success: false };
+			}
+			// Parse NDJSON stream
+			const text = await res.text();
+			const lines = text.split("\n").filter((l) => l.trim());
+			for (const line of lines) {
+				try {
+					const parsed = JSON.parse(line);
+					// Determine event type from shape
+					if (parsed.type === "Progress") {
+						if (onEvent)
+							onEvent({ type: "Progress", payload: parsed.payload || parsed });
+					} else if (parsed.type === "Complete") {
+						if (onEvent)
+							onEvent({ type: "Complete", payload: parsed.payload || parsed });
+					} else if (parsed.type === "Error") {
+						if (onEvent)
+							onEvent({
+								type: "Error",
+								payload: parsed.payload || parsed.message || line,
+							});
+					} else if (parsed.service_id && parsed.status) {
+						// Bare DeployResponse
+						if (onEvent) onEvent({ type: "Complete", payload: parsed });
+					} else if (parsed.phase) {
+						if (onEvent)
+							onEvent({
+								type: "Progress",
+								payload: {
+									phase: parsed.phase,
+									description: parsed.description || parsed.message || "",
+								},
+							});
+					} else {
+						// Unknown, show raw
+						if (onEvent)
+							onEvent({
+								type: "Progress",
+								payload: { phase: "unknown", description: line },
+							});
+					}
+				} catch {
+					if (onEvent)
+						onEvent({
+							type: "Progress",
+							payload: { phase: "raw", description: line },
+						});
+				}
+			}
+			return { success: true };
+		} catch (e: any) {
+			if (onEvent)
+				onEvent({ type: "Error", payload: e.message || "network error" });
+			return { success: false };
+		}
+	}
+}
+
+export const api = new RusselClient();

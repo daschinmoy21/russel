@@ -1,0 +1,105 @@
+---
+import type { ConnectionState } from '../lib/api';
+
+interface Props {
+  title: string;
+  subtitle?: string;
+  connection?: ConnectionState;
+  isDemo?: boolean;
+}
+
+const { title, subtitle, connection, isDemo = false } = Astro.props;
+const effective = connection ?? (isDemo ? 'demo' as const : 'live' as const);
+
+const badgeLabel = { live: 'LIVE', demo: 'DEMO', offline: 'OFFLINE' }[effective];
+const badgeClass = { live: 'badge-online', demo: 'badge-demo', offline: 'badge-offline' }[effective];
+const badgeTitle = {
+  live: 'Connected to russel-ctrl',
+  demo: 'Demo mode — mock data (Settings)',
+  offline: 'Control plane unreachable — start russel-ctrl or enable Demo mode',
+}[effective];
+---
+
+<header class="top-header">
+  <div class="header-titles">
+    <h1 class="page-title">{title}</h1>
+    {subtitle && <p class="subtitle">{subtitle}</p>}
+  </div>
+
+  <div class="header-actions">
+    <span class="api-base-tag" id="apiBaseTag">/api</span>
+    <div class={`badge ${badgeClass}`} id="connBadge" title={badgeTitle}>
+      <span class="badge-dot"></span>
+      {badgeLabel}
+    </div>
+  </div>
+</header>
+
+<script>
+  import { getApiBase, isDemoMode, api } from '../lib/api';
+
+  const tag = document.getElementById('apiBaseTag');
+  if (tag) tag.textContent = getApiBase();
+
+  // Client-side probe: SSR can't see localStorage, so re-evaluate connection state
+  const badgeEl = document.getElementById('connBadge');
+  if (badgeEl) {
+    (async () => {
+      if (isDemoMode()) {
+        badgeEl.className = 'badge badge-demo';
+        badgeEl.innerHTML = '<span class="badge-dot"></span>DEMO';
+        badgeEl.title = 'Demo mode — mock data (Settings)';
+        return;
+      }
+      try {
+        const { connection } = await api.getFleetStatus();
+        if (connection === 'live') {
+          badgeEl.className = 'badge badge-online';
+          badgeEl.innerHTML = '<span class="badge-dot"></span>LIVE';
+          badgeEl.title = 'Connected to russel-ctrl';
+        } else {
+          badgeEl.className = 'badge badge-offline';
+          badgeEl.innerHTML = '<span class="badge-dot"></span>OFFLINE';
+          badgeEl.title = 'Control plane unreachable — start russel-ctrl or enable Demo mode';
+        }
+      } catch {
+        badgeEl.className = 'badge badge-offline';
+        badgeEl.innerHTML = '<span class="badge-dot"></span>OFFLINE';
+        badgeEl.title = 'Control plane unreachable — start russel-ctrl or enable Demo mode';
+      }
+    })();
+  }
+</script>
+
+<style>
+  .top-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 1.75rem;
+    gap: 1rem;
+  }
+
+  .header-titles {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-shrink: 0;
+  }
+
+  .api-base-tag {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    background: var(--bg-input);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-sm);
+    padding: 0.2rem 0.55rem;
+  }
+</style>

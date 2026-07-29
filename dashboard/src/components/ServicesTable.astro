@@ -1,0 +1,79 @@
+---
+import type { ServiceVM } from '../lib/api';
+import { formatUptime, isServiceRunning } from '../lib/api';
+
+interface Props {
+  services: ServiceVM[];
+}
+
+const { services } = Astro.props;
+
+function getHostPort(svc: ServiceVM): number | null {
+  if (typeof svc.host_port === 'number') return svc.host_port;
+  const m = svc.ports?.match(/^\d+/);
+  return m ? parseInt(m[0], 10) : null;
+}
+---
+
+<div class="data-table-container">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Service / ID</th>
+        <th>Runtime</th>
+        <th>Status</th>
+        <th>Ports</th>
+        <th>Uptime</th>
+        <th style="text-align: right;">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {services.map(svc => (
+        <tr>
+          <td>
+            <div class="service-name-cell">
+              <a href={`/service-detail?id=${svc.id}`} class="service-link">
+                {svc.name || svc.id}
+              </a>
+              {svc.name && svc.name !== svc.id ? <span class="service-id">{svc.id}</span> : null}
+            </div>
+          </td>
+          <td>
+            <span class={`runtime-tag ${svc.runtime}`}>
+              {svc.runtime === 'microvm' ? 'MicroVM' : 'Container'}
+            </span>
+          </td>
+          <td>
+            <span class={`badge ${isServiceRunning(svc) ? 'badge-running' : 'badge-stopped'}`}>
+              <span class="badge-dot"></span>
+              {svc.status}
+            </span>
+          </td>
+          <td>
+            {getHostPort(svc) != null ? (
+              <div class="port-cell">
+                <span class="mono-text">{svc.ports || '—'}</span>
+                <a class="port-link" href={`http://localhost:${getHostPort(svc)}`} target="_blank" rel="noopener noreferrer">localhost:{getHostPort(svc)}</a>
+              </div>
+            ) : (
+              <span class="mono-text">—</span>
+            )}
+          </td>
+          <td>
+            <span class="mono-text">{formatUptime(svc.uptime_seconds)}</span>
+          </td>
+          <td>
+            <div class="row-actions">
+              <a href={`/service-detail?id=${svc.id}`} class="btn btn-secondary btn-sm">Details</a>
+              <button class="btn btn-secondary btn-sm" data-action="update" data-id={svc.id}>Update</button>
+              <button class="btn btn-secondary btn-sm" data-action="stop" data-id={svc.id}>Stop</button>
+              <button class="btn btn-danger btn-sm" data-action="destroy" data-id={svc.id}>Destroy</button>
+            </div>
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>
+
+

@@ -1,0 +1,520 @@
+---
+import type { FleetStatus, ServiceVM } from '../lib/api';
+import { formatUptime } from '../lib/api';
+
+interface Props {
+  status: FleetStatus;
+  services: ServiceVM[];
+}
+
+const { status, services } = Astro.props;
+
+const microvmCount = services.filter(s => s.runtime === 'microvm').length;
+const containerCount = services.filter(s => s.runtime === 'container').length;
+
+const barMax = Math.max(status.running_vms, status.stopped_vms, status.failed_vms, 1);
+const runtimeMax = Math.max(microvmCount, containerCount, 1);
+
+const hasFleet = status.total_vms > 0;
+
+// Colors
+const green = '#10b981';
+const amber = '#f59e0b';
+const red = '#ef4444';
+const purple = '#7C3AED';
+const cyan = '#0891B2';
+
+function barX(v: number, max: number): number {
+  return Math.max(0, (v / max) * 100);
+}
+---
+
+<div class="composition-panel card-panel" id="fleetComposition">
+  <div class="panel-header">
+    <div>
+      <h2 class="section-title">Fleet Composition</h2>
+      <p class="panel-subtitle">Live counts from the control plane</p>
+    </div>
+    {!hasFleet && (
+      <a href="/deploy" class="btn btn-primary btn-sm panel-cta">Deploy service</a>
+    )}
+  </div>
+
+  {hasFleet ? null : (
+    <div class="fleet-empty" role="status">
+      <div class="fleet-empty-copy">
+        <span class="fleet-empty-title">Fleet is empty</span>
+        <span class="fleet-empty-hint">Deploy a microVM or container to populate status, runtime mix, and live counts.</span>
+      </div>
+    </div>
+  )}
+
+  <!-- A) Status breakdown bars — always mounted so client hydrate can update -->
+  <div class="bars-grid" id="compositionBars">
+    <div class="bars-section" aria-label="Status breakdown">
+      <h3 class="bars-label">Status</h3>
+      <div class="bar-row" id="barRunning">
+        <span class="bar-name">Running</span>
+        <span class="bar-track" role="img" aria-label={`Running: ${status.running_vms} of ${status.total_vms}`}>
+          <span class="bar-fill" style={`width:${barX(status.running_vms, barMax)}%;background:${green}`}></span>
+        </span>
+        <span class="bar-count" id="countRunning">{status.running_vms}</span>
+      </div>
+      <div class="bar-row" id="barStopped">
+        <span class="bar-name">Stopped</span>
+        <span class="bar-track" role="img" aria-label={`Stopped: ${status.stopped_vms} of ${status.total_vms}`}>
+          <span class="bar-fill" style={`width:${barX(status.stopped_vms, barMax)}%;background:${amber}`}></span>
+        </span>
+        <span class="bar-count" id="countStopped">{status.stopped_vms}</span>
+      </div>
+      <div class="bar-row" id="barFailed">
+        <span class="bar-name">Failed</span>
+        <span class="bar-track" role="img" aria-label={`Failed: ${status.failed_vms} of ${status.total_vms}`}>
+          <span class="bar-fill" style={`width:${barX(status.failed_vms, barMax)}%;background:${red}`}></span>
+        </span>
+        <span class="bar-count" id="countFailed">{status.failed_vms}</span>
+      </div>
+    </div>
+
+    <!-- B) Runtime mix bars -->
+    <div class="bars-section" aria-label="Runtime mix">
+      <h3 class="bars-label">Runtime</h3>
+      <div class="bar-row" id="barMicrovm">
+        <span class="bar-name">MicroVM</span>
+        <span class="bar-track" role="img" aria-label={`MicroVM: ${microvmCount}`}>
+          <span class="bar-fill" style={`width:${barX(microvmCount, runtimeMax)}%;background:${purple}`}></span>
+        </span>
+        <span class="bar-count" id="countMicrovm">{microvmCount}</span>
+      </div>
+      <div class="bar-row" id="barContainer">
+        <span class="bar-name">Container</span>
+        <span class="bar-track" role="img" aria-label={`Container: ${containerCount}`}>
+          <span class="bar-fill" style={`width:${barX(containerCount, runtimeMax)}%;background:${cyan}`}></span>
+        </span>
+        <span class="bar-count" id="countContainer">{containerCount}</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- D) Fleet stats row -->
+  <div class="fleet-stats-row" id="fleetStatsRow">
+    <div class="fleet-stat">
+      <span class="fleet-stat-value" style="color: var(--accent-green)" id="statRunning">{status.running_vms}</span>
+      <span class="fleet-stat-label">running</span>
+    </div>
+    <div class="fleet-stat">
+      <span class="fleet-stat-value" id="statStopped">{status.stopped_vms}</span>
+      <span class="fleet-stat-label">stopped</span>
+    </div>
+    <div class="fleet-stat">
+      <span class="fleet-stat-value" id="statFailed">{status.failed_vms}</span>
+      <span class="fleet-stat-label">failed</span>
+    </div>
+    <div class="fleet-stat">
+      <span class="fleet-stat-value" id="statMicrovm">{microvmCount}</span>
+      <span class="fleet-stat-label">microVMs</span>
+    </div>
+    <div class="fleet-stat">
+      <span class="fleet-stat-value" id="statContainer">{containerCount}</span>
+      <span class="fleet-stat-label">containers</span>
+    </div>
+    <div class="fleet-stat">
+      <span class="fleet-stat-value" id="statMaxUptime">{status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '—'}</span>
+      <span class="fleet-stat-label">max uptime</span>
+    </div>
+  </div>
+
+  <!-- C) Endpoint health — full-width stacked sparklines -->
+  <div class="sparkline-section" id="endpointHealthSection">
+    <div class="sparkline-header">
+      <div class="sparkline-title-block">
+        <span class="sparkline-label">Endpoint health</span>
+        <span class="sparkline-hint">Browser probes of host ports + control-plane API (not ingress RPS)</span>
+      </div>
+    </div>
+
+    <p id="epChartEmpty" class="sparkline-empty">No samples yet — leave this page open, or deploy a service with a host port.</p>
+
+    <div class="spark-rows" id="sparkRows" style="display:none">
+      <div class="spark-row" id="sparkRowEp" style="display:none">
+        <div class="spark-meta">
+          <span class="spark-name"><span class="spark-dot spark-dot-ep"></span>Endpoint avg</span>
+          <div class="spark-figures">
+            <span class="spark-value" id="sparkValEp">—</span>
+            <span class="spark-sub" id="sparkSubEp"></span>
+            <span class="spark-range" id="sparkRangeEp"></span>
+          </div>
+        </div>
+        <div class="spark-track">
+          <svg class="spark-svg" id="sparkSvgEp" viewBox="0 0 400 48" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="gradEp" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#3B82F6" stop-opacity="0.35"/>
+                <stop offset="100%" stop-color="#3B82F6" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path id="sparkAreaEp" fill="url(#gradEp)" d=""/>
+            <path id="sparkLineEp" fill="none" stroke="#3B82F6" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" d=""/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="spark-row" id="sparkRowApi" style="display:none">
+        <div class="spark-meta">
+          <span class="spark-name"><span class="spark-dot spark-dot-api"></span>Control plane</span>
+          <div class="spark-figures">
+            <span class="spark-value" id="sparkValApi">—</span>
+            <span class="spark-sub" id="sparkSubApi"></span>
+            <span class="spark-range" id="sparkRangeApi"></span>
+          </div>
+        </div>
+        <div class="spark-track">
+          <svg class="spark-svg" id="sparkSvgApi" viewBox="0 0 400 48" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="gradApi" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#FB923C" stop-opacity="0.3"/>
+                <stop offset="100%" stop-color="#FB923C" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path id="sparkAreaApi" fill="url(#gradApi)" d=""/>
+            <path id="sparkLineApi" fill="none" stroke="#FB923C" stroke-width="1.75" stroke-dasharray="4 3" stroke-linecap="round" stroke-linejoin="round" d=""/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="spark-row" id="sparkRowRun" style="display:none">
+        <div class="spark-meta">
+          <span class="spark-name"><span class="spark-dot spark-dot-run"></span>Running VMs</span>
+          <div class="spark-figures">
+            <span class="spark-value" id="sparkValRun">—</span>
+            <span class="spark-sub" id="sparkSubRun"></span>
+            <span class="spark-range" id="sparkRangeRun"></span>
+          </div>
+        </div>
+        <div class="spark-track">
+          <svg class="spark-svg" id="sparkSvgRun" viewBox="0 0 400 48" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="gradRun" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#10b981" stop-opacity="0.3"/>
+                <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path id="sparkAreaRun" fill="url(#gradRun)" d=""/>
+            <path id="sparkLineRun" fill="none" stroke="#10b981" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" d=""/>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .composition-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+    margin-top: 1.5rem;
+  }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .panel-subtitle {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-top: 0.15rem;
+  }
+
+  .panel-cta {
+    flex-shrink: 0;
+    align-self: center;
+  }
+
+  .fleet-empty {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.7rem 0.9rem;
+    border-radius: 8px;
+    border: 1px solid var(--border-card);
+    background: var(--bg-card-hover);
+  }
+
+  .fleet-empty-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+
+  .fleet-empty-title {
+    font-size: 0.84rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .fleet-empty-hint {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  .bars-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem 2rem;
+  }
+
+  .bars-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .bars-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    margin: 0;
+  }
+
+  .bar-row {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+  }
+
+  .bar-name {
+    width: 5.5rem;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .bar-track {
+    flex: 1;
+    height: 0.7rem;
+    background: var(--bg-card-hover);
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border-card);
+    min-width: 0;
+  }
+
+  .bar-fill {
+    display: block;
+    height: 100%;
+    border-radius: 5px;
+    min-width: 0;
+    transition: width 0.4s ease;
+  }
+
+  .bar-count {
+    width: 2.2rem;
+    text-align: right;
+    font-size: 0.85rem;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    flex-shrink: 0;
+  }
+
+  .fleet-stats-row {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 0.75rem 1rem;
+    border-top: 1px solid var(--border-card);
+    padding-top: 0.9rem;
+  }
+
+  .fleet-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+  }
+
+  .fleet-stat-value {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .fleet-stat-label {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+  }
+
+  .sparkline-section {
+    border-top: 1px solid var(--border-card);
+    padding-top: 0.9rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+
+  .sparkline-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .sparkline-title-block {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .sparkline-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+
+  .sparkline-hint {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+  }
+
+  .sparkline-empty {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    text-align: left;
+    padding: 0.55rem 0.75rem;
+    margin: 0;
+    border-radius: 8px;
+    border: 1px dashed var(--border-card);
+    background: var(--bg-card-hover);
+  }
+
+  .spark-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+
+  /* Full-width stacked: meta above, chart edge-to-edge */
+  .spark-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.65rem 0.8rem 0.55rem;
+    border-radius: 8px;
+    background: var(--bg-card-hover);
+    border: 1px solid var(--border-card);
+  }
+
+  .spark-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem 1rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .spark-name {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .spark-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .spark-dot-ep { background: #3B82F6; }
+  .spark-dot-api { background: #FB923C; }
+  .spark-dot-run { background: #10b981; }
+
+  .spark-figures {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .spark-value {
+    font-size: 1.05rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .spark-sub {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .spark-range {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    opacity: 0.9;
+  }
+
+  .spark-track {
+    position: relative;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .spark-svg {
+    display: block;
+    width: 100%;
+    height: 52px;
+  }
+
+  @media (max-width: 720px) {
+    .bars-grid {
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+
+    .fleet-stats-row {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 420px) {
+    .fleet-stats-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .bar-name {
+      width: 4.5rem;
+      font-size: 0.78rem;
+    }
+  }
+</style>

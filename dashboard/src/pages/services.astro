@@ -1,0 +1,324 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import ServicesTable from '../components/ServicesTable.astro';
+import { api, isServiceRunning } from '../lib/api';
+
+const { services, connection } = await api.getServices();
+---
+
+<Layout title="Services" activePath="/services">
+  <div class="services-header-row">
+    <Header
+      title="Services"
+      subtitle="Manage your microVM and container deployments."
+      connection={connection}
+    />
+    <div class="header-buttons">
+      <button id="btnRefresh" class="btn btn-secondary" title="Refresh service list">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </svg>
+        Refresh
+      </button>
+      <a href="/deploy" class="btn btn-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        Deploy Service
+      </a>
+    </div>
+  </div>
+
+  <div class="filter-toolbar card-panel">
+    <div class="search-box">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input type="text" id="searchInput" class="search-input" placeholder="Search service name, ID, or runtime..." />
+    </div>
+
+    <div class="filter-pills" id="filterPills">
+      <button class="pill-btn active" data-filter="all">All (<span id="countAll">{services.length}</span>)</button>
+      <button class="pill-btn" data-filter="microvm">MicroVMs (<span id="countMicrovm">{services.filter(s => s.runtime === 'microvm').length}</span>)</button>
+      <button class="pill-btn" data-filter="container">Containers (<span id="countContainer">{services.filter(s => s.runtime === 'container').length}</span>)</button>
+      <button class="pill-btn" data-filter="running">Running (<span id="countRunning">{services.filter(s => isServiceRunning(s)).length}</span>)</button>
+    </div>
+  </div>
+
+  <div id="actionFeedback" class="action-feedback"></div>
+
+  <section class="services-list-area" id="servicesTableWrapper">
+    {services.length > 0 ? (
+      <ServicesTable services={services} />
+    ) : connection === 'offline' ? (
+      <div class="card-panel empty-state">
+        <p>Control plane offline.</p>
+        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p>
+        <a href="/settings" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem">Open Settings</a>
+      </div>
+    ) : (
+      <div class="card-panel empty-state">
+        <p>No services configured.</p>
+        <a href="/deploy" class="btn btn-primary" style="margin-top: 0.75rem">Deploy your first service</a>
+      </div>
+    )}
+  </section>
+</Layout>
+
+<script>
+  import { api, isDemoMode, isServiceRunning } from '../lib/api';
+
+  const tableWrapper = document.getElementById('servicesTableWrapper');
+  const btnRefresh = document.getElementById('btnRefresh');
+  const searchInput = document.getElementById('searchInput') as HTMLInputElement | null;
+  const filterPills = document.querySelectorAll('#filterPills .pill-btn');
+
+  let currentFilter = 'all';
+  let searchQuery = '';
+
+  function updateFilterCounts(services: any[]) {
+    const countAll = document.getElementById('countAll');
+    const countMicrovm = document.getElementById('countMicrovm');
+    const countContainer = document.getElementById('countContainer');
+    const countRunning = document.getElementById('countRunning');
+    if (countAll) countAll.textContent = String(services.length);
+    if (countMicrovm) countMicrovm.textContent = String(services.filter(s => s.runtime === 'microvm').length);
+    if (countContainer) countContainer.textContent = String(services.filter(s => s.runtime === 'container').length);
+    if (countRunning) countRunning.textContent = String(services.filter(s => isServiceRunning(s)).length);
+  }
+
+  function escapeHtml(s: string): string {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function getHostPort(svc: any): number | null {
+    if (typeof svc.host_port === 'number') return svc.host_port;
+    const m = typeof svc.ports === 'string' ? svc.ports.match(/^\d+/) : null;
+    return m ? parseInt(m[0], 10) : null;
+  }
+
+  function renderPortCell(svc: any): string {
+    const hp = getHostPort(svc);
+    if (!hp) return `<span class="mono-text">\u2014</span>`;
+    return `<div class="port-cell"><span class="mono-text">${escapeHtml(svc.ports || '\u2014')}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
+  }
+
+  function showFeedback(msg: string, isError: boolean = false) {
+    const fb = document.getElementById('actionFeedback');
+    if (!fb) return;
+    fb.textContent = msg;
+    fb.className = 'action-feedback' + (isError ? ' error' : '');
+    setTimeout(() => { if (fb.textContent === msg) { fb.textContent = ''; fb.className = 'action-feedback'; } }, 4000);
+  }
+
+  function renderTable(services: any[], conn: string) {
+    if (!tableWrapper) return;
+    if (services.length === 0) {
+      if (conn === 'offline') {
+        tableWrapper.innerHTML = `<div class="card-panel empty-state" style="text-align:center;padding:2rem;color:var(--text-muted)"><p>Control plane offline.</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`;
+      } else {
+        tableWrapper.innerHTML = `<div class="card-panel empty-state" style="text-align:center;padding:2rem;color:var(--text-muted)"><p>No services configured.</p><a href="/deploy" class="btn btn-primary" style="margin-top:0.75rem">Deploy your first service</a></div>`;
+      }
+      return;
+    }
+    const rows = services.map((svc) => {
+      const runtimeLabel = svc.runtime === 'microvm' ? 'MicroVM' : 'Container';
+      const statusClass = isServiceRunning(svc) ? 'badge-running' : 'badge-stopped';
+      const label = escapeHtml(svc.name || svc.id);
+      const secondaryId = (svc.name && svc.name !== svc.id) ? `<span class="service-id">${escapeHtml(svc.id)}</span>` : '';
+      return `<tr>
+        <td><div class="service-name-cell"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="service-link">${label}</a>${secondaryId}</div></td>
+        <td><span class="runtime-tag ${escapeHtml(svc.runtime)}">${runtimeLabel}</span></td>
+        <td><span class="badge ${statusClass}"><span class="badge-dot"></span>${escapeHtml(svc.status)}</span></td>
+        <td>${renderPortCell(svc)}</td>
+        <td><div class="row-actions"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="btn btn-secondary btn-sm">Details</a><button class="btn btn-secondary btn-sm" data-action="update" data-id="${escapeHtml(svc.id)}">Update</button><button class="btn btn-secondary btn-sm" data-action="stop" data-id="${escapeHtml(svc.id)}">Stop</button><button class="btn btn-danger btn-sm" data-action="destroy" data-id="${escapeHtml(svc.id)}">Destroy</button></div></td>
+      </tr>`;
+    }).join('');
+    tableWrapper.innerHTML = `<div class="data-table-container"><table class="data-table"><thead><tr><th>Service / ID</th><th>Runtime</th><th>Status</th><th>Ports</th><th style="text-align:right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
+
+  async function handleAction(action: string, id: string) {
+    let result: { success: boolean; message: string };
+    switch (action) {
+      case 'update':
+        result = await api.updateService(id);
+        break;
+      case 'stop':
+        result = await api.stopService(id);
+        break;
+      case 'destroy':
+        if (!confirm(`Destroy service ${id}? This action cannot be undone.`)) return;
+        result = await api.destroyService(id);
+        break;
+      default:
+        return;
+    }
+    showFeedback(result.message, !result.success);
+    if (result.success) await refreshServices();
+  }
+
+  tableWrapper?.addEventListener('click', async (e) => {
+    const target = e.target as HTMLElement;
+    const btn = target.closest('[data-action]') as HTMLElement | null;
+    if (!btn) return;
+    const action = btn.getAttribute('data-action');
+    const id = btn.getAttribute('data-id');
+    if (!action || !id) return;
+    btn.setAttribute('disabled', 'true');
+    try {
+      await handleAction(action, id);
+    } finally {
+      btn.removeAttribute('disabled');
+    }
+  });
+
+  async function refreshServices() {
+    if (!btnRefresh) return;
+    btnRefresh.setAttribute('disabled', 'true');
+    const { services, connection } = await api.getServices();
+    renderTable(services, connection);
+    updateFilterCounts(services);
+    btnRefresh.removeAttribute('disabled');
+    applyFilters();
+  }
+
+  function applyFilters() {
+    const rows = document.querySelectorAll('.data-table tbody tr');
+    rows.forEach(row => {
+      const text = row.textContent?.toLowerCase() || '';
+      const matchesSearch = text.includes(searchQuery.toLowerCase());
+      let matchesFilter = true;
+      if (currentFilter === 'microvm') matchesFilter = text.includes('microvm');
+      else if (currentFilter === 'container') matchesFilter = text.includes('container');
+      else if (currentFilter === 'running') matchesFilter = text.includes('deployed') || text.includes('running');
+      (row as HTMLElement).style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+    });
+  }
+
+  btnRefresh?.addEventListener('click', refreshServices);
+
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      searchQuery = (e.target as HTMLInputElement).value;
+      applyFilters();
+    });
+  }
+
+  filterPills.forEach(pill => {
+    pill.addEventListener('click', () => {
+      filterPills.forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      currentFilter = pill.getAttribute('data-filter') || 'all';
+      applyFilters();
+    });
+  });
+
+  // Hydrate: re-fetch on load to pick up demo mode from localStorage
+  (async () => {
+    const { services, connection } = await api.getServices();
+    renderTable(services, connection);
+    updateFilterCounts(services);
+  })();
+
+  if (!isDemoMode()) {
+    setInterval(refreshServices, 10000);
+  }
+</script>
+
+<style>
+  .services-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+  }
+
+  .header-buttons {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .filter-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1.1rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .search-box {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-md);
+    padding: 0.45rem 0.75rem;
+    flex: 1;
+    min-width: 240px;
+    max-width: 440px;
+    color: var(--text-muted);
+  }
+
+  .search-input {
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    outline: none;
+    width: 100%;
+    font-family: inherit;
+  }
+
+  .search-input::placeholder {
+    color: var(--text-muted);
+  }
+
+  .filter-pills {
+    display: flex;
+    gap: 0.25rem;
+    background-color: var(--bg-input);
+    padding: 0.2rem;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-card);
+  }
+
+  .pill-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    padding: 0.3rem 0.7rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    font-family: inherit;
+  }
+
+  .pill-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .pill-btn.active {
+    background-color: var(--bg-card);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-card);
+  }
+
+  .services-list-area {
+    margin-top: 0.25rem;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-muted);
+  }
+</style>

@@ -55,7 +55,7 @@ pub async fn reconcile_startup_in(state: &AppState, base: &Path) -> ReconcileRep
         };
 
         // Skip backups and well-known non-service directories.
-        if name.ends_with(".bak") || name == "traefik" {
+        if crate::metadata::is_reserved_service_dir(&name) {
             report.skipped += 1;
             continue;
         }
@@ -512,6 +512,31 @@ mod tests {
         assert!(report.skipped >= 1);
         assert_eq!(report.adopted_running, 0);
         assert_eq!(report.stopped, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_pool_and_secrets_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        for name in ["_pool", "secrets"] {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("metadata.json"),
+                serde_json::to_string(&serde_json::json!({"service_id": name})).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let state = AppState::default();
+        let report = reconcile_startup_in(&state, base).await;
+
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.adopted_running, 0);
+        assert_eq!(report.stopped, 0);
+        assert!(state.status("_pool").is_none());
+        assert!(state.status("secrets").is_none());
     }
 
     #[tokio::test]

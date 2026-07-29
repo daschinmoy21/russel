@@ -836,11 +836,18 @@ impl AppState {
         let inner = self.lock_inner();
         let s = inner.services.get(service_id)?;
         let disk = crate::metadata::load_metadata_from_disk(service_id);
+        // Only count wall-clock uptime while the workload is actually running.
+        // Stopped/failed services must not report a growing timer from started_at.
+        let uptime_seconds = if s.vm_state == "running" {
+            s.started_at.elapsed().as_secs()
+        } else {
+            0
+        };
         Some(StatusResponse {
             service_id: service_id.to_string(),
             status: s.status.clone(),
             vm_state: s.vm_state.clone(),
-            uptime_seconds: s.started_at.elapsed().as_secs(),
+            uptime_seconds,
             runtime: s.runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime)),
             host_port: s
                 .host_port
@@ -1457,6 +1464,25 @@ mod tests {
 
         state.ensure_service("disk-vm");
         let status = state.status("disk-vm").unwrap();
+        assert_eq!(status.status, "stopped");
+        assert_eq!(status.vm_state, "none");
+    }
+
+    #[test]
+    fn test_status_uptime_zero_when_not_running() {
+        let state = AppState::default();
+        state.ensure_service("stopped-svc");
+        // started_at is set at construction; without running state uptime must be 0.
+        let status = state.status("stopped-svc").unwrap();
+        assert_eq!(status.uptime_seconds, 0);
+
+        state.set_status("stopped-svc", "deployed", "running");
+        let status = state.status("stopped-svc").unwrap();
+        // Running may be 0 if just set, but must not error; then stop clears uptime.
+        let _ = status.uptime_seconds;
+        state.set_status("stopped-svc", "stopped", "none");
+        let status = state.status("stopped-svc").unwrap();
+        assert_eq!(status.uptime_seconds, 0);
         assert_eq!(status.status, "stopped");
         assert_eq!(status.vm_state, "none");
     }

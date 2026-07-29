@@ -31,6 +31,22 @@ pub fn metadata_path(service_id: &str) -> PathBuf {
     PathBuf::from(format!("/var/lib/russel/{service_id}/metadata.json"))
 }
 
+/// Directories under `/var/lib/russel` (and peers) that are **not** user services.
+///
+/// Used by list/reconcile/cleanup discovery so internal layout never appears as
+/// deployable services (e.g. dashboard `GET /vms`).
+///
+/// - `*.bak` — dual-live / destroy backups
+/// - `traefik` — ingress dynamic config root
+/// - `secrets` — host secrets store
+/// - `_pool` — warm-pool snapshot state
+pub fn is_reserved_service_dir(name: &str) -> bool {
+    name.ends_with(".bak")
+        || name == "traefik"
+        || name == "secrets"
+        || name == "_pool"
+}
+
 /// Fields commonly loaded from on-disk metadata for API rehydration.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedMetadata {
@@ -712,6 +728,18 @@ mod tests {
     }
 
     // ── Catalog write / read tests ───────────────────────────────────────────
+
+    #[test]
+    fn reserved_service_dirs_are_recognized() {
+        assert!(is_reserved_service_dir("traefik"));
+        assert!(is_reserved_service_dir("secrets"));
+        assert!(is_reserved_service_dir("_pool"));
+        assert!(is_reserved_service_dir("api.bak"));
+        assert!(is_reserved_service_dir("svc.bak"));
+        assert!(!is_reserved_service_dir("basic-http-tester-another"));
+        assert!(!is_reserved_service_dir("api"));
+        assert!(!is_reserved_service_dir("pooltpl"));
+    }
 
     #[test]
     fn catalog_write_and_read_roundtrip() {

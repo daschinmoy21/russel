@@ -1,0 +1,543 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import { api, isServiceRunning } from '../lib/api';
+
+const targetId = Astro.url.searchParams.get('id');
+const { service: initialSvc, connection } = targetId
+  ? await api.getServiceDetail(targetId)
+  : { service: null as any, connection: 'live' as const };
+const initialLogs = targetId && initialSvc ? await api.getServiceLogs(targetId) : '';
+const initialRunning = initialSvc ? isServiceRunning(initialSvc) : false;
+---
+
+<Layout title="Service Detail" activePath="/services">
+  <div class="breadcrumb">
+    <a href="/services" class="back-link">← Back to Services</a>
+  </div>
+
+  <div id="detailRoot">
+    {targetId ? (
+      initialSvc ? (
+      <>
+        <Header
+          title={initialSvc.name || initialSvc.id}
+          subtitle={`Service ID: ${initialSvc.id}`}
+          connection={connection}
+        />
+
+        <div class="detail-grid">
+          <!-- Overview Panel -->
+          <div class="card-panel info-panel">
+            <div class="panel-header-row">
+              <h2 class="section-title">Overview & Status</h2>
+              <span class={`badge ${initialRunning ? 'badge-running' : 'badge-stopped'}`} id="serviceStatusBadge">
+                <span class="badge-dot"></span>
+                <span id="serviceStatusText">{initialSvc.status}</span>
+              </span>
+            </div>
+
+        <div class="stats-grid" id="statsGrid">
+          <div class="stat-item">
+            <span class="stat-label">Runtime Engine</span>
+            <span class="stat-value" id="statRuntime">{initialSvc.runtime === 'microvm' ? 'Cloud-Hypervisor (MicroVM)' : 'Podman (Container)'}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Port Mappings</span>
+            <span class="stat-value mono" id="statPorts">{initialSvc.ports || 'None'}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">VM State</span>
+            <span class="stat-value mono" id="statVmState">{initialSvc.vm_state || 'unknown'}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Uptime</span>
+            <span class="stat-value" id="statUptime">Loading...</span>
+          </div>
+        </div>
+
+        <div class="action-bar">
+          <button id="btnStop" class="btn btn-secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="6" y="6" width="12" height="12"/>
+            </svg>
+            Stop Service
+          </button>
+          <button id="btnUpdate" class="btn btn-secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+            Update Service
+          </button>
+          <button id="btnDestroy" class="btn btn-danger">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Destroy Service
+          </button>
+        </div>
+
+        <div id="actionFeedback" class="action-feedback hidden"></div>
+      </div>
+
+      <!-- Logs Panel -->
+      <div class="card-panel logs-panel">
+        <div class="panel-header-row">
+          <h2 class="section-title">Instance Logs</h2>
+          <div class="log-actions">
+            <button id="btnRefreshLogs" class="btn btn-secondary btn-sm">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+              Fetch Logs
+            </button>
+            <button id="btnClearLogs" class="btn btn-secondary btn-sm">Clear</button>
+          </div>
+        </div>
+        <div class="log-console" id="logConsole">{initialLogs}</div>
+      </div>
+    </div>
+      </>
+      ) : (
+        <div class="card-panel empty-state">
+          <p style="font-weight: 600; font-size: 1.1rem; margin-bottom: 0.5rem;">Service unavailable</p>
+          <p style="color: var(--text-muted);">Control plane offline. Start <code>russel-ctrl</code> or enable Demo mode in Settings.</p>
+          <a href="/settings" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem">Open Settings</a>
+        </div>
+      )
+    ) : (
+      <div class="card-panel empty-state">
+        <p style="font-weight: 600; font-size: 1.1rem; margin-bottom: 0.5rem;">No service selected</p>
+        <p style="color: var(--text-muted);">Select a service from <a href="/services" style="color: var(--accent-primary)">the fleet list</a> to view details.</p>
+      </div>
+    )}
+  </div>
+
+  <!-- Deployment History Card -->
+  <div class="card-panel" id="deployHistoryCard" style="margin-top: 1rem;">
+    <div class="panel-header-row">
+      <h2 class="section-title">Generations</h2>
+      <p style="color: var(--text-muted); font-size: 0.85rem; margin: -0.75rem 0 0.5rem 0;">Deploy history — <strong>current</strong> is the desired generation (not process liveness). Use Overview above for running/stopped.</p>
+    </div>
+    <div id="deployHistoryBody">
+      <p style="color: var(--text-muted);">Loading deployment history&hellip;</p>
+    </div>
+  </div>
+
+  <!-- Rollback Confirmation Modal -->
+  <div id="rollbackModal" class="modal-overlay hidden">
+    <div class="modal-content card-panel">
+      <h3 class="modal-title" style="color: var(--accent-amber);">Confirm Rollback</h3>
+      <p class="modal-description">
+        <span id="rollbackMsg"></span>
+        Zero-downtime cutover: traffic will swap to the selected generation via ingress re-point. If that generation is no longer live, it will redeploy from recorded config.
+      </p>
+      <div class="modal-actions">
+        <button id="btnCancelRollback" class="btn btn-secondary">Cancel</button>
+        <button id="btnConfirmRollback" class="btn btn-primary">Confirm Rollback</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Destroy Confirmation Modal -->
+  <div id="destroyModal" class="modal-overlay hidden">
+    <div class="modal-content card-panel">
+      <h3 class="modal-title">Confirm Destruction</h3>
+      <p class="modal-description">
+        Are you sure you want to destroy <strong id="destroyServiceName">this service</strong>?
+        This will terminate the microVM/container instance and purge network interfaces. This action cannot be undone.
+      </p>
+      <div class="modal-actions">
+        <button id="btnCancelDestroy" class="btn btn-secondary">Cancel</button>
+        <button id="btnConfirmDestroy" class="btn btn-danger">Confirm Destroy</button>
+      </div>
+    </div>
+  </div>
+</Layout>
+
+<script>
+  import { api, formatUptime, isServiceRunning } from '../lib/api';
+
+  const params = new URLSearchParams(window.location.search);
+  const serviceId = params.get('id');
+
+  if (!serviceId) {
+    document.getElementById('detailRoot')!.innerHTML = `<div class="card-panel" style="text-align:center;padding:2rem"><p>No service ID provided. <a href="/services">Browse services</a></p></div>`;
+  }
+
+  const btnStop = document.getElementById('btnStop');
+  const btnUpdate = document.getElementById('btnUpdate');
+  const btnDestroy = document.getElementById('btnDestroy');
+  const btnRefreshLogs = document.getElementById('btnRefreshLogs');
+  const btnClearLogs = document.getElementById('btnClearLogs');
+  const logConsole = document.getElementById('logConsole');
+  const actionFeedback = document.getElementById('actionFeedback');
+  const destroyModal = document.getElementById('destroyModal');
+  const btnCancelDestroy = document.getElementById('btnCancelDestroy');
+  const btnConfirmDestroy = document.getElementById('btnConfirmDestroy');
+
+  function showFeedback(msg: string, isError = false) {
+    if (!actionFeedback) return;
+    actionFeedback.classList.remove('hidden', 'success', 'error');
+    actionFeedback.classList.add(isError ? 'error' : 'success');
+    actionFeedback.textContent = msg;
+    setTimeout(() => actionFeedback.classList.add('hidden'), 8000);
+  }
+
+  async function loadDetail(id: string) {
+    const { service, connection } = await api.getServiceDetail(id);
+    if (!service) {
+      document.getElementById('detailRoot')!.innerHTML = `<div class="card-panel empty-state" style="text-align:center;padding:2rem"><p style="font-weight:600;font-size:1.1rem;margin-bottom:0.5rem">Service unavailable</p><p style="color:var(--text-muted)">Control plane offline. Start <code>russel-ctrl</code> or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`;
+      return;
+    }
+    document.title = `Service: ${service.name || service.id} — Russel Control Plane`;
+    const h1 = document.querySelector('.page-title');
+    const sub = document.querySelector('.subtitle');
+    if (h1) h1.textContent = service.name || service.id;
+    if (sub) sub.textContent = `Service ID: ${service.id}`;
+    const badge = document.getElementById('serviceStatusBadge');
+    const statusText = document.getElementById('serviceStatusText');
+    if (badge) {
+      badge.className = `badge ${isServiceRunning(service) ? 'badge-running' : 'badge-stopped'}`;
+    }
+    if (statusText) statusText.textContent = service.status;
+    const statRuntime = document.getElementById('statRuntime');
+    const statPorts = document.getElementById('statPorts');
+    const statVmState = document.getElementById('statVmState');
+    const statUptime = document.getElementById('statUptime');
+    if (statRuntime) statRuntime.textContent = service.runtime === 'microvm' ? 'Cloud-Hypervisor (MicroVM)' : 'Podman (Container)';
+    if (statPorts) statPorts.textContent = service.ports || 'None';
+    if (statVmState) statVmState.textContent = service.vm_state || 'unknown';
+    if (statUptime) statUptime.textContent = formatUptime(service.uptime_seconds);
+    // Update header badge via connection (Header's client probe handles this, but update inline too)
+    const connBadge = document.getElementById('connBadge');
+    if (connBadge) {
+      const map: Record<string, { cls: string; label: string; title: string }> = {
+        demo: { cls: 'badge badge-demo', label: 'DEMO', title: 'Demo mode — mock data (Settings)' },
+        live: { cls: 'badge badge-online', label: 'LIVE', title: 'Connected to russel-ctrl' },
+        offline: { cls: 'badge badge-offline', label: 'OFFLINE', title: 'Control plane unreachable — start russel-ctrl or enable Demo mode' },
+      };
+      const b = map[connection] || map.live;
+      connBadge.className = b.cls;
+      connBadge.innerHTML = `<span class="badge-dot"></span>${b.label}`;
+      connBadge.title = b.title;
+    }
+    const modalName = document.getElementById('destroyServiceName');
+    if (modalName) modalName.textContent = service.name || service.id;
+  }
+
+  if (serviceId) {
+    loadDetail(serviceId);
+  }
+
+  btnStop?.addEventListener('click', async () => {
+    if (!serviceId) return;
+    btnStop.setAttribute('disabled', 'true');
+    const res = await api.stopService(serviceId);
+    showFeedback(res.message, !res.success);
+    btnStop.removeAttribute('disabled');
+    if (res.success) loadDetail(serviceId);
+  });
+
+  btnUpdate?.addEventListener('click', async () => {
+    if (!serviceId) return;
+    btnUpdate.setAttribute('disabled', 'true');
+    const res = await api.updateService(serviceId);
+    showFeedback(res.message, !res.success);
+    btnUpdate.removeAttribute('disabled');
+  });
+
+  btnDestroy?.addEventListener('click', () => {
+    destroyModal?.classList.remove('hidden');
+  });
+
+  btnCancelDestroy?.addEventListener('click', () => {
+    destroyModal?.classList.add('hidden');
+  });
+
+  btnConfirmDestroy?.addEventListener('click', async () => {
+    if (!serviceId) return;
+    destroyModal?.classList.add('hidden');
+    const res = await api.destroyService(serviceId);
+    showFeedback(res.message, !res.success);
+    if (res.success) {
+      setTimeout(() => { window.location.href = '/services'; }, 1500);
+    }
+  });
+
+  btnRefreshLogs?.addEventListener('click', async () => {
+    if (!serviceId || !logConsole) return;
+    logConsole.textContent = 'Fetching logs from Russel control plane...';
+    const logs = await api.getServiceLogs(serviceId);
+    logConsole.textContent = logs;
+    logConsole.scrollTop = logConsole.scrollHeight;
+  });
+
+  btnClearLogs?.addEventListener('click', () => {
+    if (logConsole) logConsole.textContent = '[Console cleared]';
+  });
+
+  // ── Deployment history ──
+
+  const deployBody = document.getElementById('deployHistoryBody');
+  const rollbackModal = document.getElementById('rollbackModal');
+  const btnCancelRollback = document.getElementById('btnCancelRollback');
+  const btnConfirmRollback = document.getElementById('btnConfirmRollback');
+  const rollbackMsg = document.getElementById('rollbackMsg');
+  let pendingRollbackVersion: number | undefined;
+
+  function formatDeployDate(iso: string): string {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+
+  // Generation journal status ≠ process liveness.
+  // "active" means current desired generation (may be stopped).
+  function deploymentStatusBadge(status: string): string {
+    switch (status) {
+      case 'active':
+        return '<span class="badge badge-info"><span class="badge-dot"></span>current</span>';
+      case 'previous':
+        return '<span class="badge badge-muted"><span class="badge-dot"></span>previous</span>';
+      case 'failed':
+        return '<span class="badge badge-stopped"><span class="badge-dot"></span>failed</span>';
+      case 'rolled_back':
+        return '<span class="badge badge-warning"><span class="badge-dot"></span>rolled back</span>';
+      case 'superseded':
+      default:
+        return '<span class="badge badge-muted">superseded</span>';
+    }
+  }
+
+  function renderDeployments(rows: any[]): string {
+    if (!rows.length) {
+      return '<p style="color: var(--text-muted);">No deployment history yet.</p>';
+    }
+    return `
+      <div class="data-table-container" style="margin-top: 0.5rem;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>Status</th>
+              <th>Runtime</th>
+              <th>Deployed</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows
+              .map(
+                (d) => `
+              <tr>
+                <td><strong>v${d.version}</strong></td>
+                <td>${deploymentStatusBadge(d.status)}</td>
+                <td>${d.runtime || '—'}</td>
+                <td>${formatDeployDate(d.deployed_at)}</td>
+                <td>${
+                  d.rollback_ready && d.status !== 'active'
+                    ? `<button class="btn btn-secondary btn-sm rollback-btn" data-version="${d.version}">Rollback</button>`
+                    : d.status === 'active'
+                      ? '<span style="font-size: 0.8rem; color: var(--text-muted);">Desired gen</span>'
+                      : '—'
+                }</td>
+              </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  async function loadDeployments(id: string) {
+    if (!deployBody) return;
+    deployBody.innerHTML = '<p style="color: var(--text-muted);">Loading deployment history&hellip;</p>';
+    const result = await api.getDeployments(id);
+    if (!result.supported) {
+      if (result.connection === 'offline') {
+        deployBody.innerHTML = '<p style="color: var(--text-muted);">Unavailable while control plane is offline.</p>';
+      } else {
+        deployBody.innerHTML =
+          '<p style="color: var(--text-muted);">Deployment history requires russel-ctrl with history API (<a href="https://github.com/daschinmoy21/russel-dev/issues/177">issue #177</a>).</p>';
+      }
+      return;
+    }
+    const deployments = result.data?.deployments || [];
+    deployBody.innerHTML = renderDeployments(deployments);
+    // Bind rollback buttons
+    deployBody.querySelectorAll('.rollback-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const v = parseInt(btn.getAttribute('data-version') || '0', 10);
+        pendingRollbackVersion = v;
+        if (rollbackMsg) {
+          rollbackMsg.innerHTML = `Roll back to <strong>v${v}</strong>?`;
+        }
+        rollbackModal?.classList.remove('hidden');
+      });
+    });
+  }
+
+  if (serviceId) {
+    loadDeployments(serviceId);
+
+    btnCancelRollback?.addEventListener('click', () => {
+      rollbackModal?.classList.add('hidden');
+    });
+
+    btnConfirmRollback?.addEventListener('click', async () => {
+      if (!serviceId) return;
+      rollbackModal?.classList.add('hidden');
+      const res = await api.rollbackService(serviceId, pendingRollbackVersion);
+      if (!res.supported) {
+        showFeedback('Rollback not supported by this control plane (issue #177).', true);
+        return;
+      }
+      showFeedback(res.message, !res.success);
+      if (res.success) {
+        loadDeployments(serviceId);
+        loadDetail(serviceId);
+      }
+    });
+  }
+</script>
+
+<style>
+  .breadcrumb {
+    margin-bottom: 1rem;
+  }
+
+  .back-link {
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+
+  .back-link:hover {
+    color: var(--accent-primary);
+  }
+
+  .detail-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+
+  .panel-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.25rem;
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .stat-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .stat-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+  }
+
+  .stat-value {
+    font-size: 0.92rem;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .stat-value.mono {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+  }
+
+  .action-bar {
+    display: flex;
+    gap: 0.65rem;
+    border-top: 1px solid var(--border-card);
+    padding-top: 1.25rem;
+    flex-wrap: wrap;
+  }
+
+  .action-feedback {
+    margin-top: 1rem;
+    padding: 0.65rem 1rem;
+    border-radius: var(--radius-md);
+    font-size: 0.85rem;
+  }
+
+  .action-feedback.success {
+    background-color: var(--bg-badge-success);
+    color: var(--accent-green);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+  }
+
+  .action-feedback.error {
+    background-color: var(--bg-badge-danger);
+    color: var(--accent-red);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+  }
+
+  .log-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  /* Modal */
+  .modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+
+  .modal-content {
+    max-width: 460px;
+    width: 90%;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .modal-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--accent-red);
+  }
+
+  .modal-description {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.65rem;
+    margin-top: 0.5rem;
+  }
+</style>

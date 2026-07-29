@@ -22,7 +22,10 @@ use crate::{
     deploy::DeployPipeline,
     deployments,
     ingress::default_ingress,
-    metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
+    metadata::{
+        is_reserved_service_dir, load_metadata_from_disk, prior_runtime_from_disk,
+        resolve_lifecycle_runtime,
+    },
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     state::{AppState, LifecycleClaim},
@@ -345,7 +348,12 @@ async fn logs_all(
 }
 
 async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
-    let mut vms = state.list_services();
+    // Drop reserved system dirs that may already be in memory from older builds.
+    let mut vms: Vec<String> = state
+        .list_services()
+        .into_iter()
+        .filter(|id| !is_reserved_service_dir(id))
+        .collect();
     let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
     for base in &["/var/lib/russel", "/var/lib/microvms"] {
@@ -363,7 +371,7 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if name.ends_with(".bak") {
+            if is_reserved_service_dir(&name) {
                 continue;
             }
             if seen.insert(name.clone()) {
