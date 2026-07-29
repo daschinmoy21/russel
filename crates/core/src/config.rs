@@ -37,10 +37,7 @@ impl Russelfile {
             anyhow::bail!("service.port must not be 0");
         }
         if config.service.cpus < 1 || config.service.cpus > 32 {
-            anyhow::bail!(
-                "service.cpus must be 1..=32 (got {})",
-                config.service.cpus
-            );
+            anyhow::bail!("service.cpus must be 1..=32 (got {})", config.service.cpus);
         }
         validate_source_path(&config.service.source)?;
         Ok(config)

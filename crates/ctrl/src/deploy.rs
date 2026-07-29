@@ -27,6 +27,7 @@ use crate::{
         ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec, default_base_dir,
         validate_podman_args_for_runtime, validate_podman_passthrough_args,
     },
+    deployments::{self, AppendSuccess, DesiredStateSnapshot},
     git::GitClient,
     ingress::{self, Backend, Ingress},
     metadata::{
@@ -296,6 +297,8 @@ impl DeployPipeline {
                 error: original_error,
             }) => {
                 let elapsed = started.elapsed().as_millis();
+                // Do not treat auto-rollback as completing an explicit operator rollback.
+                deployments::clear_pending_rollback(&service_id);
                 tracing::info!(
                     service_id = %service_id,
                     elapsed_ms = elapsed,
@@ -323,6 +326,7 @@ impl DeployPipeline {
             }
             Err(error) => {
                 let elapsed = started.elapsed().as_millis();
+                deployments::clear_pending_rollback(&service_id);
                 tracing::error!(
                     service_id = %service_id,
                     elapsed_ms = elapsed,
@@ -898,6 +902,31 @@ impl DeployPipeline {
         {
             tracing::warn!(service_id, error = %e, "failed to record source in metadata");
         }
+
+        // Append deployment history journal (operators / dashboard rollback surface).
+        let port = workload.port().clone();
+        let desired_snap = DesiredStateSnapshot::from_desired_json(
+            desired_state.as_ref(),
+            Some(port.host),
+            Some(port.guest),
+        );
+        if let Err(e) = deployments::append_success(
+            service_id,
+            AppendSuccess {
+                generation_id: Some(generation_id.clone()),
+                runtime: Some(runtime),
+                store_path: Some(build.store_path.display().to_string()),
+                repo_url: Some(request.repo_url.clone()),
+                config_path: Some(request.config_path.clone()),
+                host_port: Some(port.host),
+                guest_port: Some(port.guest),
+                message: Some("deploy complete".into()),
+                desired_state: Some(desired_snap),
+            },
+        ) {
+            tracing::warn!(service_id, error = %e, "failed to append deployment history");
+        }
+
         port_reservation
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("port reservation dropped before deploy completed"))?
@@ -905,7 +934,7 @@ impl DeployPipeline {
 
         Ok(DeployInnerResult::Success(Box::new(DeployOutput {
             store_path: build.store_path,
-            port: workload.port().clone(),
+            port,
             runtime,
             timing: DeployTiming {
                 resolve_ms,

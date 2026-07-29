@@ -9,6 +9,7 @@ mod container;
 // Database provisioning was a no-op stub; Russelfile already rejects enabled
 // [database] sections. Dropped in favor of external DBs (see docs).
 mod deploy;
+mod deployments;
 mod git;
 mod health;
 mod ingress;

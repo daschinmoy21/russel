@@ -10,7 +10,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use russel_core::api::{
-    DeployEvent, DeployRequest, LogsResponse, ServiceSummary, StatusResponse, VmsResponse,
+    DeployEvent, DeployRequest, DeploymentsResponse, LogsResponse, RollbackRequest, ServiceSummary,
+    StatusResponse, VmsResponse,
 };
 use russel_core::config::RuntimeKind;
 use tokio::process::Child;
@@ -19,6 +20,7 @@ use tokio_stream::StreamExt;
 use crate::{
     container::{ContainerRunner, container_log_path},
     deploy::DeployPipeline,
+    deployments,
     ingress::default_ingress,
     metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
@@ -67,6 +69,8 @@ pub fn router(state: AppState) -> Router {
         .route("/deploy", post(deploy))
         .route("/vm/{service_id}/status", get(vm_status))
         .route("/vm/{service_id}/logs", get(vm_logs))
+        .route("/vm/{service_id}/deployments", get(vm_deployments))
+        .route("/vm/{service_id}/rollback", post(vm_rollback))
         .route("/status", get(status_all))
         .route("/logs", get(logs_all))
         .route("/vms", get(vms_list))
@@ -513,6 +517,112 @@ struct UpdateBody {
     repo_url: Option<String>,
     #[serde(default)]
     config_path: Option<String>,
+}
+
+/// `GET /vm/{service_id}/deployments` — deployment history journal (newest first).
+async fn vm_deployments(
+    Path(service_id): Path<String>,
+) -> Result<Json<DeploymentsResponse>, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    tracing::info!(service_id = %service_id, "GET /vm/{}/deployments", service_id);
+    deployments::list(&service_id)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// `POST /vm/{service_id}/rollback` — explicit operator rollback to a prior version.
+///
+/// MVP strategy: redeploy from the journal entry's recorded `desired_state`
+/// (repo_url / config_path / runtime / env / port / podman_args). Instant
+/// dual-live retain-N=2 cutover is a follow-up.
+async fn vm_rollback(
+    State(state): State<AppState>,
+    Path(service_id): Path<String>,
+    body: Option<Json<RollbackRequest>>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    MicrovmRunner::validate_service_id(&service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let body = body.map(|j| j.0).unwrap_or_default();
+    tracing::info!(
+        service_id = %service_id,
+        version = ?body.version,
+        "POST /vm/{}/rollback",
+        service_id
+    );
+
+    let target = deployments::select_rollback_target(&service_id, body.version).map_err(|e| {
+        let status = match &e {
+            deployments::RollbackSelectError::NotFound { .. } => StatusCode::NOT_FOUND,
+            deployments::RollbackSelectError::Conflict { .. } => StatusCode::CONFLICT,
+            deployments::RollbackSelectError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, e.to_string())
+    })?;
+
+    // Build DeployRequest from journal desired_state / top-level source fields.
+    let ds = target.desired_state.as_ref();
+    let repo_url = ds
+        .and_then(|d| d.repo_url.clone())
+        .or_else(|| target.repo_url.clone())
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "previous generation not retained; redeploy required — full retain-N=2 cutover TBD"
+                    .to_string(),
+            )
+        })?;
+    let config_path = ds
+        .and_then(|d| d.config_path.clone())
+        .or_else(|| target.config_path.clone())
+        .unwrap_or_else(|| "Russelfile.toml".into());
+    let runtime = ds.and_then(|d| d.runtime).or(target.runtime);
+    let host_port = ds.and_then(|d| d.host_port).or(target.host_port);
+    let guest_port = ds
+        .and_then(|d| d.guest_port)
+        .or(target.guest_port)
+        .unwrap_or(3000);
+    let env = ds.map(|d| d.env.clone()).unwrap_or_default();
+    let podman_args = ds.map(|d| d.podman_args.clone()).unwrap_or_default();
+
+    let request = DeployRequest {
+        repo_url,
+        config_path,
+        vm_id: Some(service_id.clone()),
+        port: host_port.map(|host| russel_core::api::PortMapping {
+            host,
+            guest: guest_port,
+        }),
+        runtime,
+        env,
+        podman_args,
+    };
+
+    // On the next successful deploy append, demote current active → rolled_back.
+    // Marker is only consumed after success so a failed rollback redeploy leaves
+    // history pointing at the still-live generation. Fail closed: if we can't
+    // persist the marker, refuse to start the deploy stream.
+    if let Err(e) = deployments::note_pending_rollback(&service_id, target.version) {
+        tracing::error!(
+            service_id = %service_id,
+            error = %e,
+            "failed to write rollback.pending marker"
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to record rollback pending marker: {e}"),
+        ));
+    }
+
+    tracing::info!(
+        service_id = %service_id,
+        target_version = target.version,
+        "rolling back via redeploy-from-history"
+    );
+
+    spawn_deploy_stream(state, request, service_id, "rollback")
 }
 
 async fn vm_update(

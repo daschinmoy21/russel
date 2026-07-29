@@ -104,6 +104,57 @@ pub enum DeployEvent {
     Error(String),
 }
 
+/// One row in a service's deployment history journal.
+///
+/// `status` is one of: `"active"`, `"previous"`, `"superseded"`, `"failed"`,
+/// `"rolled_back"`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeploymentRecord {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeKind>,
+    /// RFC3339 timestamp of the deploy that produced this record.
+    pub deployed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// True when this version can be targeted by explicit operator rollback
+    /// (desired_state / source recorded so redeploy-from-history works).
+    #[serde(default)]
+    pub rollback_ready: bool,
+}
+
+/// Response for `GET /vm/{service_id}/deployments`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeploymentsResponse {
+    pub service_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_version: Option<u32>,
+    pub deployments: Vec<DeploymentRecord>,
+}
+
+/// Body for `POST /vm/{service_id}/rollback`.
+///
+/// `version = None` selects the latest entry with `status == "previous"` and
+/// `rollback_ready == true`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RollbackRequest {
+    #[serde(default)]
+    pub version: Option<u32>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -313,5 +364,56 @@ mod tests {
         assert!(json.contains("\"services\""));
         let parsed: VmsResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.services[0].runtime, Some(RuntimeKind::Microvm));
+    }
+
+    #[test]
+    fn deployments_response_roundtrip() {
+        let resp = DeploymentsResponse {
+            service_id: "api".into(),
+            active_version: Some(2),
+            deployments: vec![
+                DeploymentRecord {
+                    version: 2,
+                    generation_id: Some("abcd1234".into()),
+                    status: "active".into(),
+                    runtime: Some(RuntimeKind::Container),
+                    deployed_at: "2026-07-29T12:00:00Z".into(),
+                    store_path: Some("/nix/store/x".into()),
+                    repo_url: Some("https://example.com/app.git".into()),
+                    config_path: Some("Russelfile.toml".into()),
+                    host_port: Some(8080),
+                    guest_port: Some(3000),
+                    message: Some("deploy complete".into()),
+                    rollback_ready: false,
+                },
+                DeploymentRecord {
+                    version: 1,
+                    generation_id: None,
+                    status: "previous".into(),
+                    runtime: Some(RuntimeKind::Container),
+                    deployed_at: "2026-07-28T09:00:00Z".into(),
+                    store_path: None,
+                    repo_url: Some("https://example.com/app.git".into()),
+                    config_path: Some("Russelfile.toml".into()),
+                    host_port: Some(8080),
+                    guest_port: Some(3000),
+                    message: None,
+                    rollback_ready: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: DeploymentsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.active_version, Some(2));
+        assert_eq!(parsed.deployments.len(), 2);
+        assert!(parsed.deployments[1].rollback_ready);
+    }
+
+    #[test]
+    fn rollback_request_defaults_version_none() {
+        let req: RollbackRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.version.is_none());
+        let req: RollbackRequest = serde_json::from_str(r#"{"version":3}"#).unwrap();
+        assert_eq!(req.version, Some(3));
     }
 }

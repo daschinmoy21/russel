@@ -126,10 +126,18 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 | `GET`  | `/logs`   | Get logs for all services (when `service_id` omitted) |
 | `GET`  | `/vm/{service_id}/status` | Get deployment status for a service |
 | `GET`  | `/vm/{service_id}/logs`   | Get logs for a service |
+| `GET`  | `/vm/{service_id}/deployments` | List deployment history (newest first; journal under `/var/lib/russel/<id>/deployments.json`) |
+| `POST` | `/vm/{service_id}/rollback` | Explicit operator rollback to a prior version (`{"version":N}` optional; NDJSON stream) |
 | `GET`  | `/vms`                     | List registered services |
 | `POST` | `/vm/{service_id}/stop`    | Stop a service (microVM or container) |
 | `POST` | `/vm/{service_id}/update`  | Redeploy from recorded/overridden source (returns NDJSON stream) |
 | `DELETE`| `/vm/{service_id}`         | Destroy a service and clean up resources |
+
+### Deployment history and rollback
+
+Each successful deploy appends a versioned row to `/var/lib/russel/<service_id>/deployments.json` (cap 20). Status values: `active`, `previous`, `superseded`, `rolled_back`. The prior `active` becomes `previous` (one); older previous rows become `superseded`. Each row stores a `desired_state` snapshot (`repo_url`, `config_path`, `runtime`, `env`, `podman_args`, ports) so operators can roll back without waiting for a failed redeploy.
+
+`POST /vm/{id}/rollback` with optional `{"version": N}` (omit to select the latest `previous` with `rollback_ready`) **redeploys from history** via the normal deploy pipeline. Instant dual-live retain-N=2 cutover (keeping the previous generation artifact hot) is a follow-up; if a target has no recorded source, the API returns **409** with a clear message.
 
 ## CLI Commands
 

@@ -1389,9 +1389,7 @@ fn pack_cpio_blocking(work: &Path, initramfs_file: &Path, bb_bin: &str) -> anyho
     let cpio_out = cpio
         .wait_with_output()
         .map_err(|e| anyhow::anyhow!("wait cpio: {e}"))?;
-    let find_status = find
-        .wait()
-        .map_err(|e| anyhow::anyhow!("wait find: {e}"))?;
+    let find_status = find.wait().map_err(|e| anyhow::anyhow!("wait find: {e}"))?;
 
     if !cpio_out.status.success() {
         anyhow::bail!(
@@ -1410,7 +1408,10 @@ fn pack_cpio_blocking(work: &Path, initramfs_file: &Path, bb_bin: &str) -> anyho
 
     let meta = std::fs::metadata(initramfs_file)?;
     if meta.len() == 0 {
-        anyhow::bail!("cpio produced empty initramfs at {}", initramfs_file.display());
+        anyhow::bail!(
+            "cpio produced empty initramfs at {}",
+            initramfs_file.display()
+        );
     }
     Ok(())
 }
@@ -1548,9 +1549,8 @@ mod tests {
             }
         }
         // Known store path from recent deploys (optional local convenience).
-        let store = PathBuf::from(
-            "/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0/bin/busybox",
-        );
+        let store =
+            PathBuf::from("/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0/bin/busybox");
         store.is_file().then_some(store)
     }
 }
