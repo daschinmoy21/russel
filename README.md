@@ -438,6 +438,10 @@ custom kernel, microVM races are skipped.
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 - **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, coding standards, and the mandatory full test/fmt/clippy checklist. Always run `cargo test --workspace` (and fmt + clippy) before opening a PR.
+
 ## License
 
 MIT
