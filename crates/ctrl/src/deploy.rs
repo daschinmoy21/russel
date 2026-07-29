@@ -22,7 +22,7 @@ use russel_core::{
 };
 
 use crate::{
-    build::NixBuilder,
+    build::{self, BuildBackend},
     container::{
         ContainerRunner, ContainerStartSpec, PreparedRootfs, RootfsSpec, default_base_dir,
         validate_podman_args_for_runtime, validate_podman_passthrough_args,
@@ -129,7 +129,7 @@ enum DeployInnerResult {
 pub struct DeployPipeline {
     state: AppState,
     git: GitClient,
-    builder: NixBuilder,
+    builder: Arc<dyn BuildBackend>,
     runner: MicrovmRunner,
     containers: ContainerRunner,
     ports: PortAllocator,
@@ -141,7 +141,7 @@ impl std::fmt::Debug for DeployPipeline {
         f.debug_struct("DeployPipeline")
             .field("state", &self.state)
             .field("git", &self.git)
-            .field("builder", &self.builder)
+            .field("builder", &"Arc<dyn BuildBackend>")
             .field("runner", &self.runner)
             .field("containers", &self.containers)
             .field("ports", &self.ports)
@@ -155,7 +155,7 @@ impl DeployPipeline {
         Self {
             state,
             git: GitClient,
-            builder: NixBuilder,
+            builder: build::default_builder(),
             // DeployPipeline is constructed per request.  Keep the expensive
             // kernel/busybox/module resolution cache alive across requests so
             // the benchmark's later VMs measure VM work rather than repeated
@@ -165,6 +165,13 @@ impl DeployPipeline {
             ports: PortAllocator,
             ingress: ingress::default_ingress(),
         }
+    }
+
+    /// Replace the build backend (useful for tests).
+    #[allow(dead_code)]
+    pub fn with_builder(mut self, b: Arc<dyn BuildBackend>) -> Self {
+        self.builder = b;
+        self
     }
 
     pub async fn deploy(

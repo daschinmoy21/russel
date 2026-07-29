@@ -17,6 +17,7 @@ mod metadata;
 mod microvm;
 mod network;
 mod reconcile;
+mod runtime;
 mod secrets;
 mod state;
 mod traefik;

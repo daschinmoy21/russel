@@ -1527,6 +1527,17 @@ fn is_missing_container(output: &std::process::Output) -> bool {
     stderr.contains("no such object") || stderr.contains("No such container")
 }
 
+#[async_trait::async_trait]
+impl crate::runtime::RuntimeLifecycle for ContainerRunner {
+    async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
+        self.stop(service_id).await
+    }
+
+    async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
+        self.destroy(service_id).await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

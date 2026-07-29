@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use tokio::process::Command;
@@ -67,6 +67,17 @@ pub fn current_system() -> &'static str {
         .as_str()
 }
 
+/// Pluggable build backend — mirrors the `Ingress` trait pattern.
+///
+/// DeployPipeline holds an `Arc<dyn BuildBackend>` so future providers
+/// (container-first, remote build farm, Bazel) can be swapped in without
+/// touching the deploy orchestration.
+#[async_trait::async_trait]
+pub trait BuildBackend: Send + Sync {
+    async fn build(&self, repo_path: &Path) -> Result<BuildOutput>;
+}
+
+/// Default build backend backed by `nix build` on the local machine.
 #[derive(Debug, Default)]
 pub struct NixBuilder;
 
@@ -163,7 +174,16 @@ impl NixBuilder {
         Ok(true)
     }
 
+    /// Build using `nix build`; the inherent entry point for callers that
+    /// hold a concrete `NixBuilder` (delegates to `build_package`).
+    #[allow(dead_code)]
     pub async fn build(&self, repo_path: &Path) -> Result<BuildOutput> {
+        self.build_package(repo_path).await
+    }
+
+    /// Shared implementation: generates a flake if missing, runs `nix build`,
+    /// and cleans up the auto-generated flake on success.
+    async fn build_package(&self, repo_path: &Path) -> Result<BuildOutput> {
         let generated = self.ensure_flake_exists(repo_path).await?;
 
         let build_result = self.build_inner(repo_path).await;
@@ -250,5 +270,64 @@ impl NixBuilder {
         let store_path: PathBuf = store_path_raw.into();
 
         Ok(BuildOutput { store_path })
+    }
+}
+
+#[async_trait::async_trait]
+impl BuildBackend for NixBuilder {
+    async fn build(&self, repo_path: &Path) -> Result<BuildOutput> {
+        self.build_package(repo_path).await
+    }
+}
+
+/// Return the default build backend (local `nix build`).
+pub fn default_builder() -> Arc<dyn BuildBackend> {
+    Arc::new(NixBuilder)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    struct StubBuilder {
+        result: Result<BuildOutput>,
+    }
+
+    #[async_trait::async_trait]
+    impl BuildBackend for StubBuilder {
+        async fn build(&self, _repo_path: &Path) -> Result<BuildOutput> {
+            match &self.result {
+                Ok(out) => Ok(out.clone()),
+                Err(e) => Err(anyhow::anyhow!("{}", e)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_builder_err_returns_error() {
+        let stub: Arc<dyn BuildBackend> = Arc::new(StubBuilder {
+            result: Err(anyhow::anyhow!("stub failure")),
+        });
+        let err = stub.build(Path::new("/tmp")).await.unwrap_err();
+        assert!(err.to_string().contains("stub failure"));
+    }
+
+    #[tokio::test]
+    async fn stub_builder_ok_returns_output() {
+        let stub: Arc<dyn BuildBackend> = Arc::new(StubBuilder {
+            result: Ok(BuildOutput {
+                store_path: PathBuf::from("/nix/store/abc123-test"),
+            }),
+        });
+        let out = stub.build(Path::new("/tmp")).await.unwrap();
+        assert_eq!(out.store_path, PathBuf::from("/nix/store/abc123-test"));
+    }
+
+    #[test]
+    fn default_builder_is_nix_builder() {
+        // default_builder() must return an Arc that can be used as a trait object.
+        let b = default_builder();
+        let _: &dyn BuildBackend = b.as_ref();
     }
 }
