@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -28,6 +29,7 @@ use crate::{
     },
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
+    runtime::{self, RuntimeLifecycle},
     state::{AppState, LifecycleClaim},
 };
 
@@ -484,15 +486,11 @@ async fn vm_stop(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
-    let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
-    let result = match claim {
-        LifecycleClaimKind::Microvm(claim) => {
-            let result = claim.runner.stop(&service_id).await;
-            reap_children(claim.vm_child, claim.aux_processes).await;
-            result
-        }
-        LifecycleClaimKind::Container { runner } => runner.stop(&service_id).await,
-    };
+    let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
+    let result = handle.lifecycle.stop(&service_id).await;
+    if handle.runtime == RuntimeKind::Microvm {
+        reap_children(handle.vm_child, handle.aux_processes).await;
+    }
 
     let label = runtime_label(runtime);
 
@@ -795,25 +793,19 @@ async fn vm_destroy(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
-    let (runtime, claim) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
-    let result = match claim {
-        LifecycleClaimKind::Microvm(claim) => {
-            let result = claim.runner.destroy(&service_id).await;
-            reap_children(claim.vm_child, claim.aux_processes).await;
-            result
+    let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
+    let result = handle.lifecycle.destroy(&service_id).await;
+    if handle.runtime == RuntimeKind::Microvm {
+        reap_children(handle.vm_child, handle.aux_processes).await;
+    }
+    // container destroy still does base-dir cleanup on success as today
+    if handle.runtime == RuntimeKind::Container && result.is_ok() {
+        PortAllocator::release(&service_id);
+        let base = crate::container::default_base_dir(&service_id);
+        if base.exists() {
+            let _ = tokio::fs::remove_dir_all(&base).await;
         }
-        LifecycleClaimKind::Container { runner } => {
-            let result = runner.destroy(&service_id).await;
-            if result.is_ok() {
-                PortAllocator::release(&service_id);
-                let base = crate::container::default_base_dir(&service_id);
-                if base.exists() {
-                    let _ = tokio::fs::remove_dir_all(&base).await;
-                }
-            }
-            result
-        }
-    };
+    }
 
     let label = runtime_label(runtime);
 
@@ -839,16 +831,15 @@ async fn vm_destroy(
     }
 }
 
-struct MicrovmLifecycleClaim {
-    runner: MicrovmRunner,
+/// Handle returned by `claim_lifecycle_operation` — holds a swappable
+/// lifecycle provider plus any microVM child processes to reap after
+/// stop/destroy.
+struct LifecycleClaimHandle {
+    runtime: RuntimeKind,
+    lifecycle: Arc<dyn RuntimeLifecycle>,
+    /// Only microvm carries claimed children to reap after stop/destroy
     vm_child: Option<Child>,
     aux_processes: Vec<Child>,
-}
-
-enum LifecycleClaimKind {
-    // Box large variant payload (clippy large_enum_variant).
-    Microvm(Box<MicrovmLifecycleClaim>),
-    Container { runner: ContainerRunner },
 }
 
 fn runtime_label(runtime: RuntimeKind) -> &'static str {
@@ -862,7 +853,7 @@ fn claim_lifecycle_operation(
     state: &AppState,
     service_id: &str,
     target_status: &str,
-) -> Result<(RuntimeKind, LifecycleClaimKind), (StatusCode, String)> {
+) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
     let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
 
     let (vm_child, aux_processes) =
@@ -882,18 +873,14 @@ fn claim_lifecycle_operation(
             }
         };
 
-    let claim = match runtime {
-        RuntimeKind::Microvm => LifecycleClaimKind::Microvm(Box::new(MicrovmLifecycleClaim {
-            runner: MicrovmRunner::new(),
-            vm_child,
-            aux_processes,
-        })),
-        RuntimeKind::Container => LifecycleClaimKind::Container {
-            runner: ContainerRunner::new(),
-        },
+    let handle = LifecycleClaimHandle {
+        runtime,
+        lifecycle: runtime::lifecycle_for(runtime),
+        vm_child,
+        aux_processes,
     };
 
-    Ok((runtime, claim))
+    Ok((runtime, handle))
 }
 
 async fn reap_children(vm_child: Option<Child>, aux_processes: Vec<Child>) {

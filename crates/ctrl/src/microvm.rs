@@ -1431,6 +1431,17 @@ fn select_kernel_version(versions: &mut [String]) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("unreachable: versions is empty"))
 }
 
+#[async_trait::async_trait]
+impl crate::runtime::RuntimeLifecycle for MicrovmRunner {
+    async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
+        self.stop(service_id).await
+    }
+
+    async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
+        self.destroy(service_id).await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
