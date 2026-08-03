@@ -67,7 +67,7 @@ const { services, connection } = await api.getServices();
 </Layout>
 
 <script>
-  import { api, isDemoMode, isServiceRunning } from '../lib/api';
+  import { api, escapeHtml, isDemoMode, isServiceRunning } from '../lib/api';
 
   const tableWrapper = document.getElementById('servicesTableWrapper');
   const btnRefresh = document.getElementById('btnRefresh');
@@ -86,12 +86,6 @@ const { services, connection } = await api.getServices();
     if (countMicrovm) countMicrovm.textContent = String(services.filter(s => s.runtime === 'microvm').length);
     if (countContainer) countContainer.textContent = String(services.filter(s => s.runtime === 'container').length);
     if (countRunning) countRunning.textContent = String(services.filter(s => isServiceRunning(s)).length);
-  }
-
-  function escapeHtml(s: string): string {
-    const div = document.createElement('div');
-    div.textContent = s;
-    return div.innerHTML;
   }
 
   function getHostPort(svc: any): number | null {
@@ -127,14 +121,16 @@ const { services, connection } = await api.getServices();
     const rows = services.map((svc) => {
       const runtimeLabel = svc.runtime === 'microvm' ? 'MicroVM' : 'Container';
       const statusClass = isServiceRunning(svc) ? 'badge-running' : 'badge-stopped';
+      const idAttr = encodeURIComponent(svc.id);
+      const idHtml = escapeHtml(svc.id);
       const label = escapeHtml(svc.name || svc.id);
-      const secondaryId = (svc.name && svc.name !== svc.id) ? `<span class="service-id">${escapeHtml(svc.id)}</span>` : '';
+      const secondaryId = (svc.name && svc.name !== svc.id) ? `<span class="service-id">${idHtml}</span>` : '';
       return `<tr>
-        <td><div class="service-name-cell"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="service-link">${label}</a>${secondaryId}</div></td>
+        <td><div class="service-name-cell"><a href="/service-detail?id=${idAttr}" class="service-link">${label}</a>${secondaryId}</div></td>
         <td><span class="runtime-tag ${escapeHtml(svc.runtime)}">${runtimeLabel}</span></td>
         <td><span class="badge ${statusClass}"><span class="badge-dot"></span>${escapeHtml(svc.status)}</span></td>
         <td>${renderPortCell(svc)}</td>
-        <td><div class="row-actions"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="btn btn-secondary btn-sm">Details</a><button class="btn btn-secondary btn-sm" data-action="update" data-id="${escapeHtml(svc.id)}">Update</button><button class="btn btn-secondary btn-sm" data-action="stop" data-id="${escapeHtml(svc.id)}">Stop</button><button class="btn btn-danger btn-sm" data-action="destroy" data-id="${escapeHtml(svc.id)}">Destroy</button></div></td>
+        <td><div class="row-actions"><a href="/service-detail?id=${idAttr}" class="btn btn-secondary btn-sm">Details</a><button class="btn btn-secondary btn-sm" data-action="update" data-id="${idHtml}">Update</button><button class="btn btn-secondary btn-sm" data-action="stop" data-id="${idHtml}">Stop</button><button class="btn btn-danger btn-sm" data-action="destroy" data-id="${idHtml}">Destroy</button></div></td>
       </tr>`;
     }).join('');
     tableWrapper.innerHTML = `<div class="data-table-container"><table class="data-table"><thead><tr><th>Service / ID</th><th>Runtime</th><th>Status</th><th>Ports</th><th style="text-align:right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;

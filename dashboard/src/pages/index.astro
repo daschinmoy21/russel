@@ -77,18 +77,12 @@ const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === '
 </Layout>
 
 <script>
-  import { api, formatUptime, isServiceRunning, probeEndpointPort } from '../lib/api';
+  import { api, escapeHtml, formatUptime, isServiceRunning, probeEndpointPort } from '../lib/api';
 
   const SAMPLE_KEY = 'RUSSEL_FLEET_SAMPLES';
   const MAX_SAMPLES = 48;
   const MIN_SAMPLE_INTERVAL_MS = 30_000;
   const POLL_INTERVAL_MS = 10_000;
-
-  function escapeHtml(s: string): string {
-    const div = document.createElement('div');
-    div.textContent = s;
-    return div.innerHTML;
-  }
 
   function getHostPort(svc: any): number | null {
     if (typeof svc.host_port === 'number') return svc.host_port;
@@ -541,14 +535,15 @@ const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === '
       if (services.length > 0) {
         const rows = services.slice(0, 4).map((svc: any) => {
           const statusClass = isServiceRunning(svc) ? 'badge-running' : 'badge-stopped';
+          const idAttr = encodeURIComponent(svc.id);
           const label = escapeHtml(svc.name || svc.id);
           const secondaryId = (svc.name && svc.name !== svc.id) ? `<span class="service-id">${escapeHtml(svc.id)}</span>` : '';
           return `<tr>
-            <td><div class="service-name-cell"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="service-link">${label}</a>${secondaryId}</div></td>
+            <td><div class="service-name-cell"><a href="/service-detail?id=${idAttr}" class="service-link">${label}</a>${secondaryId}</div></td>
             <td><span class="runtime-tag ${escapeHtml(svc.runtime)}">${svc.runtime === 'microvm' ? 'MicroVM' : 'Container'}</span></td>
             <td><span class="badge ${statusClass}"><span class="badge-dot"></span>${escapeHtml(svc.status)}</span></td>
             <td>${renderPortCell(svc)}</td>
-            <td style="text-align:right"><a href="/service-detail?id=${escapeHtml(svc.id)}" class="btn btn-secondary btn-sm">Details</a></td>
+            <td style="text-align:right"><a href="/service-detail?id=${idAttr}" class="btn btn-secondary btn-sm">Details</a></td>
           </tr>`;
         }).join('');
         const tableHtml = `<div class="data-table-container"><table class="data-table"><thead><tr><th>Service / ID</th><th>Runtime</th><th>Status</th><th>Ports</th><th style="text-align:right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;

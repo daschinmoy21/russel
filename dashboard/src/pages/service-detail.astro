@@ -156,7 +156,7 @@ const initialRunning = initialSvc ? isServiceRunning(initialSvc) : false;
 </Layout>
 
 <script>
-  import { api, formatUptime, isServiceRunning } from '../lib/api';
+  import { api, escapeHtml, formatUptime, isServiceRunning } from '../lib/api';
 
   const params = new URLSearchParams(window.location.search);
   const serviceId = params.get('id');
@@ -332,22 +332,26 @@ const initialRunning = initialSvc ? isServiceRunning(initialSvc) : false;
           </thead>
           <tbody>
             ${rows
-              .map(
-                (d) => `
+              .map((d) => {
+                const ver = Number(d.version);
+                const verSafe = Number.isFinite(ver) ? String(ver) : '0';
+                const runtime = escapeHtml(String(d.runtime || '\u2014'));
+                const deployed = escapeHtml(formatDeployDate(String(d.deployed_at || '')));
+                return `
               <tr>
-                <td><strong>v${d.version}</strong></td>
-                <td>${deploymentStatusBadge(d.status)}</td>
-                <td>${d.runtime || '—'}</td>
-                <td>${formatDeployDate(d.deployed_at)}</td>
+                <td><strong>v${verSafe}</strong></td>
+                <td>${deploymentStatusBadge(String(d.status || ''))}</td>
+                <td>${runtime}</td>
+                <td>${deployed}</td>
                 <td>${
                   d.rollback_ready && d.status !== 'active'
-                    ? `<button class="btn btn-secondary btn-sm rollback-btn" data-version="${d.version}">Rollback</button>`
+                    ? `<button class="btn btn-secondary btn-sm rollback-btn" data-version="${verSafe}">Rollback</button>`
                     : d.status === 'active'
                       ? '<span style="font-size: 0.8rem; color: var(--text-muted);">Desired gen</span>'
-                      : '—'
+                      : '\u2014'
                 }</td>
-              </tr>`,
-              )
+              </tr>`;
+              })
               .join('')}
           </tbody>
         </table>
