@@ -93,8 +93,19 @@ impl GitClient {
         }
 
         // Local path: must be absolute, exist, and not contain traversal.
+        // Absolute local deploys are gated behind RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
+        // (default off) so a remote/shared control plane cannot treat the entire
+        // host tree as a build root unless the operator opts in.
         let path = PathBuf::from(repo);
         if path.is_absolute() {
+            if !local_path_deploy_allowed() {
+                anyhow::bail!(
+                    "local absolute path deploys are disabled; use a git URL \
+                     (https://, http://, ssh://, or git@host:path) or set \
+                     RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1 on the control plane for \
+                     single-tenant trusted hosts"
+                );
+            }
             if !path.exists() {
                 anyhow::bail!("local path does not exist: {}", repo);
             }
@@ -289,6 +300,19 @@ fn clone_security_config_args(scheme: &str) -> Vec<&'static str> {
         args.extend(["-c", "http.followRedirects=false"]);
     }
     args
+}
+
+/// Whether absolute local path deploys are permitted.
+///
+/// Default **off**. Set `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` on the control plane
+/// only on single-tenant trusted hosts (local dev). When a remote client sends
+/// an absolute path, the path is resolved on the **control-plane host**, not the
+/// client — so leaving this enabled on a shared/remote ctrl exposes the host
+/// filesystem as a build root.
+fn local_path_deploy_allowed() -> bool {
+    std::env::var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
 }
 
 /// Hosts listed in `RUSSEL_GIT_HOST_ALLOWLIST` (comma-separated, case-insensitive)
@@ -1095,5 +1119,147 @@ mod tests {
         // Literals are not re-resolved; private ones already fail validate_remote_host.
         assert!(validate_remote_host_dns("8.8.8.8").await.is_ok());
         assert!(validate_remote_host_dns("10.0.0.1").await.is_ok());
+    }
+
+    // ── RUSSEL_ALLOW_LOCAL_PATH_DEPLOY gate (#196) ─────────────────────────
+    // Serialize env mutations: cargo runs tests in parallel by default.
+
+    static LOCAL_PATH_DEPLOY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    async fn with_local_path_deploy_env<T, F, Fut>(value: Option<&str>, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _guard = LOCAL_PATH_DEPLOY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY").ok();
+        // SAFETY: exclusive lock held for the duration of the mutation + body.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", v),
+                None => std::env::remove_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY"),
+            }
+        }
+        let result = f().await;
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", v),
+                None => std::env::remove_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn local_path_deploy_allowed_defaults_off() {
+        let _guard = LOCAL_PATH_DEPLOY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY").ok();
+        unsafe {
+            std::env::remove_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY");
+        }
+        assert!(!local_path_deploy_allowed());
+        unsafe {
+            std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", "0");
+        }
+        assert!(!local_path_deploy_allowed());
+        unsafe {
+            std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", "true");
+        }
+        assert!(!local_path_deploy_allowed());
+        unsafe {
+            std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", "1");
+        }
+        assert!(local_path_deploy_allowed());
+        unsafe {
+            std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", " 1 ");
+        }
+        assert!(local_path_deploy_allowed());
+        match previous {
+            Some(v) => unsafe { std::env::set_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY", v) },
+            None => unsafe { std::env::remove_var("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY") },
+        }
+    }
+
+    #[tokio::test]
+    async fn local_absolute_path_rejected_when_gate_off() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let path_str = path.display().to_string();
+
+        with_local_path_deploy_env(None, || async {
+            let err = GitClient
+                .clone_or_use_local(&path_str)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY")
+                    && err.contains("disabled"),
+                "unexpected error: {err}"
+            );
+        })
+        .await;
+
+        with_local_path_deploy_env(Some("0"), || async {
+            let err = GitClient
+                .clone_or_use_local(&path_str)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY"),
+                "unexpected error: {err}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn local_absolute_path_accepted_when_gate_on() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let path_str = path.display().to_string();
+
+        with_local_path_deploy_env(Some("1"), || async {
+            let (resolved, _lease) = GitClient
+                .clone_or_use_local(&path_str)
+                .await
+                .expect("local path should be accepted when gate is on");
+            assert_eq!(resolved, path);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn local_absolute_path_still_checks_exists_and_dotdot_when_gate_on() {
+        with_local_path_deploy_env(Some("1"), || async {
+            let missing = "/tmp/russel-local-path-gate-missing-xyz-196";
+            let err = GitClient
+                .clone_or_use_local(missing)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("does not exist"),
+                "expected existence check, got: {err}"
+            );
+
+            // Absolute path containing '..' components is rejected even when allowed.
+            let with_dotdot = "/tmp/../etc";
+            let err = GitClient
+                .clone_or_use_local(with_dotdot)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("..") || err.contains("does not exist"),
+                "expected .. or existence rejection, got: {err}"
+            );
+        })
+        .await;
     }
 }
