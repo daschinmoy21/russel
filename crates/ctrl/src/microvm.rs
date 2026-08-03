@@ -1092,6 +1092,11 @@ impl MicrovmRunner {
                 "service_id can only contain alphanumeric characters, dashes, and underscores"
             );
         }
+        // Reject host state trees (secrets/traefik/_pool/*.bak) so deploy/destroy
+        // cannot wipe /var/lib/russel/{secrets,traefik,_pool} or backup dirs.
+        if crate::metadata::is_reserved_service_dir(service_id) {
+            anyhow::bail!("service_id is reserved: {service_id}");
+        }
         Ok(())
     }
 
@@ -1446,6 +1451,42 @@ impl crate::runtime::RuntimeLifecycle for MicrovmRunner {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_service_id_accepts_normal_ids() {
+        MicrovmRunner::validate_service_id("api").unwrap();
+        MicrovmRunner::validate_service_id("basic-http-tester").unwrap();
+        MicrovmRunner::validate_service_id("svc_01").unwrap();
+        MicrovmRunner::validate_service_id("pooltpl").unwrap();
+    }
+
+    #[test]
+    fn validate_service_id_rejects_reserved_ids() {
+        for id in ["secrets", "traefik", "_pool"] {
+            let err = MicrovmRunner::validate_service_id(id).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("reserved"),
+                "expected reserved error for {id}, got: {msg}"
+            );
+        }
+        // .bak ids fail charset (dot) and/or reserved check — must not pass.
+        let err = MicrovmRunner::validate_service_id("foo.bak").unwrap_err();
+        assert!(
+            err.to_string().contains("reserved")
+                || err.to_string().contains("alphanumeric")
+                || err.to_string().contains("path"),
+            "expected rejection for foo.bak, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_service_id_rejects_empty_and_path_chars() {
+        assert!(MicrovmRunner::validate_service_id("").is_err());
+        assert!(MicrovmRunner::validate_service_id("../etc").is_err());
+        assert!(MicrovmRunner::validate_service_id("a/b").is_err());
+        assert!(MicrovmRunner::validate_service_id("a\\b").is_err());
+    }
 
     #[test]
     fn select_kernel_version_single() {
