@@ -4,7 +4,9 @@ export default defineConfig({
 	output: "static",
 	server: {
 		port: 4321,
-		host: true,
+		// Loopback only by default (#188). Use `bun run dev:lan` to bind 0.0.0.0
+		// — never on a shared LAN without RUSSEL_API_TOKEN on the control plane.
+		host: "127.0.0.1",
 	},
 	vite: {
 		server: {
