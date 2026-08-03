@@ -437,6 +437,7 @@ custom kernel, microVM races are skipped.
 - **Database stubs** — `[database.*]` in Russelfile is still a placeholder; health probes + optional restart are implemented (`RUSSEL_HEALTH_*`).
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 - **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
+- **Nix builds trust the source repo** — a malicious `flake.nix` runs as the build user. Multi-tenant: only deploy trusted repos. Opt-in `RUSSEL_NIX_RESTRICTED=1` forces sandboxed `nix build` and disables auto-flake. Full threat model: [docs/security/nix-builds.md](docs/security/nix-builds.md).
 
 ## Contributing
 

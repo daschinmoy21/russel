@@ -81,6 +81,38 @@ pub trait BuildBackend: Send + Sync {
 #[derive(Debug, Default)]
 pub struct NixBuilder;
 
+/// Opt-in restricted Nix build mode (`RUSSEL_NIX_RESTRICTED=1` / `true` / `yes`).
+///
+/// When enabled, deploy builds:
+/// - refuse auto-generated `flake.nix` (require a committed flake)
+/// - force `sandbox = true` and `sandbox-fallback = false` on `nix build`
+///
+/// See `docs/security/nix-builds.md` for the full threat model. This is a light
+/// gate — not multi-tenant isolation. Host `nix.conf` (`trusted-users`,
+/// builders, substituters) still applies; trusted users can override sandbox.
+pub fn nix_restricted_enabled() -> bool {
+    match std::env::var("RUSSEL_NIX_RESTRICTED") {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Extra `nix build` arguments when restricted mode is on.
+fn restricted_nix_build_args() -> &'static [&'static str] {
+    // Keep as flat argv so we can `.args(...)` without owning Strings.
+    &[
+        "--option",
+        "sandbox",
+        "true",
+        "--option",
+        "sandbox-fallback",
+        "false",
+    ]
+}
+
 impl NixBuilder {
     /// Marker inserted as the first line of auto-generated flake.nix files.
     /// Used to identify and optionally clean up generated flakes after a
@@ -89,6 +121,23 @@ impl NixBuilder {
 
     pub async fn ensure_flake_exists(&self, repo_path: &Path) -> Result<bool> {
         let flake_path = repo_path.join("flake.nix");
+
+        // Restricted mode never auto-generates flakes (moving nixos-unstable pin,
+        // unrestricted builder network). Require a committed flake.nix.
+        if nix_restricted_enabled() {
+            match std::fs::symlink_metadata(&flake_path) {
+                Ok(_) => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    anyhow::bail!(
+                        "RUSSEL_NIX_RESTRICTED=1 requires a committed flake.nix \
+                         (auto-generation is disabled for supply-chain hygiene). \
+                         See docs/security/nix-builds.md"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
         // Use create_new for atomic check-and-create (fail if exists, no TOCTOU).
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -220,11 +269,22 @@ impl NixBuilder {
     async fn build_inner(&self, repo_path: &Path) -> Result<BuildOutput> {
         let system = current_system();
         let flake_ref = format!("path:{}#packages.{}.default", repo_path.display(), system);
-        let mut output = Command::new("nix")
-            .arg("build")
+        let restricted = nix_restricted_enabled();
+        if restricted {
+            tracing::info!(
+                "RUSSEL_NIX_RESTRICTED enabled — forcing sandbox=true, sandbox-fallback=false"
+            );
+        }
+
+        let mut cmd = Command::new("nix");
+        cmd.arg("build")
             .arg(&flake_ref)
             .arg("--no-link")
-            .arg("--print-out-paths")
+            .arg("--print-out-paths");
+        if restricted {
+            cmd.args(restricted_nix_build_args().iter().copied());
+        }
+        let mut output = cmd
             .stderr(std::process::Stdio::inherit())
             .output()
             .await?;
@@ -232,11 +292,16 @@ impl NixBuilder {
         if !output.status.success() {
             let fallback_ref = format!("path:{}#defaultPackage.{}", repo_path.display(), system);
             tracing::info!(system = %system, "packages.{}.default failed, trying defaultPackage", system);
-            output = Command::new("nix")
+            let mut fallback = Command::new("nix");
+            fallback
                 .arg("build")
                 .arg(&fallback_ref)
                 .arg("--no-link")
-                .arg("--print-out-paths")
+                .arg("--print-out-paths");
+            if restricted {
+                fallback.args(restricted_nix_build_args().iter().copied());
+            }
+            output = fallback
                 .stderr(std::process::Stdio::piped())
                 .output()
                 .await?;
@@ -329,5 +394,87 @@ mod tests {
         // default_builder() must return an Arc that can be used as a trait object.
         let b = default_builder();
         let _: &dyn BuildBackend = b.as_ref();
+    }
+
+    #[test]
+    fn nix_restricted_enabled_parses_truthy_values() {
+        let prev = std::env::var_os("RUSSEL_NIX_RESTRICTED");
+        // SAFETY: single-threaded unit test; restore env on drop.
+        unsafe {
+            std::env::remove_var("RUSSEL_NIX_RESTRICTED");
+        }
+        assert!(!nix_restricted_enabled());
+
+        for truthy in ["1", "true", "TRUE", "yes", "Yes", " 1 "] {
+            unsafe {
+                std::env::set_var("RUSSEL_NIX_RESTRICTED", truthy);
+            }
+            assert!(
+                nix_restricted_enabled(),
+                "expected truthy for {truthy:?}"
+            );
+        }
+        for falsy in ["0", "false", "no", "", "maybe"] {
+            unsafe {
+                std::env::set_var("RUSSEL_NIX_RESTRICTED", falsy);
+            }
+            assert!(
+                !nix_restricted_enabled(),
+                "expected falsy for {falsy:?}"
+            );
+        }
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RUSSEL_NIX_RESTRICTED", v),
+                None => std::env::remove_var("RUSSEL_NIX_RESTRICTED"),
+            }
+        }
+    }
+
+    #[test]
+    fn restricted_nix_build_args_force_sandbox() {
+        let args = restricted_nix_build_args();
+        assert!(args.windows(3).any(|w| w == ["--option", "sandbox", "true"]));
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--option", "sandbox-fallback", "false"])
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_flake_refuses_autogen_when_restricted() {
+        let prev = std::env::var_os("RUSSEL_NIX_RESTRICTED");
+        unsafe {
+            std::env::set_var("RUSSEL_NIX_RESTRICTED", "1");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let builder = NixBuilder;
+        let err = builder
+            .ensure_flake_exists(dir.path())
+            .await
+            .expect_err("must refuse missing flake under restricted mode");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RUSSEL_NIX_RESTRICTED"),
+            "unexpected error: {msg}"
+        );
+        assert!(!dir.path().join("flake.nix").exists());
+
+        // With a committed flake, ensure returns false (do not regenerate).
+        std::fs::write(dir.path().join("flake.nix"), "{}\n").unwrap();
+        let generated = builder
+            .ensure_flake_exists(dir.path())
+            .await
+            .expect("existing flake allowed");
+        assert!(!generated);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RUSSEL_NIX_RESTRICTED", v),
+                None => std::env::remove_var("RUSSEL_NIX_RESTRICTED"),
+            }
+        }
     }
 }
