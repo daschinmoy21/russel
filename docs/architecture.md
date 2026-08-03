@@ -262,10 +262,21 @@ flowchart LR
 - **socat arg0 tagging**: forwarders are spawned as `socat-russel-<id>` so
   lifecycle code can find and kill exactly one service's forwarder.
 - Startup cleanup removes only **orphan** `rsl-*` TAPs with no live service
-  directory — host iptables/Docker/VPN rules are never touched.
-- No iptables NAT is used on the microVM path: forwarding is userspace (socat),
-  so Russel's firewall footprint is zero (only `ip_forward=1` sysctl, restored
-  when the last TAP disappears).
+  directory — host iptables/Docker/VPN built-in chains are never flushed.
+- No iptables NAT is used on the microVM path: publish is userspace (socat on
+  the host OUTPUT path). Russel still sets `ip_forward=1` for TAP L3, then
+  installs a dedicated **`RUSSEL-FORWARD`** chain jumped from built-in FORWARD
+  for `-i rsl-+` / `-o rsl-+` with a terminal **DROP** (#187). That
+  default-denies guest→guest and guest→off-host pivot via host routing without
+  breaking socat publish. Rules are removed when the last `rsl-*` TAP goes away
+  (same lifecycle as restoring `ip_forward`).
+- Escape hatch (single-tenant debug only): `RUSSEL_FORWARD=allow` or
+  `RUSSEL_DISABLE_FORWARD_FILTER=1` skips the filter. **Residual risk:** with
+  `ip_forward=1` and no filter, a compromised guest can route to other guests
+  and non-local destinations via the host. Prefer the secure default.
+- If `iptables` is missing or the process lacks `CAP_NET_ADMIN`, filter install
+  fails soft with a warning (microVM boot continues) — production hosts should
+  run privileged so isolation actually applies.
 
 ---
 

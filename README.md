@@ -238,7 +238,7 @@ Russel checks readiness by TCP-connecting to the published host port (container)
 
 ## Networking Model
 
-- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward.
+- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward. Guest L3 isolation uses a dedicated `RUSSEL-FORWARD` iptables chain (default-deny for `rsl-*`); set `RUSSEL_FORWARD=allow` only for single-tenant debugging (guests can otherwise pivot via host routing when `ip_forward=1`).
 - **Container:** Rootless Podman publishes `-p HOST:GUEST` (from CLI `-p` / allocator).
 
 ### Port Publishing (today)
