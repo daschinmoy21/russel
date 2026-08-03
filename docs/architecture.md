@@ -348,7 +348,7 @@ flowchart TB
 | Layer | Mechanism |
 |-------|-----------|
 | API auth | Bearer token on every route when `RUSSEL_API_TOKEN` set (≥32 chars after trim, else refuse start); constant-time compare; non-loopback bind **refuses to start** without a token; `RUSSEL_REQUIRE_AUTH=1\|true\|yes` fails closed on loopback without a token; loopback-no-token is otherwise dev mode with warnings |
-| Transport | HTTP only today — terminate TLS at a proxy or use an SSH tunnel; the CLI warns when the token would cross the network in cleartext |
+| Transport | HTTP only in ctrl — terminate TLS at a reverse proxy (see `docs/security-tls.md`) or use an SSH tunnel; CLI/dashboard **refuse** Bearer over `http://` to non-loopback hosts unless `--insecure` / `RUSSEL_INSECURE_CLEARTEXT=1` (loopback is warn-only) |
 | Input validation | `service_id` charset/length; `bin_name` charset (no `.`/`..`); config path `openat`+`O_NOFOLLOW` chain; env key/value rules (reserved keys incl. `IFS`/`PATH`/`LD_*`, no newlines); secret name charset; podman passthrough allowlist posture |
 | SSRF guard | Repo URLs restricted to `https/http/ssh/git@`; literal-IP hosts checked against link-local + cloud-metadata ranges for all schemes |
 | Secrets | Host store `0600`/`0700`, atomic writes, names never values over the API, resolved at deploy time, never in argv; microVM delivery via `deploy.env` (`0600`) |
