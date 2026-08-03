@@ -18,7 +18,7 @@ env/secrets, and a small multi-app tour. Index: [examples/README.md](../examples
 3. Start the control plane (terminal 1):
 
    ```bash
-   export RUSSEL_API_TOKEN=your-secret-token   # optional on loopback
+   export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"   # optional on loopback; min 32 chars
    ./target/debug/russel-ctrl                  # container-only
    # sudo -E ./target/debug/russel-ctrl        # hybrid microVM + container
    ```

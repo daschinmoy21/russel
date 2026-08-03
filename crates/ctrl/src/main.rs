@@ -108,23 +108,45 @@ async fn main() -> Result<()> {
     let local_addr = listener.local_addr()?;
     let is_loopback = ip_is_loopback_for_auth(local_addr.ip());
 
-    // Auth + bind policy: non-empty RUSSEL_API_TOKEN (after trim) enables auth.
-    // Empty/whitespace is treated as unset (dev mode).
-    let token = api::configured_api_token();
+    // Auth + bind policy:
+    // - RUSSEL_API_TOKEN: non-empty after trim enables Bearer auth; must be
+    //   ≥ MIN_API_TOKEN_LEN (32) chars. Empty/whitespace = unset.
+    // - RUSSEL_REQUIRE_AUTH=1|true|yes: fail closed without a valid token even
+    //   on loopback (production packaging).
+    // - Non-loopback bind always requires a valid token.
+    let token = match api::configured_api_token() {
+        Some(t) => {
+            if let Err(msg) = api::check_api_token_min_length(&t) {
+                anyhow::bail!("{msg}");
+            }
+            Some(t)
+        }
+        None => None,
+    };
+    let require_auth = api::require_auth_enabled();
     if token.is_some() {
         info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
+    } else if require_auth {
+        anyhow::bail!(
+            "RUSSEL_REQUIRE_AUTH is set but RUSSEL_API_TOKEN is missing or blank; \
+             set a token of at least {} characters (e.g. openssl rand -hex 32)",
+            api::MIN_API_TOKEN_LEN
+        );
     } else if is_loopback {
         // F-35: loopback is not an isolation boundary — any local user and
         // any SSH/Docker port-forward into the host reaches this socket.
         tracing::warn!(
             "dev mode: no auth — any local user or forwarded port can control the API; \
-             set RUSSEL_API_TOKEN"
+             set RUSSEL_API_TOKEN (min {} chars) or RUSSEL_REQUIRE_AUTH=1",
+            api::MIN_API_TOKEN_LEN
         );
     } else {
         anyhow::bail!(
-            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}' (bound {})",
+            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}' (bound {}); \
+             use at least {} characters (e.g. openssl rand -hex 32)",
             bind_addr,
-            local_addr
+            local_addr,
+            api::MIN_API_TOKEN_LEN
         );
     }
 

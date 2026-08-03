@@ -33,12 +33,60 @@ use crate::{
     state::{AppState, LifecycleClaim},
 };
 
+/// Minimum accepted length for `RUSSEL_API_TOKEN` after trim (when set).
+///
+/// Floor is 32 characters so weak tokens like `"a"` are rejected. Prefer
+/// `openssl rand -hex 32` (64 hex chars / 256 bits) for production.
+pub const MIN_API_TOKEN_LEN: usize = 32;
+
 /// Pure token normalize: unset/blank/whitespace → None.
+///
+/// Does **not** enforce min length — call [`check_api_token_min_length`] at
+/// startup when a token is present so short secrets fail closed.
 pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Reject tokens shorter than [`MIN_API_TOKEN_LEN`] after trim.
+///
+/// Call this at control-plane startup whenever `normalize_api_token` returns
+/// `Some`. Middleware still uses the env token as-is; startup is the gate.
+pub fn check_api_token_min_length(token: &str) -> Result<(), String> {
+    if token.len() < MIN_API_TOKEN_LEN {
+        Err(format!(
+            "RUSSEL_API_TOKEN must be at least {MIN_API_TOKEN_LEN} characters after trim \
+             (got {}). Generate a strong token with: openssl rand -hex 32",
+            token.len()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, or `yes` (case-insensitive).
+///
+/// When enabled, the control plane refuses to start without a valid token even
+/// on loopback — use for production packaging that would otherwise default to
+/// loopback bind.
+pub fn require_auth_from_env(raw: Option<&str>) -> bool {
+    raw.map(|s| {
+        let s = s.trim();
+        s.eq_ignore_ascii_case("1")
+            || s.eq_ignore_ascii_case("true")
+            || s.eq_ignore_ascii_case("yes")
+    })
+    .unwrap_or(false)
+}
+
+/// Whether `RUSSEL_REQUIRE_AUTH` is set to a truthy value.
+pub fn require_auth_enabled() -> bool {
+    require_auth_from_env(std::env::var("RUSSEL_REQUIRE_AUTH").ok().as_deref())
+}
+
 /// Non-empty RUSSEL_API_TOKEN after trim; None if unset/blank.
+///
+/// Length is not checked here — `main` calls [`check_api_token_min_length`]
+/// before serving so short tokens never enable a weak auth mode.
 pub fn configured_api_token() -> Option<String> {
     normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref())
 }
@@ -108,6 +156,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Bearer auth middleware: if RUSSEL_API_TOKEN is set (non-empty, trimmed),
 /// require it on every request.
+///
+/// Env: `RUSSEL_API_TOKEN` (min length enforced at process start), optional
+/// `RUSSEL_REQUIRE_AUTH=1|true|yes` to fail closed without a token on loopback.
 async fn auth_middleware(
     request: Request<axum::body::Body>,
     next: Next,
@@ -960,6 +1011,8 @@ mod tests {
 
     #[test]
     fn token_normalize_valid() {
+        // Normalize still returns short non-empty strings; min length is a
+        // separate startup check (see check_api_token_min_length).
         assert_eq!(
             normalize_api_token(Some("secret")),
             Some("secret".to_string())
@@ -968,6 +1021,40 @@ mod tests {
             normalize_api_token(Some("  secret  ")),
             Some("secret".to_string())
         );
+        let long = "a".repeat(MIN_API_TOKEN_LEN);
+        assert_eq!(
+            normalize_api_token(Some(&format!("  {long}  "))),
+            Some(long)
+        );
+    }
+
+    #[test]
+    fn token_min_length_rejects_short() {
+        assert!(check_api_token_min_length("a").is_err());
+        assert!(check_api_token_min_length("short-token").is_err());
+        assert!(check_api_token_min_length(&"x".repeat(MIN_API_TOKEN_LEN - 1)).is_err());
+        let err = check_api_token_min_length("a").unwrap_err();
+        assert!(err.contains("openssl rand -hex 32"), "err={err}");
+        assert!(err.contains(&MIN_API_TOKEN_LEN.to_string()), "err={err}");
+    }
+
+    #[test]
+    fn token_min_length_accepts_floor_and_longer() {
+        assert!(check_api_token_min_length(&"a".repeat(MIN_API_TOKEN_LEN)).is_ok());
+        assert!(check_api_token_min_length(&"b".repeat(64)).is_ok()); // openssl rand -hex 32
+    }
+
+    #[test]
+    fn require_auth_from_env_truthy() {
+        assert!(!require_auth_from_env(None));
+        assert!(!require_auth_from_env(Some("")));
+        assert!(!require_auth_from_env(Some("0")));
+        assert!(!require_auth_from_env(Some("false")));
+        assert!(!require_auth_from_env(Some("no")));
+        assert!(require_auth_from_env(Some("1")));
+        assert!(require_auth_from_env(Some("true")));
+        assert!(require_auth_from_env(Some("YES")));
+        assert!(require_auth_from_env(Some(" True ")));
     }
 
     #[test]

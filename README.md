@@ -34,8 +34,8 @@ cargo build
 # → target/debug/russel-cli
 # → target/debug/russel-ctrl
 
-# 3. Optional auth (required if binding non-loopback)
-export RUSSEL_API_TOKEN=your-secret-token   # same value in both terminals
+# 3. Optional auth (required if binding non-loopback; min 32 chars)
+export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"   # same value in both terminals
 
 # 4. Start control plane (terminal 1) — default http://127.0.0.1:7878
 ./target/debug/russel-ctrl
@@ -105,16 +105,18 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 
 ### Authentication
 
-When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route requires an `Authorization: Bearer <token>` header. The CLI reads the same environment variable and sends it automatically. On loopback without a token the control plane runs in dev mode (with a warning); binding to a non-loopback address **requires** `RUSSEL_API_TOKEN` or the control plane refuses to start. For production deployments, always set `RUSSEL_API_TOKEN` and bind to the internal interface where your reverse proxy lives.
+When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route requires an `Authorization: Bearer <token>` header. The token must be **at least 32 characters** after trim (generate with `openssl rand -hex 32`). The CLI reads the same environment variable and sends it automatically. On loopback without a token the control plane runs in dev mode (with a warning); binding to a non-loopback address **requires** `RUSSEL_API_TOKEN` or the control plane refuses to start. Set `RUSSEL_REQUIRE_AUTH=1` (or `true`/`yes`) to refuse startup without a valid token even on loopback — recommended for production packaging. Always set a strong `RUSSEL_API_TOKEN` and bind to the internal interface where your reverse proxy lives.
 
 ### Bind Policy
 
 | Scenario | Behaviour |
 |----------|-----------|
 | Loopback (`127.0.0.1:…`) + no token | Dev mode (warn, no auth) |
-| Loopback + `RUSSEL_API_TOKEN` set | Bearer auth required on all routes |
+| Loopback + `RUSSEL_REQUIRE_AUTH` + no token | **Refuses to start** |
+| Loopback + `RUSSEL_API_TOKEN` set (≥32 chars) | Bearer auth required on all routes |
+| Any bind + token set but &lt;32 chars | **Refuses to start** |
 | Non-loopback + no token | **Refuses to start** |
-| Non-loopback + `RUSSEL_API_TOKEN` set | Bearer auth required on all routes |
+| Non-loopback + `RUSSEL_API_TOKEN` set (≥32 chars) | Bearer auth required on all routes |
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -436,7 +438,7 @@ custom kernel, microVM races are skipped.
 - **virtiofsd --readonly** — `/nix/store` is read-only from the guest (added via `--readonly` flag). Remove only when a workflow needs guest-side store mutations.
 - **Database stubs** — `[database.*]` in Russelfile is still a placeholder; health probes + optional restart are implemented (`RUSSEL_HEALTH_*`).
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
-- **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
+- **Auth optional on loopback** — dev mode warns but does not enforce. Production should set `RUSSEL_API_TOKEN` (≥32 chars, e.g. `openssl rand -hex 32`) and prefer `RUSSEL_REQUIRE_AUTH=1`.
 
 ## Contributing
 
