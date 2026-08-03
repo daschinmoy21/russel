@@ -35,23 +35,47 @@ use crate::{
 
 /// Minimum accepted length for `RUSSEL_API_TOKEN` after trim (when set).
 ///
-/// Floor is 32 characters so weak tokens like `"a"` are rejected. Prefer
-/// `openssl rand -hex 32` (64 hex chars / 256 bits) for production.
+/// Floor is 32 **ASCII** characters so weak tokens like `"a"` are rejected.
+/// Prefer `openssl rand -hex 32` (64 hex chars / 256 bits) for production.
+///
+/// Length is measured in bytes/`str::len`, which matches character count only
+/// because non-ASCII tokens are rejected (see [`check_api_token_min_length`]).
 pub const MIN_API_TOKEN_LEN: usize = 32;
 
 /// Pure token normalize: unset/blank/whitespace → None.
 ///
-/// Does **not** enforce min length — call [`check_api_token_min_length`] at
-/// startup when a token is present so short secrets fail closed.
+/// Does **not** enforce min length / charset — call [`check_api_token_min_length`]
+/// at startup when a token is present so short or non-header-safe secrets fail closed.
 pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Reject tokens shorter than [`MIN_API_TOKEN_LEN`] after trim.
+/// Whether `token` can appear in an HTTP `Authorization` header value.
+///
+/// Matches what the CLI needs: `HeaderValue` accepts visible ASCII (0x20..=0x7E)
+/// and HTAB. Multibyte Unicode and control bytes are rejected so ctrl never
+/// starts with a token clients cannot send.
+fn token_is_http_header_safe(token: &str) -> bool {
+    token.bytes().all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+}
+
+/// Reject tokens that are too short or cannot be sent as a Bearer header value.
 ///
 /// Call this at control-plane startup whenever `normalize_api_token` returns
 /// `Some`. Middleware still uses the env token as-is; startup is the gate.
+///
+/// Checks (in order):
+/// 1. HTTP header-safe charset (ASCII visible / HTAB) — same constraint as the CLI
+/// 2. Length ≥ [`MIN_API_TOKEN_LEN`] (byte length; equivalent to char count after 1)
 pub fn check_api_token_min_length(token: &str) -> Result<(), String> {
+    if !token_is_http_header_safe(token) {
+        return Err(
+            "RUSSEL_API_TOKEN must be printable ASCII only so it can be sent in an \
+             HTTP Authorization header (the CLI rejects non-header-safe tokens). \
+             Generate a strong token with: openssl rand -hex 32"
+                .to_string(),
+        );
+    }
     if token.len() < MIN_API_TOKEN_LEN {
         Err(format!(
             "RUSSEL_API_TOKEN must be at least {MIN_API_TOKEN_LEN} characters after trim \
@@ -1042,6 +1066,32 @@ mod tests {
     fn token_min_length_accepts_floor_and_longer() {
         assert!(check_api_token_min_length(&"a".repeat(MIN_API_TOKEN_LEN)).is_ok());
         assert!(check_api_token_min_length(&"b".repeat(64)).is_ok()); // openssl rand -hex 32
+    }
+
+    #[test]
+    fn token_rejects_non_ascii_even_when_utf8_byte_len_meets_floor() {
+        // Each 'é' is 2 UTF-8 bytes; 16 of them → 32 bytes, which used to pass
+        // a pure `str::len` floor while the CLI cannot put it in Authorization.
+        let unicode = "é".repeat(16);
+        assert!(unicode.len() >= MIN_API_TOKEN_LEN);
+        assert!(unicode.chars().count() < MIN_API_TOKEN_LEN);
+        let err = check_api_token_min_length(&unicode).unwrap_err();
+        assert!(
+            err.contains("printable ASCII") || err.contains("Authorization"),
+            "err={err}"
+        );
+
+        // Multibyte emoji: few chars, many bytes.
+        let emoji = "🔐".repeat(8);
+        assert!(emoji.len() >= MIN_API_TOKEN_LEN);
+        assert!(check_api_token_min_length(&emoji).is_err());
+    }
+
+    #[test]
+    fn token_rejects_ascii_control_bytes() {
+        let mut s = "a".repeat(MIN_API_TOKEN_LEN);
+        s.replace_range(0..1, "\n");
+        assert!(check_api_token_min_length(&s).is_err());
     }
 
     #[test]
