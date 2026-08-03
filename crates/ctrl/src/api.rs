@@ -102,11 +102,6 @@ pub fn require_auth_from_env(raw: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
-/// Whether `RUSSEL_REQUIRE_AUTH` is set to a truthy value.
-pub fn require_auth_enabled() -> bool {
-    require_auth_from_env(std::env::var("RUSSEL_REQUIRE_AUTH").ok().as_deref())
-}
-
 /// Non-empty RUSSEL_API_TOKEN after trim; None if unset/blank.
 ///
 /// Length is not checked here — `main` calls [`check_api_token_min_length`]

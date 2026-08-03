@@ -123,7 +123,9 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
-    let require_auth = api::require_auth_enabled();
+    let require_auth = api::require_auth_from_env(
+        std::env::var("RUSSEL_REQUIRE_AUTH").ok().as_deref(),
+    );
     if token.is_some() {
         info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
     } else if require_auth {
