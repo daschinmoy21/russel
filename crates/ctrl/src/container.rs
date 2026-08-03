@@ -1228,8 +1228,90 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Normalize and validate a passthrough mount/volume source path.
+///
+/// Requires an absolute path that lexically resolves under `/nix/store/` with
+/// no `..` path components. Prefix-only checks are insufficient: paths like
+/// `/nix/store/../etc/shadow` start with `/nix/store/` but escape the allowlist.
+///
+/// For non-existent paths (common for nix store entries not present on the
+/// validating host), we manually normalize by resolving `.` and rejecting `..`
+/// without filesystem access. When the path exists, we also `canonicalize` and
+/// re-check the result remains under `/nix/store/`.
+fn validate_nix_store_source(source: &str) -> anyhow::Result<()> {
+    if source.is_empty() {
+        anyhow::bail!("empty source path");
+    }
+
+    // Fast string-level rejection of `..` path segments (also covers odd
+    // encodings that Path::components may still treat as ParentDir).
+    if source.split('/').any(|seg| seg == "..") {
+        anyhow::bail!("source path must not contain '..' components: {source}");
+    }
+
+    let path = Path::new(source);
+    if !path.is_absolute() {
+        // Relative sources can never be under /nix/store/; keep the allowlist
+        // phrasing so call-site error checks stay stable.
+        anyhow::bail!("source {source} is not under /nix/store/");
+    }
+
+    // Lexical normalization via Path::components — reject ParentDir, collapse
+    // CurDir / repeated separators, require RootDir-rooted absolute form.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => {
+                anyhow::bail!("source path has unexpected prefix: {source}");
+            }
+            std::path::Component::RootDir => {
+                normalized.push(std::path::Component::RootDir.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::bail!("source path must not contain '..' components: {source}");
+            }
+            std::path::Component::Normal(c) => {
+                normalized.push(c);
+            }
+        }
+    }
+
+    let normalized_str = normalized
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 source path: {source}"))?;
+
+    // Must remain under /nix/store/<...>, not merely equal to /nix/store.
+    if !normalized_str.starts_with("/nix/store/") {
+        anyhow::bail!("source {source} is not under /nix/store/");
+    }
+
+    // Optional FS check: if the path exists, ensure real path still under store
+    // (catches symlinks that escape /nix/store).
+    if path.exists() {
+        match path.canonicalize() {
+            Ok(canon) => {
+                let canon_str = canon
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF-8 canonical path for {source}"))?;
+                if !canon_str.starts_with("/nix/store/") {
+                    anyhow::bail!(
+                        "source {source} resolves outside /nix/store/ (canonical: {canon_str})"
+                    );
+                }
+            }
+            Err(e) => {
+                anyhow::bail!("source path could not be canonicalized: {source}: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a `-v` / `--volume` value: only bind mounts from /nix/store/ with
 /// `:ro` are permitted.  Format: `SOURCE:DESTINATION[:OPTIONS]`.
+/// Explicit `rw` is always denied even if `ro` is also listed.
 fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
     // Split on first colon to get source; the rest are dest+options.
     let (source, rest) = val.split_once(':').ok_or_else(|| {
@@ -1240,17 +1322,27 @@ fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
         anyhow::bail!("podman passthrough arg -v/--volume has empty source: {val}");
     }
 
-    if !source.starts_with("/nix/store/") {
-        anyhow::bail!(
-            "podman passthrough arg -v/--volume denied for security: \
-             source {source} is not under /nix/store/"
-        );
-    }
+    validate_nix_store_source(source).map_err(|e| {
+        anyhow::anyhow!("podman passthrough arg -v/--volume denied for security: {e}")
+    })?;
 
     // The rest contains DESTINATION[:OPTIONS] where OPTIONS is a
     // comma-separated list (e.g. "z,ro" or just "ro").
     let (_dest, options) = rest.split_once(':').unwrap_or((rest, ""));
-    let ro_present = options.split(',').any(|opt| opt == "ro");
+    let opts: Vec<&str> = options
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ro_present = opts.iter().any(|opt| *opt == "ro");
+    let rw_present = opts.iter().any(|opt| *opt == "rw");
+
+    if rw_present {
+        anyhow::bail!(
+            "podman passthrough arg -v/--volume denied for security: \
+             {val} requests read-write (rw is not permitted; use :ro only)"
+        );
+    }
 
     if !ro_present {
         anyhow::bail!(
@@ -1265,10 +1357,12 @@ fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
 /// Validate a `--mount` value: only bind mounts from /nix/store/ with
 /// `ro=true` or `readonly` are permitted.
 /// Format: `type=TYPE,src=SOURCE,dst=DEST[,OPTIONS]`.
+/// Explicit `rw` / `rw=true` is always denied.
 fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
     let mut mount_type = None;
     let mut source = None;
     let mut readonly = false;
+    let mut readwrite = false;
 
     for kv in val.split(',') {
         let (key, value) = match kv.split_once('=') {
@@ -1280,6 +1374,9 @@ fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
             "src" | "source" => source = Some(value),
             "ro" | "readonly" if value.is_empty() || value == "true" || value == "1" => {
                 readonly = true;
+            }
+            "rw" if value.is_empty() || value == "true" || value == "1" => {
+                readwrite = true;
             }
             _ => {}
         }
@@ -1301,10 +1398,14 @@ fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
         anyhow::bail!("podman passthrough arg --mount has empty source: {val}");
     }
 
-    if !source.starts_with("/nix/store/") {
+    validate_nix_store_source(source).map_err(|e| {
+        anyhow::anyhow!("podman passthrough arg --mount denied for security: {e}")
+    })?;
+
+    if readwrite {
         anyhow::bail!(
             "podman passthrough arg --mount denied for security: \
-             source {source} is not under /nix/store/"
+             {val} requests read-write (rw is not permitted; use ro=true/readonly)"
         );
     }
 
@@ -2226,6 +2327,136 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("missing source"), "{err}");
+    }
+
+    // ── Path-traversal / allowlist hardening (#192) ───────────────────────
+
+    #[test]
+    fn reject_volume_path_traversal_past_nix_store() {
+        for val in [
+            "/nix/store/../etc/shadow:/dest:ro",
+            "/nix/store/../../home/x/.ssh:/dest:ro",
+            "/nix/store/foo/../../../etc/passwd:/dest:ro",
+            "/nix/store/abc/../def/../../etc/shadow:/dest:ro",
+            "/nix/store/hash-pkg/bin/../../../../etc/shadow:/dest:ro",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["-v".into(), val.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("..") || msg.contains("not under /nix/store/"),
+                "expected traversal rejection for -v {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_mount_path_traversal_past_nix_store() {
+        for src in [
+            "/nix/store/../etc/shadow",
+            "/nix/store/../../home/x/.ssh",
+            "/nix/store/foo/../bar/../../etc/passwd",
+            "/nix/store/hash/bin/../../../etc/shadow",
+        ] {
+            let val = format!("type=bind,src={src},dst=/dest,ro=true");
+            let err =
+                validate_podman_passthrough_args(&["--mount".into(), val.clone()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("..") || msg.contains("not under /nix/store/"),
+                "expected traversal rejection for --mount src={src}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_legitimate_nix_store_volume_paths() {
+        // Realistic nix store-style paths (hash-like prefix + package name).
+        validate_podman_passthrough_args(&[
+            "-v".into(),
+            "/nix/store/abc123def456ghi789jkl0mnopqrstuv-hello-2.12/bin/hello:/app/bin:ro".into(),
+        ])
+        .unwrap();
+        validate_podman_passthrough_args(&[
+            "-v".into(),
+            "/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0:/busybox:ro".into(),
+        ])
+        .unwrap();
+        // Dot segments under the store are fine (collapsed lexically).
+        validate_podman_passthrough_args(&[
+            "-v".into(),
+            "/nix/store/./abc123/bin/foo:/dest:ro".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn accept_legitimate_nix_store_mount_paths() {
+        validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,src=/nix/store/abc123def456ghi789jkl0mnopqrstuv-pkg/bin/foo,dst=/dest,ro=true"
+                .into(),
+        ])
+        .unwrap();
+        validate_podman_passthrough_args(&[
+            "--mount=type=bind,source=/nix/store/xyz-pkg/lib,dst=/lib,readonly".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn reject_volume_explicit_rw() {
+        for val in [
+            "/nix/store/abc123:/dest:rw",
+            "/nix/store/abc123:/dest:ro,rw",
+            "/nix/store/abc123:/dest:rw,ro",
+            "/nix/store/abc123:/dest:z,rw",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["-v".into(), val.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rw") || msg.contains("not read-only") || msg.contains("read-write"),
+                "expected rw rejection for -v {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_mount_explicit_rw() {
+        for val in [
+            "type=bind,src=/nix/store/x,dst=/dest,rw=true",
+            "type=bind,src=/nix/store/x,dst=/dest,rw",
+            "type=bind,src=/nix/store/x,dst=/dest,ro=true,rw=true",
+            "type=bind,src=/nix/store/x,dst=/dest,rw=1",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["--mount".into(), val.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rw") || msg.contains("read-write") || msg.contains("not read-only"),
+                "expected rw rejection for --mount {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_nix_store_source_direct() {
+        // Unit-level checks on the shared helper.
+        assert!(validate_nix_store_source("/nix/store/abc123/bin/foo").is_ok());
+        assert!(validate_nix_store_source("/nix/store/./abc/bin").is_ok());
+
+        assert!(validate_nix_store_source("").is_err());
+        let rel_err = validate_nix_store_source("relative/path").unwrap_err().to_string();
+        assert!(
+            rel_err.contains("not under /nix/store/"),
+            "relative path error: {rel_err}"
+        );
+        assert!(validate_nix_store_source("/etc/shadow").is_err());
+        assert!(validate_nix_store_source("/nix/store").is_err());
+        assert!(validate_nix_store_source("/nix/store/../etc/shadow").is_err());
+        assert!(validate_nix_store_source("/nix/store/../../home/x/.ssh").is_err());
+        assert!(validate_nix_store_source("/nix/store/foo/../../../etc/passwd").is_err());
     }
 
     // ── --env-file denial ─────────────────────────────────────────────────
