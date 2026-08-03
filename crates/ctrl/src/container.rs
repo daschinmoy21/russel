@@ -1029,202 +1029,389 @@ pub fn parse_podman_rootless(info_json: &str) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("podman info missing .host.security.rootless"))
 }
 
-/// Reject podman passthrough args that Russel owns (name, detach, rootfs, etc.)
-/// or that weaken container isolation (Issue #3).
+/// When `RUSSEL_ALLOW_PODMAN_ARGS=0` (or `false`/`no`/`off`), all passthrough
+/// extras are rejected. Unset or any other value leaves the allowlist in effect.
+fn podman_passthrough_disabled() -> bool {
+    match std::env::var("RUSSEL_ALLOW_PODMAN_ARGS") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no") || v.eq_ignore_ascii_case("off")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Require a following value token for a space-separated flag form.
+fn require_passthrough_value<'a>(flag: &str, next: Option<&'a String>) -> anyhow::Result<&'a str> {
+    match next {
+        Some(v) => Ok(v.as_str()),
+        None => anyhow::bail!("podman passthrough arg {flag} requires a value"),
+    }
+}
+
+/// Allowed network modes for passthrough `--network` / `--net`.
+const ALLOWED_NETWORKS: &[&str] = &["bridge", "none", "slirp4netns", "pasta"];
+
+fn validate_passthrough_network_mode(flag: &str, val: &str) -> anyhow::Result<()> {
+    if val == "host" {
+        // Keep the historical "host" wording for tests and operators.
+        if flag.contains('=') || flag.starts_with("--network=") || flag.starts_with("--net=") {
+            anyhow::bail!("podman passthrough arg denied for security: --network=host");
+        }
+        anyhow::bail!("podman passthrough arg denied for security: {flag} host");
+    }
+    if !ALLOWED_NETWORKS.contains(&val) {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: {flag} {val} \
+             (only bridge, none, slirp4netns, pasta are permitted)"
+        );
+    }
+    Ok(())
+}
+
+fn validate_passthrough_userns(val: &str) -> anyhow::Result<()> {
+    if val != "keep-id" {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: --userns {val} \
+             (only keep-id is permitted)"
+        );
+    }
+    Ok(())
+}
+
+/// Reject env assignments that would override Russel-managed `PORT`.
+fn validate_passthrough_env_assignment(flag: &str, val: &str) -> anyhow::Result<()> {
+    if val == "PORT" || val.starts_with("PORT=") {
+        if val == "PORT" {
+            anyhow::bail!("podman passthrough arg must not override PORT ({flag} PORT)");
+        }
+        anyhow::bail!("podman passthrough arg must not override PORT ({flag} PORT=...)");
+    }
+    Ok(())
+}
+
+/// Deny known isolation-weakening / Russel-owned flags with stable error text.
+/// Returns `Ok(())` when `arg` is not a special-cased deny (caller continues
+/// allowlist matching). Bails when `arg` is reserved or always-denied.
+fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
+    // ── Reserved by Russel (owned flags) ──────────────────────────────────
+    if arg == "--rootfs" || arg.starts_with("--rootfs=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: --rootfs");
+    }
+    if arg == "--name" || arg == "-n" || arg.starts_with("--name=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: --name/-n");
+    }
+    if arg == "--replace" || arg.starts_with("--replace=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: --replace");
+    }
+    if arg == "-d" || arg == "--detach" || arg.starts_with("--detach=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: detach (-d/--detach)");
+    }
+
+    // Port publish is owned by Russel (managed -p mapping).
+    if arg == "-p"
+        || arg == "--publish"
+        || arg == "--publish-all"
+        || arg == "-P"
+        || arg.starts_with("--publish=")
+        || (arg.starts_with("-p") && arg != "-p" && !arg.starts_with("--"))
+    {
+        anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
+    }
+
+    // ── Always-denied isolation / escape flags (explicit messages) ────────
+    // All --privileged variants (including =false) — deny for simplicity.
+    if arg == "--privileged" || arg.starts_with("--privileged=") {
+        anyhow::bail!("podman passthrough arg denied for security: --privileged");
+    }
+    if arg == "--pid" || arg.starts_with("--pid=") {
+        anyhow::bail!("podman passthrough arg denied for security: --pid");
+    }
+    if arg == "--user" || arg == "-u" || arg.starts_with("--user=") || arg.starts_with("-u=") {
+        anyhow::bail!("podman passthrough arg denied for security: --user/-u");
+    }
+    if arg == "--entrypoint" || arg.starts_with("--entrypoint=") {
+        anyhow::bail!("podman passthrough arg denied for security: --entrypoint");
+    }
+    if arg == "--env-file" || arg.starts_with("--env-file=") {
+        anyhow::bail!("podman passthrough arg denied for security: --env-file");
+    }
+    if arg == "--security-opt" || arg.starts_with("--security-opt=") {
+        anyhow::bail!("podman passthrough arg denied for security: --security-opt");
+    }
+    if arg == "--cap-add" || arg.starts_with("--cap-add=") {
+        anyhow::bail!("podman passthrough arg denied for security: --cap-add");
+    }
+    if arg == "--device" || arg.starts_with("--device=") {
+        anyhow::bail!("podman passthrough arg denied for security: --device");
+    }
+    if arg == "--add-device" || arg.starts_with("--add-device=") {
+        anyhow::bail!("podman passthrough arg denied for security: --add-device");
+    }
+    // Isolation-weakening / host-control surfaces not on the allowlist.
+    if arg == "--hooks-dir" || arg.starts_with("--hooks-dir=") {
+        anyhow::bail!("podman passthrough arg denied for security: --hooks-dir");
+    }
+    if arg == "--runtime" || arg.starts_with("--runtime=") {
+        anyhow::bail!("podman passthrough arg denied for security: --runtime");
+    }
+    if arg == "--log-driver" || arg.starts_with("--log-driver=") {
+        anyhow::bail!("podman passthrough arg denied for security: --log-driver");
+    }
+    if arg == "--log-opt" || arg.starts_with("--log-opt=") {
+        anyhow::bail!("podman passthrough arg denied for security: --log-opt");
+    }
+    // Disallow flipping managed read-only rootfs off via passthrough.
+    if arg == "--read-only=false" || arg == "--read-only=0" || arg == "--read-only=no" {
+        anyhow::bail!("podman passthrough arg denied for security: --read-only=false");
+    }
+    if arg == "--read-only" || arg.starts_with("--read-only=") {
+        // Managed by Russel; not a passthrough knob.
+        anyhow::bail!("podman passthrough arg denied for security: --read-only");
+    }
+
+    Ok(())
+}
+
+/// Validate podman passthrough args with an **allowlist** of known-safe flags
+/// (Issue #191). Unknown `--*` / `-X` flags are denied by default.
+///
+/// Allowed (with value constraints where noted):
+/// - `--network` / `--net` / `-net` — bridge | none | slirp4netns | pasta
+/// - `--userns=keep-id` only
+/// - `--cap-drop`, `--secret`, `-e`/`--env` (non-PORT), `--label`/`-l`,
+///   `--annotation`, memory/cpu limits, `--tmpfs`, `--shm-size`, `--hostname`,
+///   `--ulimit`
+/// - `-v` / `--volume` / `--mount` — `/nix/store/` sources, read-only only
+///
+/// Set `RUSSEL_ALLOW_PODMAN_ARGS=0` to reject any non-empty extras.
 pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
+    if !args.is_empty() && podman_passthrough_disabled() {
+        anyhow::bail!(
+            "podman passthrough args disabled (RUSSEL_ALLOW_PODMAN_ARGS=0); \
+             unset or set to 1 to allow allowlisted extras"
+        );
+    }
+
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
+        let arg = args[i].as_str();
         let next = args.get(i + 1);
 
-        // --rootfs, --name/-n, --replace, -d/--detach (owned by Russel)
-        if arg == "--rootfs" || arg.starts_with("--rootfs=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: --rootfs");
-        }
-        if arg == "--name" || arg == "-n" || arg.starts_with("--name=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: --name/-n");
-        }
-        if arg == "--replace" || arg.starts_with("--replace=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: --replace");
-        }
-        if arg == "-d" || arg == "--detach" || arg.starts_with("--detach=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: detach (-d/--detach)");
-        }
-
-        // PORT env override (Issue #2): deny any arg that sets PORT variable
-        if (arg == "-e" || arg == "--env")
-            && let Some(val) = next
-        {
-            if val.starts_with("PORT=") {
-                anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT=...)");
-            }
-            if val == "PORT" {
-                anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT)");
-            }
-        }
-        if arg.starts_with("-ePORT=") || arg.starts_with("--env=PORT=") {
-            anyhow::bail!("podman passthrough arg must not override PORT ({arg})");
-        }
-        if arg == "-ePORT" {
-            anyhow::bail!("podman passthrough arg must not override PORT ({arg})");
-        }
-
-        // Isolation-weakening flags (Issue #3)
-        if arg == "--privileged" || arg == "--privileged=true" {
-            anyhow::bail!("podman passthrough arg denied for security: --privileged");
-        }
-
-        // --pid: any value denied (host sharing)
-        if arg == "--pid" {
-            anyhow::bail!("podman passthrough arg denied for security: --pid");
-        }
-        if arg.starts_with("--pid=") {
-            anyhow::bail!("podman passthrough arg denied for security: --pid=...");
-        }
-        // --network/--net/-net: allow only known safe network modes.
-        // Deny host (already), ns:/…, and anything outside the allowlist.
-        const ALLOWED_NETWORKS: &[&str] = &["bridge", "none", "slirp4netns", "pasta"];
-        if arg == "--network" || arg == "--net" || arg == "-net" {
-            let val = match next {
-                Some(v) => v,
-                None => anyhow::bail!("podman passthrough arg {arg} requires a value"),
-            };
-            if val == "host" {
-                anyhow::bail!("podman passthrough arg denied for security: {arg} host");
-            }
-            if !ALLOWED_NETWORKS.contains(&val.as_str()) {
-                anyhow::bail!(
-                    "podman passthrough arg denied for security: {arg} {val} \
-                     (only bridge, none, slirp4netns, pasta are permitted)"
-                );
-            }
-        }
-        for eq_form in &["--network=", "--net="] {
-            if let Some(val) = arg.strip_prefix(eq_form) {
-                if val == "host" {
-                    anyhow::bail!("podman passthrough arg denied for security: --network=host");
-                }
-                if !ALLOWED_NETWORKS.contains(&val) {
-                    anyhow::bail!(
-                        "podman passthrough arg denied for security: --network={val} \
-                         (only bridge, none, slirp4netns, pasta are permitted)"
-                    );
-                }
-            }
-        }
-
-        // --ipc/--uts/--cgroupns with host
-        for flag in &["--ipc", "--uts", "--cgroupns"] {
-            if arg == *flag
-                && let Some(val) = next
-                && val == "host"
-            {
-                anyhow::bail!("podman passthrough arg denied for security: {flag} host");
-            }
-            if arg.starts_with(&format!("{}={}", flag, "host")) {
-                anyhow::bail!("podman passthrough arg denied for security: {arg}");
-            }
-        }
-
-        // --userns: deny everything except keep-id
-        if arg == "--userns" {
-            if let Some(val) = next {
-                if val != "keep-id" {
-                    anyhow::bail!(
-                        "podman passthrough arg denied for security: --userns {val} \
-                         (only keep-id is permitted)"
-                    );
-                }
-            } else {
-                anyhow::bail!("podman passthrough arg --userns requires a value");
-            }
-        }
-        if let Some(val) = arg.strip_prefix("--userns=")
-            && val != "keep-id"
-        {
+        // Positional tokens are never valid in passthrough (would become COMMAND).
+        if !arg.starts_with('-') {
             anyhow::bail!(
-                "podman passthrough arg denied for security: --userns={val} \
-                 (only keep-id is permitted)"
+                "podman passthrough arg denied for security: unexpected positional '{arg}'"
             );
         }
 
-        // --user / -u: deny all forms (container must run as its own user)
-        if arg == "--user" || arg == "-u" {
-            anyhow::bail!("podman passthrough arg denied for security: --user/-u");
+        // Stable denials for reserved / known-unsafe flags (before allowlist match).
+        deny_known_unsafe_passthrough(arg)?;
+
+        // ── Allowlist: network ────────────────────────────────────────────
+        if arg == "--network" || arg == "--net" || arg == "-net" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_network_mode(arg, val)?;
+            i += 2;
+            continue;
         }
-        if arg.starts_with("--user=") || arg.starts_with("-u=") {
-            anyhow::bail!("podman passthrough arg denied for security: --user/-u");
+        if let Some(val) = arg.strip_prefix("--network=") {
+            validate_passthrough_network_mode("--network=", val)?;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--net=") {
+            validate_passthrough_network_mode("--net=", val)?;
+            i += 1;
+            continue;
         }
 
-        // --entrypoint: deny all forms (container entrypoint is managed by Russel)
-        if arg == "--entrypoint" || arg.starts_with("--entrypoint=") {
-            anyhow::bail!("podman passthrough arg denied for security: --entrypoint");
+        // ── Allowlist: userns (keep-id only) ──────────────────────────────
+        if arg == "--userns" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_userns(val)?;
+            i += 2;
+            continue;
         }
-
-        // --env-file: deny all forms (bypasses PORT guard, reads host files)
-        if arg == "--env-file" || arg.starts_with("--env-file=") {
-            anyhow::bail!("podman passthrough arg denied for security: --env-file");
-        }
-
-        // --volume / -v / --mount: only allow bind mounts from /nix/store/ with :ro
-        if arg == "-v" || arg == "--volume" {
-            let val = match next {
-                Some(v) => v,
-                None => anyhow::bail!("podman passthrough arg {arg} requires a value"),
-            };
-            validate_passthrough_volume(val)?;
-        }
-        if let Some(val) = arg.strip_prefix("-v") {
-            // Compact form: -vSOURCE:DEST:OPTIONS (only if -vX, not plain -v)
-            if !val.is_empty() {
-                validate_passthrough_volume(val)?;
+        if let Some(val) = arg.strip_prefix("--userns=") {
+            // Preserve "userns=…" wording for disallowed values.
+            if val != "keep-id" {
+                anyhow::bail!(
+                    "podman passthrough arg denied for security: --userns={val} \
+                     (only keep-id is permitted)"
+                );
             }
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: cap-drop (further drops only; re-asserted after extras) ─
+        if arg == "--cap-drop" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--cap-drop=") {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: secret ─────────────────────────────────────────────
+        if arg == "--secret" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--secret=") {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: env (-e / --env), non-PORT ─────────────────────────
+        // Long forms before compact `-e…` so `--env` is not misparsed.
+        if arg == "--env" || arg == "-e" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_env_assignment(arg, val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--env=") {
+            validate_passthrough_env_assignment("--env", val)?;
+            i += 1;
+            continue;
+        }
+        // Compact -eKEY / -eKEY=value (single-letter short opt only).
+        if let Some(val) = arg.strip_prefix("-e")
+            && !val.is_empty()
+            && !arg.starts_with("--")
+        {
+            // Mirror historical compact-PORT messages.
+            if val == "PORT" || val.starts_with("PORT=") {
+                anyhow::bail!("podman passthrough arg must not override PORT ({arg})");
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: label / annotation ─────────────────────────────────
+        if arg == "--label" || arg == "-l" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--label=") {
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("-l")
+            && !rest.is_empty()
+            && !arg.starts_with("--")
+        {
+            i += 1;
+            continue;
+        }
+        if arg == "--annotation" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--annotation=") {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: resource limits ────────────────────────────────────
+        const RESOURCE_FLAGS: &[&str] = &[
+            "--memory",
+            "--memory-swap",
+            "--cpus",
+            "--cpu-shares",
+            "--cpu-quota",
+            "--cpu-period",
+            "--shm-size",
+            "--ulimit",
+            "--hostname",
+        ];
+        if RESOURCE_FLAGS.contains(&arg) {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if RESOURCE_FLAGS.iter().any(|f| arg.starts_with(&format!("{f}="))) {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: tmpfs (in-container only; path:options) ────────────
+        if arg == "--tmpfs" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_tmpfs(val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--tmpfs=") {
+            validate_passthrough_tmpfs(val)?;
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: volume / mount (nix-store RO only) ─────────────────
+        // Long forms before compact `-v…`.
+        if arg == "--volume" || arg == "-v" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_volume(val)?;
+            i += 2;
+            continue;
         }
         if let Some(val) = arg.strip_prefix("--volume=") {
             validate_passthrough_volume(val)?;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("-v")
+            && !val.is_empty()
+            && !arg.starts_with("--")
+        {
+            validate_passthrough_volume(val)?;
+            i += 1;
+            continue;
         }
         if arg == "--mount" {
-            let val = match next {
-                Some(v) => v,
-                None => anyhow::bail!("podman passthrough arg --mount requires a value"),
-            };
+            let val = require_passthrough_value(arg, next)?;
             validate_passthrough_mount(val)?;
+            i += 2;
+            continue;
         }
         if let Some(val) = arg.strip_prefix("--mount=") {
             validate_passthrough_mount(val)?;
+            i += 1;
+            continue;
         }
 
-        // --security-opt (any form)
-        if arg == "--security-opt" || arg.starts_with("--security-opt=") {
-            anyhow::bail!("podman passthrough arg denied for security: --security-opt");
-        }
+        // ── Default deny: unknown flag ────────────────────────────────────
+        // Prefer a short flag name in the message for operators.
+        let flag_name = arg.split('=').next().unwrap_or(arg);
+        anyhow::bail!(
+            "podman passthrough arg denied for security: {flag_name} is not on the allowlist"
+        );
+    }
+    Ok(())
+}
 
-        // --cap-add (deny all), --cap-drop (allow)
-        if arg == "--cap-add" || arg.starts_with("--cap-add=") {
-            anyhow::bail!("podman passthrough arg denied for security: --cap-add");
-        }
-
-        // --device / --add-device
-        if arg == "--device" || arg.starts_with("--device=") {
-            anyhow::bail!("podman passthrough arg denied for security: --device");
-        }
-        if arg == "--add-device" || arg.starts_with("--add-device=") {
-            anyhow::bail!("podman passthrough arg denied for security: --add-device");
-        }
-
-        // -p / --publish / --publish-all / -P (port mapping owned by Russel)
-        if arg == "-p" || arg == "--publish" || arg == "--publish-all" || arg == "-P" {
-            anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
-        }
-        if arg.starts_with("--publish=") {
-            anyhow::bail!("podman passthrough arg denied for security: --publish=...");
-        }
-        // ponytail: catch compact -p forms (-p8080:80, -p8080, etc.)
-        if arg.starts_with("-p") && arg != "-p" {
-            anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
-        }
-
-        i += 1;
+/// `--tmpfs` destinations must be absolute container paths (no host bind).
+fn validate_passthrough_tmpfs(val: &str) -> anyhow::Result<()> {
+    let dest = val.split_once(':').map(|(d, _)| d).unwrap_or(val);
+    if dest.is_empty() || !dest.starts_with('/') {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: --tmpfs destination \
+             must be an absolute container path, got {val}"
+        );
+    }
+    if dest.split('/').any(|seg| seg == "..") {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: --tmpfs path must not \
+             contain '..' components: {val}"
+        );
     }
     Ok(())
 }
@@ -1484,6 +1671,8 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         format!("path={log_path}"),
         // ── Hardening: drop all capabilities, prevent privilege escalation,
         //     mount rootfs read-only with writable tmpfs for /tmp and /run.
+        //     These are re-asserted after passthrough extras so last-wins
+        //     cannot weaken isolation (Issue #191).
         "--cap-drop".to_string(),
         "ALL".to_string(),
         "--security-opt".to_string(),
@@ -1499,6 +1688,15 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         validate_podman_passthrough_args(&spec.extra_args)?;
         args.extend(spec.extra_args.clone());
     }
+
+    // Re-assert isolation after extras: podman last-wins for boolean flags and
+    // security-opt; cap-drop is cumulative but ALL here documents intent and
+    // covers any attempt to re-order capability handling.
+    args.push("--cap-drop".to_string());
+    args.push("ALL".to_string());
+    args.push("--security-opt".to_string());
+    args.push("no-new-privileges".to_string());
+    args.push("--read-only".to_string());
 
     for (key, value) in &spec.env {
         args.push("-e".to_string());
@@ -2578,6 +2776,246 @@ mod tests {
         validate_podman_passthrough_args(&["--secret".into(), "mysecret".into()]).unwrap();
         validate_podman_passthrough_args(&["--secret=mysecret".into()]).unwrap();
     }
+
+    // ── Issue #191: allowlist default-deny + hardening re-assert ──────────
+
+    #[test]
+    fn reject_unknown_passthrough_flags() {
+        for arg in [
+            "--hooks-dir=/tmp/hooks",
+            "--runtime=runc",
+            "--sysctl=net.ipv4.ip_forward=1",
+            "--pid=host",
+            "--ipc=host",
+            "--uts=host",
+            "--cgroupns=host",
+            "--systemd=always",
+            "--pull=always",
+            "--gidmap=0:0:1",
+            "--uidmap=0:0:1",
+            "--executable=/bin/sh",
+            "--conmon-pidfile=/tmp/x",
+            "--cidfile=/tmp/x",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not on the allowlist")
+                    || msg.contains("denied for security")
+                    || msg.contains("hooks-dir")
+                    || msg.contains("runtime")
+                    || msg.contains("pid"),
+                "expected allowlist denial for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_privileged_all_variants() {
+        for arg in [
+            "--privileged",
+            "--privileged=true",
+            "--privileged=false",
+            "--privileged=0",
+            "--privileged=1",
+            "--privileged=no",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("privileged"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_read_only_false_and_passthrough_read_only() {
+        for arg in ["--read-only=false", "--read-only=0", "--read-only", "--read-only=true"] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("read-only"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_log_driver_and_hooks_runtime() {
+        for arg in [
+            "--log-driver=json-file",
+            "--log-opt",
+            "--hooks-dir",
+            "--runtime=crun",
+        ] {
+            let mut args = vec![arg.to_string()];
+            if arg == "--log-opt" || arg == "--hooks-dir" {
+                args.push("/tmp/evil".into());
+            }
+            let err = validate_podman_passthrough_args(&args).unwrap_err();
+            assert!(
+                err.to_string().contains("denied for security"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_allowlisted_resource_and_metadata_flags() {
+        validate_podman_passthrough_args(&[
+            "--label".into(),
+            "app=api".into(),
+            "--annotation".into(),
+            "io.russel/x=1".into(),
+            "--memory".into(),
+            "256m".into(),
+            "--cpus".into(),
+            "1.5".into(),
+            "--tmpfs".into(),
+            "/var/cache:size=64m".into(),
+            "--shm-size".into(),
+            "64m".into(),
+            "--hostname".into(),
+            "svc".into(),
+            "-l".into(),
+            "env=prod".into(),
+        ])
+        .unwrap();
+        validate_podman_passthrough_args(&["--memory=512m".into(), "--cpus=2".into()]).unwrap();
+        validate_podman_passthrough_args(&["--tmpfs=/data".into()]).unwrap();
+    }
+
+    #[test]
+    fn reject_tmpfs_non_absolute_destination() {
+        let err = validate_podman_passthrough_args(&["--tmpfs".into(), "relative".into()])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("absolute"),
+            "expected absolute-path rejection: {err}"
+        );
+    }
+
+    static ALLOW_PODMAN_ARGS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_allow_podman_args_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ALLOW_PODMAN_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("RUSSEL_ALLOW_PODMAN_ARGS").ok();
+        // SAFETY: exclusive lock held for the duration of the mutation + assertion.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("RUSSEL_ALLOW_PODMAN_ARGS", v),
+                None => std::env::remove_var("RUSSEL_ALLOW_PODMAN_ARGS"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("RUSSEL_ALLOW_PODMAN_ARGS", v),
+                None => std::env::remove_var("RUSSEL_ALLOW_PODMAN_ARGS"),
+            }
+        }
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn russel_allow_podman_args_zero_rejects_extras() {
+        with_allow_podman_args_env(Some("0"), || {
+            let err = validate_podman_passthrough_args(&["--network".into(), "bridge".into()])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("RUSSEL_ALLOW_PODMAN_ARGS"),
+                "expected disable message: {err}"
+            );
+            // Empty extras still ok.
+            validate_podman_passthrough_args(&[]).unwrap();
+        });
+    }
+
+    #[test]
+    fn russel_allow_podman_args_unset_allows_allowlisted() {
+        with_allow_podman_args_env(None, || {
+            validate_podman_passthrough_args(&["--network".into(), "bridge".into()]).unwrap();
+        });
+    }
+
+    #[test]
+    fn build_run_args_reasserts_hardening_after_passthrough() {
+        let spec = ContainerStartSpec {
+            service_id: "api-1".into(),
+            rootfs: PreparedRootfs {
+                rootfs_path: PathBuf::from("/var/lib/russel/api-1/rootfs"),
+                entrypoint: PathBuf::from("/bin/api"),
+            },
+            host_port: 8080,
+            guest_port: 3000,
+            memory_mb: 512,
+            env: vec![("PORT".into(), "3000".into())],
+            extra_args: vec![
+                "--cap-drop".into(),
+                "NET_RAW".into(),
+                "--network".into(),
+                "bridge".into(),
+            ],
+        };
+        let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
+        let args = build_run_args(&spec, &log_path).unwrap();
+
+        let network_pos = args.iter().position(|a| a == "--network").unwrap();
+        let passthrough_cap_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--cap-drop" && w[1] == "NET_RAW")
+            .expect("passthrough --cap-drop NET_RAW present");
+        let last_cap_drop_all = args
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] == "--cap-drop" && w[1] == "ALL")
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("--cap-drop ALL re-assert present");
+        let last_no_new_privs = args
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] == "--security-opt" && w[1] == "no-new-privileges")
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("no-new-privileges re-assert present");
+        let last_read_only = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--read-only")
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("--read-only re-assert present");
+        let rootfs_pos = args.iter().position(|a| a == "--rootfs").unwrap();
+
+        assert!(
+            last_cap_drop_all > passthrough_cap_pos,
+            "re-asserted --cap-drop ALL must follow passthrough cap-drop; args={args:?}"
+        );
+        assert!(
+            last_cap_drop_all > network_pos,
+            "re-asserted hardening must follow passthrough network; args={args:?}"
+        );
+        assert!(
+            last_no_new_privs > network_pos,
+            "re-asserted no-new-privileges must follow passthrough; args={args:?}"
+        );
+        assert!(
+            last_read_only > network_pos,
+            "re-asserted --read-only must follow passthrough; args={args:?}"
+        );
+        assert!(
+            last_cap_drop_all < rootfs_pos
+                && last_no_new_privs < rootfs_pos
+                && last_read_only < rootfs_pos,
+            "hardening must still appear before --rootfs; args={args:?}"
+        );
+    }
+
     // ── Issue #4: env wrapper in rootfs ─────────────────────────────────────
 
     #[tokio::test]
