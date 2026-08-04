@@ -56,7 +56,9 @@ pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
 /// and HTAB. Multibyte Unicode and control bytes are rejected so ctrl never
 /// starts with a token clients cannot send.
 fn token_is_http_header_safe(token: &str) -> bool {
-    token.bytes().all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+    token
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
 }
 
 /// Reject tokens that are too short or cannot be sent as a Bearer header value.

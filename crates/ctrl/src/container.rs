@@ -766,12 +766,9 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| rootfs.to_path_buf());
-    tokio::fs::create_dir_all(&base).await.map_err(|e| {
-        anyhow::anyhow!(
-            "create service dir {}: {e}",
-            base.display()
-        )
-    })?;
+    tokio::fs::create_dir_all(&base)
+        .await
+        .map_err(|e| anyhow::anyhow!("create service dir {}: {e}", base.display()))?;
 
     let uid = tokio::process::Command::new("id")
         .args(["-u", &user])
@@ -899,12 +896,8 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true).mode(0o640);
-        opts.open(&log_path).map_err(|e| {
-            anyhow::anyhow!(
-                "create container.log {}: {e}",
-                log_path.display()
-            )
-        })?;
+        opts.open(&log_path)
+            .map_err(|e| anyhow::anyhow!("create container.log {}: {e}", log_path.display()))?;
     }
     let log_s = log_path.display().to_string();
     let output = tokio::process::Command::new("chown")
@@ -1165,7 +1158,10 @@ fn podman_passthrough_disabled() -> bool {
     match std::env::var("RUSSEL_ALLOW_PODMAN_ARGS") {
         Ok(v) => {
             let v = v.trim();
-            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no") || v.eq_ignore_ascii_case("off")
+            v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off")
         }
         Err(_) => false,
     }
@@ -1174,7 +1170,12 @@ fn podman_passthrough_disabled() -> bool {
 /// Require a following value token for a space-separated flag form.
 fn require_passthrough_value<'a>(flag: &str, next: Option<&'a String>) -> anyhow::Result<&'a str> {
     match next {
-        Some(v) => Ok(v.as_str()),
+        Some(v) => {
+            if v.starts_with('-') {
+                deny_known_unsafe_passthrough(v)?;
+            }
+            Ok(v.as_str())
+        }
         None => anyhow::bail!("podman passthrough arg {flag} requires a value"),
     }
 }
@@ -1244,7 +1245,7 @@ fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
         || arg == "--publish-all"
         || arg == "-P"
         || arg.starts_with("--publish=")
-        || (arg.starts_with("-p") && arg != "-p" && !arg.starts_with("--"))
+        || (arg.starts_with("-p") && !arg.starts_with("--"))
     {
         anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
     }
@@ -1467,7 +1468,10 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             i += 2;
             continue;
         }
-        if RESOURCE_FLAGS.iter().any(|f| arg.starts_with(&format!("{f}="))) {
+        if RESOURCE_FLAGS
+            .iter()
+            .any(|f| arg.starts_with(&format!("{f}=")))
+        {
             i += 1;
             continue;
         }
@@ -1651,8 +1655,8 @@ fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let ro_present = opts.iter().any(|opt| *opt == "ro");
-    let rw_present = opts.iter().any(|opt| *opt == "rw");
+    let ro_present = opts.contains(&"ro");
+    let rw_present = opts.contains(&"rw");
 
     if rw_present {
         anyhow::bail!(
@@ -1715,9 +1719,8 @@ fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
         anyhow::bail!("podman passthrough arg --mount has empty source: {val}");
     }
 
-    validate_nix_store_source(source).map_err(|e| {
-        anyhow::anyhow!("podman passthrough arg --mount denied for security: {e}")
-    })?;
+    validate_nix_store_source(source)
+        .map_err(|e| anyhow::anyhow!("podman passthrough arg --mount denied for security: {e}"))?;
 
     if readwrite {
         anyhow::bail!(
@@ -2775,7 +2778,9 @@ mod tests {
         assert!(validate_nix_store_source("/nix/store/./abc/bin").is_ok());
 
         assert!(validate_nix_store_source("").is_err());
-        let rel_err = validate_nix_store_source("relative/path").unwrap_err().to_string();
+        let rel_err = validate_nix_store_source("relative/path")
+            .unwrap_err()
+            .to_string();
         assert!(
             rel_err.contains("not under /nix/store/"),
             "relative path error: {rel_err}"
@@ -2960,13 +2965,28 @@ mod tests {
 
     #[test]
     fn reject_read_only_false_and_passthrough_read_only() {
-        for arg in ["--read-only=false", "--read-only=0", "--read-only", "--read-only=true"] {
+        for arg in [
+            "--read-only=false",
+            "--read-only=0",
+            "--read-only",
+            "--read-only=true",
+        ] {
             let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
             assert!(
                 err.to_string().contains("read-only"),
                 "expected rejection for {arg}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn reject_denied_flags_as_option_values() {
+        let err = validate_podman_passthrough_args(&["--label".into(), "--privileged".into()])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("privileged"),
+            "expected rejection of --privileged passed as value token: {err}"
+        );
     }
 
     #[test]
@@ -3016,8 +3036,8 @@ mod tests {
 
     #[test]
     fn reject_tmpfs_non_absolute_destination() {
-        let err = validate_podman_passthrough_args(&["--tmpfs".into(), "relative".into()])
-            .unwrap_err();
+        let err =
+            validate_podman_passthrough_args(&["--tmpfs".into(), "relative".into()]).unwrap_err();
         assert!(
             err.to_string().contains("absolute"),
             "expected absolute-path rejection: {err}"
@@ -3521,15 +3541,9 @@ mod tests {
         assert!(!is_trusted_container_name("api", "russel-api_g")); // empty gen
         assert!(!is_trusted_container_name("api", "russel-api_gnotahex!"));
         assert!(!is_trusted_container_name("api", "russel-api/../evil"));
-        assert!(!is_trusted_container_name(
-            "api",
-            "russel-api;rm -rf /"
-        ));
+        assert!(!is_trusted_container_name("api", "russel-api;rm -rf /"));
         // Wrong service prefix under russel-
-        assert!(!is_trusted_container_name(
-            "api",
-            "russel-apix_gdeadbeef"
-        ));
+        assert!(!is_trusted_container_name("api", "russel-apix_gdeadbeef"));
         // Gen too long
         assert!(!is_trusted_container_name(
             "api",

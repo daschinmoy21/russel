@@ -41,10 +41,7 @@ pub fn metadata_path(service_id: &str) -> PathBuf {
 /// - `secrets` — host secrets store
 /// - `_pool` — warm-pool snapshot state
 pub fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak")
-        || name == "traefik"
-        || name == "secrets"
-        || name == "_pool"
+    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
 }
 
 /// Fields commonly loaded from on-disk metadata for API rehydration.
@@ -476,15 +473,12 @@ pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> a
             .truncate(true)
             .mode(0o600)
             .open(path)
-            .map_err(|e| {
-                anyhow::anyhow!("failed to open metadata {}: {}", path.display(), e)
-            })?;
+            .map_err(|e| anyhow::anyhow!("failed to open metadata {}: {}", path.display(), e))?;
         file.write_all(content.as_bytes()).map_err(|e| {
             anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
         })?;
-        file.sync_all().map_err(|e| {
-            anyhow::anyhow!("failed to fsync metadata {}: {}", path.display(), e)
-        })?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("failed to fsync metadata {}: {}", path.display(), e))?;
         // Re-assert mode if the file already existed with looser permissions.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
             anyhow::anyhow!("failed to chmod 0600 metadata {}: {}", path.display(), e)
@@ -492,8 +486,9 @@ pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> a
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, content)
-            .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e))?;
+        std::fs::write(path, content).map_err(|e| {
+            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
+        })?;
     }
     Ok(())
 }
