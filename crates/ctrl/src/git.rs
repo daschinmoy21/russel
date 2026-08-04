@@ -1033,26 +1033,46 @@ mod tests {
         assert!(clone_security_config_args("git-scp").is_empty());
     }
 
+    /// Serialize mutations of `RUSSEL_GIT_HOST_ALLOWLIST` and restore even on panic.
+    fn with_git_host_allowlist<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: exclusive LOCK held; only test code mutates this var.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("RUSSEL_GIT_HOST_ALLOWLIST", v),
+                        None => std::env::remove_var("RUSSEL_GIT_HOST_ALLOWLIST"),
+                    }
+                }
+            }
+        }
+
+        let prev = std::env::var_os("RUSSEL_GIT_HOST_ALLOWLIST");
+        let _restore = EnvRestore(prev);
+        // SAFETY: exclusive lock held for the duration of the mutation + body.
+        unsafe {
+            std::env::set_var("RUSSEL_GIT_HOST_ALLOWLIST", value);
+        }
+        f()
+    }
+
     #[test]
     fn git_host_allowlist_parses_comma_separated() {
-        // SAFETY: tests run single-threaded for this env var; restore after.
-        let prev = std::env::var("RUSSEL_GIT_HOST_ALLOWLIST").ok();
-        // SAFETY: process-global env mutation is scoped to this test and restored.
-        unsafe {
-            std::env::set_var(
-                "RUSSEL_GIT_HOST_ALLOWLIST",
-                "git.internal.example, Other.Git.Local",
-            );
-        }
-        assert!(is_git_host_allowlisted("git.internal.example"));
-        assert!(is_git_host_allowlisted("GIT.INTERNAL.EXAMPLE"));
-        assert!(is_git_host_allowlisted("other.git.local"));
-        assert!(!is_git_host_allowlisted("evil.example"));
-        assert!(!is_git_host_allowlisted("10.0.0.1"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("RUSSEL_GIT_HOST_ALLOWLIST", v) },
-            None => unsafe { std::env::remove_var("RUSSEL_GIT_HOST_ALLOWLIST") },
-        }
+        with_git_host_allowlist("git.internal.example, Other.Git.Local", || {
+            assert!(is_git_host_allowlisted("git.internal.example"));
+            assert!(is_git_host_allowlisted("GIT.INTERNAL.EXAMPLE"));
+            assert!(is_git_host_allowlisted("other.git.local"));
+            assert!(!is_git_host_allowlisted("evil.example"));
+            assert!(!is_git_host_allowlisted("10.0.0.1"));
+        });
     }
 
     #[test]
