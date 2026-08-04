@@ -325,7 +325,8 @@ async fn count_rsl_taps() -> usize {
 // kernel FORWARD. Guests only need L2 on their TAP + host→guest L3 for socat.
 // Enabling `ip_forward=1` without a FORWARD policy lets guest A route to guest B
 // (and off-host) via host L3. We install a dedicated chain that default-denies
-// all forwarded traffic involving `rsl-*` interfaces. Never flush built-in chains.
+// all forwarded traffic involving `rsl-*` interfaces *before* turning on
+// ip_forward. Never flush built-in chains.
 
 /// Dedicated iptables filter chain owned by Russel (never flush host FORWARD).
 pub const RUSSEL_FORWARD_CHAIN: &str = "RUSSEL-FORWARD";
@@ -474,10 +475,19 @@ fn jump_insert_args(direction: &str) -> Vec<String> {
 /// warning and does not abort microVM boot (dev without root). Production
 /// hosts should run with privileges so this succeeds.
 ///
-/// No-op when [`forward_filter_disabled`] is true (logs residual risk once per call).
+/// When [`forward_filter_disabled`] is true, logs residual risk and best-effort
+/// removes any previously installed Russel-owned FORWARD rules so an operator
+/// toggle to allow mode actually takes effect.
 pub async fn ensure_forward_filter() {
     if forward_filter_disabled() {
         tracing::warn!(target: "russel_ctrl::network", "{}", FORWARD_FILTER_ALLOW_RISK);
+        // Escape hatch must clear lingering deny rules from a prior secure run.
+        if let Err(e) = remove_forward_filter().await {
+            tracing::warn!(
+                error = %e,
+                "failed to remove RUSSEL-FORWARD while filter disabled (manual cleanup may be needed)"
+            );
+        }
         return;
     }
     match install_forward_filter().await {
@@ -542,12 +552,28 @@ async fn install_forward_filter() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove `RUSSEL-FORWARD` jumps and chain if no `rsl-` TAPs remain.
+/// Remove `RUSSEL-FORWARD` jumps and chain when appropriate.
 ///
-/// Mirrors [`restore_ip_forward`]: only cleans Russel-owned rules; never
-/// flushes host built-in chains. Fail-soft on errors.
+/// - Secure default: only clean when no `rsl-` TAPs remain (mirrors
+///   [`restore_ip_forward`]).
+/// - Allow/disable escape hatch: always best-effort remove Russel-owned rules
+///   so toggling `RUSSEL_FORWARD=allow` (or `RUSSEL_DISABLE_FORWARD_FILTER=1`)
+///   after a prior secure run actually lifts the deny (even with live TAPs).
+///
+/// Only cleans Russel-owned rules; never flushes host built-in chains.
+/// Fail-soft on errors.
 pub async fn restore_forward_filter() {
     if forward_filter_disabled() {
+        // Operator opted out: lingering RUSSEL-FORWARD would still deny traffic.
+        tracing::info!(
+            "forward filter disabled; removing any existing RUSSEL-FORWARD rules"
+        );
+        if let Err(e) = remove_forward_filter().await {
+            tracing::warn!(
+                error = %e,
+                "failed to remove RUSSEL-FORWARD while filter disabled (manual cleanup may be needed)"
+            );
+        }
         return;
     }
     let count = count_rsl_taps().await;
@@ -622,8 +648,9 @@ async fn run_iptables(args: &[&str]) -> anyhow::Result<()> {
 pub struct TapForwarder;
 
 impl TapForwarder {
-    /// Create the TAP interface, bring it up with host-side IP, enable IP
-    /// forwarding, then spawn a wildcard-bound socat TCP forwarder.
+    /// Create the TAP interface, bring it up with host-side IP, install the
+    /// guest FORWARD filter, enable IP forwarding, then spawn a wildcard-bound
+    /// socat TCP forwarder.
     pub async fn setup(
         service_id: &str,
         alloc: &SubnetAllocation,
@@ -643,10 +670,12 @@ impl TapForwarder {
         run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
         tracing::info!(tap, host_ip, "tap configured");
 
-        sysctl("net.ipv4.ip_forward", "1").await;
-        // #187: default-deny FORWARD for rsl-* before the guest can use L3.
+        // #187: install default-deny FORWARD for rsl-* *before* enabling
+        // ip_forward so there is no window where L3 forwarding is on without
+        // the filter (especially if host FORWARD already has ACCEPT jumps).
         // Publish stays on userspace socat (OUTPUT), so DROP does not break ports.
         ensure_forward_filter().await;
+        sysctl("net.ipv4.ip_forward", "1").await;
 
         match Self::spawn_socat(service_id, host_port, vm_ip, guest_port).await {
             Ok(child) => Ok(child),
