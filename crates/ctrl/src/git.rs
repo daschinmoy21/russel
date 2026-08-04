@@ -133,16 +133,22 @@ impl GitClient {
             );
         };
 
-        // Block metadata/link-local/loopback hosts for all remote schemes.
+        // Block private/metadata/link-local/loopback hosts for all remote schemes.
         //
-        // Residual risks we cannot fully mitigate without external DNS:
-        // - DNS rebinding: a hostname that resolves to a blocked IP after
-        //   this check is performed is not caught here. Keep this gap noted.
-        // - HTTP redirects: git follows 302s by default; an allowed host may
-        //   redirect to a blocked one. We do not set http.followRedirects=false
-        //   because it breaks legitimate GitHub redirects.
+        // Residual risk — DNS rebinding TOCTOU:
+        // We resolve hostnames and reject private addresses before clone, but a
+        // malicious authoritative DNS server can return a public IP for our check
+        // and a private IP for git's subsequent lookup. Full mitigation would
+        // require pinning the resolved address for the whole clone (not practical
+        // with stock git). Prefer HTTPS + known hosts; use
+        // RUSSEL_GIT_HOST_ALLOWLIST only for trusted internal hostnames.
+        //
+        // HTTP redirects: we set `http.followRedirects=false` on http(s) clones so
+        // an allowed host cannot 30x into a blocked one. Canonical clone URLs
+        // (e.g. GitHub) do not require redirects.
         let host = extract_url_host(repo, scheme)?;
         validate_remote_host(&host)?;
+        validate_remote_host_dns(&host).await?;
 
         let checkout_root = PathBuf::from("/tmp/russel/checkouts");
         fs::create_dir_all(&checkout_root).context("failed to create checkout directory")?;
@@ -156,7 +162,11 @@ impl GitClient {
         // concurrent deploys / age-based GC cannot clobber an in-use checkout.
         let checkout = reserve_checkout_dir(&checkout_root, repo)?;
 
-        let output = Command::new("git")
+        let mut cmd = Command::new("git");
+        for arg in clone_security_config_args(scheme) {
+            cmd.arg(arg);
+        }
+        let output = cmd
             .arg("clone")
             .arg("--")
             .arg(repo)
@@ -269,11 +279,37 @@ fn parse_authority_host(host_port: &str) -> anyhow::Result<String> {
     Ok(host_port.to_string())
 }
 
-/// Validate that a remote clone host is not a metadata/link-local/loopback address.
+/// Git `-c` options applied to remote clones to reduce SSRF surface.
 ///
-/// For hostnames we do not perform DNS resolution (no external dependency and
-/// no synchronous resolver), so DNS-rebinding to a blocked IP remains a
-/// residual risk.  That gap is intentional and documented at the call site.
+/// For http/https clones, disables following HTTP redirects so an allowlisted
+/// public host cannot 30x into a private/metadata endpoint.
+fn clone_security_config_args(scheme: &str) -> Vec<&'static str> {
+    let mut args = Vec::new();
+    if matches!(scheme, "http" | "https") {
+        args.extend(["-c", "http.followRedirects=false"]);
+    }
+    args
+}
+
+/// Hosts listed in `RUSSEL_GIT_HOST_ALLOWLIST` (comma-separated, case-insensitive)
+/// skip the DNS private-IP check. Use only for trusted internal git hostnames
+/// that intentionally resolve to RFC1918 / CGNAT addresses. Literal private IPs
+/// are still rejected.
+fn is_git_host_allowlisted(host: &str) -> bool {
+    let Ok(list) = std::env::var("RUSSEL_GIT_HOST_ALLOWLIST") else {
+        return false;
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|entry| entry.eq_ignore_ascii_case(host))
+}
+
+/// Validate that a remote clone host is not a private/metadata/link-local/loopback
+/// address when given as a literal IP, and apply hostname format checks.
+///
+/// Hostnames that pass this check are still subject to
+/// [`validate_remote_host_dns`] before clone.
 fn validate_remote_host(host: &str) -> anyhow::Result<()> {
     if host.eq_ignore_ascii_case("localhost") {
         anyhow::bail!("repository URL host 'localhost' is not allowed for remote clones");
@@ -287,30 +323,10 @@ fn validate_remote_host(host: &str) -> anyhow::Result<()> {
         return reject_blocked_ipv4(host, ipv4);
     }
 
-    // IPv6: unspecified, IPv4-mapped (via IPv4 blocklist), loopback, link-local, EC2 meta.
+    // IPv6: unspecified, IPv4-mapped (via IPv4 blocklist), loopback, link-local,
+    // ULA, EC2 meta.
     if let Ok(ipv6) = Ipv6Addr::from_str(host) {
-        match ipv6.to_canonical() {
-            IpAddr::V4(ipv4) => {
-                // ::ffff:169.254.169.254 / ::ffff:127.0.0.1 etc. must not bypass the
-                // IPv4 blocklist.
-                return reject_blocked_ipv4(host, ipv4);
-            }
-            IpAddr::V6(ipv6) => {
-                if ipv6.is_unspecified() {
-                    anyhow::bail!("repository URL host {host} (::) is unspecified");
-                }
-                if ipv6.is_loopback() {
-                    anyhow::bail!("repository URL host {host} (::1) is loopback");
-                }
-                if is_link_local_ipv6(ipv6) {
-                    anyhow::bail!("repository URL host {host} is link-local");
-                }
-                if is_ec2_metadata_ipv6(ipv6) {
-                    anyhow::bail!("repository URL host {host} is EC2 metadata");
-                }
-                return Ok(());
-            }
-        }
+        return reject_blocked_ipv6(host, ipv6);
     }
 
     // Reject hostnames containing '%' — percent-encoding may be decoded by
@@ -343,8 +359,53 @@ fn validate_remote_host(host: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Hostname: cannot resolve without an external dependency; accept and let
-    // the documented DNS-rebinding gap remain.
+    // Hostname format is acceptable; DNS private-IP check happens asynchronously.
+    Ok(())
+}
+
+/// Best-effort DNS resolution check: reject hostnames that resolve to any
+/// private/link-local/loopback/metadata address.
+///
+/// Residual DNS rebinding TOCTOU: the address seen here may differ from the
+/// address git later connects to. Documented at the clone call site.
+///
+/// Hosts in `RUSSEL_GIT_HOST_ALLOWLIST` skip this check (internal git only).
+/// Literal IPs are skipped (already validated by [`validate_remote_host`]).
+/// Resolution failure is fail-closed (clone cannot proceed without DNS anyway).
+async fn validate_remote_host_dns(host: &str) -> anyhow::Result<()> {
+    // Literals already fully checked.
+    if Ipv4Addr::from_str(host).is_ok() || Ipv6Addr::from_str(host).is_ok() {
+        return Ok(());
+    }
+
+    if is_git_host_allowlisted(host) {
+        tracing::debug!(
+            host,
+            "skipping DNS private-IP check (RUSSEL_GIT_HOST_ALLOWLIST)"
+        );
+        return Ok(());
+    }
+
+    // Port is required by lookup_host but ignored for the blocklist; use 443.
+    let addrs = tokio::net::lookup_host((host, 443))
+        .await
+        .with_context(|| {
+            format!("DNS resolution failed for repository host '{host}' (refusing clone)")
+        })?;
+
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        match addr.ip() {
+            IpAddr::V4(ipv4) => reject_blocked_ipv4(host, ipv4)?,
+            IpAddr::V6(ipv6) => reject_blocked_ipv6(host, ipv6)?,
+        }
+    }
+
+    if !saw_any {
+        anyhow::bail!("DNS resolution returned no addresses for repository host '{host}'");
+    }
+
     Ok(())
 }
 
@@ -367,17 +428,25 @@ fn is_canonical_ipv4(s: &str) -> bool {
 }
 
 fn is_link_local_ipv4(ip: Ipv4Addr) -> bool {
+    // 169.254.0.0/16 (also covered by Ipv4Addr::is_link_local)
     let octets = ip.octets();
     octets[0] == 169 && octets[1] == 254
+}
+
+/// Carrier-grade NAT (RFC 6598) 100.64.0.0/10.
+fn is_cgnat_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xc0) == 64
 }
 
 fn is_metadata_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     // GCP (100.100.2.0/24), Azure/DO/Oracle (100.100.100.0/24), etc.
+    // Subset of CGNAT; kept for a clearer error message.
     octets[0] == 100 && octets[1] == 100
 }
 
-/// Shared IPv4 blocklist (also used for IPv4-mapped IPv6 hosts).
+/// Shared IPv4 blocklist (also used for IPv4-mapped IPv6 hosts and DNS results).
 fn reject_blocked_ipv4(host: &str, ipv4: Ipv4Addr) -> anyhow::Result<()> {
     if ipv4.is_unspecified() {
         anyhow::bail!("repository URL host {host} is unspecified (0.0.0.0)");
@@ -385,25 +454,78 @@ fn reject_blocked_ipv4(host: &str, ipv4: Ipv4Addr) -> anyhow::Result<()> {
     if ipv4.is_loopback() {
         anyhow::bail!("repository URL host {host} is loopback");
     }
+    // RFC1918: 10/8, 172.16/12, 192.168/16
+    if ipv4.is_private() {
+        anyhow::bail!("repository URL host {host} is a private (RFC1918) address");
+    }
     if is_link_local_ipv4(ipv4) {
         anyhow::bail!("repository URL host {host} is link-local");
     }
+    // Prefer the more specific metadata message when applicable.
     if is_metadata_ipv4(ipv4) {
         anyhow::bail!("repository URL host {host} is a cloud metadata service");
+    }
+    if is_cgnat_ipv4(ipv4) {
+        anyhow::bail!("repository URL host {host} is carrier-grade NAT (100.64/10)");
+    }
+    if ipv4.is_broadcast() {
+        anyhow::bail!("repository URL host {host} is broadcast");
+    }
+    if ipv4.is_multicast() {
+        anyhow::bail!("repository URL host {host} is multicast");
     }
     Ok(())
 }
 
 fn is_link_local_ipv6(ip: Ipv6Addr) -> bool {
     // fe80::/10
-    let segments = ip.segments();
-    (segments[0] & 0xffc0) == 0xfe80
+    ip.is_unicast_link_local() || {
+        let segments = ip.segments();
+        (segments[0] & 0xffc0) == 0xfe80
+    }
+}
+
+fn is_unique_local_ipv6(ip: Ipv6Addr) -> bool {
+    // fc00::/7 (ULA)
+    ip.is_unique_local()
 }
 
 fn is_ec2_metadata_ipv6(ip: Ipv6Addr) -> bool {
-    // fd00:ec2::/32
+    // fd00:ec2::/32 (also ULA; kept for a clearer error message)
     let segments = ip.segments();
     segments[0] == 0xfd00 && segments[1] == 0x0ec2
+}
+
+/// Shared IPv6 blocklist (literals and DNS results). Handles IPv4-mapped form.
+fn reject_blocked_ipv6(host: &str, ipv6: Ipv6Addr) -> anyhow::Result<()> {
+    match ipv6.to_canonical() {
+        IpAddr::V4(ipv4) => {
+            // ::ffff:169.254.169.254 / ::ffff:127.0.0.1 etc. must not bypass the
+            // IPv4 blocklist.
+            reject_blocked_ipv4(host, ipv4)
+        }
+        IpAddr::V6(ipv6) => {
+            if ipv6.is_unspecified() {
+                anyhow::bail!("repository URL host {host} (::) is unspecified");
+            }
+            if ipv6.is_loopback() {
+                anyhow::bail!("repository URL host {host} (::1) is loopback");
+            }
+            if is_link_local_ipv6(ipv6) {
+                anyhow::bail!("repository URL host {host} is link-local");
+            }
+            if is_ec2_metadata_ipv6(ipv6) {
+                anyhow::bail!("repository URL host {host} is EC2 metadata");
+            }
+            if is_unique_local_ipv6(ipv6) {
+                anyhow::bail!("repository URL host {host} is IPv6 unique-local (fc00::/7)");
+            }
+            if ipv6.is_multicast() {
+                anyhow::bail!("repository URL host {host} is multicast");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn fnv1a_u64(bytes: impl AsRef<[u8]>) -> u64 {
@@ -864,5 +986,114 @@ mod tests {
                 "expected rejection for {host}"
             );
         }
+    }
+
+    #[test]
+    fn rfc1918_and_cgnat_literal_ips_rejected() {
+        for host in [
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.1",
+            "192.168.0.1",
+            "192.168.255.255",
+            "100.64.0.1",
+            "100.127.255.254",
+            "100.100.100.200",
+        ] {
+            let err = validate_remote_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("private")
+                    || err.contains("carrier-grade")
+                    || err.contains("metadata"),
+                "expected private/CGNAT/metadata rejection for {host}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_ula_rejected() {
+        for host in ["fc00::1", "fd12:3456:789a::1", "fd00:ec2::254"] {
+            let err = validate_remote_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("unique-local") || err.contains("EC2 metadata"),
+                "expected ULA/EC2 rejection for {host}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_clone_disables_follow_redirects() {
+        let https_args = clone_security_config_args("https");
+        assert_eq!(https_args, vec!["-c", "http.followRedirects=false"]);
+        let http_args = clone_security_config_args("http");
+        assert_eq!(http_args, vec!["-c", "http.followRedirects=false"]);
+        // ssh / scp clones do not set http.* config
+        assert!(clone_security_config_args("ssh").is_empty());
+        assert!(clone_security_config_args("git-scp").is_empty());
+    }
+
+    /// Serialize mutations of `RUSSEL_GIT_HOST_ALLOWLIST` and restore even on panic.
+    fn with_git_host_allowlist<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: exclusive LOCK held; only test code mutates this var.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("RUSSEL_GIT_HOST_ALLOWLIST", v),
+                        None => std::env::remove_var("RUSSEL_GIT_HOST_ALLOWLIST"),
+                    }
+                }
+            }
+        }
+
+        let prev = std::env::var_os("RUSSEL_GIT_HOST_ALLOWLIST");
+        let _restore = EnvRestore(prev);
+        // SAFETY: exclusive lock held for the duration of the mutation + body.
+        unsafe {
+            std::env::set_var("RUSSEL_GIT_HOST_ALLOWLIST", value);
+        }
+        f()
+    }
+
+    #[test]
+    fn git_host_allowlist_parses_comma_separated() {
+        with_git_host_allowlist("git.internal.example, Other.Git.Local", || {
+            assert!(is_git_host_allowlisted("git.internal.example"));
+            assert!(is_git_host_allowlisted("GIT.INTERNAL.EXAMPLE"));
+            assert!(is_git_host_allowlisted("other.git.local"));
+            assert!(!is_git_host_allowlisted("evil.example"));
+            assert!(!is_git_host_allowlisted("10.0.0.1"));
+        });
+    }
+
+    #[test]
+    fn reject_blocked_helpers_cover_dns_path_ips() {
+        // DNS results reuse the same helpers as literal hosts.
+        assert!(reject_blocked_ipv4("resolved", Ipv4Addr::new(10, 1, 2, 3)).is_err());
+        assert!(reject_blocked_ipv4("resolved", Ipv4Addr::new(100, 64, 0, 1)).is_err());
+        assert!(reject_blocked_ipv4("resolved", Ipv4Addr::new(8, 8, 8, 8)).is_ok());
+        assert!(
+            reject_blocked_ipv6("resolved", Ipv6Addr::from_str("fd12::1").unwrap()).is_err()
+        );
+        assert!(
+            reject_blocked_ipv6("resolved", Ipv6Addr::from_str("2001:4860:4860::8888").unwrap())
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_check_skips_literal_ips() {
+        // Literals are not re-resolved; private ones already fail validate_remote_host.
+        assert!(validate_remote_host_dns("8.8.8.8").await.is_ok());
+        assert!(validate_remote_host_dns("10.0.0.1").await.is_ok());
     }
 }
