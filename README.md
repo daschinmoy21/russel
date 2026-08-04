@@ -38,12 +38,15 @@ cargo build
 export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"   # same value in both terminals
 
 # 4. Start control plane (terminal 1) — default http://127.0.0.1:7878
+# Local absolute path deploys need an explicit opt-in on the control plane:
+export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
 ./target/debug/russel-ctrl
 # override bind: RUSSEL_CTRL_ADDR=127.0.0.1:7878
 
 # 5. Deploy example (terminal 2, from repo root)
 ./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id test-api
 # CLI target: RUSSEL_CONTROL_PLANE=http://127.0.0.1:7878 (default)
+# Prefer a git URL for remote/shared control planes (local paths default OFF).
 
 # 6. Verify
 curl http://127.0.0.1:8080/health
@@ -169,7 +172,8 @@ russel-cli secrets delete <name>
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
-- **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local metadata hosts (`169.254.169.254`) are blocked.
+- **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local / private / metadata hosts (e.g. `169.254.169.254`, RFC1918) are blocked on the control plane.
+- **Local absolute path deploys** are **disabled by default**. Set `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` on the control plane only for single-tenant trusted hosts (local dev). Paths are resolved on the **control-plane host**, not the CLI client — do not enable this on a shared/remote ctrl. Relative paths are always rejected; prefer a git URL when the control plane is remote.
 
 ### Config Path & Bin Name
 

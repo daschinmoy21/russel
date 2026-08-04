@@ -83,7 +83,52 @@ fn is_loopback_host(host: &str) -> bool {
     if let Some(rest) = host.strip_prefix("127.") {
         return rest.split('.').all(|octet| octet.parse::<u8>().is_ok());
     }
+    // Bracketed IPv6 loopback.
+    if host == "[::1]" {
+        return true;
+    }
     false
+}
+
+/// Warn when deploying a local absolute path against a non-loopback control plane.
+///
+/// The path is resolved on the **control-plane host**, not the client machine.
+/// Ctrl also requires `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` (default off).
+fn warn_remote_local_path_deploy(control_plane: &str, repo_url: &str) {
+    let path = std::path::Path::new(repo_url);
+    if !path.is_absolute() {
+        return;
+    }
+    let host = control_plane_host(control_plane);
+    if is_loopback_host(host) {
+        return;
+    }
+    eprintln!(
+        "\x1b[1;33mwarning:\x1b[0m deploying local path to non-loopback control plane \
+         \x1b[1m{host}\x1b[0m — path is resolved on the \x1b[1mcontrol-plane host\x1b[0m, \
+         not this machine. Ctrl rejects local paths unless \
+         RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1 (single-tenant trusted hosts only). \
+         Prefer a git URL for remote deploys."
+    );
+}
+
+/// Extract host from a control-plane URL (`http://host:port` / `https://host/...`).
+fn control_plane_host(control_plane: &str) -> &str {
+    let rest = control_plane
+        .strip_prefix("https://")
+        .or_else(|| control_plane.strip_prefix("http://"))
+        .unwrap_or(control_plane);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Drop userinfo if present.
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    // Bracketed IPv6: [::1]:7878
+    if let Some(inside) = host_port.strip_prefix('[') {
+        return inside.split(']').next().unwrap_or(inside);
+    }
+    host_port.split(':').next().unwrap_or(host_port)
 }
 
 /// Map a reqwest error into a user-friendly message when the control plane is unreachable.
@@ -226,6 +271,7 @@ pub struct DestroyArgs {
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     let wall = Instant::now();
     let repo_url = normalize_repo_arg(&args.repo)?;
+    warn_remote_local_path_deploy(control_plane, &repo_url);
     let runtime = resolve_deploy_runtime(&args.repo, &args.config, args.runtime.as_deref())?;
     match runtime {
         Some(RuntimeKind::Microvm) if !args.podman_args.is_empty() => {
@@ -782,6 +828,7 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
     let mut body = serde_json::Map::new();
     if let Some(repo) = args.repo {
         let repo_url = normalize_repo_arg(&repo)?;
+        warn_remote_local_path_deploy(control_plane, &repo_url);
         body.insert("repo_url".into(), serde_json::json!(repo_url));
     }
     if let Some(config) = args.config {
@@ -1025,6 +1072,30 @@ mod tests {
         assert_eq!(ms(1000), "1.0s");
         assert_eq!(ms(1500), "1.5s");
         assert_eq!(ms(12345), "12.3s");
+    }
+
+    #[test]
+    fn control_plane_host_parses_urls() {
+        assert_eq!(
+            control_plane_host("http://127.0.0.1:7878"),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            control_plane_host("https://ctrl.example.com/v1"),
+            "ctrl.example.com"
+        );
+        assert_eq!(control_plane_host("http://[::1]:7878"), "::1");
+        assert_eq!(control_plane_host("http://localhost"), "localhost");
+    }
+
+    #[test]
+    fn is_loopback_host_covers_common_forms() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("ctrl.example.com"));
     }
 
     #[test]
