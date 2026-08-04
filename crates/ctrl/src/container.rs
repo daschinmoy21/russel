@@ -453,16 +453,46 @@ fn install_env_wrapper(rootfs: &Path) -> anyhow::Result<()> {
 
 const CONTAINER_NAME_PREFIX: &str = "russel-";
 
-/// Resolve Podman container name: prefer metadata (generation promote may leave
-/// a gen-scoped name), else the canonical `russel-{service_id}`.
+/// Trusted Podman names for a service: canonical `russel-{service_id}`, or a
+/// generation-scoped name `russel-{service_id}_g{hex}` that dual-live promote
+/// may leave in metadata (only `service_id` is rewritten on promote).
+///
+/// Rejects arbitrary metadata `container_name` values so stop/destroy cannot be
+/// redirected at attacker-chosen Podman names (Issue #193).
+fn is_trusted_container_name(service_id: &str, name: &str) -> bool {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+    let canonical = ContainerRunner::container_name(service_id);
+    if name == canonical {
+        return true;
+    }
+    // Generation-scoped: russel-{service_id}_g{hex}
+    let gen_prefix = format!("{canonical}_g");
+    if let Some(generation) = name.strip_prefix(&gen_prefix) {
+        return !generation.is_empty()
+            && generation.len() <= 32
+            && generation.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    false
+}
+
+/// Resolve Podman container name: prefer metadata when the stored name is a
+/// trusted Russel name (canonical or gen-scoped), else `russel-{service_id}`.
 fn resolve_container_name(service_id: &str) -> String {
     let path = format!("/var/lib/russel/{service_id}/metadata.json");
     if let Ok(content) = std::fs::read_to_string(&path)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(name) = value.get("container_name").and_then(|v| v.as_str())
-        && !name.is_empty()
     {
-        return name.to_string();
+        if is_trusted_container_name(service_id, name) {
+            return name.to_string();
+        }
+        tracing::warn!(
+            service_id,
+            container_name = %name,
+            "metadata container_name rejected (expected russel-{{service_id}} or gen-scoped); using canonical"
+        );
     }
     ContainerRunner::container_name(service_id)
 }
@@ -715,46 +745,31 @@ async fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Make the service dir + rootfs usable by a non-root podman user when
+/// Make rootfs + container.log usable by a non-root podman user when
 /// `RUSSEL_PODMAN_USER` is set (ctrl runs as root via sudo for microVMs).
+///
+/// **Security (Issue #193):** the service base directory stays root-owned and
+/// non-group-writable (0750). Directory write would let the podman user
+/// unlink/replace root-owned `metadata.json`. Only the rootfs tree is chowned
+/// to the podman user. `container.log` is pre-created and chowned so the
+/// k8s-file log driver can write without directory write permission.
+///
+/// Ancestor world `a+rx` is intentionally not applied (that made paths
+/// world-traversable). Traversal for the podman user uses ACL `u:user:rx` on
+/// the service dir, falling back to `root:podman_gid` + mode 0750.
 async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     let Some(user) = configured_podman_user() else {
         return Ok(());
     };
 
-    // Open path components for traversal (resolve symlinks first).
-    let resolved = tokio::fs::canonicalize(rootfs)
-        .await
-        .unwrap_or_else(|_| rootfs.to_path_buf());
-    let mut walk = resolved.as_path();
-    loop {
-        let output = tokio::process::Command::new("chmod")
-            .args(["a+rx", &walk.display().to_string()])
-            .output()
-            .await?;
-        if !output.status.success() {
-            // Best-effort on parents we may not own (e.g. /); rootfs/base are critical.
-            tracing::debug!(
-                path = %walk.display(),
-                err = %String::from_utf8_lossy(&output.stderr).trim(),
-                "chmod a+rx parent skipped"
-            );
-        }
-        match walk.parent() {
-            Some(parent) if parent != walk => walk = parent,
-            _ => break,
-        }
-    }
-
-    // Only the rootfs + the service directory itself are given to the podman
-    // user.  The service dir (non-recursive) lets podman create container.log;
-    // rootfs (recursive) provides the container filesystem.  metadata.json and
-    // other files under the service dir stay root-owned — container workloads
-    // cannot tamper with them.
     let base = rootfs
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| rootfs.to_path_buf());
+    tokio::fs::create_dir_all(&base)
+        .await
+        .map_err(|e| anyhow::anyhow!("create service dir {}: {e}", base.display()))?;
+
     let uid = tokio::process::Command::new("id")
         .args(["-u", &user])
         .output()
@@ -779,22 +794,130 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
     }
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
     let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
+    let base_s = base.display().to_string();
 
-    // Service dir: non-recursive — podman needs to write container.log here;
-    // metadata.json (written later by root) remains root-owned.
+    // Keep service dir root-owned (NOT chowned to the podman user).
     let output = tokio::process::Command::new("chown")
-        .args([&format!("{uid}:{gid}"), &base.display().to_string()])
+        .args(["root:root", &base_s])
         .output()
         .await?;
     if !output.status.success() {
         anyhow::bail!(
-            "chown service dir to {user} ({uid}:{gid}) failed: {}",
+            "chown service dir root:root failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
 
-    // Rootfs: recursive — the container filesystem must be readable/writable
-    // by the podman user.
+    // 0750: owner rwx, group rx, other none — never group/other write.
+    let output = tokio::process::Command::new("chmod")
+        .args(["0750", &base_s])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chmod 0750 service dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    // Grant podman user traverse+read on the service dir without write
+    // (cannot unlink metadata.json). Prefer ACL; fall back to root:gid 0750.
+    let acl = tokio::process::Command::new("setfacl")
+        .args(["-m", &format!("u:{user}:rx"), &base_s])
+        .output()
+        .await;
+    match acl {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            tracing::debug!(
+                path = %base_s,
+                user = %user,
+                gid = %gid,
+                err = %String::from_utf8_lossy(&out.stderr).trim(),
+                "setfacl on service dir failed; falling back to root:gid 0750"
+            );
+            let output = tokio::process::Command::new("chown")
+                .args([&format!("root:{gid}"), &base_s])
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "chown service dir root:{gid} fallback failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %base_s,
+                user = %user,
+                gid = %gid,
+                error = %e,
+                "setfacl unavailable; falling back to root:gid 0750"
+            );
+            let output = tokio::process::Command::new("chown")
+                .args([&format!("root:{gid}"), &base_s])
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "chown service dir root:{gid} fallback failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+    }
+
+    // Best-effort: allow the podman user to traverse /var/lib/russel without
+    // world a+rx. User execute-only ACL; skip on failure.
+    let russel_root = Path::new("/var/lib/russel");
+    if russel_root.exists() {
+        let root_s = russel_root.display().to_string();
+        let output = tokio::process::Command::new("setfacl")
+            .args(["-m", &format!("u:{user}:--x"), &root_s])
+            .output()
+            .await;
+        if let Ok(out) = &output
+            && !out.status.success()
+        {
+            tracing::debug!(
+                path = %root_s,
+                user = %user,
+                err = %String::from_utf8_lossy(&out.stderr).trim(),
+                "setfacl execute on /var/lib/russel skipped"
+            );
+        }
+    }
+
+    // Pre-create container.log owned by the podman user so the log driver can
+    // write without needing write permission on the service directory.
+    let log_path = base.join("container.log");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o640);
+        opts.open(&log_path)
+            .map_err(|e| anyhow::anyhow!("create container.log {}: {e}", log_path.display()))?;
+    }
+    let log_s = log_path.display().to_string();
+    let output = tokio::process::Command::new("chown")
+        .args([&format!("{uid}:{gid}"), &log_s])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chown container.log to {user} ({uid}:{gid}) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    // ACL write as a belt-and-suspenders for the log file.
+    let _ = tokio::process::Command::new("setfacl")
+        .args(["-m", &format!("u:{user}:rw"), &log_s])
+        .output()
+        .await;
+
+    // Rootfs only (recursive) — container filesystem for the podman user.
+    // Do NOT chown the service base dir.
     let output = tokio::process::Command::new("chown")
         .args(["-R", &format!("{uid}:{gid}"), &rootfs.display().to_string()])
         .output()
@@ -1029,207 +1152,487 @@ pub fn parse_podman_rootless(info_json: &str) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("podman info missing .host.security.rootless"))
 }
 
-/// Reject podman passthrough args that Russel owns (name, detach, rootfs, etc.)
-/// or that weaken container isolation (Issue #3).
-pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        let next = args.get(i + 1);
+/// When `RUSSEL_ALLOW_PODMAN_ARGS=0` (or `false`/`no`/`off`), all passthrough
+/// extras are rejected. Unset or any other value leaves the allowlist in effect.
+fn podman_passthrough_disabled() -> bool {
+    match std::env::var("RUSSEL_ALLOW_PODMAN_ARGS") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off")
+        }
+        Err(_) => false,
+    }
+}
 
-        // --rootfs, --name/-n, --replace, -d/--detach (owned by Russel)
-        if arg == "--rootfs" || arg.starts_with("--rootfs=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: --rootfs");
-        }
-        if arg == "--name" || arg == "-n" || arg.starts_with("--name=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: --name/-n");
-        }
-        if arg == "--replace" || arg.starts_with("--replace=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: --replace");
-        }
-        if arg == "-d" || arg == "--detach" || arg.starts_with("--detach=") {
-            anyhow::bail!("podman passthrough arg reserved by Russel: detach (-d/--detach)");
-        }
-
-        // PORT env override (Issue #2): deny any arg that sets PORT variable
-        if (arg == "-e" || arg == "--env")
-            && let Some(val) = next
-        {
-            if val.starts_with("PORT=") {
-                anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT=...)");
+/// Require a following value token for a space-separated flag form.
+fn require_passthrough_value<'a>(flag: &str, next: Option<&'a String>) -> anyhow::Result<&'a str> {
+    match next {
+        Some(v) => {
+            if v.starts_with('-') {
+                deny_known_unsafe_passthrough(v)?;
             }
-            if val == "PORT" {
-                anyhow::bail!("podman passthrough arg must not override PORT ({arg} PORT)");
-            }
+            Ok(v.as_str())
         }
-        if arg.starts_with("-ePORT=") || arg.starts_with("--env=PORT=") {
-            anyhow::bail!("podman passthrough arg must not override PORT ({arg})");
-        }
-        if arg == "-ePORT" {
-            anyhow::bail!("podman passthrough arg must not override PORT ({arg})");
-        }
+        None => anyhow::bail!("podman passthrough arg {flag} requires a value"),
+    }
+}
 
-        // Isolation-weakening flags (Issue #3)
-        if arg == "--privileged" || arg == "--privileged=true" {
-            anyhow::bail!("podman passthrough arg denied for security: --privileged");
-        }
+/// Allowed network modes for passthrough `--network` / `--net`.
+const ALLOWED_NETWORKS: &[&str] = &["bridge", "none", "slirp4netns", "pasta"];
 
-        // --pid: any value denied (host sharing)
-        if arg == "--pid" {
-            anyhow::bail!("podman passthrough arg denied for security: --pid");
+fn validate_passthrough_network_mode(flag: &str, val: &str) -> anyhow::Result<()> {
+    if val == "host" {
+        // Keep the historical "host" wording for tests and operators.
+        if flag.contains('=') || flag.starts_with("--network=") || flag.starts_with("--net=") {
+            anyhow::bail!("podman passthrough arg denied for security: --network=host");
         }
-        if arg.starts_with("--pid=") {
-            anyhow::bail!("podman passthrough arg denied for security: --pid=...");
-        }
-        // --network/--net/-net: allow only known safe network modes.
-        // Deny host (already), ns:/…, and anything outside the allowlist.
-        const ALLOWED_NETWORKS: &[&str] = &["bridge", "none", "slirp4netns", "pasta"];
-        if arg == "--network" || arg == "--net" || arg == "-net" {
-            let val = match next {
-                Some(v) => v,
-                None => anyhow::bail!("podman passthrough arg {arg} requires a value"),
-            };
-            if val == "host" {
-                anyhow::bail!("podman passthrough arg denied for security: {arg} host");
-            }
-            if !ALLOWED_NETWORKS.contains(&val.as_str()) {
-                anyhow::bail!(
-                    "podman passthrough arg denied for security: {arg} {val} \
-                     (only bridge, none, slirp4netns, pasta are permitted)"
-                );
-            }
-        }
-        for eq_form in &["--network=", "--net="] {
-            if let Some(val) = arg.strip_prefix(eq_form) {
-                if val == "host" {
-                    anyhow::bail!("podman passthrough arg denied for security: --network=host");
-                }
-                if !ALLOWED_NETWORKS.contains(&val) {
-                    anyhow::bail!(
-                        "podman passthrough arg denied for security: --network={val} \
-                         (only bridge, none, slirp4netns, pasta are permitted)"
-                    );
-                }
-            }
-        }
-
-        // --ipc/--uts/--cgroupns with host
-        for flag in &["--ipc", "--uts", "--cgroupns"] {
-            if arg == *flag
-                && let Some(val) = next
-                && val == "host"
-            {
-                anyhow::bail!("podman passthrough arg denied for security: {flag} host");
-            }
-            if arg.starts_with(&format!("{}={}", flag, "host")) {
-                anyhow::bail!("podman passthrough arg denied for security: {arg}");
-            }
-        }
-
-        // --userns: deny everything except keep-id
-        if arg == "--userns" {
-            if let Some(val) = next {
-                if val != "keep-id" {
-                    anyhow::bail!(
-                        "podman passthrough arg denied for security: --userns {val} \
-                         (only keep-id is permitted)"
-                    );
-                }
-            } else {
-                anyhow::bail!("podman passthrough arg --userns requires a value");
-            }
-        }
-        if let Some(val) = arg.strip_prefix("--userns=")
-            && val != "keep-id"
-        {
-            anyhow::bail!(
-                "podman passthrough arg denied for security: --userns={val} \
-                 (only keep-id is permitted)"
-            );
-        }
-
-        // --user / -u: deny all forms (container must run as its own user)
-        if arg == "--user" || arg == "-u" {
-            anyhow::bail!("podman passthrough arg denied for security: --user/-u");
-        }
-        if arg.starts_with("--user=") || arg.starts_with("-u=") {
-            anyhow::bail!("podman passthrough arg denied for security: --user/-u");
-        }
-
-        // --entrypoint: deny all forms (container entrypoint is managed by Russel)
-        if arg == "--entrypoint" || arg.starts_with("--entrypoint=") {
-            anyhow::bail!("podman passthrough arg denied for security: --entrypoint");
-        }
-
-        // --env-file: deny all forms (bypasses PORT guard, reads host files)
-        if arg == "--env-file" || arg.starts_with("--env-file=") {
-            anyhow::bail!("podman passthrough arg denied for security: --env-file");
-        }
-
-        // --volume / -v / --mount: only allow bind mounts from /nix/store/ with :ro
-        if arg == "-v" || arg == "--volume" {
-            let val = match next {
-                Some(v) => v,
-                None => anyhow::bail!("podman passthrough arg {arg} requires a value"),
-            };
-            validate_passthrough_volume(val)?;
-        }
-        if let Some(val) = arg.strip_prefix("-v") {
-            // Compact form: -vSOURCE:DEST:OPTIONS (only if -vX, not plain -v)
-            if !val.is_empty() {
-                validate_passthrough_volume(val)?;
-            }
-        }
-        if let Some(val) = arg.strip_prefix("--volume=") {
-            validate_passthrough_volume(val)?;
-        }
-        if arg == "--mount" {
-            let val = match next {
-                Some(v) => v,
-                None => anyhow::bail!("podman passthrough arg --mount requires a value"),
-            };
-            validate_passthrough_mount(val)?;
-        }
-        if let Some(val) = arg.strip_prefix("--mount=") {
-            validate_passthrough_mount(val)?;
-        }
-
-        // --security-opt (any form)
-        if arg == "--security-opt" || arg.starts_with("--security-opt=") {
-            anyhow::bail!("podman passthrough arg denied for security: --security-opt");
-        }
-
-        // --cap-add (deny all), --cap-drop (allow)
-        if arg == "--cap-add" || arg.starts_with("--cap-add=") {
-            anyhow::bail!("podman passthrough arg denied for security: --cap-add");
-        }
-
-        // --device / --add-device
-        if arg == "--device" || arg.starts_with("--device=") {
-            anyhow::bail!("podman passthrough arg denied for security: --device");
-        }
-        if arg == "--add-device" || arg.starts_with("--add-device=") {
-            anyhow::bail!("podman passthrough arg denied for security: --add-device");
-        }
-
-        // -p / --publish / --publish-all / -P (port mapping owned by Russel)
-        if arg == "-p" || arg == "--publish" || arg == "--publish-all" || arg == "-P" {
-            anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
-        }
-        if arg.starts_with("--publish=") {
-            anyhow::bail!("podman passthrough arg denied for security: --publish=...");
-        }
-        // ponytail: catch compact -p forms (-p8080:80, -p8080, etc.)
-        if arg.starts_with("-p") && arg != "-p" {
-            anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
-        }
-
-        i += 1;
+        anyhow::bail!("podman passthrough arg denied for security: {flag} host");
+    }
+    if !ALLOWED_NETWORKS.contains(&val) {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: {flag} {val} \
+             (only bridge, none, slirp4netns, pasta are permitted)"
+        );
     }
     Ok(())
 }
+
+fn validate_passthrough_userns(val: &str) -> anyhow::Result<()> {
+    if val != "keep-id" {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: --userns {val} \
+             (only keep-id is permitted)"
+        );
+    }
+    Ok(())
+}
+
+/// Reject env assignments that would override Russel-managed `PORT`.
+fn validate_passthrough_env_assignment(flag: &str, val: &str) -> anyhow::Result<()> {
+    if val == "PORT" || val.starts_with("PORT=") {
+        if val == "PORT" {
+            anyhow::bail!("podman passthrough arg must not override PORT ({flag} PORT)");
+        }
+        anyhow::bail!("podman passthrough arg must not override PORT ({flag} PORT=...)");
+    }
+    Ok(())
+}
+
+/// Deny known isolation-weakening / Russel-owned flags with stable error text.
+/// Returns `Ok(())` when `arg` is not a special-cased deny (caller continues
+/// allowlist matching). Bails when `arg` is reserved or always-denied.
+fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
+    // ── Reserved by Russel (owned flags) ──────────────────────────────────
+    if arg == "--rootfs" || arg.starts_with("--rootfs=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: --rootfs");
+    }
+    if arg == "--name" || arg == "-n" || arg.starts_with("--name=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: --name/-n");
+    }
+    if arg == "--replace" || arg.starts_with("--replace=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: --replace");
+    }
+    if arg == "-d" || arg == "--detach" || arg.starts_with("--detach=") {
+        anyhow::bail!("podman passthrough arg reserved by Russel: detach (-d/--detach)");
+    }
+
+    // Port publish is owned by Russel (managed -p mapping).
+    if arg == "-p"
+        || arg == "--publish"
+        || arg == "--publish-all"
+        || arg == "-P"
+        || arg.starts_with("--publish=")
+        || (arg.starts_with("-p") && !arg.starts_with("--"))
+    {
+        anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
+    }
+
+    // ── Always-denied isolation / escape flags (explicit messages) ────────
+    // All --privileged variants (including =false) — deny for simplicity.
+    if arg == "--privileged" || arg.starts_with("--privileged=") {
+        anyhow::bail!("podman passthrough arg denied for security: --privileged");
+    }
+    if arg == "--pid" || arg.starts_with("--pid=") {
+        anyhow::bail!("podman passthrough arg denied for security: --pid");
+    }
+    if arg == "--user" || arg == "-u" || arg.starts_with("--user=") || arg.starts_with("-u=") {
+        anyhow::bail!("podman passthrough arg denied for security: --user/-u");
+    }
+    if arg == "--entrypoint" || arg.starts_with("--entrypoint=") {
+        anyhow::bail!("podman passthrough arg denied for security: --entrypoint");
+    }
+    if arg == "--env-file" || arg.starts_with("--env-file=") {
+        anyhow::bail!("podman passthrough arg denied for security: --env-file");
+    }
+    if arg == "--security-opt" || arg.starts_with("--security-opt=") {
+        anyhow::bail!("podman passthrough arg denied for security: --security-opt");
+    }
+    if arg == "--cap-add" || arg.starts_with("--cap-add=") {
+        anyhow::bail!("podman passthrough arg denied for security: --cap-add");
+    }
+    if arg == "--device" || arg.starts_with("--device=") {
+        anyhow::bail!("podman passthrough arg denied for security: --device");
+    }
+    if arg == "--add-device" || arg.starts_with("--add-device=") {
+        anyhow::bail!("podman passthrough arg denied for security: --add-device");
+    }
+    // Isolation-weakening / host-control surfaces not on the allowlist.
+    if arg == "--hooks-dir" || arg.starts_with("--hooks-dir=") {
+        anyhow::bail!("podman passthrough arg denied for security: --hooks-dir");
+    }
+    if arg == "--runtime" || arg.starts_with("--runtime=") {
+        anyhow::bail!("podman passthrough arg denied for security: --runtime");
+    }
+    if arg == "--log-driver" || arg.starts_with("--log-driver=") {
+        anyhow::bail!("podman passthrough arg denied for security: --log-driver");
+    }
+    if arg == "--log-opt" || arg.starts_with("--log-opt=") {
+        anyhow::bail!("podman passthrough arg denied for security: --log-opt");
+    }
+    // Disallow flipping managed read-only rootfs off via passthrough.
+    if arg == "--read-only=false" || arg == "--read-only=0" || arg == "--read-only=no" {
+        anyhow::bail!("podman passthrough arg denied for security: --read-only=false");
+    }
+    if arg == "--read-only" || arg.starts_with("--read-only=") {
+        // Managed by Russel; not a passthrough knob.
+        anyhow::bail!("podman passthrough arg denied for security: --read-only");
+    }
+
+    Ok(())
+}
+
+/// Validate podman passthrough args with an **allowlist** of known-safe flags
+/// (Issue #191). Unknown `--*` / `-X` flags are denied by default.
+///
+/// Allowed (with value constraints where noted):
+/// - `--network` / `--net` / `-net` — bridge | none | slirp4netns | pasta
+/// - `--userns=keep-id` only
+/// - `--cap-drop`, `--secret`, `-e`/`--env` (non-PORT), `--label`/`-l`,
+///   `--annotation`, memory/cpu limits, `--tmpfs`, `--shm-size`, `--hostname`,
+///   `--ulimit`
+/// - `-v` / `--volume` / `--mount` — `/nix/store/` sources, read-only only
+///
+/// Set `RUSSEL_ALLOW_PODMAN_ARGS=0` to reject any non-empty extras.
+pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
+    if !args.is_empty() && podman_passthrough_disabled() {
+        anyhow::bail!(
+            "podman passthrough args disabled (RUSSEL_ALLOW_PODMAN_ARGS=0); \
+             unset or set to 1 to allow allowlisted extras"
+        );
+    }
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let next = args.get(i + 1);
+
+        // Positional tokens are never valid in passthrough (would become COMMAND).
+        if !arg.starts_with('-') {
+            anyhow::bail!(
+                "podman passthrough arg denied for security: unexpected positional '{arg}'"
+            );
+        }
+
+        // Stable denials for reserved / known-unsafe flags (before allowlist match).
+        deny_known_unsafe_passthrough(arg)?;
+
+        // ── Allowlist: network ────────────────────────────────────────────
+        if arg == "--network" || arg == "--net" || arg == "-net" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_network_mode(arg, val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--network=") {
+            validate_passthrough_network_mode("--network=", val)?;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--net=") {
+            validate_passthrough_network_mode("--net=", val)?;
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: userns (keep-id only) ──────────────────────────────
+        if arg == "--userns" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_userns(val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--userns=") {
+            // Preserve "userns=…" wording for disallowed values.
+            if val != "keep-id" {
+                anyhow::bail!(
+                    "podman passthrough arg denied for security: --userns={val} \
+                     (only keep-id is permitted)"
+                );
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: cap-drop (further drops only; re-asserted after extras) ─
+        if arg == "--cap-drop" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--cap-drop=") {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: secret ─────────────────────────────────────────────
+        if arg == "--secret" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--secret=") {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: env (-e / --env), non-PORT ─────────────────────────
+        // Long forms before compact `-e…` so `--env` is not misparsed.
+        if arg == "--env" || arg == "-e" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_env_assignment(arg, val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--env=") {
+            validate_passthrough_env_assignment("--env", val)?;
+            i += 1;
+            continue;
+        }
+        // Compact -eKEY / -eKEY=value (single-letter short opt only).
+        if let Some(val) = arg.strip_prefix("-e")
+            && !val.is_empty()
+            && !arg.starts_with("--")
+        {
+            // Mirror historical compact-PORT messages.
+            if val == "PORT" || val.starts_with("PORT=") {
+                anyhow::bail!("podman passthrough arg must not override PORT ({arg})");
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: label / annotation ─────────────────────────────────
+        if arg == "--label" || arg == "-l" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--label=") {
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("-l")
+            && !rest.is_empty()
+            && !arg.starts_with("--")
+        {
+            i += 1;
+            continue;
+        }
+        if arg == "--annotation" {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--annotation=") {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: resource limits ────────────────────────────────────
+        const RESOURCE_FLAGS: &[&str] = &[
+            "--memory",
+            "--memory-swap",
+            "--cpus",
+            "--cpu-shares",
+            "--cpu-quota",
+            "--cpu-period",
+            "--shm-size",
+            "--ulimit",
+            "--hostname",
+        ];
+        if RESOURCE_FLAGS.contains(&arg) {
+            let _ = require_passthrough_value(arg, next)?;
+            i += 2;
+            continue;
+        }
+        if RESOURCE_FLAGS
+            .iter()
+            .any(|f| arg.starts_with(&format!("{f}=")))
+        {
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: tmpfs (in-container only; path:options) ────────────
+        if arg == "--tmpfs" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_tmpfs(val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--tmpfs=") {
+            validate_passthrough_tmpfs(val)?;
+            i += 1;
+            continue;
+        }
+
+        // ── Allowlist: volume / mount (nix-store RO only) ─────────────────
+        // Long forms before compact `-v…`.
+        if arg == "--volume" || arg == "-v" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_volume(val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--volume=") {
+            validate_passthrough_volume(val)?;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("-v")
+            && !val.is_empty()
+            && !arg.starts_with("--")
+        {
+            validate_passthrough_volume(val)?;
+            i += 1;
+            continue;
+        }
+        if arg == "--mount" {
+            let val = require_passthrough_value(arg, next)?;
+            validate_passthrough_mount(val)?;
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--mount=") {
+            validate_passthrough_mount(val)?;
+            i += 1;
+            continue;
+        }
+
+        // ── Default deny: unknown flag ────────────────────────────────────
+        // Prefer a short flag name in the message for operators.
+        let flag_name = arg.split('=').next().unwrap_or(arg);
+        anyhow::bail!(
+            "podman passthrough arg denied for security: {flag_name} is not on the allowlist"
+        );
+    }
+    Ok(())
+}
+
+/// `--tmpfs` destinations must be absolute container paths (no host bind).
+fn validate_passthrough_tmpfs(val: &str) -> anyhow::Result<()> {
+    let dest = val.split_once(':').map(|(d, _)| d).unwrap_or(val);
+    if dest.is_empty() || !dest.starts_with('/') {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: --tmpfs destination \
+             must be an absolute container path, got {val}"
+        );
+    }
+    if dest.split('/').any(|seg| seg == "..") {
+        anyhow::bail!(
+            "podman passthrough arg denied for security: --tmpfs path must not \
+             contain '..' components: {val}"
+        );
+    }
+    Ok(())
+}
+/// Normalize and validate a passthrough mount/volume source path.
+///
+/// Requires an absolute path that lexically resolves under `/nix/store/` with
+/// no `..` path components. Prefix-only checks are insufficient: paths like
+/// `/nix/store/../etc/shadow` start with `/nix/store/` but escape the allowlist.
+///
+/// For non-existent paths (common for nix store entries not present on the
+/// validating host), we manually normalize by resolving `.` and rejecting `..`
+/// without filesystem access. When the path exists, we also `canonicalize` and
+/// re-check the result remains under `/nix/store/`.
+fn validate_nix_store_source(source: &str) -> anyhow::Result<()> {
+    if source.is_empty() {
+        anyhow::bail!("empty source path");
+    }
+
+    // Fast string-level rejection of `..` path segments (also covers odd
+    // encodings that Path::components may still treat as ParentDir).
+    if source.split('/').any(|seg| seg == "..") {
+        anyhow::bail!("source path must not contain '..' components: {source}");
+    }
+
+    let path = Path::new(source);
+    if !path.is_absolute() {
+        // Relative sources can never be under /nix/store/; keep the allowlist
+        // phrasing so call-site error checks stay stable.
+        anyhow::bail!("source {source} is not under /nix/store/");
+    }
+
+    // Lexical normalization via Path::components — reject ParentDir, collapse
+    // CurDir / repeated separators, require RootDir-rooted absolute form.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => {
+                anyhow::bail!("source path has unexpected prefix: {source}");
+            }
+            std::path::Component::RootDir => {
+                normalized.push(std::path::Component::RootDir.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::bail!("source path must not contain '..' components: {source}");
+            }
+            std::path::Component::Normal(c) => {
+                normalized.push(c);
+            }
+        }
+    }
+
+    let normalized_str = normalized
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 source path: {source}"))?;
+
+    // Must remain under /nix/store/<...>, not merely equal to /nix/store.
+    if !normalized_str.starts_with("/nix/store/") {
+        anyhow::bail!("source {source} is not under /nix/store/");
+    }
+
+    // Optional FS check: if the path exists, ensure real path still under store
+    // (catches symlinks that escape /nix/store).
+    if path.exists() {
+        match path.canonicalize() {
+            Ok(canon) => {
+                let canon_str = canon
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF-8 canonical path for {source}"))?;
+                if !canon_str.starts_with("/nix/store/") {
+                    anyhow::bail!(
+                        "source {source} resolves outside /nix/store/ (canonical: {canon_str})"
+                    );
+                }
+            }
+            Err(e) => {
+                anyhow::bail!("source path could not be canonicalized: {source}: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a `-v` / `--volume` value: only bind mounts from /nix/store/ with
 /// `:ro` are permitted.  Format: `SOURCE:DESTINATION[:OPTIONS]`.
+/// Explicit `rw` is always denied even if `ro` is also listed.
 fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
     // Split on first colon to get source; the rest are dest+options.
     let (source, rest) = val.split_once(':').ok_or_else(|| {
@@ -1240,17 +1643,27 @@ fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
         anyhow::bail!("podman passthrough arg -v/--volume has empty source: {val}");
     }
 
-    if !source.starts_with("/nix/store/") {
-        anyhow::bail!(
-            "podman passthrough arg -v/--volume denied for security: \
-             source {source} is not under /nix/store/"
-        );
-    }
+    validate_nix_store_source(source).map_err(|e| {
+        anyhow::anyhow!("podman passthrough arg -v/--volume denied for security: {e}")
+    })?;
 
     // The rest contains DESTINATION[:OPTIONS] where OPTIONS is a
     // comma-separated list (e.g. "z,ro" or just "ro").
     let (_dest, options) = rest.split_once(':').unwrap_or((rest, ""));
-    let ro_present = options.split(',').any(|opt| opt == "ro");
+    let opts: Vec<&str> = options
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ro_present = opts.contains(&"ro");
+    let rw_present = opts.contains(&"rw");
+
+    if rw_present {
+        anyhow::bail!(
+            "podman passthrough arg -v/--volume denied for security: \
+             {val} requests read-write (rw is not permitted; use :ro only)"
+        );
+    }
 
     if !ro_present {
         anyhow::bail!(
@@ -1265,10 +1678,12 @@ fn validate_passthrough_volume(val: &str) -> anyhow::Result<()> {
 /// Validate a `--mount` value: only bind mounts from /nix/store/ with
 /// `ro=true` or `readonly` are permitted.
 /// Format: `type=TYPE,src=SOURCE,dst=DEST[,OPTIONS]`.
+/// Explicit `rw` / `rw=true` is always denied.
 fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
     let mut mount_type = None;
     let mut source = None;
     let mut readonly = false;
+    let mut readwrite = false;
 
     for kv in val.split(',') {
         let (key, value) = match kv.split_once('=') {
@@ -1280,6 +1695,9 @@ fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
             "src" | "source" => source = Some(value),
             "ro" | "readonly" if value.is_empty() || value == "true" || value == "1" => {
                 readonly = true;
+            }
+            "rw" if value.is_empty() || value == "true" || value == "1" => {
+                readwrite = true;
             }
             _ => {}
         }
@@ -1301,10 +1719,13 @@ fn validate_passthrough_mount(val: &str) -> anyhow::Result<()> {
         anyhow::bail!("podman passthrough arg --mount has empty source: {val}");
     }
 
-    if !source.starts_with("/nix/store/") {
+    validate_nix_store_source(source)
+        .map_err(|e| anyhow::anyhow!("podman passthrough arg --mount denied for security: {e}"))?;
+
+    if readwrite {
         anyhow::bail!(
             "podman passthrough arg --mount denied for security: \
-             source {source} is not under /nix/store/"
+             {val} requests read-write (rw is not permitted; use ro=true/readonly)"
         );
     }
 
@@ -1383,6 +1804,8 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         format!("path={log_path}"),
         // ── Hardening: drop all capabilities, prevent privilege escalation,
         //     mount rootfs read-only with writable tmpfs for /tmp and /run.
+        //     These are re-asserted after passthrough extras so last-wins
+        //     cannot weaken isolation (Issue #191).
         "--cap-drop".to_string(),
         "ALL".to_string(),
         "--security-opt".to_string(),
@@ -1398,6 +1821,15 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         validate_podman_passthrough_args(&spec.extra_args)?;
         args.extend(spec.extra_args.clone());
     }
+
+    // Re-assert isolation after extras: podman last-wins for boolean flags and
+    // security-opt; cap-drop is cumulative but ALL here documents intent and
+    // covers any attempt to re-order capability handling.
+    args.push("--cap-drop".to_string());
+    args.push("ALL".to_string());
+    args.push("--security-opt".to_string());
+    args.push("no-new-privileges".to_string());
+    args.push("--read-only".to_string());
 
     for (key, value) in &spec.env {
         args.push("-e".to_string());
@@ -2228,6 +2660,138 @@ mod tests {
         assert!(err.to_string().contains("missing source"), "{err}");
     }
 
+    // ── Path-traversal / allowlist hardening (#192) ───────────────────────
+
+    #[test]
+    fn reject_volume_path_traversal_past_nix_store() {
+        for val in [
+            "/nix/store/../etc/shadow:/dest:ro",
+            "/nix/store/../../home/x/.ssh:/dest:ro",
+            "/nix/store/foo/../../../etc/passwd:/dest:ro",
+            "/nix/store/abc/../def/../../etc/shadow:/dest:ro",
+            "/nix/store/hash-pkg/bin/../../../../etc/shadow:/dest:ro",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["-v".into(), val.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("..") || msg.contains("not under /nix/store/"),
+                "expected traversal rejection for -v {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_mount_path_traversal_past_nix_store() {
+        for src in [
+            "/nix/store/../etc/shadow",
+            "/nix/store/../../home/x/.ssh",
+            "/nix/store/foo/../bar/../../etc/passwd",
+            "/nix/store/hash/bin/../../../etc/shadow",
+        ] {
+            let val = format!("type=bind,src={src},dst=/dest,ro=true");
+            let err =
+                validate_podman_passthrough_args(&["--mount".into(), val.clone()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("..") || msg.contains("not under /nix/store/"),
+                "expected traversal rejection for --mount src={src}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_legitimate_nix_store_volume_paths() {
+        // Realistic nix store-style paths (hash-like prefix + package name).
+        validate_podman_passthrough_args(&[
+            "-v".into(),
+            "/nix/store/abc123def456ghi789jkl0mnopqrstuv-hello-2.12/bin/hello:/app/bin:ro".into(),
+        ])
+        .unwrap();
+        validate_podman_passthrough_args(&[
+            "-v".into(),
+            "/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0:/busybox:ro".into(),
+        ])
+        .unwrap();
+        // Dot segments under the store are fine (collapsed lexically).
+        validate_podman_passthrough_args(&[
+            "-v".into(),
+            "/nix/store/./abc123/bin/foo:/dest:ro".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn accept_legitimate_nix_store_mount_paths() {
+        validate_podman_passthrough_args(&[
+            "--mount".into(),
+            "type=bind,src=/nix/store/abc123def456ghi789jkl0mnopqrstuv-pkg/bin/foo,dst=/dest,ro=true"
+                .into(),
+        ])
+        .unwrap();
+        validate_podman_passthrough_args(&[
+            "--mount=type=bind,source=/nix/store/xyz-pkg/lib,dst=/lib,readonly".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn reject_volume_explicit_rw() {
+        for val in [
+            "/nix/store/abc123:/dest:rw",
+            "/nix/store/abc123:/dest:ro,rw",
+            "/nix/store/abc123:/dest:rw,ro",
+            "/nix/store/abc123:/dest:z,rw",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["-v".into(), val.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rw") || msg.contains("not read-only") || msg.contains("read-write"),
+                "expected rw rejection for -v {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_mount_explicit_rw() {
+        for val in [
+            "type=bind,src=/nix/store/x,dst=/dest,rw=true",
+            "type=bind,src=/nix/store/x,dst=/dest,rw",
+            "type=bind,src=/nix/store/x,dst=/dest,ro=true,rw=true",
+            "type=bind,src=/nix/store/x,dst=/dest,rw=1",
+        ] {
+            let err =
+                validate_podman_passthrough_args(&["--mount".into(), val.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rw") || msg.contains("read-write") || msg.contains("not read-only"),
+                "expected rw rejection for --mount {val}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_nix_store_source_direct() {
+        // Unit-level checks on the shared helper.
+        assert!(validate_nix_store_source("/nix/store/abc123/bin/foo").is_ok());
+        assert!(validate_nix_store_source("/nix/store/./abc/bin").is_ok());
+
+        assert!(validate_nix_store_source("").is_err());
+        let rel_err = validate_nix_store_source("relative/path")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rel_err.contains("not under /nix/store/"),
+            "relative path error: {rel_err}"
+        );
+        assert!(validate_nix_store_source("/etc/shadow").is_err());
+        assert!(validate_nix_store_source("/nix/store").is_err());
+        assert!(validate_nix_store_source("/nix/store/../etc/shadow").is_err());
+        assert!(validate_nix_store_source("/nix/store/../../home/x/.ssh").is_err());
+        assert!(validate_nix_store_source("/nix/store/foo/../../../etc/passwd").is_err());
+    }
+
     // ── --env-file denial ─────────────────────────────────────────────────
 
     #[test]
@@ -2347,6 +2911,261 @@ mod tests {
         validate_podman_passthrough_args(&["--secret".into(), "mysecret".into()]).unwrap();
         validate_podman_passthrough_args(&["--secret=mysecret".into()]).unwrap();
     }
+
+    // ── Issue #191: allowlist default-deny + hardening re-assert ──────────
+
+    #[test]
+    fn reject_unknown_passthrough_flags() {
+        for arg in [
+            "--hooks-dir=/tmp/hooks",
+            "--runtime=runc",
+            "--sysctl=net.ipv4.ip_forward=1",
+            "--pid=host",
+            "--ipc=host",
+            "--uts=host",
+            "--cgroupns=host",
+            "--systemd=always",
+            "--pull=always",
+            "--gidmap=0:0:1",
+            "--uidmap=0:0:1",
+            "--executable=/bin/sh",
+            "--conmon-pidfile=/tmp/x",
+            "--cidfile=/tmp/x",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not on the allowlist")
+                    || msg.contains("denied for security")
+                    || msg.contains("hooks-dir")
+                    || msg.contains("runtime")
+                    || msg.contains("pid"),
+                "expected allowlist denial for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_privileged_all_variants() {
+        for arg in [
+            "--privileged",
+            "--privileged=true",
+            "--privileged=false",
+            "--privileged=0",
+            "--privileged=1",
+            "--privileged=no",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("privileged"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_read_only_false_and_passthrough_read_only() {
+        for arg in [
+            "--read-only=false",
+            "--read-only=0",
+            "--read-only",
+            "--read-only=true",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("read-only"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_denied_flags_as_option_values() {
+        let err = validate_podman_passthrough_args(&["--label".into(), "--privileged".into()])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("privileged"),
+            "expected rejection of --privileged passed as value token: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_log_driver_and_hooks_runtime() {
+        for arg in [
+            "--log-driver=json-file",
+            "--log-opt",
+            "--hooks-dir",
+            "--runtime=crun",
+        ] {
+            let mut args = vec![arg.to_string()];
+            if arg == "--log-opt" || arg == "--hooks-dir" {
+                args.push("/tmp/evil".into());
+            }
+            let err = validate_podman_passthrough_args(&args).unwrap_err();
+            assert!(
+                err.to_string().contains("denied for security"),
+                "expected rejection for {arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_allowlisted_resource_and_metadata_flags() {
+        validate_podman_passthrough_args(&[
+            "--label".into(),
+            "app=api".into(),
+            "--annotation".into(),
+            "io.russel/x=1".into(),
+            "--memory".into(),
+            "256m".into(),
+            "--cpus".into(),
+            "1.5".into(),
+            "--tmpfs".into(),
+            "/var/cache:size=64m".into(),
+            "--shm-size".into(),
+            "64m".into(),
+            "--hostname".into(),
+            "svc".into(),
+            "-l".into(),
+            "env=prod".into(),
+        ])
+        .unwrap();
+        validate_podman_passthrough_args(&["--memory=512m".into(), "--cpus=2".into()]).unwrap();
+        validate_podman_passthrough_args(&["--tmpfs=/data".into()]).unwrap();
+    }
+
+    #[test]
+    fn reject_tmpfs_non_absolute_destination() {
+        let err =
+            validate_podman_passthrough_args(&["--tmpfs".into(), "relative".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute"),
+            "expected absolute-path rejection: {err}"
+        );
+    }
+
+    static ALLOW_PODMAN_ARGS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_allow_podman_args_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ALLOW_PODMAN_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("RUSSEL_ALLOW_PODMAN_ARGS").ok();
+        // SAFETY: exclusive lock held for the duration of the mutation + assertion.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("RUSSEL_ALLOW_PODMAN_ARGS", v),
+                None => std::env::remove_var("RUSSEL_ALLOW_PODMAN_ARGS"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("RUSSEL_ALLOW_PODMAN_ARGS", v),
+                None => std::env::remove_var("RUSSEL_ALLOW_PODMAN_ARGS"),
+            }
+        }
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn russel_allow_podman_args_zero_rejects_extras() {
+        with_allow_podman_args_env(Some("0"), || {
+            let err = validate_podman_passthrough_args(&["--network".into(), "bridge".into()])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("RUSSEL_ALLOW_PODMAN_ARGS"),
+                "expected disable message: {err}"
+            );
+            // Empty extras still ok.
+            validate_podman_passthrough_args(&[]).unwrap();
+        });
+    }
+
+    #[test]
+    fn russel_allow_podman_args_unset_allows_allowlisted() {
+        with_allow_podman_args_env(None, || {
+            validate_podman_passthrough_args(&["--network".into(), "bridge".into()]).unwrap();
+        });
+    }
+
+    #[test]
+    fn build_run_args_reasserts_hardening_after_passthrough() {
+        let spec = ContainerStartSpec {
+            service_id: "api-1".into(),
+            rootfs: PreparedRootfs {
+                rootfs_path: PathBuf::from("/var/lib/russel/api-1/rootfs"),
+                entrypoint: PathBuf::from("/bin/api"),
+            },
+            host_port: 8080,
+            guest_port: 3000,
+            memory_mb: 512,
+            env: vec![("PORT".into(), "3000".into())],
+            extra_args: vec![
+                "--cap-drop".into(),
+                "NET_RAW".into(),
+                "--network".into(),
+                "bridge".into(),
+            ],
+        };
+        let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
+        let args = build_run_args(&spec, &log_path).unwrap();
+
+        let network_pos = args.iter().position(|a| a == "--network").unwrap();
+        let passthrough_cap_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--cap-drop" && w[1] == "NET_RAW")
+            .expect("passthrough --cap-drop NET_RAW present");
+        let last_cap_drop_all = args
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] == "--cap-drop" && w[1] == "ALL")
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("--cap-drop ALL re-assert present");
+        let last_no_new_privs = args
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] == "--security-opt" && w[1] == "no-new-privileges")
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("no-new-privileges re-assert present");
+        let last_read_only = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--read-only")
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("--read-only re-assert present");
+        let rootfs_pos = args.iter().position(|a| a == "--rootfs").unwrap();
+
+        assert!(
+            last_cap_drop_all > passthrough_cap_pos,
+            "re-asserted --cap-drop ALL must follow passthrough cap-drop; args={args:?}"
+        );
+        assert!(
+            last_cap_drop_all > network_pos,
+            "re-asserted hardening must follow passthrough network; args={args:?}"
+        );
+        assert!(
+            last_no_new_privs > network_pos,
+            "re-asserted no-new-privileges must follow passthrough; args={args:?}"
+        );
+        assert!(
+            last_read_only > network_pos,
+            "re-asserted --read-only must follow passthrough; args={args:?}"
+        );
+        assert!(
+            last_cap_drop_all < rootfs_pos
+                && last_no_new_privs < rootfs_pos
+                && last_read_only < rootfs_pos,
+            "hardening must still appear before --rootfs; args={args:?}"
+        );
+    }
+
     // ── Issue #4: env wrapper in rootfs ─────────────────────────────────────
 
     #[tokio::test]
@@ -2688,5 +3507,56 @@ mod tests {
         assert_eq!(resolve_podman_user(Some("root"), None, 0), None);
         assert_eq!(resolve_podman_user(Some(""), None, 0), None);
         assert_eq!(resolve_podman_user(Some("  "), None, 0), None);
+    }
+
+    // ── container_name trust / resolve (Issue #193) ─────────────────────
+
+    #[test]
+    fn trusted_container_name_accepts_canonical() {
+        assert!(is_trusted_container_name("api", "russel-api"));
+        assert!(is_trusted_container_name("my-service", "russel-my-service"));
+        assert!(is_trusted_container_name(
+            "api_gdeadbeef",
+            "russel-api_gdeadbeef"
+        ));
+    }
+
+    #[test]
+    fn trusted_container_name_accepts_generation_scoped() {
+        // After dual-live promote, metadata may keep the runtime-key name.
+        assert!(is_trusted_container_name("api", "russel-api_gdeadbeef"));
+        assert!(is_trusted_container_name("api", "russel-api_gABCDEF12"));
+        assert!(is_trusted_container_name(
+            "my-svc",
+            "russel-my-svc_g0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn trusted_container_name_rejects_arbitrary_and_malformed() {
+        assert!(!is_trusted_container_name("api", ""));
+        assert!(!is_trusted_container_name("api", "russel-other"));
+        assert!(!is_trusted_container_name("api", "other-api"));
+        assert!(!is_trusted_container_name("api", "russel-api_evil"));
+        assert!(!is_trusted_container_name("api", "russel-api_g")); // empty gen
+        assert!(!is_trusted_container_name("api", "russel-api_gnotahex!"));
+        assert!(!is_trusted_container_name("api", "russel-api/../evil"));
+        assert!(!is_trusted_container_name("api", "russel-api;rm -rf /"));
+        // Wrong service prefix under russel-
+        assert!(!is_trusted_container_name("api", "russel-apix_gdeadbeef"));
+        // Gen too long
+        assert!(!is_trusted_container_name(
+            "api",
+            &format!("russel-api_g{}", "a".repeat(33))
+        ));
+    }
+
+    #[test]
+    fn resolve_container_name_falls_back_when_metadata_missing() {
+        // No metadata under a non-existent service path → canonical.
+        assert_eq!(
+            resolve_container_name("no-such-service-193-unit"),
+            "russel-no-such-service-193-unit"
+        );
     }
 }

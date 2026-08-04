@@ -34,16 +34,19 @@ cargo build
 # → target/debug/russel-cli
 # → target/debug/russel-ctrl
 
-# 3. Optional auth (required if binding non-loopback)
-export RUSSEL_API_TOKEN=your-secret-token   # same value in both terminals
+# 3. Optional auth (required if binding non-loopback; min 32 chars)
+export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"   # same value in both terminals
 
 # 4. Start control plane (terminal 1) — default http://127.0.0.1:7878
+# Local absolute path deploys need an explicit opt-in on the control plane:
+export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
 ./target/debug/russel-ctrl
 # override bind: RUSSEL_CTRL_ADDR=127.0.0.1:7878
 
 # 5. Deploy example (terminal 2, from repo root)
 ./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id test-api
 # CLI target: RUSSEL_CONTROL_PLANE=http://127.0.0.1:7878 (default)
+# Prefer a git URL for remote/shared control planes (local paths default OFF).
 
 # 6. Verify
 curl http://127.0.0.1:8080/health
@@ -105,16 +108,20 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 
 ### Authentication
 
-When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route requires an `Authorization: Bearer <token>` header. The CLI reads the same environment variable and sends it automatically. On loopback without a token the control plane runs in dev mode (with a warning); binding to a non-loopback address **requires** `RUSSEL_API_TOKEN` or the control plane refuses to start. For production deployments, always set `RUSSEL_API_TOKEN` and bind to the internal interface where your reverse proxy lives.
+When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route requires an `Authorization: Bearer <token>` header. The token must be **at least 32 characters** after trim (generate with `openssl rand -hex 32`). The CLI reads the same environment variable and sends it automatically. On loopback without a token the control plane runs in dev mode (with a warning); binding to a non-loopback address **requires** `RUSSEL_API_TOKEN` or the control plane refuses to start. Set `RUSSEL_REQUIRE_AUTH=1` (or `true`/`yes`) to refuse startup without a valid token even on loopback — recommended for production packaging. Always set a strong `RUSSEL_API_TOKEN` and bind to the internal interface where your reverse proxy lives.
+
+**Cleartext Bearer (#189):** `russel-ctrl` is HTTP-only. The CLI (and dashboard client) **refuse** to send the token over `http://` to a non-loopback host. Terminate TLS at Caddy/nginx/Traefik in front of loopback ctrl — see [docs/security-tls.md](docs/security-tls.md). Override only with `--insecure` or `RUSSEL_INSECURE_CLEARTEXT=1` (not recommended).
 
 ### Bind Policy
 
 | Scenario | Behaviour |
 |----------|-----------|
 | Loopback (`127.0.0.1:…`) + no token | Dev mode (warn, no auth) |
-| Loopback + `RUSSEL_API_TOKEN` set | Bearer auth required on all routes |
+| Loopback + `RUSSEL_REQUIRE_AUTH` + no token | **Refuses to start** |
+| Loopback + `RUSSEL_API_TOKEN` set (≥32 chars) | Bearer auth required on all routes |
+| Any bind + token set but &lt;32 chars | **Refuses to start** |
 | Non-loopback + no token | **Refuses to start** |
-| Non-loopback + `RUSSEL_API_TOKEN` set | Bearer auth required on all routes |
+| Non-loopback + `RUSSEL_API_TOKEN` set (≥32 chars) | Bearer auth required on all routes |
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -143,7 +150,9 @@ Each successful deploy appends a versioned row to `/var/lib/russel/<service_id>/
 
 Binaries are `russel-cli` and `russel-ctrl` (debug: `./target/debug/...`). Clap program name is `russel`.
 
-**Global option:** `--control-plane URL` (env: `RUSSEL_CONTROL_PLANE`, default `http://127.0.0.1:7878`). All subcommands honour it.
+**Global options:**
+- `--control-plane URL` (env: `RUSSEL_CONTROL_PLANE`, default `http://127.0.0.1:7878`)
+- `--insecure` — allow Bearer over plain HTTP to non-loopback hosts (also `RUSSEL_INSECURE_CLEARTEXT=1|true|yes`; prefer HTTPS — [docs/security-tls.md](docs/security-tls.md))
 
 ```bash
 russel-cli deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
@@ -167,7 +176,8 @@ russel-cli secrets delete <name>
 
 - **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
 - Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
-- **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local metadata hosts (`169.254.169.254`) are blocked.
+- **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local / private / metadata hosts (e.g. `169.254.169.254`, RFC1918) are blocked on the control plane.
+- **Local absolute path deploys** are **disabled by default**. Set `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` on the control plane only for single-tenant trusted hosts (local dev). Paths are resolved on the **control-plane host**, not the CLI client — do not enable this on a shared/remote ctrl. Relative paths are always rejected; prefer a git URL when the control plane is remote.
 
 ### Config Path & Bin Name
 
@@ -228,7 +238,7 @@ Russel checks readiness by TCP-connecting to the published host port (container)
 
 ## Networking Model
 
-- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward.
+- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward. Guest L3 isolation uses a dedicated `RUSSEL-FORWARD` iptables chain (default-deny for `rsl-*`); set `RUSSEL_FORWARD=allow` only for single-tenant debugging (guests can otherwise pivot via host routing when `ip_forward=1`).
 - **Container:** Rootless Podman publishes `-p HOST:GUEST` (from CLI `-p` / allocator).
 
 ### Port Publishing (today)

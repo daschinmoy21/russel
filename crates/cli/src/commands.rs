@@ -20,8 +20,10 @@ use russel_core::{
 ///
 /// Token handling matches ctrl `normalize_api_token`: trim whitespace; blank → no auth.
 ///
-/// When a token is present and the control-plane URL is plain `http://` with a
-/// non-loopback host, prints a one-time warning to stderr (F-05).
+/// When a token is present and the control-plane URL is plain `http://`:
+/// - **non-loopback host** → hard-fail (F-05 / #189) unless `--insecure` or
+///   `RUSSEL_INSECURE_CLEARTEXT=1|true|yes`
+/// - **loopback host** → one-time stderr warning only
 ///
 /// Returns an error when the token value cannot be parsed into a valid HTTP
 /// header value (F-47).
@@ -34,8 +36,8 @@ fn http_client(control_plane: &str) -> Result<reqwest::Client> {
                 anyhow!("RUSSEL_API_TOKEN contains characters invalid in an HTTP header")
             })?;
             headers.insert(AUTHORIZATION, header_value);
-            // F-05: warn once when token is sent over cleartext to a non-loopback host.
-            warn_cleartext_token(control_plane);
+            // F-05 / #189: refuse cleartext Bearer to non-loopback; warn on loopback.
+            ensure_cleartext_token_ok(control_plane)?;
         }
     }
     reqwest::Client::builder()
@@ -44,46 +46,143 @@ fn http_client(control_plane: &str) -> Result<reqwest::Client> {
         .map_err(|e| anyhow!("failed to build HTTP client: {e}"))
 }
 
-// ── F-05: cleartext token warning ──────────────────────────────────────────
+// ── F-05 / #189: cleartext Bearer policy ───────────────────────────────────
 
 static CLEARTEXT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn warn_cleartext_token(control_plane: &str) {
-    // Issue once per process invocation.
-    if CLEARTEXT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
+/// CLI `--insecure` latch (set once from `main` before any subcommand runs).
+static CLI_INSECURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the global `--insecure` flag for cleartext Bearer policy.
+pub fn set_cli_insecure(insecure: bool) {
+    CLI_INSECURE.store(insecure, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn insecure_cleartext_allowed() -> bool {
+    if CLI_INSECURE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
     }
-    // Only warn for plain http:// (not https://).
+    match std::env::var("RUSSEL_INSECURE_CLEARTEXT") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Enforce cleartext Bearer policy when a non-empty token will be sent.
+///
+/// - `https://` → ok
+/// - `http://` + loopback → warn once, ok
+/// - `http://` + non-loopback → error unless insecure escape hatch (then warn once)
+fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
     let rest = match control_plane.strip_prefix("http://") {
         Some(r) => r,
-        None => return,
+        None => return Ok(()), // https:// or other schemes
     };
-    // Extract host: everything before the first '/' or ':' or end-of-string.
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
+    let host = extract_http_host(rest);
     if is_loopback_host(host) {
-        return;
+        // Warn-only on loopback (local dev still cleartext, but not on-path WAN risk).
+        if !CLEARTEXT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "\x1b[1;33mwarning:\x1b[0m RUSSEL_API_TOKEN is sent in cleartext over \
+                 plain HTTP to loopback host \x1b[1m{host}\x1b[0m"
+            );
+        }
+        return Ok(());
     }
-    eprintln!(
-        "\x1b[1;33mwarning:\x1b[0m RUSSEL_API_TOKEN is sent in cleartext to \
-         non-loopback host \x1b[1m{host}\x1b[0m over plain HTTP"
-    );
+    if insecure_cleartext_allowed() {
+        if !CLEARTEXT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "\x1b[1;33mwarning:\x1b[0m RUSSEL_API_TOKEN is sent in cleartext to \
+                 non-loopback host \x1b[1m{host}\x1b[0m over plain HTTP \
+                 (--insecure / RUSSEL_INSECURE_CLEARTEXT)"
+            );
+        }
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to send RUSSEL_API_TOKEN over cleartext HTTP to non-loopback host `{host}`\n\
+         \n\
+         Use HTTPS (terminate TLS at a reverse proxy in front of russel-ctrl — see docs/security-tls.md),\n\
+         or target a loopback URL (e.g. http://127.0.0.1:7878),\n\
+         or override with --insecure / RUSSEL_INSECURE_CLEARTEXT=1 (not recommended)."
+    ))
+}
+
+/// Extract host from the authority part of an `http://` URL (no scheme prefix).
+///
+/// Handles `host:port/path`, bare `host`, and bracketed IPv6 (`[::1]:7878/...`).
+fn extract_http_host(rest: &str) -> &str {
+    let authority = rest.split('/').next().unwrap_or("");
+    if let Some(inner) = authority.strip_prefix('[') {
+        if let Some(end) = inner.find(']') {
+            return &inner[..end];
+        }
+    }
+    authority.split(':').next().unwrap_or("")
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    if host == "localhost" || host == "::1" {
+    // Strip surrounding brackets if a caller passed `[::1]` whole.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
         return true;
     }
     // Check 127.0.0.0/8.
     if let Some(rest) = host.strip_prefix("127.") {
         return rest.split('.').all(|octet| octet.parse::<u8>().is_ok());
     }
+    // Bracketed IPv6 loopback.
+    if host == "[::1]" {
+        return true;
+    }
     false
+}
+
+/// Warn when deploying a local absolute path against a non-loopback control plane.
+///
+/// The path is resolved on the **control-plane host**, not the client machine.
+/// Ctrl also requires `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` (default off).
+fn warn_remote_local_path_deploy(control_plane: &str, repo_url: &str) {
+    let path = std::path::Path::new(repo_url);
+    if !path.is_absolute() {
+        return;
+    }
+    let host = control_plane_host(control_plane);
+    if is_loopback_host(host) {
+        return;
+    }
+    eprintln!(
+        "\x1b[1;33mwarning:\x1b[0m deploying local path to non-loopback control plane \
+         \x1b[1m{host}\x1b[0m — path is resolved on the \x1b[1mcontrol-plane host\x1b[0m, \
+         not this machine. Ctrl rejects local paths unless \
+         RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1 (single-tenant trusted hosts only). \
+         Prefer a git URL for remote deploys."
+    );
+}
+
+/// Extract host from a control-plane URL (`http://host:port` / `https://host/...`).
+fn control_plane_host(control_plane: &str) -> &str {
+    let rest = control_plane
+        .strip_prefix("https://")
+        .or_else(|| control_plane.strip_prefix("http://"))
+        .unwrap_or(control_plane);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Drop userinfo if present.
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    // Bracketed IPv6: [::1]:7878
+    if let Some(inside) = host_port.strip_prefix('[') {
+        return inside.split(']').next().unwrap_or(inside);
+    }
+    host_port.split(':').next().unwrap_or(host_port)
 }
 
 /// Map a reqwest error into a user-friendly message when the control plane is unreachable.
@@ -109,6 +208,12 @@ pub struct Cli {
         default_value = "http://127.0.0.1:7878"
     )]
     pub control_plane: String,
+
+    /// Allow sending Bearer token over plain HTTP to non-loopback hosts.
+    /// Prefer HTTPS (TLS reverse proxy) — see docs/security-tls.md.
+    /// Also accepted via `RUSSEL_INSECURE_CLEARTEXT=1|true|yes`.
+    #[arg(long)]
+    pub insecure: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -226,6 +331,7 @@ pub struct DestroyArgs {
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     let wall = Instant::now();
     let repo_url = normalize_repo_arg(&args.repo)?;
+    warn_remote_local_path_deploy(control_plane, &repo_url);
     let runtime = resolve_deploy_runtime(&args.repo, &args.config, args.runtime.as_deref())?;
     match runtime {
         Some(RuntimeKind::Microvm) if !args.podman_args.is_empty() => {
@@ -782,6 +888,7 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
     let mut body = serde_json::Map::new();
     if let Some(repo) = args.repo {
         let repo_url = normalize_repo_arg(&repo)?;
+        warn_remote_local_path_deploy(control_plane, &repo_url);
         body.insert("repo_url".into(), serde_json::json!(repo_url));
     }
     if let Some(config) = args.config {
@@ -1028,6 +1135,30 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_host_parses_urls() {
+        assert_eq!(
+            control_plane_host("http://127.0.0.1:7878"),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            control_plane_host("https://ctrl.example.com/v1"),
+            "ctrl.example.com"
+        );
+        assert_eq!(control_plane_host("http://[::1]:7878"), "::1");
+        assert_eq!(control_plane_host("http://localhost"), "localhost");
+    }
+
+    #[test]
+    fn is_loopback_host_covers_common_forms() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("ctrl.example.com"));
+    }
+
+    #[test]
     fn normalize_repo_arg_is_identity_for_remote() {
         let url = "https://github.com/user/repo.git";
         assert_eq!(normalize_repo_arg(url).unwrap(), url);
@@ -1230,17 +1361,104 @@ mod tests {
         assert!(truncated.len() < 300);
     }
 
-    // ── F-05: loopback detection ──────────────────────────────────────────
+    // ── F-05 / #189: loopback detection + cleartext policy ────────────────
 
     #[test]
     fn loopback_detection() {
         assert!(is_loopback_host("127.0.0.1"));
         assert!(is_loopback_host("127.255.255.255"));
         assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
         assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
         assert!(!is_loopback_host("192.168.1.1"));
         assert!(!is_loopback_host("example.com"));
         assert!(!is_loopback_host("127")); // not a full octet
+    }
+
+    #[test]
+    fn extract_http_host_ipv4_and_ipv6() {
+        assert_eq!(extract_http_host("127.0.0.1:7878/vms"), "127.0.0.1");
+        assert_eq!(extract_http_host("example.com/foo"), "example.com");
+        assert_eq!(extract_http_host("[::1]:7878"), "::1");
+        assert_eq!(extract_http_host("[2001:db8::1]:443/x"), "2001:db8::1");
+        assert_eq!(extract_http_host("192.168.1.1"), "192.168.1.1");
+    }
+
+    #[test]
+    fn cleartext_policy_https_ok() {
+        // No panic / no error for https regardless of host.
+        ensure_cleartext_token_ok("https://example.com:7878").unwrap();
+        ensure_cleartext_token_ok("https://192.168.1.1").unwrap();
+    }
+
+    #[test]
+    fn cleartext_policy_loopback_http_ok() {
+        // Loopback is warn-only (should not error).
+        ensure_cleartext_token_ok("http://127.0.0.1:7878").unwrap();
+        ensure_cleartext_token_ok("http://localhost:7878").unwrap();
+        ensure_cleartext_token_ok("http://[::1]:7878").unwrap();
+    }
+
+    #[test]
+    fn cleartext_policy_non_loopback_http_refuses() {
+        // Reset escape hatch for isolation.
+        set_cli_insecure(false);
+        // Ensure env is not set for this test.
+        // SAFETY: test process; we restore below.
+        let prev = std::env::var("RUSSEL_INSECURE_CLEARTEXT").ok();
+        unsafe { std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT") };
+
+        let err = ensure_cleartext_token_ok("http://192.168.1.10:7878").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to send RUSSEL_API_TOKEN"), "got: {msg}");
+        assert!(msg.contains("192.168.1.10"), "got: {msg}");
+        assert!(msg.contains("--insecure"), "got: {msg}");
+
+        let err = ensure_cleartext_token_ok("http://example.com/api").unwrap_err();
+        assert!(
+            err.to_string().contains("example.com"),
+            "got: {}",
+            err
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v) },
+            None => unsafe { std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT") },
+        }
+    }
+
+    #[test]
+    fn cleartext_policy_insecure_flag_allows_non_loopback() {
+        set_cli_insecure(true);
+        ensure_cleartext_token_ok("http://10.0.0.5:7878").unwrap();
+        set_cli_insecure(false);
+    }
+
+    #[test]
+    fn cleartext_policy_env_escape_allows_non_loopback() {
+        set_cli_insecure(false);
+        let prev = std::env::var("RUSSEL_INSECURE_CLEARTEXT").ok();
+        unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", "1") };
+        ensure_cleartext_token_ok("http://10.0.0.5:7878").unwrap();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v) },
+            None => unsafe { std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT") },
+        }
+    }
+
+    #[test]
+    fn insecure_flag_parses_on_cli() {
+        let cli = Cli::try_parse_from([
+            "russel",
+            "--insecure",
+            "--control-plane",
+            "http://10.0.0.1:7878",
+            "vms",
+        ])
+        .unwrap();
+        assert!(cli.insecure);
+        assert_eq!(cli.control_plane, "http://10.0.0.1:7878");
     }
 
     #[tokio::test]

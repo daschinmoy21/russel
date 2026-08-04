@@ -64,6 +64,8 @@ async fn main() -> Result<()> {
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
+    // #187: re-install default-deny FORWARD for any live rsl-* TAPs after restart.
+    network::ensure_forward_filter_if_taps_present().await;
     // Hybrid privileges: microVM uses this process (often root/sudo for TAP/KVM);
     // containers use rootless podman as RUSSEL_PODMAN_USER or SUDO_USER.
     container::log_podman_identity();
@@ -108,23 +110,46 @@ async fn main() -> Result<()> {
     let local_addr = listener.local_addr()?;
     let is_loopback = ip_is_loopback_for_auth(local_addr.ip());
 
-    // Auth + bind policy: non-empty RUSSEL_API_TOKEN (after trim) enables auth.
-    // Empty/whitespace is treated as unset (dev mode).
-    let token = api::configured_api_token();
+    // Auth + bind policy:
+    // - RUSSEL_API_TOKEN: non-empty after trim enables Bearer auth; must be
+    //   ≥ MIN_API_TOKEN_LEN (32) chars. Empty/whitespace = unset.
+    // - RUSSEL_REQUIRE_AUTH=1|true|yes: fail closed without a valid token even
+    //   on loopback (production packaging).
+    // - Non-loopback bind always requires a valid token.
+    let token = match api::configured_api_token() {
+        Some(t) => {
+            if let Err(msg) = api::check_api_token_min_length(&t) {
+                anyhow::bail!("{msg}");
+            }
+            Some(t)
+        }
+        None => None,
+    };
+    let require_auth =
+        api::require_auth_from_env(std::env::var("RUSSEL_REQUIRE_AUTH").ok().as_deref());
     if token.is_some() {
         info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
+    } else if require_auth {
+        anyhow::bail!(
+            "RUSSEL_REQUIRE_AUTH is set but RUSSEL_API_TOKEN is missing or blank; \
+             set a token of at least {} characters (e.g. openssl rand -hex 32)",
+            api::MIN_API_TOKEN_LEN
+        );
     } else if is_loopback {
         // F-35: loopback is not an isolation boundary — any local user and
         // any SSH/Docker port-forward into the host reaches this socket.
         tracing::warn!(
             "dev mode: no auth — any local user or forwarded port can control the API; \
-             set RUSSEL_API_TOKEN"
+             set RUSSEL_API_TOKEN (min {} chars) or RUSSEL_REQUIRE_AUTH=1",
+            api::MIN_API_TOKEN_LEN
         );
     } else {
         anyhow::bail!(
-            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}' (bound {})",
+            "RUSSEL_API_TOKEN must be set when binding to non-loopback address '{}' (bound {}); \
+             use at least {} characters (e.g. openssl rand -hex 32)",
             bind_addr,
-            local_addr
+            local_addr,
+            api::MIN_API_TOKEN_LEN
         );
     }
 
@@ -292,7 +317,9 @@ async fn cleanup_stale_resources() {
         }
     }
 
-    tracing::info!("stale resource cleanup finished (Russel TAPs only; host iptables untouched)");
+    tracing::info!(
+        "stale resource cleanup finished (Russel TAPs only; host built-in iptables chains untouched)"
+    );
 }
 
 /// Collect tap_ids for all live services that have metadata on disk.

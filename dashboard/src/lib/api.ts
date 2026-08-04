@@ -159,6 +159,41 @@ export function getConnectionLabel(c: ConnectionState): string {
 
 // ---- Demo mode / settings ----
 
+const TOKEN_KEY = "RUSSEL_API_TOKEN";
+
+/** Escape text for safe interpolation into HTML (text or quoted attributes). */
+export function escapeHtml(s: string): string {
+	return s
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
+
+let warnedPublicToken = false;
+
+/**
+ * Never bake secrets into the client bundle via PUBLIC_* env vars.
+ * If someone still sets PUBLIC_RUSSEL_API_TOKEN at build time, ignore it
+ * and warn once — tokens must be entered at runtime (Settings UI).
+ */
+function warnPublicTokenOnce(): void {
+	if (warnedPublicToken) return;
+	warnedPublicToken = true;
+	try {
+		const baked = (import.meta as any).env?.PUBLIC_RUSSEL_API_TOKEN;
+		if (baked) {
+			console.warn(
+				"[russel] PUBLIC_RUSSEL_API_TOKEN is set but ignored. " +
+					"Do not bake API tokens into the client bundle; enter the token in Settings instead.",
+			);
+		}
+	} catch {
+		/* import.meta.env may be unavailable in some contexts */
+	}
+}
+
 export function isDemoMode(): boolean {
 	if (typeof window === "undefined") return false;
 	return localStorage.getItem("RUSSEL_DEMO_MODE") === "1";
@@ -176,11 +211,27 @@ export function getApiBase(): string {
 	return (import.meta as any).env?.PUBLIC_RUSSEL_API || "/api";
 }
 
+/**
+ * Bearer token for the control plane.
+ * Stored in sessionStorage (tab-scoped, cleared when the tab closes) so XSS
+ * in a later session cannot read a long-lived localStorage secret.
+ * Never reads PUBLIC_RUSSEL_API_TOKEN — that would ship the secret in the JS bundle.
+ */
 export function getApiToken(): string | null {
-	if (typeof window !== "undefined") {
-		return localStorage.getItem("RUSSEL_API_TOKEN") || null;
+	warnPublicTokenOnce();
+	if (typeof window === "undefined") return null;
+
+	let token = sessionStorage.getItem(TOKEN_KEY);
+	if (!token) {
+		// One-time migrate from pre-#198 localStorage storage
+		const legacy = localStorage.getItem(TOKEN_KEY);
+		if (legacy) {
+			sessionStorage.setItem(TOKEN_KEY, legacy);
+			localStorage.removeItem(TOKEN_KEY);
+			token = legacy;
+		}
 	}
-	return (import.meta as any).env?.PUBLIC_RUSSEL_API_TOKEN || null;
+	return token || null;
 }
 
 export function setApiBase(url: string): void {
@@ -190,7 +241,70 @@ export function setApiBase(url: string): void {
 
 export function setApiToken(token: string): void {
 	if (typeof window === "undefined") return;
-	localStorage.setItem("RUSSEL_API_TOKEN", token);
+	if (token) {
+		sessionStorage.setItem(TOKEN_KEY, token);
+	} else {
+		sessionStorage.removeItem(TOKEN_KEY);
+	}
+	// Drop any legacy long-lived copy
+	localStorage.removeItem(TOKEN_KEY);
+}
+
+// ---- Cleartext Bearer policy (#189) ----
+
+/** True for localhost / 127.0.0.0/8 / ::1. */
+export function isLoopbackHost(host: string): boolean {
+	const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+	if (h === "localhost" || h === "::1") return true;
+	if (h.startsWith("127.")) {
+		const parts = h.split(".");
+		return (
+			parts.length === 4 &&
+			parts.every((p) => {
+				const n = Number(p);
+				return Number.isInteger(n) && n >= 0 && n <= 255;
+			})
+		);
+	}
+	return false;
+}
+
+/**
+ * Refuse to attach a Bearer token when the API base is plain `http://` to a
+ * non-loopback host. Relative bases (`/api`) resolve against `window.location`.
+ * Escape hatch: `localStorage.RUSSEL_INSECURE_CLEARTEXT = "1"`.
+ */
+export function assertCleartextTokenOk(
+	apiBase: string,
+	token: string | null,
+): void {
+	if (!token || !token.trim()) return;
+	if (
+		typeof window !== "undefined" &&
+		localStorage.getItem("RUSSEL_INSECURE_CLEARTEXT") === "1"
+	) {
+		return;
+	}
+	let url: URL;
+	try {
+		if (/^https?:\/\//i.test(apiBase)) {
+			url = new URL(apiBase);
+		} else if (typeof window !== "undefined") {
+			url = new URL(apiBase || "/", window.location.href);
+		} else {
+			return; // SSR / no origin — nothing to send yet
+		}
+	} catch {
+		return;
+	}
+	if (url.protocol !== "http:") return;
+	const host = url.hostname;
+	if (isLoopbackHost(host)) return;
+	throw new Error(
+		`Refusing to send API token over cleartext HTTP to non-loopback host "${host}". ` +
+			`Use HTTPS (reverse proxy in front of russel-ctrl; see docs/security-tls.md), ` +
+			`a loopback API URL, or set localStorage RUSSEL_INSECURE_CLEARTEXT=1.`,
+	);
 }
 
 // ---- Helpers ----
@@ -339,6 +453,8 @@ export class RusselClient {
 			"Content-Type": "application/json",
 		};
 		const token = getApiToken();
+		// #189: refuse cleartext Bearer to non-loopback (relative /api uses page origin).
+		assertCleartextTokenOk(getApiBase(), token);
 		if (token) headers["Authorization"] = `Bearer ${token}`;
 		return headers;
 	}

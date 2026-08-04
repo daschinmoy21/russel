@@ -37,7 +37,7 @@ import { isDemoMode } from '../lib/api';
             class="form-input"
             placeholder="Leave empty if unconfigured"
           />
-          <span class="field-hint">Passed as <code>Authorization: Bearer &lt;token&gt;</code> on HTTP calls.</span>
+          <span class="field-hint">Passed as <code>Authorization: Bearer &lt;token&gt;</code> on HTTP calls. Enter at runtime only — never bake into the build via <code>PUBLIC_*</code> env vars.</span>
         </div>
 
         <div class="demo-toggle-section">
@@ -87,7 +87,9 @@ import { isDemoMode } from '../lib/api';
         <div class="faq-item">
           <h3 class="faq-q">Where are settings stored?</h3>
           <p class="faq-a">
-            Dashboard settings are saved in browser <code>localStorage</code> (keys: <code>RUSSEL_API_URL</code>, <code>RUSSEL_API_TOKEN</code>, <code>RUSSEL_DEMO_MODE</code>).
+            API base URL and demo mode use <code>localStorage</code> (<code>RUSSEL_API_URL</code>, <code>RUSSEL_DEMO_MODE</code>).
+            The bearer token is kept in <code>sessionStorage</code> (<code>RUSSEL_API_TOKEN</code>) so it is tab-scoped and cleared when the tab closes — not long-lived across sessions.
+            Never set <code>PUBLIC_RUSSEL_API_TOKEN</code>; tokens must be entered here at runtime.
           </p>
         </div>
 

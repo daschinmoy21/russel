@@ -41,10 +41,7 @@ pub fn metadata_path(service_id: &str) -> PathBuf {
 /// - `secrets` — host secrets store
 /// - `_pool` — warm-pool snapshot state
 pub fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak")
-        || name == "traefik"
-        || name == "secrets"
-        || name == "_pool"
+    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
 }
 
 /// Fields commonly loaded from on-disk metadata for API rehydration.
@@ -463,8 +460,37 @@ pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> a
     }
     let content = serde_json::to_string_pretty(metadata)
         .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-    std::fs::write(path, content)
-        .map_err(|e| anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e))
+
+    // Mode 0600 so non-root (e.g. podman user) cannot read/rewrite control
+    // plane metadata even if they can traverse the service dir (Issue #193).
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("failed to open metadata {}: {}", path.display(), e))?;
+        file.write_all(content.as_bytes()).map_err(|e| {
+            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
+        })?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("failed to fsync metadata {}: {}", path.display(), e))?;
+        // Re-assert mode if the file already existed with looser permissions.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            anyhow::anyhow!("failed to chmod 0600 metadata {}: {}", path.display(), e)
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content).map_err(|e| {
+            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
+        })?;
+    }
+    Ok(())
 }
 
 /// Current UTC time as RFC3339 (second precision).

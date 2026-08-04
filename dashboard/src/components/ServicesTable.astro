@@ -32,7 +32,7 @@ function getHostPort(svc: ServiceVM): number | null {
         <tr>
           <td>
             <div class="service-name-cell">
-              <a href={`/service-detail?id=${svc.id}`} class="service-link">
+              <a href={`/service-detail?id=${encodeURIComponent(svc.id)}`} class="service-link">
                 {svc.name || svc.id}
               </a>
               {svc.name && svc.name !== svc.id ? <span class="service-id">{svc.id}</span> : null}
@@ -64,7 +64,7 @@ function getHostPort(svc: ServiceVM): number | null {
           </td>
           <td>
             <div class="row-actions">
-              <a href={`/service-detail?id=${svc.id}`} class="btn btn-secondary btn-sm">Details</a>
+              <a href={`/service-detail?id=${encodeURIComponent(svc.id)}`} class="btn btn-secondary btn-sm">Details</a>
               <button class="btn btn-secondary btn-sm" data-action="update" data-id={svc.id}>Update</button>
               <button class="btn btn-secondary btn-sm" data-action="stop" data-id={svc.id}>Stop</button>
               <button class="btn btn-danger btn-sm" data-action="destroy" data-id={svc.id}>Destroy</button>
