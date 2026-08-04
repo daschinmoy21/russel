@@ -262,10 +262,24 @@ flowchart LR
 - **socat arg0 tagging**: forwarders are spawned as `socat-russel-<id>` so
   lifecycle code can find and kill exactly one service's forwarder.
 - Startup cleanup removes only **orphan** `rsl-*` TAPs with no live service
-  directory — host iptables/Docker/VPN rules are never touched.
-- No iptables NAT is used on the microVM path: forwarding is userspace (socat),
-  so Russel's firewall footprint is zero (only `ip_forward=1` sysctl, restored
-  when the last TAP disappears).
+  directory — host iptables/Docker/VPN built-in chains are never flushed.
+- No iptables NAT is used on the microVM path: publish is userspace (socat on
+  the host OUTPUT path). Russel installs a dedicated **`RUSSEL-FORWARD`** chain
+  jumped from built-in FORWARD for `-i rsl-+` / `-o rsl-+` with a terminal
+  **DROP** (#187) **before** setting `ip_forward=1` for TAP L3, so there is no
+  window where forwarding is enabled without the filter. That default-denies
+  guest→guest and guest→off-host pivot via host routing without breaking socat
+  publish. Rules are removed when the last `rsl-*` TAP goes away (same
+  lifecycle as restoring `ip_forward`).
+- Escape hatch (single-tenant debug only): `RUSSEL_FORWARD=allow` or
+  `RUSSEL_DISABLE_FORWARD_FILTER=1` skips installing the filter and
+  best-effort **removes** any previously installed Russel-owned FORWARD rules
+  so a mid-flight toggle actually takes effect. **Residual risk:** with
+  `ip_forward=1` and no filter, a compromised guest can route to other guests
+  and non-local destinations via the host. Prefer the secure default.
+- If `iptables` is missing or the process lacks `CAP_NET_ADMIN`, filter install
+  fails soft with a warning (microVM boot continues) — production hosts should
+  run privileged so isolation actually applies.
 
 ---
 
@@ -348,7 +362,7 @@ flowchart TB
 | Layer | Mechanism |
 |-------|-----------|
 | API auth | Bearer token on every route when `RUSSEL_API_TOKEN` set (≥32 chars after trim, else refuse start); constant-time compare; non-loopback bind **refuses to start** without a token; `RUSSEL_REQUIRE_AUTH=1\|true\|yes` fails closed on loopback without a token; loopback-no-token is otherwise dev mode with warnings |
-| Transport | HTTP only today — terminate TLS at a proxy or use an SSH tunnel; the CLI warns when the token would cross the network in cleartext |
+| Transport | HTTP only in ctrl — terminate TLS at a reverse proxy (see `docs/security-tls.md`) or use an SSH tunnel; CLI/dashboard **refuse** Bearer over `http://` to non-loopback hosts unless `--insecure` / `RUSSEL_INSECURE_CLEARTEXT=1` (loopback is warn-only) |
 | Input validation | `service_id` charset/length; `bin_name` charset (no `.`/`..`); config path `openat`+`O_NOFOLLOW` chain; env key/value rules (reserved keys incl. `IFS`/`PATH`/`LD_*`, no newlines); secret name charset; podman passthrough allowlist posture |
 | SSRF guard | Repo URLs restricted to `https/http/ssh/git@`; literal-IP hosts checked against link-local + cloud-metadata ranges for all schemes |
 | Secrets | Host store `0600`/`0700`, atomic writes, names never values over the API, resolved at deploy time, never in argv; microVM delivery via `deploy.env` (`0600`) |

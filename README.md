@@ -110,6 +110,8 @@ The control plane listens on `127.0.0.1:7878` by default (override with `RUSSEL_
 
 When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route requires an `Authorization: Bearer <token>` header. The token must be **at least 32 characters** after trim (generate with `openssl rand -hex 32`). The CLI reads the same environment variable and sends it automatically. On loopback without a token the control plane runs in dev mode (with a warning); binding to a non-loopback address **requires** `RUSSEL_API_TOKEN` or the control plane refuses to start. Set `RUSSEL_REQUIRE_AUTH=1` (or `true`/`yes`) to refuse startup without a valid token even on loopback — recommended for production packaging. Always set a strong `RUSSEL_API_TOKEN` and bind to the internal interface where your reverse proxy lives.
 
+**Cleartext Bearer (#189):** `russel-ctrl` is HTTP-only. The CLI (and dashboard client) **refuse** to send the token over `http://` to a non-loopback host. Terminate TLS at Caddy/nginx/Traefik in front of loopback ctrl — see [docs/security-tls.md](docs/security-tls.md). Override only with `--insecure` or `RUSSEL_INSECURE_CLEARTEXT=1` (not recommended).
+
 ### Bind Policy
 
 | Scenario | Behaviour |
@@ -148,7 +150,9 @@ Each successful deploy appends a versioned row to `/var/lib/russel/<service_id>/
 
 Binaries are `russel-cli` and `russel-ctrl` (debug: `./target/debug/...`). Clap program name is `russel`.
 
-**Global option:** `--control-plane URL` (env: `RUSSEL_CONTROL_PLANE`, default `http://127.0.0.1:7878`). All subcommands honour it.
+**Global options:**
+- `--control-plane URL` (env: `RUSSEL_CONTROL_PLANE`, default `http://127.0.0.1:7878`)
+- `--insecure` — allow Bearer over plain HTTP to non-loopback hosts (also `RUSSEL_INSECURE_CLEARTEXT=1|true|yes`; prefer HTTPS — [docs/security-tls.md](docs/security-tls.md))
 
 ```bash
 russel-cli deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
@@ -234,7 +238,7 @@ Russel checks readiness by TCP-connecting to the published host port (container)
 
 ## Networking Model
 
-- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward.
+- **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward. Guest L3 isolation uses a dedicated `RUSSEL-FORWARD` iptables chain (default-deny for `rsl-*`); set `RUSSEL_FORWARD=allow` only for single-tenant debugging (guests can otherwise pivot via host routing when `ip_forward=1`).
 - **Container:** Rootless Podman publishes `-p HOST:GUEST` (from CLI `-p` / allocator).
 
 ### Port Publishing (today)

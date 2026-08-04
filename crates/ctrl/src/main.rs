@@ -64,6 +64,8 @@ async fn main() -> Result<()> {
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
+    // #187: re-install default-deny FORWARD for any live rsl-* TAPs after restart.
+    network::ensure_forward_filter_if_taps_present().await;
     // Hybrid privileges: microVM uses this process (often root/sudo for TAP/KVM);
     // containers use rootless podman as RUSSEL_PODMAN_USER or SUDO_USER.
     container::log_podman_identity();
@@ -315,7 +317,9 @@ async fn cleanup_stale_resources() {
         }
     }
 
-    tracing::info!("stale resource cleanup finished (Russel TAPs only; host iptables untouched)");
+    tracing::info!(
+        "stale resource cleanup finished (Russel TAPs only; host built-in iptables chains untouched)"
+    );
 }
 
 /// Collect tap_ids for all live services that have metadata on disk.

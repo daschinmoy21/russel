@@ -250,6 +250,63 @@ export function setApiToken(token: string): void {
 	localStorage.removeItem(TOKEN_KEY);
 }
 
+// ---- Cleartext Bearer policy (#189) ----
+
+/** True for localhost / 127.0.0.0/8 / ::1. */
+export function isLoopbackHost(host: string): boolean {
+	const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+	if (h === "localhost" || h === "::1") return true;
+	if (h.startsWith("127.")) {
+		const parts = h.split(".");
+		return (
+			parts.length === 4 &&
+			parts.every((p) => {
+				const n = Number(p);
+				return Number.isInteger(n) && n >= 0 && n <= 255;
+			})
+		);
+	}
+	return false;
+}
+
+/**
+ * Refuse to attach a Bearer token when the API base is plain `http://` to a
+ * non-loopback host. Relative bases (`/api`) resolve against `window.location`.
+ * Escape hatch: `localStorage.RUSSEL_INSECURE_CLEARTEXT = "1"`.
+ */
+export function assertCleartextTokenOk(
+	apiBase: string,
+	token: string | null,
+): void {
+	if (!token || !token.trim()) return;
+	if (
+		typeof window !== "undefined" &&
+		localStorage.getItem("RUSSEL_INSECURE_CLEARTEXT") === "1"
+	) {
+		return;
+	}
+	let url: URL;
+	try {
+		if (/^https?:\/\//i.test(apiBase)) {
+			url = new URL(apiBase);
+		} else if (typeof window !== "undefined") {
+			url = new URL(apiBase || "/", window.location.href);
+		} else {
+			return; // SSR / no origin — nothing to send yet
+		}
+	} catch {
+		return;
+	}
+	if (url.protocol !== "http:") return;
+	const host = url.hostname;
+	if (isLoopbackHost(host)) return;
+	throw new Error(
+		`Refusing to send API token over cleartext HTTP to non-loopback host "${host}". ` +
+			`Use HTTPS (reverse proxy in front of russel-ctrl; see docs/security-tls.md), ` +
+			`a loopback API URL, or set localStorage RUSSEL_INSECURE_CLEARTEXT=1.`,
+	);
+}
+
 // ---- Helpers ----
 
 export function formatUptime(seconds?: number): string {
@@ -396,6 +453,8 @@ export class RusselClient {
 			"Content-Type": "application/json",
 		};
 		const token = getApiToken();
+		// #189: refuse cleartext Bearer to non-loopback (relative /api uses page origin).
+		assertCleartextTokenOk(getApiBase(), token);
 		if (token) headers["Authorization"] = `Bearer ${token}`;
 		return headers;
 	}

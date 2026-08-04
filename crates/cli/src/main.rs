@@ -10,6 +10,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    // Latch --insecure for cleartext Bearer policy (also RUSSEL_INSECURE_CLEARTEXT).
+    commands::set_cli_insecure(cli.insecure);
 
     match cli.command {
         Command::Deploy(args) => commands::deploy(args, &cli.control_plane).await?,
