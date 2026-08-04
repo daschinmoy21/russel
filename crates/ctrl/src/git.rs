@@ -1105,12 +1105,13 @@ mod tests {
         assert!(reject_blocked_ipv4("resolved", Ipv4Addr::new(10, 1, 2, 3)).is_err());
         assert!(reject_blocked_ipv4("resolved", Ipv4Addr::new(100, 64, 0, 1)).is_err());
         assert!(reject_blocked_ipv4("resolved", Ipv4Addr::new(8, 8, 8, 8)).is_ok());
+        assert!(reject_blocked_ipv6("resolved", Ipv6Addr::from_str("fd12::1").unwrap()).is_err());
         assert!(
-            reject_blocked_ipv6("resolved", Ipv6Addr::from_str("fd12::1").unwrap()).is_err()
-        );
-        assert!(
-            reject_blocked_ipv6("resolved", Ipv6Addr::from_str("2001:4860:4860::8888").unwrap())
-                .is_ok()
+            reject_blocked_ipv6(
+                "resolved",
+                Ipv6Addr::from_str("2001:4860:4860::8888").unwrap()
+            )
+            .is_ok()
         );
     }
 
@@ -1197,8 +1198,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY")
-                    && err.contains("disabled"),
+                err.contains("RUSSEL_ALLOW_LOCAL_PATH_DEPLOY") && err.contains("disabled"),
                 "unexpected error: {err}"
             );
         })

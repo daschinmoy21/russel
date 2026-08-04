@@ -116,10 +116,10 @@ fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
 /// Handles `host:port/path`, bare `host`, and bracketed IPv6 (`[::1]:7878/...`).
 fn extract_http_host(rest: &str) -> &str {
     let authority = rest.split('/').next().unwrap_or("");
-    if let Some(inner) = authority.strip_prefix('[') {
-        if let Some(end) = inner.find(']') {
-            return &inner[..end];
-        }
+    if let Some(inner) = authority.strip_prefix('[')
+        && let Some(end) = inner.find(']')
+    {
+        return &inner[..end];
     }
     authority.split(':').next().unwrap_or("")
 }
@@ -1136,10 +1136,7 @@ mod tests {
 
     #[test]
     fn control_plane_host_parses_urls() {
-        assert_eq!(
-            control_plane_host("http://127.0.0.1:7878"),
-            "127.0.0.1"
-        );
+        assert_eq!(control_plane_host("http://127.0.0.1:7878"), "127.0.0.1");
         assert_eq!(
             control_plane_host("https://ctrl.example.com/v1"),
             "ctrl.example.com"
@@ -1411,16 +1408,15 @@ mod tests {
 
         let err = ensure_cleartext_token_ok("http://192.168.1.10:7878").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("refusing to send RUSSEL_API_TOKEN"), "got: {msg}");
+        assert!(
+            msg.contains("refusing to send RUSSEL_API_TOKEN"),
+            "got: {msg}"
+        );
         assert!(msg.contains("192.168.1.10"), "got: {msg}");
         assert!(msg.contains("--insecure"), "got: {msg}");
 
         let err = ensure_cleartext_token_ok("http://example.com/api").unwrap_err();
-        assert!(
-            err.to_string().contains("example.com"),
-            "got: {}",
-            err
-        );
+        assert!(err.to_string().contains("example.com"), "got: {}", err);
 
         match prev {
             Some(v) => unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v) },

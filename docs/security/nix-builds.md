@@ -177,8 +177,10 @@ export RUSSEL_NIX_RESTRICTED=1   # also accepts true / yes
 
 When set, `NixBuilder`:
 
-1. **Refuses auto-generated flakes** — deploy fails if the checkout has no
-   `flake.nix` (error points here).
+1. **Requires a committed regular `flake.nix`** — deploy fails if it is
+   missing, a symlink/non-file, or still starts with Russel's auto-generation
+   marker (leftover from a prior non-restricted build). Auto-generation is
+   disabled entirely.
 2. Passes to every deploy `nix build`:
    - `--option sandbox true`
    - `--option sandbox-fallback false`
