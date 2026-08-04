@@ -453,16 +453,46 @@ fn install_env_wrapper(rootfs: &Path) -> anyhow::Result<()> {
 
 const CONTAINER_NAME_PREFIX: &str = "russel-";
 
-/// Resolve Podman container name: prefer metadata (generation promote may leave
-/// a gen-scoped name), else the canonical `russel-{service_id}`.
+/// Trusted Podman names for a service: canonical `russel-{service_id}`, or a
+/// generation-scoped name `russel-{service_id}_g{hex}` that dual-live promote
+/// may leave in metadata (only `service_id` is rewritten on promote).
+///
+/// Rejects arbitrary metadata `container_name` values so stop/destroy cannot be
+/// redirected at attacker-chosen Podman names (Issue #193).
+fn is_trusted_container_name(service_id: &str, name: &str) -> bool {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+    let canonical = ContainerRunner::container_name(service_id);
+    if name == canonical {
+        return true;
+    }
+    // Generation-scoped: russel-{service_id}_g{hex}
+    let gen_prefix = format!("{canonical}_g");
+    if let Some(generation) = name.strip_prefix(&gen_prefix) {
+        return !generation.is_empty()
+            && generation.len() <= 32
+            && generation.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    false
+}
+
+/// Resolve Podman container name: prefer metadata when the stored name is a
+/// trusted Russel name (canonical or gen-scoped), else `russel-{service_id}`.
 fn resolve_container_name(service_id: &str) -> String {
     let path = format!("/var/lib/russel/{service_id}/metadata.json");
     if let Ok(content) = std::fs::read_to_string(&path)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(name) = value.get("container_name").and_then(|v| v.as_str())
-        && !name.is_empty()
     {
-        return name.to_string();
+        if is_trusted_container_name(service_id, name) {
+            return name.to_string();
+        }
+        tracing::warn!(
+            service_id,
+            container_name = %name,
+            "metadata container_name rejected (expected russel-{{service_id}} or gen-scoped); using canonical"
+        );
     }
     ContainerRunner::container_name(service_id)
 }
@@ -715,46 +745,34 @@ async fn sanitize_podman_user_runtime_dir() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Make the service dir + rootfs usable by a non-root podman user when
+/// Make rootfs + container.log usable by a non-root podman user when
 /// `RUSSEL_PODMAN_USER` is set (ctrl runs as root via sudo for microVMs).
+///
+/// **Security (Issue #193):** the service base directory stays root-owned and
+/// non-group-writable (0750). Directory write would let the podman user
+/// unlink/replace root-owned `metadata.json`. Only the rootfs tree is chowned
+/// to the podman user. `container.log` is pre-created and chowned so the
+/// k8s-file log driver can write without directory write permission.
+///
+/// Ancestor world `a+rx` is intentionally not applied (that made paths
+/// world-traversable). Traversal for the podman user uses ACL `u:user:rx` on
+/// the service dir, falling back to `root:podman_gid` + mode 0750.
 async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result<()> {
     let Some(user) = configured_podman_user() else {
         return Ok(());
     };
 
-    // Open path components for traversal (resolve symlinks first).
-    let resolved = tokio::fs::canonicalize(rootfs)
-        .await
-        .unwrap_or_else(|_| rootfs.to_path_buf());
-    let mut walk = resolved.as_path();
-    loop {
-        let output = tokio::process::Command::new("chmod")
-            .args(["a+rx", &walk.display().to_string()])
-            .output()
-            .await?;
-        if !output.status.success() {
-            // Best-effort on parents we may not own (e.g. /); rootfs/base are critical.
-            tracing::debug!(
-                path = %walk.display(),
-                err = %String::from_utf8_lossy(&output.stderr).trim(),
-                "chmod a+rx parent skipped"
-            );
-        }
-        match walk.parent() {
-            Some(parent) if parent != walk => walk = parent,
-            _ => break,
-        }
-    }
-
-    // Only the rootfs + the service directory itself are given to the podman
-    // user.  The service dir (non-recursive) lets podman create container.log;
-    // rootfs (recursive) provides the container filesystem.  metadata.json and
-    // other files under the service dir stay root-owned — container workloads
-    // cannot tamper with them.
     let base = rootfs
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| rootfs.to_path_buf());
+    tokio::fs::create_dir_all(&base).await.map_err(|e| {
+        anyhow::anyhow!(
+            "create service dir {}: {e}",
+            base.display()
+        )
+    })?;
+
     let uid = tokio::process::Command::new("id")
         .args(["-u", &user])
         .output()
@@ -779,22 +797,134 @@ async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> anyhow::Result
     }
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
     let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
+    let base_s = base.display().to_string();
 
-    // Service dir: non-recursive — podman needs to write container.log here;
-    // metadata.json (written later by root) remains root-owned.
+    // Keep service dir root-owned (NOT chowned to the podman user).
     let output = tokio::process::Command::new("chown")
-        .args([&format!("{uid}:{gid}"), &base.display().to_string()])
+        .args(["root:root", &base_s])
         .output()
         .await?;
     if !output.status.success() {
         anyhow::bail!(
-            "chown service dir to {user} ({uid}:{gid}) failed: {}",
+            "chown service dir root:root failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
 
-    // Rootfs: recursive — the container filesystem must be readable/writable
-    // by the podman user.
+    // 0750: owner rwx, group rx, other none — never group/other write.
+    let output = tokio::process::Command::new("chmod")
+        .args(["0750", &base_s])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chmod 0750 service dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    // Grant podman user traverse+read on the service dir without write
+    // (cannot unlink metadata.json). Prefer ACL; fall back to root:gid 0750.
+    let acl = tokio::process::Command::new("setfacl")
+        .args(["-m", &format!("u:{user}:rx"), &base_s])
+        .output()
+        .await;
+    match acl {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            tracing::debug!(
+                path = %base_s,
+                user = %user,
+                gid = %gid,
+                err = %String::from_utf8_lossy(&out.stderr).trim(),
+                "setfacl on service dir failed; falling back to root:gid 0750"
+            );
+            let output = tokio::process::Command::new("chown")
+                .args([&format!("root:{gid}"), &base_s])
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "chown service dir root:{gid} fallback failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %base_s,
+                user = %user,
+                gid = %gid,
+                error = %e,
+                "setfacl unavailable; falling back to root:gid 0750"
+            );
+            let output = tokio::process::Command::new("chown")
+                .args([&format!("root:{gid}"), &base_s])
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "chown service dir root:{gid} fallback failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+    }
+
+    // Best-effort: allow the podman user to traverse /var/lib/russel without
+    // world a+rx. User execute-only ACL; skip on failure.
+    let russel_root = Path::new("/var/lib/russel");
+    if russel_root.exists() {
+        let root_s = russel_root.display().to_string();
+        let output = tokio::process::Command::new("setfacl")
+            .args(["-m", &format!("u:{user}:--x"), &root_s])
+            .output()
+            .await;
+        if let Ok(out) = &output
+            && !out.status.success()
+        {
+            tracing::debug!(
+                path = %root_s,
+                user = %user,
+                err = %String::from_utf8_lossy(&out.stderr).trim(),
+                "setfacl execute on /var/lib/russel skipped"
+            );
+        }
+    }
+
+    // Pre-create container.log owned by the podman user so the log driver can
+    // write without needing write permission on the service directory.
+    let log_path = base.join("container.log");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o640);
+        opts.open(&log_path).map_err(|e| {
+            anyhow::anyhow!(
+                "create container.log {}: {e}",
+                log_path.display()
+            )
+        })?;
+    }
+    let log_s = log_path.display().to_string();
+    let output = tokio::process::Command::new("chown")
+        .args([&format!("{uid}:{gid}"), &log_s])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chown container.log to {user} ({uid}:{gid}) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    // ACL write as a belt-and-suspenders for the log file.
+    let _ = tokio::process::Command::new("setfacl")
+        .args(["-m", &format!("u:{user}:rw"), &log_s])
+        .output()
+        .await;
+
+    // Rootfs only (recursive) — container filesystem for the podman user.
+    // Do NOT chown the service base dir.
     let output = tokio::process::Command::new("chown")
         .args(["-R", &format!("{uid}:{gid}"), &rootfs.display().to_string()])
         .output()
@@ -3357,5 +3487,62 @@ mod tests {
         assert_eq!(resolve_podman_user(Some("root"), None, 0), None);
         assert_eq!(resolve_podman_user(Some(""), None, 0), None);
         assert_eq!(resolve_podman_user(Some("  "), None, 0), None);
+    }
+
+    // ── container_name trust / resolve (Issue #193) ─────────────────────
+
+    #[test]
+    fn trusted_container_name_accepts_canonical() {
+        assert!(is_trusted_container_name("api", "russel-api"));
+        assert!(is_trusted_container_name("my-service", "russel-my-service"));
+        assert!(is_trusted_container_name(
+            "api_gdeadbeef",
+            "russel-api_gdeadbeef"
+        ));
+    }
+
+    #[test]
+    fn trusted_container_name_accepts_generation_scoped() {
+        // After dual-live promote, metadata may keep the runtime-key name.
+        assert!(is_trusted_container_name("api", "russel-api_gdeadbeef"));
+        assert!(is_trusted_container_name("api", "russel-api_gABCDEF12"));
+        assert!(is_trusted_container_name(
+            "my-svc",
+            "russel-my-svc_g0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn trusted_container_name_rejects_arbitrary_and_malformed() {
+        assert!(!is_trusted_container_name("api", ""));
+        assert!(!is_trusted_container_name("api", "russel-other"));
+        assert!(!is_trusted_container_name("api", "other-api"));
+        assert!(!is_trusted_container_name("api", "russel-api_evil"));
+        assert!(!is_trusted_container_name("api", "russel-api_g")); // empty gen
+        assert!(!is_trusted_container_name("api", "russel-api_gnotahex!"));
+        assert!(!is_trusted_container_name("api", "russel-api/../evil"));
+        assert!(!is_trusted_container_name(
+            "api",
+            "russel-api;rm -rf /"
+        ));
+        // Wrong service prefix under russel-
+        assert!(!is_trusted_container_name(
+            "api",
+            "russel-apix_gdeadbeef"
+        ));
+        // Gen too long
+        assert!(!is_trusted_container_name(
+            "api",
+            &format!("russel-api_g{}", "a".repeat(33))
+        ));
+    }
+
+    #[test]
+    fn resolve_container_name_falls_back_when_metadata_missing() {
+        // No metadata under a non-existent service path → canonical.
+        assert_eq!(
+            resolve_container_name("no-such-service-193-unit"),
+            "russel-no-such-service-193-unit"
+        );
     }
 }
