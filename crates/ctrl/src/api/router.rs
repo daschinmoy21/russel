@@ -1,3 +1,5 @@
+//! HTTP router and service lifecycle handlers.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,9 +7,8 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{Request, StatusCode},
-    middleware::{self, Next},
-    response::Response,
+    http::StatusCode,
+    middleware,
     routing::{delete, get, post},
 };
 use russel_core::api::{
@@ -18,6 +19,8 @@ use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 use tokio_stream::StreamExt;
 
+use super::auth::{auth_middleware, deploy_semaphore, max_concurrent_deploys};
+use super::secrets::{secrets_delete, secrets_list, secrets_set};
 use crate::{
     container::{ContainerRunner, container_log_path},
     deploy::DeployPipeline,
@@ -32,111 +35,6 @@ use crate::{
     runtime::{self, RuntimeLifecycle},
     state::{AppState, LifecycleClaim},
 };
-
-/// Minimum accepted length for `RUSSEL_API_TOKEN` after trim (when set).
-///
-/// Floor is 32 **ASCII** characters so weak tokens like `"a"` are rejected.
-/// Prefer `openssl rand -hex 32` (64 hex chars / 256 bits) for production.
-///
-/// Length is measured in bytes/`str::len`, which matches character count only
-/// because non-ASCII tokens are rejected (see [`check_api_token_min_length`]).
-pub const MIN_API_TOKEN_LEN: usize = 32;
-
-/// Pure token normalize: unset/blank/whitespace → None.
-///
-/// Does **not** enforce min length / charset — call [`check_api_token_min_length`]
-/// at startup when a token is present so short or non-header-safe secrets fail closed.
-pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
-    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-/// Whether `token` can appear in an HTTP `Authorization` header value.
-///
-/// Matches what the CLI needs: `HeaderValue` accepts visible ASCII (0x20..=0x7E)
-/// and HTAB. Multibyte Unicode and control bytes are rejected so ctrl never
-/// starts with a token clients cannot send.
-fn token_is_http_header_safe(token: &str) -> bool {
-    token
-        .bytes()
-        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
-}
-
-/// Reject tokens that are too short or cannot be sent as a Bearer header value.
-///
-/// Call this at control-plane startup whenever `normalize_api_token` returns
-/// `Some`. Middleware still uses the env token as-is; startup is the gate.
-///
-/// Checks (in order):
-/// 1. HTTP header-safe charset (ASCII visible / HTAB) — same constraint as the CLI
-/// 2. Length ≥ [`MIN_API_TOKEN_LEN`] (byte length; equivalent to char count after 1)
-pub fn check_api_token_min_length(token: &str) -> Result<(), String> {
-    if !token_is_http_header_safe(token) {
-        return Err(
-            "RUSSEL_API_TOKEN must be printable ASCII only so it can be sent in an \
-             HTTP Authorization header (the CLI rejects non-header-safe tokens). \
-             Generate a strong token with: openssl rand -hex 32"
-                .to_string(),
-        );
-    }
-    if token.len() < MIN_API_TOKEN_LEN {
-        Err(format!(
-            "RUSSEL_API_TOKEN must be at least {MIN_API_TOKEN_LEN} characters after trim \
-             (got {}). Generate a strong token with: openssl rand -hex 32",
-            token.len()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, or `yes` (case-insensitive).
-///
-/// When enabled, the control plane refuses to start without a valid token even
-/// on loopback — use for production packaging that would otherwise default to
-/// loopback bind.
-pub fn require_auth_from_env(raw: Option<&str>) -> bool {
-    raw.map(|s| {
-        let s = s.trim();
-        s.eq_ignore_ascii_case("1")
-            || s.eq_ignore_ascii_case("true")
-            || s.eq_ignore_ascii_case("yes")
-    })
-    .unwrap_or(false)
-}
-
-/// Non-empty RUSSEL_API_TOKEN after trim; None if unset/blank.
-///
-/// Length is not checked here — `main` calls [`check_api_token_min_length`]
-/// before serving so short tokens never enable a weak auth mode.
-pub fn configured_api_token() -> Option<String> {
-    normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref())
-}
-
-/// Parse max concurrent deploys (default 4, clamp 1..=64).
-pub fn parse_max_concurrent_deploys(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.trim().parse().ok())
-        .map(|n: usize| n.clamp(1, 64))
-        .unwrap_or(4)
-}
-
-/// Max concurrent deploy tasks, from RUSSEL_MAX_CONCURRENT_DEPLOYS (default 4).
-fn max_concurrent_deploys() -> usize {
-    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        parse_max_concurrent_deploys(
-            std::env::var("RUSSEL_MAX_CONCURRENT_DEPLOYS")
-                .ok()
-                .as_deref(),
-        )
-    });
-    *MAX
-}
-
-/// Global semaphore bounding in-flight deploy/update tasks.
-pub(crate) fn deploy_semaphore() -> &'static tokio::sync::Semaphore {
-    static SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
-        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(max_concurrent_deploys()));
-    &SEM
-}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -155,52 +53,6 @@ pub fn router(state: AppState) -> Router {
         .route("/secrets/{name}", post(secrets_set).delete(secrets_delete))
         .layer(middleware::from_fn(auth_middleware))
         .with_state(state)
-}
-
-/// Constant-time token comparison to avoid timing side-channels.
-///
-/// Always walks `max(a.len(), b.len())` bytes so the result does not leak the
-/// input lengths. A length mismatch is folded into the accumulator as a
-/// non-zero delta rather than returned early.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let max_len = a.len().max(b.len());
-    // Length mismatch must always contribute a nonzero delta. Narrowing
-    // `(a.len() ^ b.len()) as u8` drops high bits (e.g. len 1 vs 257 → 0).
-    let mut diff: u8 = u8::from(a.len() != b.len());
-    for i in 0..max_len {
-        let x = *a.get(i).unwrap_or(&0);
-        let y = *b.get(i).unwrap_or(&0);
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Bearer auth middleware: if RUSSEL_API_TOKEN is set (non-empty, trimmed),
-/// require it on every request.
-///
-/// Env: `RUSSEL_API_TOKEN` (min length enforced at process start), optional
-/// `RUSSEL_REQUIRE_AUTH=1|true|yes` to fail closed without a token on loopback.
-async fn auth_middleware(
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let Some(expected) = configured_api_token() else {
-        return Ok(next.run(request).await);
-    };
-
-    let header = request
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let provided = header.strip_prefix("Bearer ").unwrap_or("");
-
-    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    Ok(next.run(request).await)
 }
 
 /// Build an `application/x-ndjson` streaming response from a deploy-event
@@ -914,7 +766,7 @@ struct LifecycleClaimHandle {
     aux_processes: Vec<Child>,
 }
 
-fn runtime_label(runtime: RuntimeKind) -> &'static str {
+pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
     match runtime {
         RuntimeKind::Microvm => "microvm",
         RuntimeKind::Container => "container",
@@ -969,205 +821,5 @@ async fn reap_child(mut child: Child) {
     if !matches!(wait, Ok(Ok(_))) {
         let _ = child.kill().await;
         let _ = child.wait().await;
-    }
-}
-
-// ── Secrets API ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, serde::Deserialize)]
-struct SecretSetBody {
-    value: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct SecretsListResponse {
-    secrets: Vec<String>,
-}
-
-async fn secrets_list() -> Result<Json<SecretsListResponse>, (StatusCode, String)> {
-    crate::secrets::list_secrets()
-        .map(|secrets| Json(SecretsListResponse { secrets }))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-async fn secrets_set(
-    Path(name): Path<String>,
-    Json(body): Json<SecretSetBody>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let result = crate::secrets::set_secret(&name, &body.value)
-        .map(|_| StatusCode::NO_CONTENT)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()));
-    if result.is_ok() {
-        // Audit log — name only, never the secret value.
-        tracing::info!(secret = %name, "secret set via API");
-    }
-    result
-}
-
-async fn secrets_delete(Path(name): Path<String>) -> Result<StatusCode, (StatusCode, String)> {
-    match crate::secrets::delete_secret(&name) {
-        Ok(true) => {
-            // Audit log — name only, never the secret value.
-            tracing::info!(secret = %name, "secret deleted via API");
-            Ok(StatusCode::NO_CONTENT)
-        }
-        Ok(false) => Err((StatusCode::NOT_FOUND, format!("secret {name:?} not found"))),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    // ── auth / concurrency helpers ─────────────────────────────────────
-
-    #[test]
-    fn token_normalize_empty() {
-        assert_eq!(normalize_api_token(None), None);
-        assert_eq!(normalize_api_token(Some("")), None);
-        assert_eq!(normalize_api_token(Some("   ")), None);
-    }
-
-    #[test]
-    fn token_normalize_valid() {
-        // Normalize still returns short non-empty strings; min length is a
-        // separate startup check (see check_api_token_min_length).
-        assert_eq!(
-            normalize_api_token(Some("secret")),
-            Some("secret".to_string())
-        );
-        assert_eq!(
-            normalize_api_token(Some("  secret  ")),
-            Some("secret".to_string())
-        );
-        let long = "a".repeat(MIN_API_TOKEN_LEN);
-        assert_eq!(
-            normalize_api_token(Some(&format!("  {long}  "))),
-            Some(long)
-        );
-    }
-
-    #[test]
-    fn token_min_length_rejects_short() {
-        assert!(check_api_token_min_length("a").is_err());
-        assert!(check_api_token_min_length("short-token").is_err());
-        assert!(check_api_token_min_length(&"x".repeat(MIN_API_TOKEN_LEN - 1)).is_err());
-        let err = check_api_token_min_length("a").unwrap_err();
-        assert!(err.contains("openssl rand -hex 32"), "err={err}");
-        assert!(err.contains(&MIN_API_TOKEN_LEN.to_string()), "err={err}");
-    }
-
-    #[test]
-    fn token_min_length_accepts_floor_and_longer() {
-        assert!(check_api_token_min_length(&"a".repeat(MIN_API_TOKEN_LEN)).is_ok());
-        assert!(check_api_token_min_length(&"b".repeat(64)).is_ok()); // openssl rand -hex 32
-    }
-
-    #[test]
-    fn token_rejects_non_ascii_even_when_utf8_byte_len_meets_floor() {
-        // Each 'é' is 2 UTF-8 bytes; 16 of them → 32 bytes, which used to pass
-        // a pure `str::len` floor while the CLI cannot put it in Authorization.
-        let unicode = "é".repeat(16);
-        assert!(unicode.len() >= MIN_API_TOKEN_LEN);
-        assert!(unicode.chars().count() < MIN_API_TOKEN_LEN);
-        let err = check_api_token_min_length(&unicode).unwrap_err();
-        assert!(
-            err.contains("printable ASCII") || err.contains("Authorization"),
-            "err={err}"
-        );
-
-        // Multibyte emoji: few chars, many bytes.
-        let emoji = "🔐".repeat(8);
-        assert!(emoji.len() >= MIN_API_TOKEN_LEN);
-        assert!(check_api_token_min_length(&emoji).is_err());
-    }
-
-    #[test]
-    fn token_rejects_ascii_control_bytes() {
-        let mut s = "a".repeat(MIN_API_TOKEN_LEN);
-        s.replace_range(0..1, "\n");
-        assert!(check_api_token_min_length(&s).is_err());
-    }
-
-    #[test]
-    fn require_auth_from_env_truthy() {
-        assert!(!require_auth_from_env(None));
-        assert!(!require_auth_from_env(Some("")));
-        assert!(!require_auth_from_env(Some("0")));
-        assert!(!require_auth_from_env(Some("false")));
-        assert!(!require_auth_from_env(Some("no")));
-        assert!(require_auth_from_env(Some("1")));
-        assert!(require_auth_from_env(Some("true")));
-        assert!(require_auth_from_env(Some("YES")));
-        assert!(require_auth_from_env(Some(" True ")));
-    }
-
-    #[test]
-    fn parse_max_concurrent_deploys_clamps() {
-        assert_eq!(parse_max_concurrent_deploys(None), 4);
-        assert_eq!(parse_max_concurrent_deploys(Some("")), 4);
-        assert_eq!(parse_max_concurrent_deploys(Some("8")), 8);
-        assert_eq!(parse_max_concurrent_deploys(Some("0")), 1);
-        assert_eq!(parse_max_concurrent_deploys(Some("999")), 64);
-        assert_eq!(parse_max_concurrent_deploys(Some("nope")), 4);
-    }
-
-    // ── existing tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_lifecycle_runtime_uses_state_over_disk_default() {
-        assert_eq!(
-            resolve_lifecycle_runtime(Some(RuntimeKind::Container), "missing"),
-            RuntimeKind::Container
-        );
-        assert_eq!(
-            resolve_lifecycle_runtime(None, "missing"),
-            RuntimeKind::Microvm
-        );
-    }
-
-    #[test]
-    fn runtime_label_matches_kind() {
-        assert_eq!(runtime_label(RuntimeKind::Microvm), "microvm");
-        assert_eq!(runtime_label(RuntimeKind::Container), "container");
-    }
-
-    // ── constant_time_eq ───────────────────────────────────────────────
-
-    #[test]
-    fn constant_time_eq_identical() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn constant_time_eq_different_same_length() {
-        assert!(!constant_time_eq(b"hello", b"world"));
-        assert!(!constant_time_eq(b"\x00\x01", b"\x00\x00"));
-    }
-
-    #[test]
-    fn constant_time_eq_different_lengths() {
-        // Same prefix, different lengths — MUST return false.
-        assert!(!constant_time_eq(b"hello", b"hello!"));
-        // Completely different lengths
-        assert!(!constant_time_eq(b"a", b""));
-        assert!(!constant_time_eq(b"", b"a"));
-        // Long vs short with shared prefix
-        assert!(!constant_time_eq(b"abcdefghij", b"abcde"));
-    }
-
-    #[test]
-    fn constant_time_eq_zeroed_suffix_matches() {
-        // A shorter slice that is a prefix of the longer one, where the
-        // longer slice has zero-padding after the shared prefix — NOT equal
-        // because the length mismatch is folded into the diff.
-        assert!(!constant_time_eq(b"abc", b"abc\0\0"));
-        // Len XOR truncated to u8 would be 0 for 1 vs 257; still must reject.
-        let short = [0u8; 1];
-        let long = [0u8; 257];
-        assert!(!constant_time_eq(&short, &long));
     }
 }
