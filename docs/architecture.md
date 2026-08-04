@@ -126,6 +126,9 @@ Notable hardening on this path:
   refs are resolved from the host secret store, then re-validated.
 - Concurrent deploys are bounded by a semaphore (default 4) and per-service by
   the `mark_building` guard.
+- **Nix builds assume trusted source** unless you harden the host and set
+  `RUSSEL_NIX_RESTRICTED=1` (sandbox options + no auto-flake). Threat model:
+  [security/nix-builds.md](security/nix-builds.md).
 
 ---
 

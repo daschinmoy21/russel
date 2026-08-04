@@ -350,7 +350,9 @@ non-local destinations via host L3 routing. Use only for single-tenant debugging
 pub fn forward_filter_disabled() -> bool {
     forward_filter_disabled_from_env(
         std::env::var("RUSSEL_FORWARD").ok().as_deref(),
-        std::env::var("RUSSEL_DISABLE_FORWARD_FILTER").ok().as_deref(),
+        std::env::var("RUSSEL_DISABLE_FORWARD_FILTER")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -385,12 +387,13 @@ fn env_value_truthy(value: Option<&str>) -> bool {
 }
 
 /// Spec of one iptables filter rule Russel manages (for tests + docs).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForwardRuleSpec {
+struct ForwardRuleSpec {
     /// Role within the install plan.
-    pub role: &'static str,
+    role: &'static str,
     /// Arguments after `iptables` (excluding the binary name).
-    pub args: Vec<&'static str>,
+    args: Vec<&'static str>,
 }
 
 /// Pure description of the filter rules we install (#187).
@@ -398,7 +401,8 @@ pub struct ForwardRuleSpec {
 /// Order: create dedicated chain → flush only that chain → DROP terminal →
 /// jump from built-in FORWARD for `-i rsl-+` and `-o rsl-+`.
 /// Jumps use `-I FORWARD 1` at install time; presence is checked with `-C`.
-pub fn russel_forward_rule_plan() -> Vec<ForwardRuleSpec> {
+#[cfg(test)]
+fn russel_forward_rule_plan() -> Vec<ForwardRuleSpec> {
     vec![
         ForwardRuleSpec {
             role: "create-chain",
@@ -565,9 +569,7 @@ async fn install_forward_filter() -> anyhow::Result<()> {
 pub async fn restore_forward_filter() {
     if forward_filter_disabled() {
         // Operator opted out: lingering RUSSEL-FORWARD would still deny traffic.
-        tracing::info!(
-            "forward filter disabled; removing any existing RUSSEL-FORWARD rules"
-        );
+        tracing::info!("forward filter disabled; removing any existing RUSSEL-FORWARD rules");
         if let Err(e) = remove_forward_filter().await {
             tracing::warn!(
                 error = %e,
@@ -578,7 +580,10 @@ pub async fn restore_forward_filter() {
     }
     let count = count_rsl_taps().await;
     if count > 0 {
-        tracing::debug!(count, "rsl- TAPs still present; leaving RUSSEL-FORWARD in place");
+        tracing::debug!(
+            count,
+            "rsl- TAPs still present; leaving RUSSEL-FORWARD in place"
+        );
         return;
     }
     tracing::info!("no rsl- TAPs remain; removing RUSSEL-FORWARD filter rules");
@@ -593,19 +598,18 @@ pub async fn restore_forward_filter() {
 async fn remove_forward_filter() -> anyhow::Result<()> {
     // Delete jump rules (loop until gone — tolerate duplicates from races).
     for direction in ["-i", "-o"] {
-        let del = vec![
-            "-w".to_string(),
-            "-D".to_string(),
-            "FORWARD".to_string(),
-            direction.to_string(),
-            RSL_IFACE_MATCH.to_string(),
-            "-j".to_string(),
-            RUSSEL_FORWARD_CHAIN.to_string(),
+        let del = [
+            "-w",
+            "-D",
+            "FORWARD",
+            direction,
+            RSL_IFACE_MATCH,
+            "-j",
+            RUSSEL_FORWARD_CHAIN,
         ];
-        let del_refs: Vec<&str> = del.iter().map(String::as_str).collect();
         // Best-effort: keep deleting while -D succeeds.
         for _ in 0..16 {
-            if run_iptables(&del_refs).await.is_err() {
+            if run_iptables(&del).await.is_err() {
                 break;
             }
         }
@@ -1020,7 +1024,9 @@ mod tests {
 
     #[test]
     fn forward_filter_disabled_via_russel_forward_allow() {
-        for v in ["allow", "ALLOW", "off", "0", "false", "disabled", "no", " Allow "] {
+        for v in [
+            "allow", "ALLOW", "off", "0", "false", "disabled", "no", " Allow ",
+        ] {
             assert!(
                 forward_filter_disabled_from_env(Some(v), None),
                 "RUSSEL_FORWARD={v:?} should disable filter"

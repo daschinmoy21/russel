@@ -2,7 +2,12 @@
 
 To provide a zero-config developer experience similar to Docker or Heroku buildpacks, Russel automatically generates a `flake.nix` build definition if the target repository doesn't check one in.
 
-The implementation is managed inside the control plane builder: [`crates/ctrl/src/build.rs`](file:///home/crimxnhaze/russel-dev/crates/ctrl/src/build.rs) under the `ensure_flake_exists` function.
+The implementation is managed inside the control plane builder: [`crates/ctrl/src/build.rs`](../crates/ctrl/src/build.rs) under the `ensure_flake_exists` function.
+
+> **Security:** Auto-generation pins floating `nixos-unstable` and is disabled when
+> `RUSSEL_NIX_RESTRICTED=1`. See the Nix build threat model in
+> [security/nix-builds.md](security/nix-builds.md). Production / multi-tenant hosts
+> should require committed flakes and only deploy trusted repositories.
 
 ---
 

@@ -191,6 +191,17 @@ This requires:
 
 ## 5. Security & Validation
 
+### Nix builds (supply-chain / untrusted source)
+
+Deploy runs `nix build` on the control-plane host against the checked-out repo
+(including any `flake.nix` the repository ships, or an auto-generated one). That
+is a **trusted-operator** model: multi-tenant hosts must only deploy repositories
+they trust. Residual risk remains even for single-tenant self-host.
+
+**Operator guidance, host `nix.conf` (`sandbox`, `trusted-users`, `builders`), and
+the opt-in `RUSSEL_NIX_RESTRICTED=1` flag** are documented in
+[security/nix-builds.md](security/nix-builds.md).
+
 ### Repository URLs
 
 - **Local deploys** require **absolute** paths. The CLI canonicalizes relative paths before sending; the control plane rejects relative paths, `file://` URLs, and `..` traversal components.
