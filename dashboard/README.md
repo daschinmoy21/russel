@@ -33,9 +33,31 @@ The dev server proxies `/api/*` → `http://127.0.0.1:7878/*` (override via `RUS
 
 Enable in **Settings** → Demo Mode toggle, or set `localStorage.RUSSEL_DEMO_MODE=1`. All API calls return mock data — no control plane needed.
 
-## Settings
+## Settings & API token (security)
 
-Configure API base URL, bearer token, and demo mode in the `/settings` page. Stored in `localStorage`.
+Configure API base URL, bearer token, and demo mode on the `/settings` page.
+
+| Key | Storage | Purpose |
+|-----|---------|---------|
+| `RUSSEL_API_URL` | `localStorage` | API base URL (default `/api`) |
+| `RUSSEL_API_TOKEN` | **`sessionStorage`** | Bearer token (tab-scoped; cleared when the tab closes) |
+| `RUSSEL_DEMO_MODE` | `localStorage` | `"1"` = mock data, no control plane |
+
+### Never bake the token into the client bundle
+
+**Do not set `PUBLIC_RUSSEL_API_TOKEN`.** Astro/`PUBLIC_*` vars are inlined into the built JS and would ship the secret to every browser that loads the dashboard. The client **ignores** that env var (and logs a one-time console warning if it is present). Enter the token only via **Settings** at runtime.
+
+Also avoid any other `PUBLIC_*` secret: only non-sensitive config (e.g. a public API base URL) belongs there.
+
+### XSS / token exfiltration note
+
+The bearer token is readable by any script that runs in the dashboard origin. Prefer:
+
+- Loopback bind (default) or an authenticated reverse proxy
+- Short-lived tab sessions (`sessionStorage`)
+- Escaping user/control-plane strings when building HTML (service IDs, statuses, etc.)
+
+If you serve the static `dist/` behind a reverse proxy, consider a Content-Security-Policy that restricts `script-src` (note: Astro may use inline scripts for FOUC/theme — adjust CSP carefully, e.g. hashes or nonces).
 
 ## Documentation
 
