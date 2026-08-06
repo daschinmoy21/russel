@@ -907,6 +907,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "russel-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "russel-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "russel-cli"
 version = "0.1.0"
 dependencies = [

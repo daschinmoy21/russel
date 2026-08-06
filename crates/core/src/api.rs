@@ -155,6 +155,72 @@ pub struct RollbackRequest {
     pub version: Option<u32>,
 }
 
+// ---------------------------------------------------------------------------
+// Agent API (horizontal scaling Phase 1 / #213)
+// ---------------------------------------------------------------------------
+
+/// Worker readiness reported on heartbeat.
+///
+/// `Ready` can receive new work; `NotReady` is draining or unhealthy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNodeStatus {
+    #[default]
+    Ready,
+    NotReady,
+}
+
+/// Host capacity snapshot attached to every agent heartbeat.
+///
+/// Units are operator-facing: memory in MiB, CPUs as logical processor counts.
+/// Optional fields may be omitted when a probe is unavailable (tests, restricted
+/// environments) so clients must tolerate missing data.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct NodeCapacity {
+    /// Logical CPUs visible to the agent process (`available_parallelism`).
+    pub cpus_total: u32,
+    /// Approximate free/available memory in MiB (`MemAvailable` when present).
+    pub mem_available_mb: u64,
+    /// Total physical memory in MiB (`MemTotal`).
+    pub mem_total_mb: u64,
+    /// Count of non-reserved service dirs under the data root (observed load).
+    pub running_services: u32,
+    /// Host has `/dev/kvm` (microVM capable).
+    pub kvm: bool,
+    /// Rootless Podman appears usable (`podman info` reports rootless).
+    pub rootless_podman: bool,
+    /// Nix system triple when detected (e.g. `x86_64-linux`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_system: Option<String>,
+}
+
+/// Full heartbeat payload returned by `GET /agent/v1/heartbeat`.
+///
+/// Phase 1 skeleton: the agent *serves* this for ctrl (or ops) to poll.
+/// Phase 3 may invert to agent→ctrl push; the JSON shape stays the contract.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AgentHeartbeat {
+    /// Stable node identity (`RUSSEL_NODE_ID` → hostname → `local`).
+    pub node_id: String,
+    /// RFC3339 UTC timestamp when the sample was taken.
+    pub timestamp: String,
+    pub status: AgentNodeStatus,
+    pub capacity: NodeCapacity,
+    /// Optional operator labels (`RUSSEL_NODE_LABELS=key=val,key2=val2`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+    /// Agent binary / API version string for mismatch detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+}
+
+/// Minimal JSON body for agent routes that are not yet implemented (#214+).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentNotImplemented {
+    pub error: String,
+    pub phase: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -415,5 +481,53 @@ mod tests {
         assert!(req.version.is_none());
         let req: RollbackRequest = serde_json::from_str(r#"{"version":3}"#).unwrap();
         assert_eq!(req.version, Some(3));
+    }
+
+    #[test]
+    fn agent_heartbeat_roundtrip() {
+        let mut labels = HashMap::new();
+        labels.insert("zone".into(), "a".into());
+        let hb = AgentHeartbeat {
+            node_id: "worker-1".into(),
+            timestamp: "2026-08-06T12:00:00Z".into(),
+            status: AgentNodeStatus::Ready,
+            capacity: NodeCapacity {
+                cpus_total: 8,
+                mem_available_mb: 4096,
+                mem_total_mb: 16384,
+                running_services: 2,
+                kvm: true,
+                rootless_podman: true,
+                nix_system: Some("x86_64-linux".into()),
+            },
+            labels,
+            agent_version: Some("0.1.0".into()),
+        };
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(json.contains("\"status\":\"ready\""));
+        assert!(json.contains("worker-1"));
+        let parsed: AgentHeartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, hb);
+    }
+
+    #[test]
+    fn agent_heartbeat_deserializes_minimal() {
+        let json = r#"{
+            "node_id": "local",
+            "timestamp": "2026-08-06T00:00:00Z",
+            "status": "not_ready",
+            "capacity": {
+                "cpus_total": 1,
+                "mem_available_mb": 0,
+                "mem_total_mb": 0,
+                "running_services": 0,
+                "kvm": false,
+                "rootless_podman": false
+            }
+        }"#;
+        let hb: AgentHeartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(hb.status, AgentNodeStatus::NotReady);
+        assert!(hb.labels.is_empty());
+        assert!(hb.capacity.nix_system.is_none());
     }
 }
