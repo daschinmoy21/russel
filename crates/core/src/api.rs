@@ -183,7 +183,9 @@ pub struct NodeCapacity {
     pub mem_available_mb: u64,
     /// Total physical memory in MiB (`MemTotal`).
     pub mem_total_mb: u64,
-    /// Count of non-reserved service dirs under the data root (observed load).
+    /// Count of **running** service instances under the data root (not merely
+    /// deployed): microVMs with a live `vm_pid`, containers with a non-empty
+    /// `container_id` in on-disk metadata.
     pub running_services: u32,
     /// Host has `/dev/kvm` (microVM capable).
     pub kvm: bool,

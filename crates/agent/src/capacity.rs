@@ -3,15 +3,43 @@
 //! Reads Linux `/proc` and filesystem checks only — no heavy sysinfo crate.
 //! Each probe is best-effort so a missing `/proc` (tests, weird hosts) still
 //! yields a usable zeroed snapshot.
+//!
+//! Subprocess probes (`podman`, `nix`) are **timeout-bounded** and **TTL-cached**
+//! so a slow/hung binary cannot stall every heartbeat.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use russel_core::api::NodeCapacity;
 use tokio::process::Command;
 
 /// Default Russel data root (service dirs live under here).
 pub const DEFAULT_DATA_ROOT: &str = "/var/lib/russel";
+
+/// Bound for `podman info` (rootless detection).
+const PODMAN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound for `nix eval … builtins.currentSystem`.
+const NIX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Reuse probe results across heartbeats so we do not re-spawn every request.
+const PROBE_CACHE_TTL: Duration = Duration::from_secs(45);
+
+/// Process-local cache for expensive capacity subprocesses.
+struct ProbeCache {
+    last_podman: Option<(Instant, bool)>,
+    last_nix: Option<(Instant, Option<String>)>,
+}
+
+fn probe_cache() -> &'static Mutex<ProbeCache> {
+    static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(ProbeCache {
+            last_podman: None,
+            last_nix: None,
+        })
+    })
+}
 
 /// Directories that are not user services (keep in sync with ctrl metadata).
 fn is_reserved_service_dir(name: &str) -> bool {
@@ -30,11 +58,11 @@ pub async fn collect_capacity(data_root: &Path, podman_probe: bool) -> NodeCapac
     let running_services = count_running_services(data_root);
     let kvm = Path::new("/dev/kvm").exists();
     let rootless_podman = if podman_probe {
-        probe_rootless_podman().await
+        probe_rootless_podman_cached().await
     } else {
         false
     };
-    let nix_system = detect_nix_system().await;
+    let nix_system = detect_nix_system_cached().await;
 
     NodeCapacity {
         cpus_total,
@@ -79,7 +107,16 @@ fn parse_meminfo_kb(rest: &str) -> Option<u64> {
     Some(n)
 }
 
-/// Count non-reserved immediate children of `data_root` that look like services.
+/// Count services under `data_root` that look **actually running**.
+///
+/// Only non-reserved dirs with a readable `metadata.json` are considered.
+/// Running is determined from on-disk metadata signals (same fields ctrl writes):
+/// - **microVM:** `vm_pid` present and process still alive (`/proc/{pid}` exists).
+/// - **container:** non-empty `container_id` (heartbeat stays cheap — no per-container
+///   `podman inspect`; absence of `container_id` means not running / never started).
+///
+/// Metadata-only deploys with neither live `vm_pid` nor `container_id` are **not**
+/// counted (deployed ≠ running).
 pub fn count_running_services(data_root: &Path) -> u32 {
     let Ok(entries) = std::fs::read_dir(data_root) else {
         return 0;
@@ -96,32 +133,123 @@ pub fn count_running_services(data_root: &Path) -> u32 {
         let Ok(ft) = ent.file_type() else {
             continue;
         };
-        if ft.is_dir() {
-            // Prefer dirs that have metadata.json (deployed service).
-            let meta = ent.path().join("metadata.json");
-            if meta.is_file() {
-                n = n.saturating_add(1);
-            }
+        if !ft.is_dir() {
+            continue;
+        }
+        let meta_path = ent.path().join("metadata.json");
+        if !meta_path.is_file() {
+            continue;
+        }
+        if service_metadata_looks_running(&meta_path) {
+            n = n.saturating_add(1);
         }
     }
     n
 }
 
+/// True when metadata indicates a live microVM or a started container.
+fn service_metadata_looks_running(meta_path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(meta_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    service_value_looks_running(&value)
+}
+
+/// Pure helper for tests: decide running from a metadata JSON value.
+pub fn service_value_looks_running(value: &serde_json::Value) -> bool {
+    let runtime = value.get("runtime").and_then(|v| v.as_str());
+    let vm_pid = value
+        .get("vm_pid")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u32::try_from(p).ok());
+    let container_id = value
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match runtime {
+        Some("container") => container_id.is_some(),
+        Some("microvm") => vm_pid.is_some_and(pid_is_alive),
+        // Legacy / missing runtime: accept either authoritative live signal.
+        _ => {
+            if let Some(pid) = vm_pid
+                && pid_is_alive(pid)
+            {
+                return true;
+            }
+            container_id.is_some()
+        }
+    }
+}
+
+/// Linux: process exists if `/proc/{pid}` is present.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Cached rootless-podman probe (TTL); on miss runs timeout-bounded subprocess.
+async fn probe_rootless_podman_cached() -> bool {
+    {
+        let cache = probe_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, val)) = cache.last_podman
+            && at.elapsed() < PROBE_CACHE_TTL
+        {
+            return val;
+        }
+    }
+    let val = probe_rootless_podman().await;
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.last_podman = Some((Instant::now(), val));
+    }
+    val
+}
+
+/// Cached nix-system probe (TTL); on miss runs timeout-bounded subprocess.
+async fn detect_nix_system_cached() -> Option<String> {
+    {
+        let cache = probe_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, ref val)) = cache.last_nix
+            && at.elapsed() < PROBE_CACHE_TTL
+        {
+            return val.clone();
+        }
+    }
+    let val = detect_nix_system().await;
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.last_nix = Some((Instant::now(), val.clone()));
+    }
+    val
+}
+
 /// True when `podman info` JSON reports rootless mode.
+///
+/// Hard-capped at [`PODMAN_PROBE_TIMEOUT`]; errors/timeouts → `false`.
+/// Child is `kill_on_drop` so a hung `podman` does not leak forever after timeout.
 async fn probe_rootless_podman() -> bool {
-    let output = Command::new("podman")
+    let child = Command::new("podman")
         .args(["info", "--format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .await;
-    let Ok(out) = output else {
+        .kill_on_drop(true)
+        .spawn();
+    let Ok(child) = child else {
         return false;
     };
-    if !out.status.success() {
+    let output = match tokio::time::timeout(PODMAN_PROBE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => return false,
+    };
+    if !output.status.success() {
         return false;
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
         return false;
     };
     // podman info: host.security.rootless == true, or rootlessNetworkCmd present.
@@ -136,8 +264,10 @@ async fn probe_rootless_podman() -> bool {
 }
 
 /// Best-effort Nix system triple via `nix eval --impure --raw --expr builtins.currentSystem`.
+///
+/// Hard-capped at [`NIX_PROBE_TIMEOUT`]; errors/timeouts → `None`.
 async fn detect_nix_system() -> Option<String> {
-    let output = Command::new("nix")
+    let child = Command::new("nix")
         .args([
             "eval",
             "--impure",
@@ -147,9 +277,13 @@ async fn detect_nix_system() -> Option<String> {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .await
+        .kill_on_drop(true)
+        .spawn()
         .ok()?;
+    let output = match tokio::time::timeout(NIX_PROBE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => return None,
+    };
     if !output.status.success() {
         return None;
     }
@@ -212,14 +346,88 @@ mod tests {
     }
 
     #[test]
-    fn count_services_skips_reserved_and_requires_metadata() {
+    fn count_services_skips_reserved_and_metadata_only_not_running() {
         let dir = tempfile_dir();
+        // Deployed metadata without live signals → not running.
         std::fs::create_dir_all(dir.join("api")).unwrap();
         std::fs::write(dir.join("api/metadata.json"), "{}").unwrap();
         std::fs::create_dir_all(dir.join("traefik")).unwrap();
         std::fs::create_dir_all(dir.join("orphan")).unwrap(); // no metadata
         std::fs::create_dir_all(dir.join("old.bak")).unwrap();
+        assert_eq!(count_running_services(&dir), 0);
+    }
+
+    #[test]
+    fn count_services_microvm_live_pid() {
+        let dir = tempfile_dir();
+        let pid = std::process::id();
+        std::fs::create_dir_all(dir.join("vm-live")).unwrap();
+        std::fs::write(
+            dir.join("vm-live/metadata.json"),
+            format!(r#"{{"runtime":"microvm","vm_pid":{pid}}}"#),
+        )
+        .unwrap();
         assert_eq!(count_running_services(&dir), 1);
+    }
+
+    #[test]
+    fn count_services_microvm_dead_pid_not_counted() {
+        let dir = tempfile_dir();
+        // Extremely unlikely to be a live PID on a Linux host.
+        std::fs::create_dir_all(dir.join("vm-dead")).unwrap();
+        std::fs::write(
+            dir.join("vm-dead/metadata.json"),
+            r#"{"runtime":"microvm","vm_pid":2147483646}"#,
+        )
+        .unwrap();
+        assert_eq!(count_running_services(&dir), 0);
+    }
+
+    #[test]
+    fn count_services_container_with_id_counted() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.join("ctr")).unwrap();
+        std::fs::write(
+            dir.join("ctr/metadata.json"),
+            r#"{"runtime":"container","container_id":"abc123"}"#,
+        )
+        .unwrap();
+        // Empty container_id does not count.
+        std::fs::create_dir_all(dir.join("ctr-empty")).unwrap();
+        std::fs::write(
+            dir.join("ctr-empty/metadata.json"),
+            r#"{"runtime":"container","container_id":""}"#,
+        )
+        .unwrap();
+        assert_eq!(count_running_services(&dir), 1);
+    }
+
+    #[test]
+    fn service_value_looks_running_pure() {
+        let live = std::process::id();
+        assert!(!service_value_looks_running(&serde_json::json!({})));
+        assert!(!service_value_looks_running(&serde_json::json!({
+            "runtime": "microvm"
+        })));
+        assert!(service_value_looks_running(&serde_json::json!({
+            "runtime": "microvm",
+            "vm_pid": live
+        })));
+        assert!(!service_value_looks_running(&serde_json::json!({
+            "runtime": "microvm",
+            "vm_pid": 2147483646u32
+        })));
+        assert!(service_value_looks_running(&serde_json::json!({
+            "runtime": "container",
+            "container_id": "x"
+        })));
+        assert!(!service_value_looks_running(&serde_json::json!({
+            "runtime": "container"
+        })));
+        // Legacy without runtime: live pid counts.
+        assert!(service_value_looks_running(&serde_json::json!({
+            "vm_pid": live
+        })));
     }
 
     #[test]
