@@ -1,7 +1,9 @@
 //! Agent HTTP routes (`/agent/v1/*`).
 //!
-//! Phase 1 (#213): heartbeat + health are live; runtime lifecycle endpoints
-//! return 501 until ctrl→agent RPC lands (#214).
+//! Phase 1 (#213): heartbeat + health are live. Phase 2 (#214): stop / destroy /
+//! status are real — they reuse `russel-ctrl`'s in-process runners after
+//! resolving the runtime kind from on-disk metadata. Deploy boot and logs are
+//! still 501 (documented follow-ups).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,14 +12,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
-use russel_core::api::{AgentHeartbeat, AgentNodeStatus, AgentNotImplemented, NodeCapacity};
+use russel_core::api::{
+    AgentErrorResponse, AgentHeartbeat, AgentLifecycleResponse, AgentNodeStatus,
+    AgentNotImplemented, AgentStatusResponse, NodeCapacity,
+};
 
 use crate::capacity::{collect_capacity, parse_node_labels};
+use crate::lifecycle;
 
 /// Shared agent process state.
 #[derive(Clone)]
@@ -51,12 +57,13 @@ pub fn agent_router(state: Arc<AgentState>) -> Router {
     Router::new()
         .route("/agent/v1/health", get(health))
         .route("/agent/v1/heartbeat", get(heartbeat))
-        // Runtime lifecycle — skeleton only (#214 will implement).
-        .route("/agent/v1/deploy", post(not_implemented))
-        .route("/agent/v1/stop/{service_id}", post(not_implemented_path))
-        .route("/agent/v1/destroy/{service_id}", post(not_implemented_path))
-        .route("/agent/v1/status/{service_id}", get(not_implemented_path))
-        .route("/agent/v1/logs/{service_id}", get(not_implemented_path))
+        // Runtime lifecycle (#214): stop/destroy/status live on the agent;
+        // deploy boot + logs remain 501 (documented follow-ups).
+        .route("/agent/v1/deploy", post(deploy_not_implemented))
+        .route("/agent/v1/stop/{service_id}", post(stop_handler))
+        .route("/agent/v1/destroy/{service_id}", post(destroy_handler))
+        .route("/agent/v1/status/{service_id}", get(status_handler))
+        .route("/agent/v1/logs/{service_id}", get(logs_not_implemented))
         .with_state(state)
 }
 
@@ -136,18 +143,64 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
-async fn not_implemented() -> impl IntoResponse {
+async fn deploy_not_implemented() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(AgentNotImplemented {
-            error: "runtime lifecycle not implemented on agent yet".into(),
+            error: "agent deploy boot is not implemented yet — control plane still boots \
+                     workloads in-process; stop/destroy/status are live (#214)"
+                .into(),
             phase: "horiz/p1-02 (#214)".into(),
         }),
     )
 }
 
-async fn not_implemented_path() -> impl IntoResponse {
-    not_implemented().await
+async fn logs_not_implemented() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(AgentNotImplemented {
+            error: "agent logs are not implemented yet (#214 follow-up)".into(),
+            phase: "horiz/p1-02 (#214)".into(),
+        }),
+    )
+}
+
+/// Map a lifecycle error to a structured `{"error": …}` response.
+fn lifecycle_error_response(
+    err: lifecycle::LifecycleError,
+) -> (StatusCode, Json<AgentErrorResponse>) {
+    let status = err.status;
+    (status, Json(AgentErrorResponse { error: err.message }))
+}
+
+async fn stop_handler(
+    State(state): State<Arc<AgentState>>,
+    Path(service_id): Path<String>,
+) -> Result<Json<AgentLifecycleResponse>, (StatusCode, Json<AgentErrorResponse>)> {
+    lifecycle::stop(&state.data_root, &service_id)
+        .await
+        .map(Json)
+        .map_err(lifecycle_error_response)
+}
+
+async fn destroy_handler(
+    State(state): State<Arc<AgentState>>,
+    Path(service_id): Path<String>,
+) -> Result<Json<AgentLifecycleResponse>, (StatusCode, Json<AgentErrorResponse>)> {
+    lifecycle::destroy(&state.data_root, &service_id)
+        .await
+        .map(Json)
+        .map_err(lifecycle_error_response)
+}
+
+async fn status_handler(
+    State(state): State<Arc<AgentState>>,
+    Path(service_id): Path<String>,
+) -> Result<Json<AgentStatusResponse>, (StatusCode, Json<AgentErrorResponse>)> {
+    lifecycle::status(&state.data_root, &service_id)
+        .await
+        .map(Json)
+        .map_err(lifecycle_error_response)
 }
 
 #[cfg(test)]
@@ -248,13 +301,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_returns_501() {
+    async fn stop_unknown_service_returns_404() {
         let app = agent_router(test_state());
         let res = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/agent/v1/stop/svc-a")
+                    .uri("/agent/v1/stop/svc-unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let v = body_json(res).await;
+        assert!(v["error"].as_str().unwrap().contains("svc-unknown"));
+    }
+
+    #[tokio::test]
+    async fn stop_invalid_service_id_returns_400() {
+        let app = agent_router(test_state());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/v1/stop/..%2Fetc%2Fpasswd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn destroy_unknown_service_returns_404() {
+        let app = agent_router(test_state());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/v1/destroy/svc-unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_unknown_service_returns_404() {
+        let app = agent_router(test_state());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/v1/status/svc-unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_reports_stopped_for_service_without_live_process() {
+        // Metadata exists in the temp data root, but no podman container /
+        // live pid backs it → the agent reports "stopped" with a 200.
+        let state = test_state();
+        std::fs::create_dir_all(state.data_root.join("svc-c")).unwrap();
+        std::fs::write(
+            state.data_root.join("svc-c/metadata.json"),
+            r#"{"service_id":"svc-c","runtime":"container","host_port":8080,"guest_port":3000}"#,
+        )
+        .unwrap();
+        let app = agent_router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/v1/status/svc-c")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["status"], "stopped");
+        assert_eq!(v["runtime"], "container");
+        assert_eq!(v["host_port"], 8080);
+    }
+
+    #[tokio::test]
+    async fn logs_returns_501() {
+        let app = agent_router(test_state());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/v1/logs/svc-a")
                     .body(Body::empty())
                     .unwrap(),
             )

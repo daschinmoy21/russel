@@ -11,6 +11,7 @@ compile_error!("russel-agent requires Linux (same host constraints as russel-ctr
 
 mod auth;
 mod capacity;
+mod lifecycle;
 mod node_id;
 mod routes;
 
@@ -99,7 +100,7 @@ async fn main() -> Result<()> {
         %node_id,
         %local_addr,
         data_root = %data_root.display(),
-        "russel-agent listening (Phase 1 skeleton — heartbeat live, deploy RPC in #214)"
+        "russel-agent listening (heartbeat + stop/destroy/status live; deploy RPC TBD)"
     );
 
     axum::serve(listener, app)

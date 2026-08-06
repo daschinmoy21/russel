@@ -123,6 +123,8 @@ pub struct ServiceDiskRecord {
     pub host_port: Option<u16>,
     pub guest_port: Option<u16>,
     pub container_id: Option<String>,
+    /// Podman name: canonical `russel-{id}` or gen-scoped `russel-{id}_g{hex}`.
+    pub container_name: Option<String>,
     pub vm_pid: Option<u32>,
     pub socat_pid: Option<u32>,
     pub virtiofsd_pids: Vec<u32>,
@@ -225,6 +227,10 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
             .and_then(|p| u16::try_from(p).ok()),
         container_id: value
             .get("container_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        container_name: value
+            .get("container_name")
             .and_then(|v| v.as_str())
             .map(str::to_string),
         vm_pid: value

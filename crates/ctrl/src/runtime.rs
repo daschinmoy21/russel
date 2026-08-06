@@ -15,11 +15,27 @@ pub trait RuntimeLifecycle: Send + Sync {
     async fn destroy(&self, service_id: &str) -> anyhow::Result<()>;
 }
 
-/// Return a lifecycle provider for the given runtime kind.
-pub fn lifecycle_for(runtime: RuntimeKind) -> Arc<dyn RuntimeLifecycle> {
+/// Return an in-process lifecycle provider for the given runtime kind.
+///
+/// Used by the worker agent's RPC handlers and by tests; the control plane
+/// goes through [`lifecycle_for`] so agent mode stays a single seam.
+pub fn in_process_lifecycle(runtime: RuntimeKind) -> Arc<dyn RuntimeLifecycle> {
     match runtime {
         RuntimeKind::Microvm => Arc::new(crate::microvm::MicrovmRunner::new()),
         RuntimeKind::Container => Arc::new(crate::container::ContainerRunner::new()),
+    }
+}
+
+/// Return a lifecycle provider for the given runtime kind.
+///
+/// When `RUSSEL_AGENT_URL` is set, teardown is issued to the worker agent
+/// over HTTP (the agent resolves the runtime kind from its own on-disk
+/// metadata). Default (env unset) runs in-process — the monolithic
+/// single-node path, unchanged.
+pub fn lifecycle_for(runtime: RuntimeKind) -> Arc<dyn RuntimeLifecycle> {
+    match crate::agent_client::AgentClient::from_env() {
+        Some(client) => Arc::new(client),
+        None => in_process_lifecycle(runtime),
     }
 }
 

@@ -13,6 +13,7 @@ anyhow.workspace = true
 async-trait = "0.1"
 axum.workspace = true
 libc = "0.2"
+reqwest.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

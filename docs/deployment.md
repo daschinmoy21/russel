@@ -252,8 +252,22 @@ curl -s http://127.0.0.1:7946/agent/v1/heartbeat | jq .
 | `RUSSEL_NODE_LABELS` | unset | Comma-separated `key=val` labels in heartbeat |
 | `RUSSEL_DATA_DIR` | `/var/lib/russel` | Data root used to count running services |
 
-**Live routes:** `GET /agent/v1/health`, `GET /agent/v1/heartbeat`.  
-**Skeleton (501 until #214):** `POST /agent/v1/deploy`, stop/destroy/status/logs.
+**Ctrl → agent RPC (Phase 2 / #214).** Set `RUSSEL_AGENT_URL` on the control plane to route `stop` / `destroy` / `status` through the worker agent instead of the in-process runners:
+
+```bash
+export RUSSEL_AGENT_URL=http://127.0.0.1:7946
+# optional; falls back to RUSSEL_API_TOKEN, same as the agent server
+# export RUSSEL_AGENT_TOKEN="$(openssl rand -hex 32)"
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RUSSEL_AGENT_URL` | unset | Agent base URL. When set, ctrl sends stop/destroy/status to the agent over HTTP; when unset the monolithic in-process path is used (no single-node regression) |
+
+The agent resolves each service's runtime kind from on-disk metadata and runs the same teardown logic as monolithic ctrl. Deploy boot still runs in-process on the control plane (agent-side deploy is a follow-up layer); ingress / service-state bookkeeping remains ctrl's job. Agent-side deploy and logs endpoints stay 501 for now.
+
+**Live routes:** `GET /agent/v1/health`, `GET /agent/v1/heartbeat`, `POST /agent/v1/stop/{id}`, `POST /agent/v1/destroy/{id}`, `GET /agent/v1/status/{id}`.  
+**Skeleton (501):** `POST /agent/v1/deploy`, `GET /agent/v1/logs/{id}`.
 
 ### Service deploy env
 

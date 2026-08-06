@@ -223,6 +223,46 @@ pub struct AgentNotImplemented {
     pub phase: String,
 }
 
+/// Result of an agent lifecycle operation (`POST /agent/v1/stop|destroy/{id}`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentLifecycleResponse {
+    pub service_id: String,
+    /// `"stop"` or `"destroy"`.
+    pub operation: String,
+    /// `"stopped"` or `"destroyed"`.
+    pub status: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeKind>,
+}
+
+/// Worker-side service status (`GET /agent/v1/status/{service_id}`).
+///
+/// `status` / `vm_state` are `"running"` or `"stopped"` — the agent probes
+/// local process state (metadata PID liveness for microVM, `podman ps` for
+/// containers). Wall-clock uptime is best-effort from `/proc`; control-plane
+/// in-memory state may report richer status strings.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentStatusResponse {
+    pub service_id: String,
+    /// `"running"` or `"stopped"`.
+    pub status: String,
+    pub vm_state: String,
+    pub uptime_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_port: Option<u16>,
+}
+
+/// Structured error body returned by agent RPC routes (4xx/5xx).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentErrorResponse {
+    pub error: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -531,5 +571,48 @@ mod tests {
         assert_eq!(hb.status, AgentNodeStatus::NotReady);
         assert!(hb.labels.is_empty());
         assert!(hb.capacity.nix_system.is_none());
+    }
+
+    #[test]
+    fn agent_lifecycle_response_roundtrip() {
+        let resp = AgentLifecycleResponse {
+            service_id: "svc-a".into(),
+            operation: "stop".into(),
+            status: "stopped".into(),
+            message: "stopped container svc-a".into(),
+            runtime: Some(RuntimeKind::Container),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"runtime\":\"container\""));
+        let parsed: AgentLifecycleResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, resp);
+    }
+
+    #[test]
+    fn agent_status_response_roundtrip_and_optional_runtime() {
+        let resp = AgentStatusResponse {
+            service_id: "svc-a".into(),
+            status: "running".into(),
+            vm_state: "running".into(),
+            uptime_seconds: 37,
+            runtime: None,
+            host_port: Some(8080),
+            guest_port: Some(3000),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: AgentStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, resp);
+        // runtime omitted from JSON when None (skip_serializing_if).
+        assert!(!json.contains("runtime"));
+    }
+
+    #[test]
+    fn agent_error_response_roundtrip() {
+        let err = AgentErrorResponse {
+            error: "service svc-a not found".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let parsed: AgentErrorResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, err);
     }
 }

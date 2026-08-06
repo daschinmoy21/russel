@@ -20,7 +20,7 @@ pub use rootfs::{
 #[allow(unused_imports)]
 pub use runner::{
     ContainerRunner, ContainerStartSpec, RunningContainer, build_run_args, container_log_path,
-    parse_podman_rootless,
+    is_trusted_container_name, parse_podman_rootless,
 };
 
 #[cfg(test)]
