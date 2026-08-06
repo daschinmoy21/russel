@@ -229,6 +229,32 @@ The binary name (from `Russelfile.toml` `bin` or `name`) must match the safe cha
 
 `node_id` is **not** a deploy-time app env var and is not injected into guests. It only labels which control-plane host recorded the deployment. Multi-tenant multi-node still requires the security P0 baseline (#185).
 
+### Worker agent (horizontal scaling Phase 1 / #213)
+
+Optional process for the multi-node path. Default single-node installs keep using monolithic `russel-ctrl` only.
+
+```bash
+cargo build -p russel-agent
+# → target/debug/russel-agent
+
+export RUSSEL_NODE_ID=worker-1          # optional; same resolution as ctrl
+export RUSSEL_AGENT_TOKEN="$(openssl rand -hex 32)"  # required off-loopback
+./target/debug/russel-agent
+# default bind: http://127.0.0.1:7946
+curl -s http://127.0.0.1:7946/agent/v1/heartbeat | jq .
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RUSSEL_AGENT_ADDR` | `127.0.0.1:7946` | Agent HTTP bind address |
+| `RUSSEL_AGENT_TOKEN` | unset | Bearer token for `/agent/v1/*` (min 32 chars). Falls back to `RUSSEL_API_TOKEN` if unset |
+| `RUSSEL_NODE_ID` | hostname, else `local` | Same identity as ctrl metadata |
+| `RUSSEL_NODE_LABELS` | unset | Comma-separated `key=val` labels in heartbeat |
+| `RUSSEL_DATA_DIR` | `/var/lib/russel` | Data root used to count running services |
+
+**Live routes:** `GET /agent/v1/health`, `GET /agent/v1/heartbeat`.  
+**Skeleton (501 until #214):** `POST /agent/v1/deploy`, stop/destroy/status/logs.
+
 ### Service deploy env
 
 Deploy-time environment variables can be set via three mechanisms, merged in order (later wins):
