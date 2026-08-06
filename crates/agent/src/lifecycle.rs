@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use axum::http::StatusCode;
 use russel_core::api::{AgentLifecycleResponse, AgentStatusResponse};
 use russel_core::config::RuntimeKind;
+use russel_ctrl::container::{ContainerRunner, is_trusted_container_name};
 use russel_ctrl::metadata::load_service_disk_record_from;
 use russel_ctrl::microvm::MicrovmRunner;
 use russel_ctrl::runtime::in_process_lifecycle;
@@ -72,8 +73,13 @@ fn resolve_service(data_root: &Path, service_id: &str) -> Result<ResolvedService
             path.display()
         )));
     }
+    // Corrupt / partially-written metadata is an unknown service to callers
+    // (same contract as missing file) — not a 500.
     let record = load_service_disk_record_from(&path).ok_or_else(|| {
-        LifecycleError::internal(format!("failed to parse metadata at {}", path.display()))
+        LifecycleError::not_found(format!(
+            "service {service_id} not found (invalid metadata at {})",
+            path.display()
+        ))
     })?;
     let runtime = match record.runtime {
         Some(rt) => rt,
@@ -178,21 +184,85 @@ async fn probe_runtime(
     service_id: &str,
 ) -> (bool, u64) {
     match runtime {
-        RuntimeKind::Microvm => match record.vm_pid.filter(|pid| process_alive(*pid)) {
+        RuntimeKind::Microvm => match record
+            .vm_pid
+            .filter(|pid| microvm_pid_is_alive(*pid, service_id))
+        {
             Some(pid) => (true, uptime_seconds_from_pid(pid).unwrap_or(0)),
             None => (false, 0),
         },
-        RuntimeKind::Container => match container_state(service_id).await {
-            Some(state) if state == "running" => {
-                (true, container_pid_uptime(service_id).await.unwrap_or(0))
+        RuntimeKind::Container => {
+            let target = resolve_status_container_ref(record, service_id);
+            match container_state(&target).await {
+                Some(state) if state.eq_ignore_ascii_case("running") => {
+                    (true, container_pid_uptime(&target).await.unwrap_or(0))
+                }
+                _ => (false, 0),
             }
-            _ => (false, 0),
-        },
+        }
     }
 }
 
-fn process_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+/// Prefer metadata `container_id`, then trusted `container_name` (incl. gen-scoped),
+/// else canonical `russel-{service_id}`.
+fn resolve_status_container_ref(
+    record: &russel_ctrl::metadata::ServiceDiskRecord,
+    service_id: &str,
+) -> String {
+    if let Some(id) = record
+        .container_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return id.to_string();
+    }
+    if let Some(name) = record
+        .container_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && is_trusted_container_name(service_id, name)
+    {
+        return name.to_string();
+    }
+    ContainerRunner::container_name(service_id)
+}
+
+/// True when `pid` is alive **and** is cloud-hypervisor for this service.
+///
+/// Guards against PID reuse after the original VMM exited (stale metadata).
+fn microvm_pid_is_alive(pid: u32, service_id: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) only checks existence/permissions; pid is a u32 process id.
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&bytes).replace('\0', " ");
+    cloud_hypervisor_cmdline_matches(&cmdline, service_id)
+}
+
+/// Pure identity check for unit tests (no /proc).
+///
+/// Requires `cloud-hypervisor` **and** the service data dir
+/// (`/var/lib/russel/{service_id}/`) in the command line. A bare
+/// `cmdline.contains(service_id)` is too weak — e.g. service id `api` matches
+/// `--api-socket`. TAP needles are optional (agent status does not always
+/// have the TAP key).
+pub fn cloud_hypervisor_cmdline_matches(cmdline: &str, service_id: &str) -> bool {
+    if !cmdline.contains("cloud-hypervisor") {
+        return false;
+    }
+    if service_id.is_empty() {
+        return false;
+    }
+    // Service-scoped paths used at boot (API sock, cfg under the service dir).
+    cmdline.contains(&format!("/var/lib/russel/{service_id}/"))
 }
 
 /// Wall-clock seconds a process has been running, from `/proc`:
@@ -220,18 +290,32 @@ fn boot_time_epoch_secs() -> Option<u64> {
         .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
 }
 
-/// Podman container state for the canonical `russel-{service_id}` name.
+/// Podman container state for an exact name **or** container id.
 ///
-/// `--filter name=` takes a regex; anchoring prevents `russel-api` matching
-/// `russel-api-extra`. Generation-scoped names (`russel-{id}_g…`) are not
-/// probed yet — documented follow-up.
-async fn container_state(service_id: &str) -> Option<String> {
+/// When `target` looks like a name (contains no `/` and is not a long hex id),
+/// use an anchored `--filter name=` so `russel-api` does not match `russel-api-extra`.
+/// Generation-scoped names (`russel-{id}_g…`) and raw container ids are probed
+/// via `podman inspect` (exact key).
+async fn container_state(target: &str) -> Option<String> {
+    // Prefer inspect: works for id *and* exact name including gen-scoped.
+    let output = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", "{{.State.Status}}", target])
+        .output()
+        .await
+        .ok()?;
+    if output.status.success() {
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !state.is_empty() {
+            return Some(state);
+        }
+    }
+    // Fallback: anchored name filter (canonical names only).
     let output = tokio::process::Command::new("podman")
         .args([
             "ps",
             "-a",
             "--filter",
-            &format!("name=^russel-{service_id}$"),
+            &format!("name=^{target}$"),
             "--format",
             "{{.State}}",
         ])
@@ -250,14 +334,9 @@ async fn container_state(service_id: &str) -> Option<String> {
 }
 
 /// Uptime of the podman container's main process (`{{.State.Pid}}`).
-async fn container_pid_uptime(service_id: &str) -> Option<u64> {
+async fn container_pid_uptime(target: &str) -> Option<u64> {
     let output = tokio::process::Command::new("podman")
-        .args([
-            "inspect",
-            "--format",
-            "{{.State.Pid}}",
-            &format!("russel-{service_id}"),
-        ])
+        .args(["inspect", "--format", "{{.State.Pid}}", target])
         .output()
         .await
         .ok()?;
@@ -323,6 +402,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_metadata_is_not_found() {
+        let root = temp_root();
+        write_metadata(&root, "bad-json", "{not valid json");
+        let err = status(&root, "bad-json").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert!(err.message.contains("invalid metadata"));
+        let err = stop(&root, "bad-json").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn status_reports_stopped_for_container_without_running_container() {
         let root = temp_root();
         write_metadata(
@@ -338,9 +428,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_running_for_live_pid() {
+    async fn status_reports_stopped_for_live_but_non_ch_pid() {
+        // Own pid is alive in /proc but is not cloud-hypervisor → must not
+        // report running (PID-reuse / stale metadata guard).
         let root = temp_root();
-        // Own pid is always alive in /proc → deterministic "running" probe.
         let pid = std::process::id();
         write_metadata(
             &root,
@@ -350,10 +441,9 @@ mod tests {
             ),
         );
         let resp = status(&root, "svc-m").await.unwrap();
-        assert_eq!(resp.status, "running");
-        assert_eq!(resp.vm_state, "running");
+        assert_eq!(resp.status, "stopped");
+        assert_eq!(resp.vm_state, "stopped");
         assert_eq!(resp.runtime, Some(RuntimeKind::Microvm));
-        assert!(resp.uptime_seconds > 0);
     }
 
     #[tokio::test]
@@ -377,6 +467,49 @@ mod tests {
     #[test]
     fn uptime_from_proc_parses_own_pid() {
         let uptime = uptime_seconds_from_pid(std::process::id());
-        assert!(uptime.is_some_and(|s| s > 0));
+        // Fresh processes can report 0s; parse success is the contract.
+        assert!(uptime.is_some());
+    }
+
+    #[test]
+    fn cloud_hypervisor_identity_requires_ch_and_service_dir() {
+        assert!(cloud_hypervisor_cmdline_matches(
+            "cloud-hypervisor --api-socket /var/lib/russel/api/cloud-hypervisor.sock",
+            "api"
+        ));
+        // Unrelated process with reused PID shape.
+        assert!(!cloud_hypervisor_cmdline_matches(
+            "/usr/bin/sleep 999",
+            "api"
+        ));
+        // CH for a different service — must not match "api" via --api-socket.
+        assert!(!cloud_hypervisor_cmdline_matches(
+            "cloud-hypervisor --api-socket /var/lib/russel/other/cloud-hypervisor.sock",
+            "api"
+        ));
+        assert!(!cloud_hypervisor_cmdline_matches(
+            "cloud-hypervisor --api-socket /tmp/x.sock",
+            "api"
+        ));
+        assert!(!cloud_hypervisor_cmdline_matches("cloud-hypervisor", ""));
+    }
+
+    #[test]
+    fn resolve_status_prefers_container_id_then_trusted_name() {
+        let mut rec = russel_ctrl::metadata::ServiceDiskRecord {
+            container_id: Some("abc123deadbeef".into()),
+            container_name: Some("russel-api_gdeadbeef".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_status_container_ref(&rec, "api"), "abc123deadbeef");
+        rec.container_id = None;
+        assert_eq!(
+            resolve_status_container_ref(&rec, "api"),
+            "russel-api_gdeadbeef"
+        );
+        rec.container_name = Some("evil-name".into());
+        assert_eq!(resolve_status_container_ref(&rec, "api"), "russel-api");
+        rec.container_name = None;
+        assert_eq!(resolve_status_container_ref(&rec, "api"), "russel-api");
     }
 }

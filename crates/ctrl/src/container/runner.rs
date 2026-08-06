@@ -16,7 +16,8 @@ const CONTAINER_NAME_PREFIX: &str = "russel-";
 ///
 /// Rejects arbitrary metadata `container_name` values so stop/destroy cannot be
 /// redirected at attacker-chosen Podman names (Issue #193).
-pub(crate) fn is_trusted_container_name(service_id: &str, name: &str) -> bool {
+/// Public for agent status probes (#214) that must accept generation-scoped names.
+pub fn is_trusted_container_name(service_id: &str, name: &str) -> bool {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return false;
     }
