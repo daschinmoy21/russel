@@ -63,7 +63,7 @@ curl http://127.0.0.1:8080/health
 
 **Without `-p`:** Traefik is the primary HTTP ingress. Omit publish and open `http://<service_id>.russel.local` once Traefik watches `/var/lib/russel/traefik/dynamic` (see [docs/traefik.md](docs/traefik.md)).
 
-**Container runtime:** the example Russelfile already has `type = "container"`. Pass `--runtime container` only if it matches. Needs **rootless** Podman.
+**Container runtime:** `examples/basic-http` sets `type = "container"`. Pass `--runtime container` only if it matches. Needs **rootless** Podman.
 
 If ctrl runs under `sudo` for microVMs, container deploys use rootless podman as `RUSSEL_PODMAN_USER` or `SUDO_USER` (not root). That user needs `podman info` → rootless true and `/run/user/$(id -u)` (try `loginctl enable-linger $USER` on headless hosts).
 
@@ -89,6 +89,46 @@ printf '%s' "$DB_PASSWORD" | ./target/debug/russel-cli secrets set DB_PASSWORD
 ```
 
 More walkthroughs: [docs/examples.md](docs/examples.md) · packaging: [docs/deployment.md](docs/deployment.md).
+
+## Remote VPS (one developer)
+
+For a **single trusted operator** on one Linux VPS, the supported path is
+**containers** (rootless Podman). Most cheap VPS images have no `/dev/kvm`;
+skip microVMs unless you have nested virt or bare metal.
+
+| Ready? | Item |
+|--------|------|
+| Yes | CLI → remote `russel-ctrl` → git deploy → status / logs / destroy |
+| Yes | Bearer auth (`RUSSEL_API_TOKEN` ≥32 chars); non-loopback requires token |
+| Yes | TLS via reverse proxy (Caddy/nginx) in front of loopback ctrl |
+| Containers only | Typical no-KVM VPS — set `type = "container"` in every Russelfile |
+| DIY | Build from source; no shipping systemd unit / install package yet |
+| No | Multi-tenant isolation, managed DBs, native ctrl TLS |
+
+**Server (sketch):**
+
+```bash
+export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"   # save this
+export RUSSEL_CTRL_ADDR=127.0.0.1:7878
+export RUSSEL_REQUIRE_AUTH=1
+# optional public app ports: export RUSSEL_PUBLISH_BIND=0.0.0.0
+./target/release/russel-ctrl
+# Terminate TLS at Caddy/nginx → 127.0.0.1:7878  (see docs/security-tls.md)
+```
+
+**Laptop:**
+
+```bash
+export RUSSEL_CONTROL_PLANE=https://russel.example.com
+export RUSSEL_API_TOKEN='…same…'
+russel-cli deploy https://github.com/you/app.git \
+  --vm-id app -p 8080:3000 --runtime container
+```
+
+Prefer **git URLs** on a remote control plane (local laptop paths are not uploaded).
+Full operator checklist, security gates, and dashboard notes:
+[docs/vps-one-dev.md](docs/vps-one-dev.md). Plan context:
+[docs/plans/mvp-self-hosted.md](docs/plans/mvp-self-hosted.md).
 
 ## Build Command
 
@@ -325,7 +365,7 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 │   ├── core/         # shared types & config
 │   └── ctrl/         # control plane (main logic)
 ├── examples/         # see examples/README.md
-│   ├── basic-http/   # Go + /health (container default)
+│   ├── basic-http/   # Go + /health, type = container
 │   ├── microvm-http/ # same app, type = microvm
 │   ├── hello-rust/   # pure-std Rust HTTP
 │   ├── env-config/   # [service.env] + secret://
@@ -341,7 +381,10 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 │   ├── deployment.md      # App packaging guide
 │   ├── examples.md        # Example projects (microVM + container)
 │   ├── russelfile.md      # Russelfile reference / design
-│   └── traefik.md         # Traefik ingress setup
+│   ├── security-tls.md    # TLS reverse-proxy runbook
+│   ├── traefik.md         # Traefik ingress setup
+│   ├── vps-one-dev.md     # Single-VPS one-dev checklist
+│   └── plans/             # MVP / scaling plans
 ├── flake.nix         # development shell
 └── README.md
 ```
