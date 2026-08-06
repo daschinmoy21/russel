@@ -1,6 +1,6 @@
 # basic-http — Go stdlib HTTP server with /health and embedded static assets.
-# Default runtime: container (rootless Podman). For microVM, set type = "microvm"
-# and deploy with matching --runtime if you pass one.
+# Runtime: container (rootless Podman). For microVM, use examples/microvm-http
+# or set type = "microvm" and pass matching --runtime if you pass one.
 
 [service]
 name = "api"
@@ -9,6 +9,7 @@ port = 3000
 memory = "256mb"
 # Binary name produced by `go build` (module path last component).
 bin = "basic-http"
+type = "container"
 # debug = true   # bash + curl + /usr/bin/env in rootfs (not needed for this ELF binary)
 
 # Optional deploy-time env (plain values or secret://NAME from host secrets store):
