@@ -2,9 +2,12 @@
 //!
 //! ## Schema (`schema_version` = 1)
 //!
-//! Shared fields: `schema_version`, `service_id`, `runtime` (`microvm`|`container`),
-//! `host_port`, `guest_port`, `store_path`, `mem_mb`, `deployed_at` (RFC3339),
-//! optional `bin_name`.
+//! Shared fields: `schema_version`, `service_id`, `node_id`, `runtime`
+//! (`microvm`|`container`), `host_port`, `guest_port`, `store_path`, `mem_mb`,
+//! `deployed_at` (RFC3339), optional `bin_name`.
+//!
+//! `node_id` is the host that wrote the record (`RUSSEL_NODE_ID`, else hostname,
+//! else `local`). Pre-#212 metadata may omit it; readers must tolerate missing.
 //!
 //! **microVM** also writes: `vm_ip`, `host_ip` (TAP host side), `kernel_path`,
 //! optional `vm_pid` / `socat_pid` / `initramfs` / `app_path`, and
@@ -26,9 +29,53 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Env override for stable node identity (horizontal scaling Phase 0 / #212).
+pub const NODE_ID_ENV: &str = "RUSSEL_NODE_ID";
+
 /// On-disk path for a service's metadata.json.
 pub fn metadata_path(service_id: &str) -> PathBuf {
     PathBuf::from(format!("/var/lib/russel/{service_id}/metadata.json"))
+}
+
+/// Resolve the node id written into service `metadata.json`.
+///
+/// Order: `RUSSEL_NODE_ID` (trimmed, non-empty) → hostname → `"local"`.
+/// Single-node installs need no config; multi-node sets a stable id per host.
+pub fn resolve_node_id() -> String {
+    if let Ok(v) = std::env::var(NODE_ID_ENV) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+
+    hostname_for_node_id().unwrap_or_else(|| "local".to_string())
+}
+
+fn hostname_for_node_id() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // HOST_NAME_MAX is typically 64; 256 is a safe portable buffer.
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid writable region of length `buf.len()`.
+        // gethostname writes a NUL-terminated name when it succeeds.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let s = std::str::from_utf8(&buf[..len]).ok()?.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Directories under `/var/lib/russel` (and peers) that are **not** user services.
@@ -331,6 +378,7 @@ pub fn build_microvm_metadata_with_gen(
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "service_id": service_id,
+        "node_id": resolve_node_id(),
         "runtime": "microvm",
         "host_port": host_port,
         "guest_port": guest_port,
@@ -414,6 +462,7 @@ pub fn build_container_metadata_with_gen(
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "service_id": service_id,
+        "node_id": resolve_node_id(),
         "runtime": "container",
         "host_port": host_port,
         "guest_port": guest_port,
@@ -530,50 +579,163 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
 
+    /// Serialize mutations of `RUSSEL_NODE_ID` and restore even on panic.
+    fn with_node_id_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: exclusive LOCK held; only test code mutates this var.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(NODE_ID_ENV, v),
+                        None => std::env::remove_var(NODE_ID_ENV),
+                    }
+                }
+            }
+        }
+
+        let prev = std::env::var_os(NODE_ID_ENV);
+        let _restore = EnvRestore(prev);
+        // SAFETY: exclusive lock held for the duration of the mutation + body.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(NODE_ID_ENV, v),
+                None => std::env::remove_var(NODE_ID_ENV),
+            }
+        }
+        f()
+    }
+
+    #[test]
+    fn resolve_node_id_prefers_env() {
+        with_node_id_env(Some("worker-a"), || {
+            assert_eq!(resolve_node_id(), "worker-a");
+        });
+        with_node_id_env(Some("  worker-b  "), || {
+            assert_eq!(resolve_node_id(), "worker-b");
+        });
+    }
+
+    #[test]
+    fn resolve_node_id_ignores_blank_env() {
+        with_node_id_env(Some("   "), || {
+            let id = resolve_node_id();
+            assert!(!id.is_empty());
+            assert_ne!(id.trim(), "");
+            // Falls through to hostname or "local", never a blank string.
+        });
+        with_node_id_env(Some(""), || {
+            let id = resolve_node_id();
+            assert!(!id.is_empty());
+        });
+    }
+
+    #[test]
+    fn resolve_node_id_without_env_is_nonempty() {
+        with_node_id_env(None, || {
+            let id = resolve_node_id();
+            assert!(!id.is_empty());
+        });
+    }
+
     #[test]
     fn metadata_includes_schema_version() {
-        let meta = build_microvm_metadata(
-            "api",
-            3100,
-            3000,
-            "10.0.1.2",
-            "10.0.1.1",
-            Some(42),
-            &[43u32],
-            Some(44),
-            "/nix/store/kernel",
-            "/nix/store/app",
-            512,
-            1,
-            Some("/nix/store/app/bin/myapp"),
-            Some("myapp"),
-            Some("/var/lib/russel/api/initramfs.cpio"),
-        );
-        assert_eq!(meta["schema_version"], SCHEMA_VERSION);
-        assert_eq!(meta["runtime"], "microvm");
-        assert_eq!(meta["host_ip"], "10.0.1.1");
-        assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
-        assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
-        assert_eq!(meta["bin_name"], "myapp");
-        assert_eq!(meta["host_ip"], "10.0.1.1");
-        assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
-        assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
-        assert!(meta["deployed_at"].as_str().unwrap().ends_with('Z'));
+        with_node_id_env(Some("test-node"), || {
+            let meta = build_microvm_metadata(
+                "api",
+                3100,
+                3000,
+                "10.0.1.2",
+                "10.0.1.1",
+                Some(42),
+                &[43u32],
+                Some(44),
+                "/nix/store/kernel",
+                "/nix/store/app",
+                512,
+                1,
+                Some("/nix/store/app/bin/myapp"),
+                Some("myapp"),
+                Some("/var/lib/russel/api/initramfs.cpio"),
+            );
+            assert_eq!(meta["schema_version"], SCHEMA_VERSION);
+            assert_eq!(meta["node_id"], "test-node");
+            assert_eq!(meta["runtime"], "microvm");
+            assert_eq!(meta["host_ip"], "10.0.1.1");
+            assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
+            assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
+            assert_eq!(meta["bin_name"], "myapp");
+            assert_eq!(meta["host_ip"], "10.0.1.1");
+            assert_eq!(meta["virtiofsd_pids"], serde_json::json!([43]));
+            assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
+            assert!(meta["deployed_at"].as_str().unwrap().ends_with('Z'));
 
-        let container = build_container_metadata(
-            "api",
-            3100,
-            3000,
-            "/nix/store/app",
-            "abc123",
-            "russel-api",
-            "/var/lib/russel/api/rootfs",
-            512,
-            Some("myapp"),
-            &[],
-        );
-        assert_eq!(container["schema_version"], SCHEMA_VERSION);
-        assert_eq!(container["runtime"], "container");
+            let container = build_container_metadata(
+                "api",
+                3100,
+                3000,
+                "/nix/store/app",
+                "abc123",
+                "russel-api",
+                "/var/lib/russel/api/rootfs",
+                512,
+                Some("myapp"),
+                &[],
+            );
+            assert_eq!(container["schema_version"], SCHEMA_VERSION);
+            assert_eq!(container["node_id"], "test-node");
+            assert_eq!(container["runtime"], "container");
+        });
+    }
+
+    #[test]
+    fn metadata_builders_emit_node_id_from_env() {
+        with_node_id_env(Some("edge-1"), || {
+            let micro = build_microvm_metadata_with_gen(
+                "api",
+                3100,
+                3000,
+                "10.0.1.2",
+                "10.0.1.1",
+                Some(1),
+                &[],
+                None,
+                "/nix/store/kernel",
+                "/nix/store/app",
+                512,
+                1,
+                None,
+                None,
+                None,
+                Some("gen1"),
+                Some("rsl-abc"),
+            );
+            assert_eq!(micro["node_id"], "edge-1");
+            assert_eq!(micro["generation_id"], "gen1");
+
+            let container = build_container_metadata_with_gen(
+                "api",
+                3100,
+                3000,
+                "/nix/store/app",
+                "cid",
+                "russel-api",
+                "/var/lib/russel/api/rootfs",
+                512,
+                None,
+                &[],
+                Some("gen2"),
+            );
+            assert_eq!(container["node_id"], "edge-1");
+            assert_eq!(container["generation_id"], "gen2");
+        });
     }
 
     #[test]

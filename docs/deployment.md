@@ -221,6 +221,16 @@ The binary name (from `Russelfile.toml` `bin` or `name`) must match the safe cha
 
 ## 6. Environment Variables
 
+### Control-plane host identity
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RUSSEL_NODE_ID` | hostname, else `local` | Stable node identity written into each service's `metadata.json` on deploy/rollback. Single-node installs need no config; multi-node should set a unique value per host (horizontal scaling Phase 0 / #212). |
+
+`node_id` is **not** a deploy-time app env var and is not injected into guests. It only labels which control-plane host recorded the deployment. Multi-tenant multi-node still requires the security P0 baseline (#185).
+
+### Service deploy env
+
 Deploy-time environment variables can be set via three mechanisms, merged in order (later wins):
 
 1. **`[service.env]` in Russelfile.toml** — project defaults, checked into version control.
