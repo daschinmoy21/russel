@@ -2,9 +2,12 @@
 //!
 //! ## Schema (`schema_version` = 1)
 //!
-//! Shared fields: `schema_version`, `service_id`, `runtime` (`microvm`|`container`),
-//! `host_port`, `guest_port`, `store_path`, `mem_mb`, `deployed_at` (RFC3339),
-//! optional `bin_name`.
+//! Shared fields: `schema_version`, `service_id`, `node_id`, `runtime`
+//! (`microvm`|`container`), `host_port`, `guest_port`, `store_path`, `mem_mb`,
+//! `deployed_at` (RFC3339), optional `bin_name`.
+//!
+//! `node_id` is the host that wrote the record (`RUSSEL_NODE_ID`, else hostname,
+//! else `local`). Pre-#212 metadata may omit it; readers must tolerate missing.
 //!
 //! **microVM** also writes: `vm_ip`, `host_ip` (TAP host side), `kernel_path`,
 //! optional `vm_pid` / `socat_pid` / `initramfs` / `app_path`, and
@@ -26,9 +29,67 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Env override for stable node identity (horizontal scaling Phase 0 / #212).
+pub const NODE_ID_ENV: &str = "RUSSEL_NODE_ID";
+
 /// On-disk path for a service's metadata.json.
 pub fn metadata_path(service_id: &str) -> PathBuf {
     PathBuf::from(format!("/var/lib/russel/{service_id}/metadata.json"))
+}
+
+/// Resolve the node id written into service `metadata.json`.
+///
+/// Order: `RUSSEL_NODE_ID` (trimmed, non-empty) → hostname → `"local"`.
+/// Single-node installs need no config; multi-node sets a stable id per host.
+pub fn resolve_node_id() -> String {
+    resolve_node_id_with(
+        std::env::var(NODE_ID_ENV).ok().as_deref(),
+        hostname_for_node_id,
+    )
+}
+
+/// Resolve node id with injectable env override and host fallback.
+///
+/// Order: non-empty trimmed `env_override` → `host_fallback()` → `"local"`.
+/// Production uses [`resolve_node_id`]; tests pass fixed values so they never
+/// mutate process-global `RUSSEL_NODE_ID`.
+pub fn resolve_node_id_with(
+    env_override: Option<&str>,
+    host_fallback: impl FnOnce() -> Option<String>,
+) -> String {
+    if let Some(v) = env_override {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    host_fallback().unwrap_or_else(|| "local".to_string())
+}
+
+fn hostname_for_node_id() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // HOST_NAME_MAX is typically 64; 256 is a safe portable buffer.
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid writable region of length `buf.len()`.
+        // gethostname writes a NUL-terminated name when it succeeds.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let s = std::str::from_utf8(&buf[..len]).ok()?.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Directories under `/var/lib/russel` (and peers) that are **not** user services.
@@ -331,6 +392,7 @@ pub fn build_microvm_metadata_with_gen(
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "service_id": service_id,
+        "node_id": resolve_node_id(),
         "runtime": "microvm",
         "host_port": host_port,
         "guest_port": guest_port,
@@ -414,6 +476,7 @@ pub fn build_container_metadata_with_gen(
     let mut meta = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "service_id": service_id,
+        "node_id": resolve_node_id(),
         "runtime": "container",
         "host_port": host_port,
         "guest_port": guest_port,
@@ -531,7 +594,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolve_node_id_prefers_env() {
+        assert_eq!(
+            resolve_node_id_with(Some("worker-a"), || Some("host".into())),
+            "worker-a"
+        );
+        assert_eq!(
+            resolve_node_id_with(Some("  worker-b  "), || Some("host".into())),
+            "worker-b"
+        );
+    }
+
+    #[test]
+    fn resolve_node_id_ignores_blank_env() {
+        // Blank/empty env falls through to host fallback — never a blank string.
+        assert_eq!(
+            resolve_node_id_with(Some("   "), || Some("from-host".into())),
+            "from-host"
+        );
+        assert_eq!(
+            resolve_node_id_with(Some(""), || Some("from-host".into())),
+            "from-host"
+        );
+        assert_eq!(resolve_node_id_with(Some("   "), || None), "local");
+        assert_eq!(resolve_node_id_with(Some(""), || None), "local");
+    }
+
+    #[test]
+    fn resolve_node_id_without_env_is_nonempty() {
+        assert_eq!(
+            resolve_node_id_with(None, || Some("myhost".into())),
+            "myhost"
+        );
+        assert_eq!(resolve_node_id_with(None, || None), "local");
+        // Production path (real env + hostname) must also be non-empty.
+        assert!(!resolve_node_id().is_empty());
+    }
+
+    #[test]
     fn metadata_includes_schema_version() {
+        let expected_node = resolve_node_id();
         let meta = build_microvm_metadata(
             "api",
             3100,
@@ -550,6 +652,7 @@ mod tests {
             Some("/var/lib/russel/api/initramfs.cpio"),
         );
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
+        assert_eq!(meta["node_id"], expected_node);
         assert_eq!(meta["runtime"], "microvm");
         assert_eq!(meta["host_ip"], "10.0.1.1");
         assert_eq!(meta["app_path"], "/nix/store/app/bin/myapp");
@@ -573,7 +676,52 @@ mod tests {
             &[],
         );
         assert_eq!(container["schema_version"], SCHEMA_VERSION);
+        assert_eq!(container["node_id"], expected_node);
         assert_eq!(container["runtime"], "container");
+    }
+
+    #[test]
+    fn metadata_builders_emit_node_id_from_env() {
+        // Builders call resolve_node_id(); env→value mapping is covered by
+        // resolve_node_id_with unit tests above (no process env mutation here).
+        let expected_node = resolve_node_id();
+        let micro = build_microvm_metadata_with_gen(
+            "api",
+            3100,
+            3000,
+            "10.0.1.2",
+            "10.0.1.1",
+            Some(1),
+            &[],
+            None,
+            "/nix/store/kernel",
+            "/nix/store/app",
+            512,
+            1,
+            None,
+            None,
+            None,
+            Some("gen1"),
+            Some("rsl-abc"),
+        );
+        assert_eq!(micro["node_id"], expected_node);
+        assert_eq!(micro["generation_id"], "gen1");
+
+        let container = build_container_metadata_with_gen(
+            "api",
+            3100,
+            3000,
+            "/nix/store/app",
+            "cid",
+            "russel-api",
+            "/var/lib/russel/api/rootfs",
+            512,
+            None,
+            &[],
+            Some("gen2"),
+        );
+        assert_eq!(container["node_id"], expected_node);
+        assert_eq!(container["generation_id"], "gen2");
     }
 
     #[test]

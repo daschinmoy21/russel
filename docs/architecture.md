@@ -343,10 +343,13 @@ flowchart TB
     M --> CAT
 ```
 
-- **`metadata.json` is the source of truth**: schema version, runtime, ports,
+- **`metadata.json` is the source of truth**: schema version, `node_id` (host that
+  wrote the record: `RUSSEL_NODE_ID`, else hostname, else `local`), runtime, ports,
   PIDs, TAP identity, store/bin paths, generation id, `repo_url`/`config_path`,
   and `desired_state` (env refs, podman args, fixed port) so rollback, update,
-  and health-restart can rebuild the exact original deployment.
+  and health-restart can rebuild the exact original deployment. Recording
+  `node_id` prepares multi-node placement metadata (Phase 0); multi-tenant
+  multi-node still depends on security P0 (#185).
 - **Reconcile at startup** verifies PID identity via `/proc/<pid>/cmdline`
   (guards against PID reuse) before adopting a process as alive; containers are
   probed via `podman inspect` and by the `russel-<id>` naming convention.
