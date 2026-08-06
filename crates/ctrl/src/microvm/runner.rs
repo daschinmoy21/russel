@@ -17,8 +17,6 @@ use super::process::{
 };
 use super::spec::{KernelInfo, VmSpec};
 
-// ── MicrovmRunner ────────────────────────────────────────────────────────────
-
 /// Shared runner singleton — kernel/busybox/modules caches live across deploys.
 pub(crate) fn shared_runner() -> MicrovmRunner {
     static RUNNER: std::sync::LazyLock<MicrovmRunner> =
@@ -64,8 +62,6 @@ impl MicrovmRunner {
         Self::default()
     }
 
-    // ── Kernel resolution ────────────────────────────────────────────────
-
     /// Get or build the microVM-optimised kernel (virtio/fuse built-in).
     ///
     /// Resolution order:
@@ -77,12 +73,10 @@ impl MicrovmRunner {
     ///
     /// Result is cached in-memory for the lifetime of the runner.
     pub async fn ensure_kernel(&self) -> anyhow::Result<KernelInfo> {
-        // 1. In-memory cache
         if let Some(info) = self.check_kernel_cache() {
             return Ok(info);
         }
 
-        // 2. RUSSEL_KERNEL_PATH env var
         if let Ok(env_path) = std::env::var("RUSSEL_KERNEL_PATH") {
             let p = PathBuf::from(&env_path);
             if p.exists() {
@@ -101,7 +95,6 @@ impl MicrovmRunner {
             tracing::warn!("RUSSEL_KERNEL_PATH={env_path} does not exist, continuing");
         }
 
-        // 3. Flake package: nix build .#microvm-kernel
         if let Some(repo_root) = self.find_repo_root()
             && repo_root.join("flake.nix").exists()
         {
@@ -128,7 +121,6 @@ impl MicrovmRunner {
             }
         }
 
-        // 4. Relative result/bzImage (user ran nix build without --no-link)
         let result_bzimage = PathBuf::from("result/bzImage");
         if result_bzimage.exists() {
             let abs =
@@ -146,7 +138,6 @@ impl MicrovmRunner {
             return Ok(info);
         }
 
-        // 5. Stock kernel fallback (drivers as modules)
         let path = self.build_stock_kernel().await?;
         let info = KernelInfo {
             path,
@@ -256,7 +247,7 @@ impl MicrovmRunner {
         }
     }
 
-    // ── Busybox (still needed for initramfs) ─────────────────────────────
+    // Busybox (still needed for initramfs).
 
     pub async fn ensure_busybox(&self) -> anyhow::Result<PathBuf> {
         if let Some(path) = self.check_path_cache(&self.busybox_cache) {
@@ -292,7 +283,7 @@ impl MicrovmRunner {
         Ok(path)
     }
 
-    // ── Kernel modules (only needed when falling back to stock kernel) ───
+    // Kernel modules (only needed when falling back to stock kernel).
 
     /// Resolve kernel modules for the stock kernel fallback path.
     /// Returns `None` when the microvm kernel is in use (drivers built-in).
@@ -336,8 +327,6 @@ impl MicrovmRunner {
         Ok(Some(path))
     }
 
-    // ── Path cache helpers ───────────────────────────────────────────────
-
     fn check_path_cache(&self, cache: &Mutex<Option<PathBuf>>) -> Option<PathBuf> {
         if let Ok(cache) = cache.lock() {
             if let Some(ref path) = *cache
@@ -359,7 +348,7 @@ impl MicrovmRunner {
         }
     }
 
-    // ── Agent initramfs (generic, config-driven via deploy.env) ──────────
+    // Agent initramfs (generic, config-driven via deploy.env).
 
     /// Build a **generic** agent initramfs once (cached).
     ///
@@ -374,7 +363,6 @@ impl MicrovmRunner {
     ///
     /// No app binary is baked in — it is resolved at deploy time via `deploy.env`.
     pub async fn build_agent_initramfs(&self) -> anyhow::Result<PathBuf> {
-        // Fast path: cache hit without lock.
         if let Some(path) = self.check_path_cache(&self.agent_initramfs_cache) {
             return Ok(path);
         }
@@ -636,8 +624,6 @@ impl MicrovmRunner {
         Ok(())
     }
 
-    // ── Boot ─────────────────────────────────────────────────────────────
-
     /// Boot a Cloud Hypervisor microVM using a `VmSpec`.
     ///
     /// Spawns virtiofsd for each `FsMount`, waits for their sockets, then
@@ -666,8 +652,6 @@ impl MicrovmRunner {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700))?;
         }
-
-        // ── Spawn virtiofsd for each fs mount ──────────────────────────
         let mut virtiofsd_children: Vec<tokio::process::Child> = Vec::new();
         match spec.fs.as_slice() {
             [] => {}
@@ -694,8 +678,6 @@ impl MicrovmRunner {
                 }
             }
         }
-
-        // ── Build CH command line ──────────────────────────────────────
         let mem_mb = spec.memory_mb.max(256);
 
         let mut cmd = Command::new("cloud-hypervisor");
@@ -866,8 +848,6 @@ impl MicrovmRunner {
         Ok(child)
     }
 
-    // ── Stop / destroy ───────────────────────────────────────────────────
-
     /// Gracefully stop a VM through Cloud Hypervisor's REST API.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
         Self::validate_service_id(service_id)?;
@@ -937,11 +917,11 @@ impl MicrovmRunner {
 
         // Kill socat
         let socat_pattern = format!("^socat-russel-{service_id}( |$)");
-        if let Some(pid) = metadata.as_ref().and_then(|m| m.socat_pid)
-            && terminate_owned_process(pid, service_id).await?
-        {
-            // killed by PID
-        } else {
+        let socat_killed = match metadata.as_ref().and_then(|m| m.socat_pid) {
+            Some(pid) => terminate_owned_process(pid, service_id).await?,
+            None => false,
+        };
+        if !socat_killed {
             self.pkill_service_process(service_id, "socat", &socat_pattern)
                 .await?;
         }
@@ -1060,8 +1040,7 @@ impl MicrovmRunner {
     }
 }
 /// Select the greatest kernel version from a list of version strings.
-/// Sorts lexicographically (natural version sort) and returns the last.
-/// Exported for unit testing.
+/// Sorts lexicographically and returns the last; exported for unit testing.
 pub(super) fn select_kernel_version(versions: &mut [String]) -> anyhow::Result<String> {
     if versions.is_empty() {
         anyhow::bail!("no kernel versions provided");
