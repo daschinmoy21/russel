@@ -1,39 +1,11 @@
-// clippy::type_complexity / too_many_arguments: deploy/lifecycle signatures are wide
-// by design (runtime + process handoff); silence until those APIs are split.
-#![allow(clippy::type_complexity, clippy::too_many_arguments)]
-
-mod api;
-mod build;
-mod ch_api;
-mod container;
-// Database provisioning was a no-op stub; Russelfile already rejects enabled
-// [database] sections. Dropped in favor of external DBs (see docs).
-mod deploy;
-mod deployments;
-mod git;
-mod health;
-mod ingress;
-mod metadata;
-mod microvm;
-mod network;
-mod reconcile;
-mod runtime;
-mod secrets;
-mod state;
-mod traefik;
-mod warm_pool;
-
-#[cfg(not(target_os = "linux"))]
-compile_error!(
-    "russel-ctrl requires Linux — it depends on cloud-hypervisor, iptables, socat, and TAP networking"
-);
+//! `russel-ctrl` binary — thin entry point over the `russel_ctrl` library.
 
 use anyhow::Result;
 use axum::Router;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::state::AppState;
+use russel_ctrl::state::AppState;
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -60,15 +32,15 @@ async fn main() -> Result<()> {
     let _instance_lock = acquire_instance_lock()?;
 
     // Detect Nix system triple once at startup — cached for all builds/deploys.
-    crate::build::init_current_system().await?;
+    russel_ctrl::build::init_current_system().await?;
     // Remove only Russel-owned stale TAP interfaces from previous sessions.
     // Never flush host-global iptables chains (Docker/VPN/admin rules).
     cleanup_stale_resources().await;
     // #187: re-install default-deny FORWARD for any live rsl-* TAPs after restart.
-    network::ensure_forward_filter_if_taps_present().await;
+    russel_ctrl::network::ensure_forward_filter_if_taps_present().await;
     // Hybrid privileges: microVM uses this process (often root/sudo for TAP/KVM);
     // containers use rootless podman as RUSSEL_PODMAN_USER or SUDO_USER.
-    container::log_podman_identity();
+    russel_ctrl::container::log_podman_identity();
 
     // Build state early so reconcile can rehydrate services from disk
     // before the router starts serving requests.
@@ -76,14 +48,14 @@ async fn main() -> Result<()> {
 
     // Rehydrate observed service state from on-disk metadata so status
     // endpoints work without waiting for GET /vms lazy discovery.
-    let report = crate::reconcile::reconcile_startup(&state).await;
+    let report = russel_ctrl::reconcile::reconcile_startup(&state).await;
     tracing::info!(?report, "startup reconcile complete");
 
     // Start warm pool prepare in the background so the first deploy after
     // ctrl restart can restore from a paused snapshot instead of cold booting.
     // Failures are logged but never block the control plane from serving.
     tokio::spawn(async move {
-        let pool = crate::warm_pool::shared_warm_pool();
+        let pool = russel_ctrl::warm_pool::shared_warm_pool();
         if let Err(e) = pool.prepare().await {
             tracing::warn!(
                 error = %e,
@@ -98,9 +70,9 @@ async fn main() -> Result<()> {
 
     // Periodic TCP health probes; set RUSSEL_HEALTH_RESTART=1 to redeploy
     // after 3 consecutive failures when metadata records repo_url.
-    crate::health::spawn_health_loop(state.clone());
+    russel_ctrl::health::spawn_health_loop(state.clone());
 
-    let app: Router = api::router(state.clone());
+    let app: Router = russel_ctrl::api::router(state.clone());
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
 
     // Bind first, then decide auth from the *actual* bound address (F-36).
@@ -116,24 +88,25 @@ async fn main() -> Result<()> {
     // - RUSSEL_REQUIRE_AUTH=1|true|yes: fail closed without a valid token even
     //   on loopback (production packaging).
     // - Non-loopback bind always requires a valid token.
-    let token = match api::configured_api_token() {
+    let token = match russel_ctrl::api::configured_api_token() {
         Some(t) => {
-            if let Err(msg) = api::check_api_token_min_length(&t) {
+            if let Err(msg) = russel_ctrl::api::check_api_token_min_length(&t) {
                 anyhow::bail!("{msg}");
             }
             Some(t)
         }
         None => None,
     };
-    let require_auth =
-        api::require_auth_from_env(std::env::var("RUSSEL_REQUIRE_AUTH").ok().as_deref());
+    let require_auth = russel_ctrl::api::require_auth_from_env(
+        std::env::var("RUSSEL_REQUIRE_AUTH").ok().as_deref(),
+    );
     if token.is_some() {
         info!("RUSSEL_API_TOKEN set — requiring Bearer auth on all routes");
     } else if require_auth {
         anyhow::bail!(
             "RUSSEL_REQUIRE_AUTH is set but RUSSEL_API_TOKEN is missing or blank; \
              set a token of at least {} characters (e.g. openssl rand -hex 32)",
-            api::MIN_API_TOKEN_LEN
+            russel_ctrl::api::MIN_API_TOKEN_LEN
         );
     } else if is_loopback {
         // F-35: loopback is not an isolation boundary — any local user and
@@ -141,7 +114,7 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "dev mode: no auth — any local user or forwarded port can control the API; \
              set RUSSEL_API_TOKEN (min {} chars) or RUSSEL_REQUIRE_AUTH=1",
-            api::MIN_API_TOKEN_LEN
+            russel_ctrl::api::MIN_API_TOKEN_LEN
         );
     } else {
         anyhow::bail!(
@@ -149,7 +122,7 @@ async fn main() -> Result<()> {
              use at least {} characters (e.g. openssl rand -hex 32)",
             bind_addr,
             local_addr,
-            api::MIN_API_TOKEN_LEN
+            russel_ctrl::api::MIN_API_TOKEN_LEN
         );
     }
 
@@ -327,7 +300,7 @@ async fn cleanup_stale_resources() {
 /// Also re-primes `SUBNET_REGISTRY` from saved host_ip so collision leases
 /// survive control-plane restarts (stable mapping, not rehash-from-id).
 fn live_service_tap_ids() -> std::collections::HashSet<String> {
-    use crate::network::{
+    use russel_ctrl::network::{
         allocation_from_network_key, claim_subnet_key, network_key_from_host_ip, subnet_for,
     };
     let mut taps = std::collections::HashSet::new();
@@ -338,7 +311,7 @@ fn live_service_tap_ids() -> std::collections::HashSet<String> {
                 && ft.is_dir()
                 && let Some(name) = entry.file_name().to_str()
             {
-                if crate::metadata::is_reserved_service_dir(name) {
+                if russel_ctrl::metadata::is_reserved_service_dir(name) {
                     continue;
                 }
                 let meta_path = entry.path().join("metadata.json");

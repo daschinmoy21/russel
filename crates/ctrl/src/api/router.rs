@@ -182,6 +182,29 @@ async fn vm_status(
     MicrovmRunner::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/status", service_id);
+
+    // Agent mode (#214): the worker's view of local process state is
+    // authoritative. Default (RUSSEL_AGENT_URL unset) stays in-process.
+    if let Some(agent) = crate::agent_client::AgentClient::from_env() {
+        let agent_status = agent
+            .status(&service_id)
+            .await
+            .map_err(|e| (e.status, e.message))?;
+        return Ok(Json(StatusResponse {
+            service_id,
+            status: if agent_status.status == "running" {
+                "deployed".to_string()
+            } else {
+                agent_status.status
+            },
+            vm_state: agent_status.vm_state,
+            uptime_seconds: agent_status.uptime_seconds,
+            runtime: agent_status.runtime,
+            host_port: agent_status.host_port,
+            guest_port: agent_status.guest_port,
+        }));
+    }
+
     state.status(&service_id).map(Json).ok_or((
         StatusCode::NOT_FOUND,
         format!("service {} not found", service_id),
