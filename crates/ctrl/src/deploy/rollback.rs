@@ -236,7 +236,7 @@ pub(crate) async fn attempt_microvm_rollback(
 
     // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick.
     //    Include user env from desired_state (F-04: env restored on rollback).
-    let alloc = subnet_for(service_id);
+    let alloc = subnet_for(service_id)?;
     let cfg_dir = format!("{}/cfg", russel_dir);
     std::fs::create_dir_all(&cfg_dir)?;
     #[cfg(unix)]

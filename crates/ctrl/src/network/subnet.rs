@@ -60,14 +60,23 @@ pub fn allocation_from_network_key(key: u16) -> SubnetAllocation {
     }
 }
 
+/// Preferred (unregistered) allocation derived from `service_id`.
+///
+/// No registry side effects — safe for teardown/ownership checks when
+/// on-disk metadata is missing and registering a lease would be wrong.
+pub fn preferred_subnet(service_id: &str) -> SubnetAllocation {
+    allocation_from_network_key(network_key(fnv1a(service_id.as_bytes())))
+}
+
 /// Allocate a unique /30 for `service_id`.
 ///
 /// Preferred key is the lower 16 bits of FNV-1a(service_id). On collision
 /// with another service, rehash with a salt until a free 16-bit key is found.
-pub fn subnet_for(service_id: &str) -> SubnetAllocation {
+/// Fails closed if no free key is found within the probe budget.
+pub fn subnet_for(service_id: &str) -> anyhow::Result<SubnetAllocation> {
     let mut reg = subnet_registry();
     if let Some(&key) = reg.by_service.get(service_id) {
-        return allocation_from_network_key(key);
+        return Ok(allocation_from_network_key(key));
     }
 
     let mut key = network_key(fnv1a(service_id.as_bytes()));
@@ -82,17 +91,27 @@ pub fn subnet_for(service_id: &str) -> SubnetAllocation {
         }
         reg.by_key.insert(key, service_id.to_string());
         reg.by_service.insert(service_id.to_string(), key);
-        return allocation_from_network_key(key);
+        return Ok(allocation_from_network_key(key));
     }
 
-    // Exhausted probes — do NOT clobber another service's mapping (F-45).
-    // Return the preferred key without registering it; the allocation may
-    // collide but the registry stays intact.
-    tracing::error!(
-        service_id,
-        "subnet registry exhausted probes; using preferred key (possible collision, not registered)"
+    anyhow::bail!(
+        "subnet registry exhausted: no free /30 for service '{service_id}' after 1024 probes"
     );
-    allocation_from_network_key(network_key(fnv1a(service_id.as_bytes())))
+}
+
+#[cfg(test)]
+pub fn test_fill_all_subnet_keys() {
+    let mut reg = subnet_registry();
+    for k in 0u16..=u16::MAX {
+        reg.by_key.insert(k, format!("filler-{k}"));
+    }
+}
+
+#[cfg(test)]
+pub fn test_clear_subnet_registry() {
+    let mut reg = subnet_registry();
+    reg.by_key.clear();
+    reg.by_service.clear();
 }
 
 /// Release the subnet lease for a service so another can reuse the slot.

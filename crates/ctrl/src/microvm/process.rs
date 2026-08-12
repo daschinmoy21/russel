@@ -71,26 +71,36 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
 }
 
 /// Prefer generation-recorded TAP / IPs so destroy still works after promote.
+///
+/// Does not register a subnet lease. Metadata is the source of truth for
+/// teardown; without it, the unregistered preferred key is used only for
+/// best-effort cleanup identifiers.
 pub(super) fn network_alloc_for_service(service_id: &str) -> crate::network::SubnetAllocation {
-    let fallback = crate::network::subnet_for(service_id);
-    let Some(meta) = read_metadata(service_id) else {
-        return fallback;
-    };
-    match (meta.tap_id, meta.host_ip, meta.vm_ip) {
-        (Some(tap_id), Some(host_ip), Some(vm_ip)) => crate::network::SubnetAllocation {
-            host_ip,
-            vm_ip,
-            mac: fallback.mac,
-            tap_id,
-        },
-        _ => fallback,
+    if let Some(meta) = read_metadata(service_id) {
+        match (meta.tap_id, meta.host_ip, meta.vm_ip) {
+            (Some(tap_id), Some(host_ip), Some(vm_ip)) => {
+                let mac = crate::network::network_key_from_host_ip(&host_ip)
+                    .map(|k| crate::network::allocation_from_network_key(k).mac)
+                    .unwrap_or_else(|| crate::network::preferred_subnet(service_id).mac);
+                return crate::network::SubnetAllocation {
+                    host_ip,
+                    vm_ip,
+                    mac,
+                    tap_id,
+                };
+            }
+            _ => {}
+        }
     }
+    crate::network::preferred_subnet(service_id)
 }
 
 /// Verify PID ownership via /proc/<pid>/cmdline.
 pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
     let cmdline_path = format!("/proc/{pid}/cmdline");
-    let tap_arg = format!("tap={}", crate::network::subnet_for(service_id).tap_id);
+    // Prefer metadata TAP; fall back to preferred (unregistered) key for matching.
+    let tap_id = network_alloc_for_service(service_id).tap_id;
+    let tap_arg = format!("tap={tap_id}");
     std::fs::read(cmdline_path)
         .map(|cmdline| {
             cmdline.split(|byte| *byte == 0).any(|arg| {

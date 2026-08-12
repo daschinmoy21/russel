@@ -885,7 +885,7 @@ impl MicrovmRunner {
             let tap = metadata
                 .as_ref()
                 .and_then(|m| m.tap_id.clone())
-                .unwrap_or_else(|| crate::network::subnet_for(service_id).tap_id);
+                .unwrap_or_else(|| crate::network::preferred_subnet(service_id).tap_id);
             self.pkill_service_process(
                 service_id,
                 "cloud-hypervisor",
@@ -955,7 +955,7 @@ impl MicrovmRunner {
         Self::validate_service_id(service_id)?;
 
         // Prefer on-disk network identity (generation-scoped TAP) before stop
-        // clears processes; fall back to deterministic subnet_for.
+        // clears processes; fall back to preferred_subnet (no registry lease).
         let alloc = network_alloc_for_service(service_id);
 
         self.stop(service_id).await?;
