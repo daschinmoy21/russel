@@ -76,21 +76,18 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
 /// teardown; without it, the unregistered preferred key is used only for
 /// best-effort cleanup identifiers.
 pub(super) fn network_alloc_for_service(service_id: &str) -> crate::network::SubnetAllocation {
-    if let Some(meta) = read_metadata(service_id) {
-        match (meta.tap_id, meta.host_ip, meta.vm_ip) {
-            (Some(tap_id), Some(host_ip), Some(vm_ip)) => {
-                let mac = crate::network::network_key_from_host_ip(&host_ip)
-                    .map(|k| crate::network::allocation_from_network_key(k).mac)
-                    .unwrap_or_else(|| crate::network::preferred_subnet(service_id).mac);
-                return crate::network::SubnetAllocation {
-                    host_ip,
-                    vm_ip,
-                    mac,
-                    tap_id,
-                };
-            }
-            _ => {}
-        }
+    if let Some(meta) = read_metadata(service_id)
+        && let (Some(tap_id), Some(host_ip), Some(vm_ip)) = (meta.tap_id, meta.host_ip, meta.vm_ip)
+    {
+        let mac = crate::network::network_key_from_host_ip(&host_ip)
+            .map(|k| crate::network::allocation_from_network_key(k).mac)
+            .unwrap_or_else(|| crate::network::preferred_subnet(service_id).mac);
+        return crate::network::SubnetAllocation {
+            host_ip,
+            vm_ip,
+            mac,
+            tap_id,
+        };
     }
     crate::network::preferred_subnet(service_id)
 }
