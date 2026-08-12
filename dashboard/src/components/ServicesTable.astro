@@ -53,8 +53,11 @@ function getHostPort(svc: ServiceVM): number | null {
             {getHostPort(svc) != null ? (
               <div class="port-cell">
                 <span class="mono-text">{svc.ports || '—'}</span>
-                {/* Client hydrate rewrites links based on API base loopback (#283). */}
-                <span class="port-link port-link-static mono-text">port {getHostPort(svc)}</span>
+                {/* Client script rewrites to localhost <a> when API base is loopback (#283). */}
+                <span
+                  class="port-link port-link-static mono-text"
+                  data-host-port={getHostPort(svc)}
+                >port {getHostPort(svc)}</span>
               </div>
             ) : (
               <span class="mono-text">—</span>
@@ -77,4 +80,32 @@ function getHostPort(svc: ServiceVM): number | null {
   </table>
 </div>
 
+<script>
+  import { isApiBaseLoopback } from '../lib/api';
 
+  function hydratePortLinks() {
+    const loopback = isApiBaseLoopback();
+    document.querySelectorAll<HTMLElement>('.port-link-static[data-host-port]').forEach((el) => {
+      const port = el.getAttribute('data-host-port');
+      if (!port) return;
+      if (loopback) {
+        const a = document.createElement('a');
+        a.className = 'port-link';
+        a.href = `http://localhost:${port}`;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = `localhost:${port}`;
+        el.replaceWith(a);
+      } else {
+        el.classList.add('port-link-remote');
+        el.title = 'Host port is on the remote control-plane host, not this browser';
+      }
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', hydratePortLinks);
+  } else {
+    hydratePortLinks();
+  }
+</script>

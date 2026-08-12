@@ -123,6 +123,7 @@ import { isDemoMode } from '../lib/api';
     validateApiBase,
     apiBaseValidationError,
     assertCleartextTokenOk,
+    joinApiUrl,
   } from '../lib/api';
 
   const apiUrlInput = document.getElementById('apiUrl') as HTMLInputElement | null;
@@ -132,7 +133,8 @@ import { isDemoMode } from '../lib/api';
   const btnTest = document.getElementById('btnTestConn');
   const toast = document.getElementById('settingsToast');
 
-  if (apiUrlInput) apiUrlInput.value = getApiBase();
+  // "" means same-origin root — show "/" so the field is not blank
+  if (apiUrlInput) apiUrlInput.value = getApiBase() || '/';
   if (apiTokenInput) apiTokenInput.value = getApiToken() || '';
   if (demoModeToggle) demoModeToggle.checked = isDemoMode();
 
@@ -168,7 +170,8 @@ import { isDemoMode } from '../lib/api';
       const formBaseRaw = (apiUrlInput?.value ?? '').trim() || getApiBase();
       const formToken = (apiTokenInput?.value ?? '').trim() || null;
       const normalized = validateApiBase(formBaseRaw);
-      if (!normalized) {
+      // "" is valid same-origin root — only null is rejection
+      if (normalized === null) {
         showToast(apiBaseValidationError(formBaseRaw), true);
         return;
       }
@@ -179,7 +182,7 @@ import { isDemoMode } from '../lib/api';
       const headers: Record<string, string> = {};
       if (formToken) headers['Authorization'] = `Bearer ${formToken}`;
 
-      const res = await fetch(`${normalized}/vms`, {
+      const res = await fetch(joinApiUrl(normalized, '/vms'), {
         headers,
         signal: AbortSignal.timeout(3000),
       });
