@@ -16,8 +16,8 @@ pub use forward::{
 };
 pub use ports::{PortAllocator, publish_bind_addr};
 pub use subnet::{
-    SubnetAllocation, allocation_from_network_key, claim_subnet_key, network_key_from_host_ip,
-    preferred_subnet, release_subnet, subnet_for,
+    SubnetAllocation, allocation_from_network_key, claim_subnet_key, lookup_subnet,
+    network_key_from_host_ip, preferred_subnet, release_subnet, subnet_for,
 };
 pub use tap::TapForwarder;
 

@@ -5,6 +5,9 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
 #[derive(Debug, Clone)]
 pub struct SubnetAllocation {
     pub host_ip: String,
@@ -68,6 +71,19 @@ pub fn preferred_subnet(service_id: &str) -> SubnetAllocation {
     allocation_from_network_key(network_key(fnv1a(service_id.as_bytes())))
 }
 
+/// Read-only registry lookup for an existing lease.
+///
+/// No allocation side effects — returns `None` when `service_id` has no lease.
+/// Prefer this over [`preferred_subnet`] for teardown when a collision rehash
+/// may have assigned a non-preferred key.
+pub fn lookup_subnet(service_id: &str) -> Option<SubnetAllocation> {
+    let reg = subnet_registry();
+    reg.by_service
+        .get(service_id)
+        .copied()
+        .map(allocation_from_network_key)
+}
+
 /// Allocate a unique /30 for `service_id`.
 ///
 /// Preferred key is the lower 16 bits of FNV-1a(service_id). On collision
@@ -100,6 +116,18 @@ pub fn subnet_for(service_id: &str) -> anyhow::Result<SubnetAllocation> {
 }
 
 #[cfg(test)]
+static SUBNET_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Process-wide lock for tests that mutate the global subnet registry.
+#[cfg(test)]
+pub fn subnet_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    SUBNET_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
 pub fn test_fill_all_subnet_keys() {
     let mut reg = subnet_registry();
     for k in 0u16..=u16::MAX {
@@ -112,6 +140,15 @@ pub fn test_clear_subnet_registry() {
     let mut reg = subnet_registry();
     reg.by_key.clear();
     reg.by_service.clear();
+}
+
+/// Hold the test lock, clear the registry, run `f`, then clear again.
+#[cfg(test)]
+pub fn test_with_empty_registry(f: impl FnOnce()) {
+    let _g = subnet_test_lock();
+    test_clear_subnet_registry();
+    f();
+    test_clear_subnet_registry();
 }
 
 /// Release the subnet lease for a service so another can reuse the slot.

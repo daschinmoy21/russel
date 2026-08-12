@@ -4,68 +4,81 @@ use super::*;
 
 #[test]
 fn subnet_for_is_deterministic() {
-    let a1 = subnet_for("my-service").unwrap();
-    let a2 = subnet_for("my-service").unwrap();
-    assert_eq!(a1.host_ip, a2.host_ip);
-    assert_eq!(a1.vm_ip, a2.vm_ip);
-    assert_eq!(a1.mac, a2.mac);
-    release_subnet("my-service");
+    super::subnet::test_with_empty_registry(|| {
+        let a1 = subnet_for("my-service").unwrap();
+        let a2 = subnet_for("my-service").unwrap();
+        assert_eq!(a1.host_ip, a2.host_ip);
+        assert_eq!(a1.vm_ip, a2.vm_ip);
+        assert_eq!(a1.mac, a2.mac);
+        release_subnet("my-service");
+    });
 }
 
 #[test]
 fn subnet_for_different_services_differ() {
-    let a = subnet_for("service-a").unwrap();
-    let b = subnet_for("service-b").unwrap();
-    assert_ne!(a.host_ip, b.host_ip);
-    release_subnet("service-a");
-    release_subnet("service-b");
+    super::subnet::test_with_empty_registry(|| {
+        let a = subnet_for("service-a").unwrap();
+        let b = subnet_for("service-b").unwrap();
+        assert_ne!(a.host_ip, b.host_ip);
+        release_subnet("service-a");
+        release_subnet("service-b");
+    });
 }
 
 #[test]
 fn release_subnet_frees_lease() {
-    let a = subnet_for("lease-svc").unwrap();
-    release_subnet("lease-svc");
-    // After release, re-allocate should succeed with same preferred hash.
-    let b = subnet_for("lease-svc").unwrap();
-    assert_eq!(a.tap_id, b.tap_id);
-    release_subnet("lease-svc");
+    super::subnet::test_with_empty_registry(|| {
+        let a = subnet_for("lease-svc").unwrap();
+        release_subnet("lease-svc");
+        // After release, re-allocate should succeed with same preferred hash.
+        let b = subnet_for("lease-svc").unwrap();
+        assert_eq!(a.tap_id, b.tap_id);
+        release_subnet("lease-svc");
+    });
 }
 
 #[test]
 fn subnet_for_produces_valid_tap_id() {
-    let a = subnet_for("a-service-id-that-is-much-longer-than-a-linux-interface-name").unwrap();
-    assert!(a.tap_id.starts_with("rsl-"));
-    assert!(a.tap_id.len() <= 15);
-    assert!(a.tap_id.bytes().all(|byte| byte.is_ascii_hexdigit()
-        || byte == b'-'
-        || byte == b'r'
-        || byte == b's'
-        || byte == b'l'));
-    release_subnet("a-service-id-that-is-much-longer-than-a-linux-interface-name");
+    super::subnet::test_with_empty_registry(|| {
+        let a =
+            subnet_for("a-service-id-that-is-much-longer-than-a-linux-interface-name").unwrap();
+        assert!(a.tap_id.starts_with("rsl-"));
+        assert!(a.tap_id.len() <= 15);
+        assert!(a.tap_id.bytes().all(|byte| byte.is_ascii_hexdigit()
+            || byte == b'-'
+            || byte == b'r'
+            || byte == b's'
+            || byte == b'l'));
+        release_subnet("a-service-id-that-is-much-longer-than-a-linux-interface-name");
+    });
 }
 
 #[test]
 fn subnet_for_produces_valid_mac() {
-    let a = subnet_for("bar").unwrap();
-    assert!(a.mac.starts_with("02:00:00:00:"));
-    assert_eq!(a.mac.len(), 17);
-    release_subnet("bar");
+    super::subnet::test_with_empty_registry(|| {
+        let a = subnet_for("bar").unwrap();
+        assert!(a.mac.starts_with("02:00:00:00:"));
+        assert_eq!(a.mac.len(), 17);
+        release_subnet("bar");
+    });
 }
 
 #[test]
 fn subnet_index_bounded() {
-    for s in &["a", "b", "long-service-name-123", "edge", "max"] {
-        let allocation = subnet_for(s).unwrap();
-        let parts: Vec<&str> = allocation.host_ip.split('.').collect();
-        assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0], "10");
-        assert_eq!(parts[3], "1");
-        let x: u8 = parts[1].parse().unwrap();
-        let y: u8 = parts[2].parse().unwrap();
-        // Both octets are valid (full 16-bit space)
-        let _ = (x, y);
-        release_subnet(s);
-    }
+    super::subnet::test_with_empty_registry(|| {
+        for s in &["a", "b", "long-service-name-123", "edge", "max"] {
+            let allocation = subnet_for(s).unwrap();
+            let parts: Vec<&str> = allocation.host_ip.split('.').collect();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], "10");
+            assert_eq!(parts[3], "1");
+            let x: u8 = parts[1].parse().unwrap();
+            let y: u8 = parts[2].parse().unwrap();
+            // Both octets are valid (full 16-bit space)
+            let _ = (x, y);
+            release_subnet(s);
+        }
+    });
 }
 
 #[test]
@@ -182,6 +195,10 @@ fn pkill_virtiofsd_pattern_no_prefix_collision() {
 
 #[test]
 fn subnet_for_exhaustion_fails_closed() {
+    // Serialize against other subnet tests: filling all keys races with
+    // concurrent subnet_for callers in the same process.
+    let _g = super::subnet::subnet_test_lock();
+    super::subnet::test_clear_subnet_registry();
     // Fill every 16-bit key so the 1024-probe path cannot find a free slot.
     super::subnet::test_fill_all_subnet_keys();
     let err = subnet_for("exhaust-new-service").unwrap_err();
@@ -190,11 +207,16 @@ fn subnet_for_exhaustion_fails_closed() {
         "unexpected err: {err}"
     );
     // Must not register the new service under any key.
+    assert!(
+        super::subnet::lookup_subnet("exhaust-new-service").is_none(),
+        "exhausted allocate must not register a lease"
+    );
     super::subnet::test_clear_subnet_registry();
     // After clear, allocation succeeds and uses the preferred key.
     let alloc = subnet_for("exhaust-new-service").unwrap();
     assert_eq!(alloc.tap_id, preferred_subnet("exhaust-new-service").tap_id);
     release_subnet("exhaust-new-service");
+    super::subnet::test_clear_subnet_registry();
 }
 #[test]
 fn port_allocator_claim_existing_registers_port() {

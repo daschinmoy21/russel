@@ -73,15 +73,19 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
 /// Prefer generation-recorded TAP / IPs so destroy still works after promote.
 ///
 /// Does not register a subnet lease. Metadata is the source of truth for
-/// teardown; without it, the unregistered preferred key is used only for
-/// best-effort cleanup identifiers.
+/// teardown; without it, use a read-only registry lookup, then the unregistered
+/// preferred key only for best-effort cleanup identifiers.
 pub(super) fn network_alloc_for_service(service_id: &str) -> crate::network::SubnetAllocation {
     if let Some(meta) = read_metadata(service_id)
         && let (Some(tap_id), Some(host_ip), Some(vm_ip)) = (meta.tap_id, meta.host_ip, meta.vm_ip)
     {
         let mac = crate::network::network_key_from_host_ip(&host_ip)
             .map(|k| crate::network::allocation_from_network_key(k).mac)
-            .unwrap_or_else(|| crate::network::preferred_subnet(service_id).mac);
+            .unwrap_or_else(|| {
+                crate::network::lookup_subnet(service_id)
+                    .unwrap_or_else(|| crate::network::preferred_subnet(service_id))
+                    .mac
+            });
         return crate::network::SubnetAllocation {
             host_ip,
             vm_ip,
@@ -89,7 +93,8 @@ pub(super) fn network_alloc_for_service(service_id: &str) -> crate::network::Sub
             tap_id,
         };
     }
-    crate::network::preferred_subnet(service_id)
+    crate::network::lookup_subnet(service_id)
+        .unwrap_or_else(|| crate::network::preferred_subnet(service_id))
 }
 
 /// Verify PID ownership via /proc/<pid>/cmdline.
