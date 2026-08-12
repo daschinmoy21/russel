@@ -1,9 +1,102 @@
 use super::agent::{
     AGENT_BUSYBOX_APPLETS, AGENT_INIT_SCRIPT, AGENT_INITRAMFS_BASENAME, pack_cpio_blocking,
 };
+use super::process::{cloud_hypervisor_stop_pattern, stop_tap_identity};
 use super::runner::{MicrovmRunner, select_kernel_version};
 use crate::network::{PortAllocator, lookup_subnet, release_subnet, subnet_for};
 use std::path::PathBuf;
+
+// ── Stop process-selection fallback (metadata / registry / service-path) ────
+
+#[test]
+fn stop_tap_prefers_metadata_over_registry() {
+    crate::network::test_with_empty_registry(|| {
+        let svc = "stop-meta-svc";
+        // Registry holds a different TAP than metadata would report.
+        let leased = subnet_for(svc).unwrap();
+        let meta_tap = "rsl-deadbeef";
+        assert_ne!(leased.tap_id, meta_tap);
+
+        let chosen = stop_tap_identity(svc, Some(meta_tap));
+        assert_eq!(chosen.as_deref(), Some(meta_tap));
+
+        let pattern = cloud_hypervisor_stop_pattern(svc, chosen.as_deref());
+        assert!(
+            pattern.contains(&format!("tap={meta_tap}")),
+            "pattern must pin metadata TAP: {pattern}"
+        );
+        assert!(
+            !pattern.contains(&leased.tap_id),
+            "must not fall through to registry TAP when metadata is present"
+        );
+        release_subnet(svc);
+    });
+}
+
+#[test]
+fn stop_tap_uses_registry_when_metadata_absent() {
+    crate::network::test_with_empty_registry(|| {
+        let svc = "stop-reg-svc";
+        let leased = subnet_for(svc).unwrap();
+
+        assert!(stop_tap_identity(svc, None).as_deref() == Some(leased.tap_id.as_str()));
+        assert!(stop_tap_identity(svc, Some("")).as_deref() == Some(leased.tap_id.as_str()));
+
+        let pattern = cloud_hypervisor_stop_pattern(svc, Some(&leased.tap_id));
+        assert!(pattern.contains(&format!("tap={}", leased.tap_id)));
+        assert!(
+            !pattern.contains(&format!("russel/{svc}/")),
+            "TAP path should not use service-path marker"
+        );
+        release_subnet(svc);
+    });
+}
+
+#[test]
+fn stop_pattern_falls_back_to_service_path_without_identity() {
+    crate::network::test_with_empty_registry(|| {
+        let svc = "stop-path-svc";
+        assert!(lookup_subnet(svc).is_none());
+        assert!(stop_tap_identity(svc, None).is_none());
+
+        let pattern = cloud_hypervisor_stop_pattern(svc, None);
+        assert!(
+            pattern.contains(&format!("russel/{svc}/")),
+            "expected service-path marker: {pattern}"
+        );
+        assert!(
+            !pattern.contains("tap="),
+            "must not invent a preferred TAP identity: {pattern}"
+        );
+    });
+}
+
+#[test]
+fn stop_pattern_does_not_select_other_service_identity() {
+    crate::network::test_with_empty_registry(|| {
+        let svc_a = "stop-iso-a";
+        let svc_b = "stop-iso-b";
+        let lease_b = subnet_for(svc_b).unwrap();
+
+        // Service A has no metadata or lease — path fallback only.
+        assert!(stop_tap_identity(svc_a, None).is_none());
+        let pattern_a = cloud_hypervisor_stop_pattern(svc_a, None);
+
+        // Must not match B's TAP or B's service path.
+        assert!(!pattern_a.contains(&lease_b.tap_id));
+        assert!(!pattern_a.contains(&format!("russel/{svc_b}/")));
+        assert!(pattern_a.contains(&format!("russel/{svc_a}/")));
+
+        // Service B with its own TAP must not match A's path either.
+        let pattern_b = cloud_hypervisor_stop_pattern(svc_b, Some(&lease_b.tap_id));
+        assert!(pattern_b.contains(&format!("tap={}", lease_b.tap_id)));
+        assert!(!pattern_b.contains(&format!("russel/{svc_a}/")));
+        assert!(!pattern_b.contains(&format!("russel/{svc_b}/")));
+
+        release_subnet(svc_a);
+        release_subnet(svc_b);
+    });
+}
 
 #[test]
 fn validate_service_id_accepts_normal_ids() {

@@ -82,10 +82,12 @@ pub(super) fn network_alloc_for_service(
     if let Some(meta) = read_metadata(service_id)
         && let (Some(tap_id), Some(host_ip), Some(vm_ip)) = (meta.tap_id, meta.host_ip, meta.vm_ip)
     {
+        // MAC from host_ip key when possible; else registered lease; else preferred
+        // string only (not used as TAP identity).
         let mac = crate::network::network_key_from_host_ip(&host_ip)
             .map(|k| crate::network::allocation_from_network_key(k).mac)
             .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.mac))
-            .unwrap_or_default();
+            .unwrap_or_else(|| crate::network::preferred_subnet(service_id).mac);
         return Some(crate::network::SubnetAllocation {
             host_ip,
             vm_ip,
@@ -94,6 +96,27 @@ pub(super) fn network_alloc_for_service(
         });
     }
     crate::network::lookup_subnet(service_id)
+}
+
+/// Authoritative TAP for stop process-selection: metadata TAP first, then this
+/// service's registry lease. Never invents a preferred hash TAP.
+pub(super) fn stop_tap_identity(service_id: &str, metadata_tap: Option<&str>) -> Option<String> {
+    if let Some(tap) = metadata_tap.filter(|t| !t.is_empty()) {
+        return Some(tap.to_string());
+    }
+    crate::network::lookup_subnet(service_id).map(|a| a.tap_id)
+}
+
+/// `pkill -f` pattern for Cloud Hypervisor stop fallback.
+///
+/// - With a known TAP: match that TAP only.
+/// - Without: match the service path marker under `russel/{service_id}/` so
+///   cleanup cannot select another service's CH process via preferred hash.
+pub(super) fn cloud_hypervisor_stop_pattern(service_id: &str, tap: Option<&str>) -> String {
+    match tap {
+        Some(tap) => format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)"),
+        None => format!("(^|[[:space:]])cloud-hypervisor .*russel/{service_id}/"),
+    }
 }
 
 /// Owned TAP ids from metadata and/or registry lease (no preferred invent).

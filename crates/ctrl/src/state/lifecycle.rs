@@ -525,8 +525,10 @@ impl AppState {
     /// [`abort_lifecycle_operation`] to restore prior status and re-supervise.
     ///
     /// Distinguishes NotFound (no such service) from Busy (conflicting op).
-    /// Same-op re-entry is allowed (hung stop retry); destroy may supersede stop.
-    /// Each claim returns a `claim_generation` that abort must present.
+    /// Same-op re-entry (stop-while-stopping, destroy-while-destroying) is Busy
+    /// so concurrent claims cannot race two cleanups. Destroy may still
+    /// supersede a stuck stop. Each claim returns a `claim_generation` that
+    /// abort must present so a superseded claim cannot restore.
     pub fn begin_lifecycle_operation(
         &self,
         service_id: &str,
@@ -537,8 +539,6 @@ impl AppState {
         let Some(s) = inner.services.get_mut(service_id) else {
             return LifecycleClaim::NotFound;
         };
-        // Serialize lifecycle ops per service. Same-op re-entry is Busy so two
-        // stop/destroy calls cannot race. Destroy may supersede a stuck stop.
         let busy = match s.status.as_str() {
             "building" | "destroying" => true,
             "stopping" => status != "destroying",
