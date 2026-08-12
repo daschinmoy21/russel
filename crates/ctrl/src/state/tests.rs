@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -570,13 +568,35 @@ fn test_write_catalog_emits_valid_json() {
     let state = AppState::default();
     state.adopt_running_microvm("cat-svc", 4000, 3000, None, None);
 
-    // write_catalog writes /var/lib/russel/ctrl-catalog.json —
-    // we can't unit-test that path directly without root, but we can
-    // verify it doesn't panic and the catalog machinery works.
-    // In CI/tests the /var/lib/russel path may not exist, so this
-    // is a best-effort smoke test.
-    let result = state.write_catalog();
-    // The write may fail if /var/lib/russel doesn't exist in test env.
-    // That's fine — the code path is exercised.
-    let _ = result;
+    // Assert catalog JSON shape without writing /var/lib/russel (no root needed).
+    let catalog = state.build_catalog();
+    assert_eq!(catalog["schema_version"], 1);
+    assert!(
+        catalog["updated_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "updated_at must be a non-empty string, got: {:?}",
+        catalog["updated_at"]
+    );
+    assert_eq!(catalog["services"]["cat-svc"]["status"], "deployed");
+    assert_eq!(catalog["services"]["cat-svc"]["runtime"], "microvm");
+    assert_eq!(catalog["services"]["cat-svc"]["host_port"], 4000);
+
+    // Round-trip through serde to prove the value is valid JSON.
+    let encoded = serde_json::to_string_pretty(&catalog).expect("catalog serializes");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&encoded).expect("catalog deserializes as JSON");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["services"]["cat-svc"]["host_port"], 4000);
+
+    // Disk write path may fail without /var/lib/russel; if it succeeds, file is JSON.
+    if let Ok(()) = state.write_catalog() {
+        let path = std::path::Path::new("/var/lib/russel/ctrl-catalog.json");
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let from_disk: serde_json::Value =
+                serde_json::from_str(&raw).expect("on-disk catalog is valid JSON");
+            assert_eq!(from_disk["schema_version"], 1);
+            assert_eq!(from_disk["services"]["cat-svc"]["status"], "deployed");
+        }
+    }
 }

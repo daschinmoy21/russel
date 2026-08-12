@@ -105,10 +105,16 @@ fn fnv1a_is_xor_then_multiply() {
         2_166_136_261,
         "FNV-1a empty-string = offset basis"
     );
-    // "a" = (0x811c9dc5 ^ 0x61) * 0x01000193 = 0xe40c2d6c = 3826002220.
+    // "a" = (0x811c9dc5 ^ 0x61) * 0x01000193 = 0xe40c292c = 3826002220.
     assert_eq!(fnv1a("a"), 3_826_002_220, "FNV-1a(\"a\") known answer");
-    // "foo" cross-check: deterministic but we don't need the exact value.
-    assert_eq!(fnv1a("foo"), fnv1a("foo"));
+    // "foo" known-answer: 0xa9f37ed7 = 2851307223.
+    assert_eq!(fnv1a("foo"), 2_851_307_223, "FNV-1a(\"foo\") known answer");
+    // "hello" known-answer: 0x4f9f2cab = 1335831723.
+    assert_eq!(
+        fnv1a("hello"),
+        1_335_831_723,
+        "FNV-1a(\"hello\") known answer"
+    );
 }
 
 #[test]
