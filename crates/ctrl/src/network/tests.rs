@@ -148,6 +148,32 @@ fn port_allocator_release_drops_hold() {
 }
 
 #[test]
+fn claim_existing_same_port_drops_residual_hold() {
+    // reserve holds a TcpListener; claim_existing means the live publisher
+    // already owns the port, so any residual hold must be released.
+    PortAllocator::release("claim-hold-svc");
+    PortAllocator::reserve("claim-hold-svc", 4012).unwrap();
+    let bind = publish_bind_addr();
+    assert!(
+        std::net::TcpListener::bind((bind.as_str(), 4012u16)).is_err(),
+        "port must be held after reserve"
+    );
+    PortAllocator::claim_existing("claim-hold-svc", 4012).unwrap();
+    // Hold should be gone so the publisher (or a test bind) can take the port.
+    assert!(
+        PortAllocator::take_hold("claim-hold-svc").is_none(),
+        "claim_existing must clear residual hold for same port"
+    );
+    let after = std::net::TcpListener::bind((bind.as_str(), 4012u16));
+    assert!(
+        after.is_ok(),
+        "port must be free for bind after claim_existing same port"
+    );
+    drop(after);
+    PortAllocator::release("claim-hold-svc");
+}
+
+#[test]
 fn fnv1a_is_xor_then_multiply() {
     // Verify FNV-1a uses XOR-then-MULTIPLY, not MULTIPLY-then-XOR (FNV-1).
     // Also check known-answer test vectors for the 32-bit variant.

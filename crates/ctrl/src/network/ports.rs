@@ -153,6 +153,9 @@ impl PortAllocator {
         // If this service already has a different port, release it first.
         if let Some(&old_port) = registry.allocations.get(service_id) {
             if old_port == port {
+                // Live publisher already owns the port — drop any residual hold
+                // left by a prior reserve so the publisher can (re)bind.
+                drop(registry.holds.remove(service_id));
                 return Ok(());
             }
             registry.busy_ports.remove(&old_port);
