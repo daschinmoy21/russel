@@ -33,7 +33,7 @@ async fn test_detach_all_processes_nonempty() {
         .expect("failed to spawn sleep");
 
     let _vm_pid = vm_child.id();
-    state.mark_deployed_with_aux("test-svc", vm_child, vec![aux1, aux2]);
+    state.mark_deployed_with_aux("test-svc", vm_child, vec![aux1, aux2], None, None);
 
     // Verify initial state
     let status = state.status("test-svc").unwrap();
@@ -125,6 +125,37 @@ fn test_mark_deployed_then_logs_and_status() {
     assert_eq!(status.status, "failed");
     let logs = state.logs("svc-a").unwrap();
     assert!(logs.output.contains("test error"));
+}
+
+#[tokio::test]
+async fn test_mark_deployed_with_aux_stores_ports() {
+    let state = AppState::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    state.mark_deployed_with_aux("ports-vm", child, vec![], Some(8080), Some(3000));
+    let status = state.status("ports-vm").unwrap();
+    assert_eq!(status.host_port, Some(8080));
+    assert_eq!(status.guest_port, Some(3000));
+    assert_eq!(status.runtime, Some(RuntimeKind::Microvm));
+    // Clean up child so the test process does not leak a sleep.
+    let (vm, _) = state.take_processes("ports-vm").expect("processes");
+    if let Some(mut child) = vm {
+        let _ = child.kill().await;
+    }
+}
+
+#[test]
+fn test_mark_deployed_container_stores_ports() {
+    let state = AppState::default();
+    state.mark_deployed_container("ports-ctr", "cid-1", Some(9090), Some(3000));
+    let status = state.status("ports-ctr").unwrap();
+    assert_eq!(status.host_port, Some(9090));
+    assert_eq!(status.guest_port, Some(3000));
+    assert_eq!(status.runtime, Some(RuntimeKind::Container));
+    assert_eq!(status.status, "deployed");
+    assert_eq!(status.vm_state, "running");
 }
 
 #[test]
@@ -343,7 +374,7 @@ async fn supervisor_marks_failed_when_child_exits() {
     let child = tokio::process::Command::new("true")
         .spawn()
         .expect("spawn true");
-    state.mark_deployed_with_aux("svc-exit", child, vec![]);
+    state.mark_deployed_with_aux("svc-exit", child, vec![], None, None);
 
     // Supervisor polls every 500ms after an initial tick skip.
     let mut saw_failed = false;
@@ -372,7 +403,7 @@ async fn supervisor_ignores_intentional_take_processes() {
         .arg("30")
         .spawn()
         .expect("spawn sleep");
-    state.mark_deployed_with_aux("svc-take", child, vec![]);
+    state.mark_deployed_with_aux("svc-take", child, vec![], None, None);
 
     let (vm, _aux) = state.take_processes("svc-take").expect("processes present");
     // Give the supervisor time to observe the generation change.
@@ -521,7 +552,7 @@ async fn test_adopt_running_microvm_does_not_overwrite_live_handle() {
     let child = tokio::process::Command::new("true")
         .spawn()
         .expect("spawn true");
-    state.mark_deployed_with_aux("protected", child, vec![]);
+    state.mark_deployed_with_aux("protected", child, vec![], None, None);
 
     // Adopt should not overwrite.
     state.adopt_running_microvm("protected", 9999, 9999, None, None);
@@ -551,7 +582,7 @@ async fn test_adopt_running_container_does_not_overwrite_live_handle() {
     let child = tokio::process::Command::new("true")
         .spawn()
         .expect("spawn true");
-    state.mark_deployed_with_aux("protected-ctr", child, vec![]);
+    state.mark_deployed_with_aux("protected-ctr", child, vec![], None, None);
 
     // Adopt should not overwrite.
     state.adopt_running_container("protected-ctr", "xyz", 9999, 9999, None);

@@ -242,8 +242,13 @@ impl DeployPipeline {
                     } => {
                         let mut aux = vec![*socat_child];
                         aux.extend(virtiofsd_children);
-                        self.state
-                            .mark_deployed_with_aux(&service_id, *vm_child, aux);
+                        self.state.mark_deployed_with_aux(
+                            &service_id,
+                            *vm_child,
+                            aux,
+                            Some(host_port),
+                            Some(guest_port),
+                        );
                         (
                             format!(
                                 "microVM running. localhost:{host_port} -> {}:{guest_port}",
@@ -259,8 +264,12 @@ impl DeployPipeline {
                         rootfs_path,
                         ..
                     } => {
-                        self.state
-                            .mark_deployed_container(&service_id, &container_id);
+                        self.state.mark_deployed_container(
+                            &service_id,
+                            &container_id,
+                            Some(host_port),
+                            Some(guest_port),
+                        );
                         (
                             format!(
                                 "container {container_name} running. localhost:{host_port} -> guest:{guest_port}"
