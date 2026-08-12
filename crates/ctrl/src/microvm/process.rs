@@ -70,12 +70,12 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
     })
 }
 
-/// Prefer generation-recorded TAP / IPs so destroy still works after promote.
+/// Resolve TAP / IP identity for teardown without registering a subnet lease.
 ///
-/// Does not register a subnet lease. Metadata is the source of truth for
-/// teardown; without it, only a read-only registry lookup of an owned lease is
-/// used. Never falls back to preferred_subnet: that unregistered key may
-/// belong to another live service and would make destroy/stop target the wrong TAP.
+/// Priority:
+/// 1. Complete on-disk metadata (`tap_id`, `host_ip`, `vm_ip`)
+/// 2. Registered lease via [`crate::network::lookup_subnet`]
+/// 3. `None` — never invent preferred_subnet (hash collisions can hit another service)
 pub(super) fn network_alloc_for_service(
     service_id: &str,
 ) -> Option<crate::network::SubnetAllocation> {
@@ -96,28 +96,96 @@ pub(super) fn network_alloc_for_service(
     crate::network::lookup_subnet(service_id)
 }
 
+/// Owned TAP ids from metadata and/or registry lease (no preferred invent).
+fn owned_tap_ids(service_id: &str) -> Vec<String> {
+    let mut tap_ids = Vec::new();
+    if let Some(meta) = read_metadata(service_id)
+        && let Some(tap) = meta.tap_id
+    {
+        tap_ids.push(tap);
+    }
+    if let Some(alloc) = crate::network::lookup_subnet(service_id)
+        && !tap_ids.contains(&alloc.tap_id)
+    {
+        tap_ids.push(alloc.tap_id);
+    }
+    tap_ids
+}
+
+fn exe_basename(arg0: &str) -> &str {
+    std::path::Path::new(arg0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(arg0)
+}
+
+/// True when `arg` is exactly `tap={id}` or `tap={id},...` (CH multi-device form).
+fn arg_matches_tap(arg: &str, tap_id: &str) -> bool {
+    let tap_arg = format!("tap={tap_id}");
+    arg == tap_arg || arg.starts_with(&format!("{tap_arg},"))
+}
+
+/// Socat process title / argv token bound to this service (space or end after id).
+fn arg_matches_socat_title(arg: &str, service_id: &str) -> bool {
+    let needle = format!("socat-russel-{service_id}");
+    if arg == needle {
+        return true;
+    }
+    arg.strip_prefix(&needle)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('-'))
+}
+
 /// Verify PID ownership via /proc/<pid>/cmdline.
+///
+/// Requires a corroborating executable identity before trusting service-scoped
+/// path or name markers. TAP matches only use owned (metadata/lease) identities.
+/// Never registers a lease and never invents preferred_subnet.
 pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
     let cmdline_path = format!("/proc/{pid}/cmdline");
-    // Prefer owned TAP (metadata or registry lease); never preferred_subnet.
-    let tap_match = network_alloc_for_service(service_id).map(|a| {
-        let tap_arg = format!("tap={}", a.tap_id);
-        (tap_arg.clone(), format!("{tap_arg},"))
-    });
-    std::fs::read(cmdline_path)
-        .map(|cmdline| {
-            cmdline.split(|byte| *byte == 0).any(|arg| {
-                let arg = String::from_utf8_lossy(arg);
-                if let Some((ref tap_arg, ref tap_prefix)) = tap_match
-                    && (arg == *tap_arg || arg.starts_with(tap_prefix.as_str()))
-                {
-                    return true;
-                }
-                arg.contains(&format!("russel/{service_id}/"))
-                    || arg.contains(&format!("socat-russel-{service_id}"))
-            })
-        })
-        .unwrap_or(false)
+    let Ok(raw) = std::fs::read(cmdline_path) else {
+        return false;
+    };
+    let args: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    if args.is_empty() {
+        return false;
+    }
+
+    let exe = args[0].as_str();
+    let base = exe_basename(exe);
+    let tap_ids = owned_tap_ids(service_id);
+    let trusted_path = format!("/var/lib/russel/{service_id}/");
+    let path_marker = format!("russel/{service_id}/");
+
+    // cloud-hypervisor: executable + owned TAP device argument.
+    if base == "cloud-hypervisor" {
+        return args
+            .iter()
+            .any(|arg| tap_ids.iter().any(|tap| arg_matches_tap(arg, tap)));
+    }
+
+    // virtiofsd: executable + trusted socket/path under this service tree.
+    if base == "virtiofsd" {
+        return args
+            .iter()
+            .any(|arg| arg.contains(&trusted_path) || arg.contains(&path_marker));
+    }
+
+    // socat: executable (or retitled argv0) + service-bound title/token.
+    // Retitled processes may present argv0 as `socat-russel-{id}`.
+    if base == "socat" || arg_matches_socat_title(base, service_id) {
+        return args
+            .iter()
+            .any(|arg| arg_matches_socat_title(arg, service_id))
+            || (base != "socat" && arg_matches_socat_title(base, service_id));
+    }
+
+    // No unscoped substring match: unrelated processes that merely mention the
+    // service id in an argument must not pass ownership checks.
+    false
 }
 
 pub(super) async fn terminate_owned_process(pid: u32, service_id: &str) -> anyhow::Result<bool> {
