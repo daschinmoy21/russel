@@ -537,14 +537,11 @@ impl AppState {
         let Some(s) = inner.services.get_mut(service_id) else {
             return LifecycleClaim::NotFound;
         };
-        // Prevent concurrent lifecycle ops on a different kind of op.
-        // Same-op re-entry (stop while "stopping", destroy while "destroying")
-        // is allowed so a hung first attempt can be retried/forced. Destroy is
-        // also allowed to supersede a stuck stop.
+        // Serialize lifecycle ops per service. Same-op re-entry is Busy so two
+        // stop/destroy calls cannot race. Destroy may supersede a stuck stop.
         let busy = match s.status.as_str() {
-            "building" => true,
-            "destroying" => status != "destroying",
-            "stopping" => status != "stopping" && status != "destroying",
+            "building" | "destroying" => true,
+            "stopping" => status != "destroying",
             _ => false,
         };
         if busy {

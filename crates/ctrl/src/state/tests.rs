@@ -188,7 +188,7 @@ fn test_begin_lifecycle_operation() {
 }
 
 #[test]
-fn test_begin_lifecycle_allows_stop_reentry_when_stuck_stopping() {
+fn test_begin_lifecycle_same_op_reentry_is_busy() {
     let state = AppState::default();
     state.mark_building("svc-1").unwrap();
     state.set_status("svc-1", "deployed", "running");
@@ -196,17 +196,21 @@ fn test_begin_lifecycle_allows_stop_reentry_when_stuck_stopping() {
         state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
         LifecycleClaim::Claimed { .. }
     ));
-    // Second stop while already stopping — recovery / force path.
+    // Second stop while already stopping — Busy (no overlapping claims).
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
-        LifecycleClaim::Claimed { .. }
+        LifecycleClaim::Busy
     ));
     // Destroy may supersede stuck stop.
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
         LifecycleClaim::Claimed { .. }
     ));
-    // Stop cannot run while destroying.
+    // Same-op destroy re-entry and stop-while-destroying are both Busy.
+    assert!(matches!(
+        state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
+        LifecycleClaim::Busy
+    ));
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
         LifecycleClaim::Busy
