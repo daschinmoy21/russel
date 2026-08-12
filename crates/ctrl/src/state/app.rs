@@ -14,9 +14,14 @@ use tokio::process::Child;
 use tokio::sync::Notify;
 
 /// Outcome of attempting to claim a service for a lifecycle operation.
+#[derive(Debug)]
 pub enum LifecycleClaim {
-    /// Service was claimed; processes are handed off to the caller.
-    Claimed(Option<Child>, Vec<Child>),
+    /// Service was claimed. Process handles remain in `AppState` until the
+    /// success path takes them for reaping; `prior_*` restore status on abort.
+    Claimed {
+        prior_status: String,
+        prior_vm_state: String,
+    },
     /// No such service in state.
     NotFound,
     /// Service exists but is already in a conflicting lifecycle op.

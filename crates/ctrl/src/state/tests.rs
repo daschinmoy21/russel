@@ -192,23 +192,132 @@ fn test_begin_lifecycle_allows_stop_reentry_when_stuck_stopping() {
     state.set_status("svc-1", "deployed", "running");
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
-        LifecycleClaim::Claimed(_, _)
+        LifecycleClaim::Claimed { .. }
     ));
     // Second stop while already stopping — recovery / force path.
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
-        LifecycleClaim::Claimed(_, _)
+        LifecycleClaim::Claimed { .. }
     ));
     // Destroy may supersede stuck stop.
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
-        LifecycleClaim::Claimed(_, _)
+        LifecycleClaim::Claimed { .. }
     ));
     // Stop cannot run while destroying.
     assert!(matches!(
         state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
         LifecycleClaim::Busy
     ));
+}
+
+#[tokio::test]
+async fn begin_lifecycle_keeps_processes_until_take() {
+    let state = AppState::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let expected_pid = child.id();
+    state.mark_deployed_with_aux("svc-keep", child, vec![]);
+
+    let gen_before = {
+        let inner = state.lock_inner();
+        inner.services.get("svc-keep").unwrap().process_generation
+    };
+
+    let claim = state.begin_lifecycle_operation("svc-keep", "stopping", "pending");
+    match claim {
+        LifecycleClaim::Claimed {
+            prior_status,
+            prior_vm_state,
+        } => {
+            assert_eq!(prior_status, "deployed");
+            assert_eq!(prior_vm_state, "running");
+        }
+        other => panic!("expected Claimed, got non-Claimed: {other:?}"),
+    }
+
+    // Claim must not strip process ownership.
+    {
+        let inner = state.lock_inner();
+        let s = inner.services.get("svc-keep").unwrap();
+        assert_eq!(s.status, "stopping");
+        assert_eq!(s.vm_state, "pending");
+        assert!(s.vm_process.is_some(), "children must remain after claim");
+        assert_eq!(s.vm_pid, expected_pid);
+        assert_ne!(
+            s.process_generation, gen_before,
+            "supervisor generation must bump on claim"
+        );
+    }
+
+    let (vm, aux) = state
+        .take_processes_for_reap("svc-keep")
+        .expect("service present");
+    assert!(vm.is_some());
+    assert!(aux.is_empty());
+    {
+        let inner = state.lock_inner();
+        let s = inner.services.get("svc-keep").unwrap();
+        assert!(s.vm_process.is_none());
+        assert!(s.vm_pid.is_none());
+    }
+    if let Some(mut child) = vm {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
+#[tokio::test]
+async fn abort_lifecycle_restores_status_and_keeps_processes() {
+    let state = AppState::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    state.mark_deployed_with_aux("svc-abort", child, vec![]);
+
+    let claim = state.begin_lifecycle_operation("svc-abort", "stopping", "pending");
+    let LifecycleClaim::Claimed {
+        prior_status,
+        prior_vm_state,
+    } = claim
+    else {
+        panic!("expected Claimed");
+    };
+
+    let gen_after_claim = {
+        let inner = state.lock_inner();
+        inner.services.get("svc-abort").unwrap().process_generation
+    };
+
+    state.abort_lifecycle_operation("svc-abort", &prior_status, &prior_vm_state);
+
+    let status = state.status("svc-abort").unwrap();
+    assert_eq!(status.status, "deployed");
+    assert_eq!(status.vm_state, "running");
+    {
+        let inner = state.lock_inner();
+        let s = inner.services.get("svc-abort").unwrap();
+        assert!(
+            s.vm_process.is_some(),
+            "abort must leave process ownership intact"
+        );
+        assert_ne!(
+            s.process_generation, gen_after_claim,
+            "abort re-bumps generation for re-supervision"
+        );
+    }
+
+    // Clean up so kill_on_drop does not leave sleep zombies if the test process
+    // exits before Child Drop runs in some runners.
+    if let Some((vm, _)) = state.take_processes_for_reap("svc-abort")
+        && let Some(mut child) = vm
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
 }
 
 #[test]

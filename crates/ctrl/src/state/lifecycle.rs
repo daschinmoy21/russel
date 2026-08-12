@@ -519,9 +519,12 @@ impl AppState {
         Some((vm, aux))
     }
 
-    /// Atomically begin a lifecycle operation: claim processes and update status.
-    /// Distinguishes between NotFound (no such service) and Busy (already in a
-    /// conflicting lifecycle op).
+    /// Atomically begin a lifecycle operation: mark status and invalidate the
+    /// process supervisor. Process handles stay in state until the success path
+    /// calls [`take_processes_for_reap`]; on failure call
+    /// [`abort_lifecycle_operation`] to restore prior status and re-supervise.
+    ///
+    /// Distinguishes NotFound (no such service) from Busy (conflicting op).
     pub fn begin_lifecycle_operation(
         &self,
         service_id: &str,
@@ -545,16 +548,60 @@ impl AppState {
         if busy {
             return LifecycleClaim::Busy;
         }
+        let prior_status = s.status.clone();
+        let prior_vm_state = s.vm_state.clone();
         s.status = status.to_string();
         s.vm_state = vm_state.to_string();
         // Invalidate supervisor so intentional stop/destroy is not reported as crash.
+        // Children remain owned by this ServiceState until take_processes_for_reap.
         s.process_generation = s.process_generation.wrapping_add(1);
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
+        LifecycleClaim::Claimed {
+            prior_status,
+            prior_vm_state,
+        }
+    }
+
+    /// Take process handles for reaping after a successful stop/destroy.
+    ///
+    /// Does not bump `process_generation` — [`begin_lifecycle_operation`] already
+    /// invalidated the supervisor. Returns `None` if the service is gone.
+    pub fn take_processes_for_reap(&self, service_id: &str) -> Option<(Option<Child>, Vec<Child>)> {
+        let mut inner = self.lock_inner();
+        let s = inner.services.get_mut(service_id)?;
         let vm = s.vm_process.take();
         let aux = std::mem::take(&mut s.aux_processes);
         s.vm_pid = None;
-        s.prebuild_status = None;
-        s.prebuild_vm_state = None;
-        LifecycleClaim::Claimed(vm, aux)
+        Some((vm, aux))
+    }
+
+    /// Abort a failed lifecycle op: restore prior status/vm_state, re-bump
+    /// generation, and re-spawn a process supervisor if children remain.
+    pub fn abort_lifecycle_operation(
+        &self,
+        service_id: &str,
+        prior_status: &str,
+        prior_vm_state: &str,
+    ) {
+        let needs_supervisor = {
+            let mut inner = self.lock_inner();
+            let Some(s) = inner.services.get_mut(service_id) else {
+                return;
+            };
+            s.status = prior_status.to_string();
+            s.vm_state = prior_vm_state.to_string();
+            s.process_generation = s.process_generation.wrapping_add(1);
+            let generation = s.process_generation;
+            let has_children = s.vm_process.is_some() || !s.aux_processes.is_empty();
+            if has_children { Some(generation) } else { None }
+        };
+        if let Some(generation) = needs_supervisor {
+            self.spawn_process_supervisor(service_id.to_string(), generation);
+        }
+        if let Err(e) = self.write_catalog() {
+            tracing::warn!(error = %e, "failed to write catalog after abort_lifecycle_operation");
+        }
     }
 
     pub fn set_status(&self, service_id: &str, status: &str, vm_state: &str) {
@@ -569,38 +616,6 @@ impl AppState {
         if let Err(e) = self.write_catalog() {
             tracing::warn!(error = %e, "failed to write catalog after set_status");
         }
-    }
-
-    // kept for deploy error recovery / future reconcile
-    #[allow(dead_code)]
-    pub fn restore_processes(
-        &self,
-        service_id: &str,
-        vm_process: Option<Child>,
-        aux_processes: Vec<Child>,
-    ) {
-        let generation = {
-            let mut inner = self.lock_inner();
-            if let Some(s) = inner.services.get_mut(service_id) {
-                if let Some(p) = vm_process {
-                    s.vm_pid = p.id();
-                    s.vm_process = Some(p);
-                }
-                s.aux_processes.extend(aux_processes);
-                // ponytail: bump generation and spawn a supervisor so the restored
-                // children are monitored (issue #32). If status is not "deployed" the
-                // supervisor exits harmlessly; the next deployment will spawn its own.
-                s.process_generation = s.process_generation.wrapping_add(1);
-                s.process_generation
-            } else {
-                tracing::warn!(
-                    service_id = %service_id,
-                    "restore_processes called for unknown service"
-                );
-                return;
-            }
-        };
-        self.spawn_process_supervisor(service_id.to_string(), generation);
     }
 
     pub fn remove_service(&self, service_id: &str) {
