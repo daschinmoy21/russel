@@ -1,14 +1,9 @@
 ---
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
-import { api, isServiceRunning } from '../lib/api';
 
-const targetId = Astro.url.searchParams.get('id');
-const { service: initialSvc, connection } = targetId
-  ? await api.getServiceDetail(targetId)
-  : { service: null as any, connection: 'live' as const };
-const initialLogs = targetId && initialSvc ? await api.getServiceLogs(targetId) : '';
-const initialRunning = initialSvc ? isServiceRunning(initialSvc) : false;
+// Static shell only — no build-time control-plane fetch (#306).
+// Query ?id= is client-only on static builds; loadDetail() hydrates live data.
 ---
 
 <Layout title="Service Detail" activePath="/services">
@@ -17,42 +12,38 @@ const initialRunning = initialSvc ? isServiceRunning(initialSvc) : false;
   </div>
 
   <div id="detailRoot">
-    {targetId ? (
-      initialSvc ? (
-      <>
-        <Header
-          title={initialSvc.name || initialSvc.id}
-          subtitle={`Service ID: ${initialSvc.id}`}
-          connection={connection}
-        />
+    <Header
+      title="Loading…"
+      subtitle="Service details load in the browser."
+    />
 
-        <div class="detail-grid">
-          <!-- Overview Panel -->
-          <div class="card-panel info-panel">
-            <div class="panel-header-row">
-              <h2 class="section-title">Overview & Status</h2>
-              <span class={`badge ${initialRunning ? 'badge-running' : 'badge-stopped'}`} id="serviceStatusBadge">
-                <span class="badge-dot"></span>
-                <span id="serviceStatusText">{initialSvc.status}</span>
-              </span>
-            </div>
+    <div class="detail-grid">
+      <!-- Overview Panel -->
+      <div class="card-panel info-panel">
+        <div class="panel-header-row">
+          <h2 class="section-title">Overview & Status</h2>
+          <span class="badge badge-muted" id="serviceStatusBadge">
+            <span class="badge-dot"></span>
+            <span id="serviceStatusText">Loading…</span>
+          </span>
+        </div>
 
         <div class="stats-grid" id="statsGrid">
           <div class="stat-item">
             <span class="stat-label">Runtime Engine</span>
-            <span class="stat-value" id="statRuntime">{initialSvc.runtime === 'microvm' ? 'Cloud-Hypervisor (MicroVM)' : 'Podman (Container)'}</span>
+            <span class="stat-value" id="statRuntime">—</span>
           </div>
           <div class="stat-item">
             <span class="stat-label">Port Mappings</span>
-            <span class="stat-value mono" id="statPorts">{initialSvc.ports || 'None'}</span>
+            <span class="stat-value mono" id="statPorts">—</span>
           </div>
           <div class="stat-item">
             <span class="stat-label">VM State</span>
-            <span class="stat-value mono" id="statVmState">{initialSvc.vm_state || 'unknown'}</span>
+            <span class="stat-value mono" id="statVmState">—</span>
           </div>
           <div class="stat-item">
             <span class="stat-label">Uptime</span>
-            <span class="stat-value" id="statUptime">Loading...</span>
+            <span class="stat-value" id="statUptime">Loading…</span>
           </div>
         </div>
 
@@ -94,23 +85,9 @@ const initialRunning = initialSvc ? isServiceRunning(initialSvc) : false;
             <button id="btnClearLogs" class="btn btn-secondary btn-sm">Clear</button>
           </div>
         </div>
-        <div class="log-console" id="logConsole">{initialLogs}</div>
+        <div class="log-console" id="logConsole">Loading…</div>
       </div>
     </div>
-      </>
-      ) : (
-        <div class="card-panel empty-state">
-          <p style="font-weight: 600; font-size: 1.1rem; margin-bottom: 0.5rem;">Service unavailable</p>
-          <p style="color: var(--text-muted);">Control plane offline. Start <code>russel-ctrl</code> or enable Demo mode in Settings.</p>
-          <a href="/settings" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem">Open Settings</a>
-        </div>
-      )
-    ) : (
-      <div class="card-panel empty-state">
-        <p style="font-weight: 600; font-size: 1.1rem; margin-bottom: 0.5rem;">No service selected</p>
-        <p style="color: var(--text-muted);">Select a service from <a href="/services" style="color: var(--accent-primary)">the fleet list</a> to view details.</p>
-      </div>
-    )}
   </div>
 
   <!-- Deployment History Card -->

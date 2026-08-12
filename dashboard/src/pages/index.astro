@@ -3,48 +3,51 @@ import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import MetricCard from '../components/MetricCard.astro';
 import ActivityChart from '../components/ActivityChart.astro';
-import ServicesTable from '../components/ServicesTable.astro';
-import { api, formatUptime, isServiceRunning } from '../lib/api';
-import type { ConnectionState } from '../lib/api';
+import type { FleetStatus, ServiceVM } from '../lib/api';
 
-const { status, connection } = await api.getFleetStatus();
-const { services, connection: svcConn } = await api.getServices();
-const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === 'demo' ? 'demo' : connection;
+// Static shell only — no build-time control-plane fetch (#306).
+// Client hydrate() fills live metrics from the browser.
+const status: FleetStatus = {
+  online: false,
+  total_vms: 0,
+  running_vms: 0,
+  stopped_vms: 0,
+  failed_vms: 0,
+  api_latency_ms: 0,
+  max_uptime_seconds: 0,
+};
+const services: ServiceVM[] = [];
 ---
 
 <Layout title="Dashboard" activePath="/">
   <Header
     title="Overview"
     subtitle="Self-hosted control plane for microVMs and container workloads."
-    connection={pageConn}
   />
 
   <div class="metrics-grid" id="metricsGrid">
     <MetricCard
       title="Fleet Health"
-      value={`${status.running_vms} / ${status.total_vms}`}
-      subtext={status.online ? 'All systems operational' : connection === 'offline' ? 'Control plane offline' : 'API unreachable'}
-      progressPercent={status.total_vms > 0 ? Math.round((status.running_vms / status.total_vms) * 100) : 0}
+      value="—"
+      subtext="Loading…"
       accentColor="var(--accent-green)"
-      trend={status.running_vms > 0 ? 'up' : 'down'}
     />
     <MetricCard
       title="Longest Uptime"
-      value={status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '—'}
+      value="—"
       subtext="Across all services"
       accentColor="var(--accent-primary)"
     />
     <MetricCard
       title="API Latency"
-      value={status.online ? `${status.api_latency_ms} ms` : 'Offline'}
-      subtext={status.online ? 'Control plane reachable' : 'Unreachable'}
-      accentColor={status.online ? 'var(--accent-green)' : 'var(--accent-red)'}
-      trend={status.online ? 'up' : 'down'}
+      value="—"
+      subtext="Loading…"
+      accentColor="var(--accent-primary)"
     />
     <MetricCard
       title="Services"
-      value={`${services.length}`}
-      subtext={`${services.filter(s => isServiceRunning(s)).length} running`}
+      value="—"
+      subtext="Loading…"
       accentColor="var(--accent-primary)"
     />
   </div>
@@ -59,20 +62,9 @@ const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === '
       </div>
       <a href="/services" class="btn btn-secondary btn-sm">View all</a>
     </div>
-    {services.length > 0 ? (
-      <ServicesTable services={services.slice(0, 4)} />
-    ) : connection === 'offline' ? (
-      <div class="card-panel empty-state">
-        <p>Control plane offline.</p>
-        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p>
-        <a href="/settings" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem">Open Settings</a>
-      </div>
-    ) : (
-      <div class="card-panel empty-state">
-        <p>No services configured.</p>
-        <a href="/deploy" class="btn btn-primary" style="margin-top: 0.75rem">Deploy your first service</a>
-      </div>
-    )}
+    <div class="card-panel empty-state">
+      <p>Loading…</p>
+    </div>
   </section>
 </Layout>
 
@@ -526,6 +518,28 @@ const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === '
           <div class="metric-value-row"><span class="metric-value">${services.length}</span></div>
           <span class="metric-subtext">${active} running</span>
         </div>`;
+    } else if (grid && connection === 'offline') {
+      grid.innerHTML = `
+        <div class="metric-card card-panel">
+          <span class="metric-title">Fleet Health</span>
+          <div class="metric-value-row"><span class="metric-value">0 / 0</span></div>
+          <span class="metric-subtext">Control plane offline</span>
+        </div>
+        <div class="metric-card card-panel">
+          <span class="metric-title">Longest Uptime</span>
+          <div class="metric-value-row"><span class="metric-value">\u2014</span></div>
+          <span class="metric-subtext">Across all services</span>
+        </div>
+        <div class="metric-card card-panel">
+          <span class="metric-title">API Latency</span>
+          <div class="metric-value-row"><span class="metric-value">Offline</span></div>
+          <span class="metric-subtext">Unreachable</span>
+        </div>
+        <div class="metric-card card-panel">
+          <span class="metric-title">Services</span>
+          <div class="metric-value-row"><span class="metric-value">0</span></div>
+          <span class="metric-subtext">0 running</span>
+        </div>`;
     }
 
     // Update services table
@@ -556,6 +570,12 @@ const pageConn: ConnectionState = connection === 'demo' ? 'demo' : svcConn === '
         if (afterHeader) afterHeader.remove();
         if (headerRow) {
           headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>Control plane offline.</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`);
+        }
+      } else {
+        const afterHeader = section.querySelector('.data-table-container, .empty-state');
+        if (afterHeader) afterHeader.remove();
+        if (headerRow) {
+          headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>No services configured.</p><a href="/deploy" class="btn btn-primary" style="margin-top:0.75rem">Deploy your first service</a></div>`);
         }
       }
     }
