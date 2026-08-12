@@ -195,6 +195,29 @@ impl DeployPipeline {
             };
         }
 
+        // Defense in depth: reject host/guest port 0 even if API skipped validate.
+        if let Some(ref p) = request.port
+            && let Err(e) = p.validate()
+        {
+            tracing::error!(service_id = %service_id, error = %e, "deploy rejected: invalid port");
+            return DeployResponse {
+                service_id,
+                vm_id,
+                status: "failed".to_string(),
+                store_path: None,
+                microvm_config_path: None,
+                runner_path: None,
+                port: None,
+                elapsed_ms: started.elapsed().as_millis(),
+                timing: None,
+                vm_ip: None,
+                runtime: request.runtime,
+                message: e,
+                route_host: None,
+                backend_port: None,
+            };
+        }
+
         if let Err(e) = self.state.mark_building(&service_id) {
             tracing::error!(service_id = %service_id, error = %e, "deploy rejected: service busy");
             return DeployResponse {
@@ -564,8 +587,8 @@ impl DeployPipeline {
 
         // H4: remember the fixed host port the operator requested so we can
         // try to re-claim it after dual-live cutover destroys the old gen.
-        // Port 0 is rejected at the deploy API / PortMapping::validate boundary.
-        let fixed_host = request.port.as_ref().map(|p| p.host);
+        // Keep 0 out of recovery even if an invalid mapping slipped through.
+        let fixed_host = request.port.as_ref().map(|p| p.host).filter(|&h| h != 0);
 
         let mut port_reservation = None;
         let deploy_result = async {

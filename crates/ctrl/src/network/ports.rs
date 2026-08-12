@@ -59,10 +59,8 @@ impl PortAllocator {
                 anyhow::bail!("Port exhaustion: no ports available between 3100 and 65535");
             }
             let port_u16 = port as u16;
-            if port_u16 != 0
-                && !registry.busy_ports.contains(&port_u16)
-                && port_is_available(port_u16)
-            {
+            // Starts at 3100; try_bind / port_is_available already reject 0.
+            if !registry.busy_ports.contains(&port_u16) && port_is_available(port_u16) {
                 // #40: re-verify availability to narrow the TOCTOU window.
                 if port_is_available(port_u16) {
                     registry.busy_ports.insert(port_u16);
