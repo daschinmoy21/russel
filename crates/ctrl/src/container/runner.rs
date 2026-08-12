@@ -150,8 +150,9 @@ impl ContainerRunner {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // ponytail: make rootfs readable for configured podman user when running via sudo
         ensure_rootfs_readable_for_podman_user(&spec.rootfs.rootfs_path).await?;
+        // Free the held publish port immediately before podman binds it.
+        drop(crate::network::PortAllocator::take_hold(&spec.service_id));
         let output = run_podman(&args).await?;
         if !output.status.success() {
             anyhow::bail!(
