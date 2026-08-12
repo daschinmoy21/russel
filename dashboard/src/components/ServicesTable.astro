@@ -53,7 +53,8 @@ function getHostPort(svc: ServiceVM): number | null {
             {getHostPort(svc) != null ? (
               <div class="port-cell">
                 <span class="mono-text">{svc.ports || '—'}</span>
-                <a class="port-link" href={`http://localhost:${getHostPort(svc)}`} target="_blank" rel="noopener noreferrer">localhost:{getHostPort(svc)}</a>
+                {/* Client hydrate rewrites links based on API base loopback (#283). */}
+                <span class="port-link port-link-static mono-text">port {getHostPort(svc)}</span>
               </div>
             ) : (
               <span class="mono-text">—</span>

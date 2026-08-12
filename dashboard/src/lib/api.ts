@@ -372,9 +372,99 @@ export function setDemoMode(on: boolean): void {
 	localStorage.setItem("RUSSEL_DEMO_MODE", on ? "1" : "0");
 }
 
+/**
+ * Validate and normalize an API base URL.
+ * Returns the normalized base on success, or `null` when invalid.
+ *
+ * Allowed:
+ * - Relative path starting with `/` (e.g. `/api`) — not protocol-relative `//`
+ * - Absolute `http://` or `https://` URL without credentials in userinfo
+ *
+ * Rejected: empty, `javascript:`, `data:`, credentials (`user:pass@`),
+ * bare host without scheme, whitespace-only garbage.
+ */
+export function validateApiBase(url: string): string | null {
+	const raw = url.trim();
+	if (!raw) return null;
+
+	// Relative path: must start with single `/`, not `//` (protocol-relative)
+	if (raw.startsWith("/")) {
+		if (raw.startsWith("//")) return null;
+		if (/[\s<>"'`\\]/.test(raw)) return null;
+		return raw === "/" ? "/" : raw.replace(/\/+$/, "");
+	}
+
+	// Reject known-dangerous schemes before URL parse (parse may accept them)
+	const schemeMatch = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+	if (schemeMatch) {
+		const scheme = schemeMatch[1].toLowerCase();
+		if (scheme !== "http" && scheme !== "https") return null;
+	}
+
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		return null;
+	}
+
+	const protocol = parsed.protocol.toLowerCase();
+	if (protocol !== "http:" && protocol !== "https:") return null;
+
+	// Reject credentials in userinfo (user:pass@host)
+	if (parsed.username || parsed.password) return null;
+	if (!parsed.hostname) return null;
+
+	let path = parsed.pathname || "";
+	if (path !== "/" && path.endsWith("/")) {
+		path = path.replace(/\/+$/, "");
+	}
+	if (path === "/") path = "";
+	return `${parsed.origin}${path}`;
+}
+
+/** Human-readable reason when `validateApiBase` returns null. */
+export function apiBaseValidationError(url: string): string {
+	const raw = url.trim();
+	if (!raw) return "API base URL is required.";
+	if (raw.startsWith("//")) {
+		return "Protocol-relative URLs are not allowed; use http(s):// or a path starting with /.";
+	}
+	if (raw.startsWith("/")) {
+		if (/[\s<>"'`\\]/.test(raw)) {
+			return "API base path contains invalid characters.";
+		}
+		return "Invalid API base path.";
+	}
+	const schemeMatch = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+	if (schemeMatch) {
+		const scheme = schemeMatch[1].toLowerCase();
+		if (scheme !== "http" && scheme !== "https") {
+			return `Unsupported URL scheme "${schemeMatch[1]}:". Use http://, https://, or a relative path starting with /.`;
+		}
+	}
+	try {
+		const parsed = new URL(raw);
+		if (parsed.username || parsed.password) {
+			return "API base URL must not include credentials (user:pass@). Use the token field instead.";
+		}
+		if (!parsed.hostname) return "API base URL is missing a hostname.";
+	} catch {
+		/* fall through */
+	}
+	return "Invalid API base URL. Use a path like /api or an http(s):// URL.";
+}
+
 export function getApiBase(): string {
 	if (typeof window !== "undefined") {
-		return localStorage.getItem("RUSSEL_API_URL") || "/api";
+		const stored = localStorage.getItem("RUSSEL_API_URL");
+		if (stored) {
+			const validated = validateApiBase(stored);
+			if (validated) return validated;
+			// Invalid stored value — fall back rather than using garbage
+			return "/api";
+		}
+		return "/api";
 	}
 	return (import.meta as any).env?.PUBLIC_RUSSEL_API || "/api";
 }
@@ -402,9 +492,17 @@ export function getApiToken(): string | null {
 	return token || null;
 }
 
+/**
+ * Persist API base after validation. Throws Error with a user-facing message
+ * when the URL is invalid so Settings can show the toast without a separate check.
+ */
 export function setApiBase(url: string): void {
 	if (typeof window === "undefined") return;
-	localStorage.setItem("RUSSEL_API_URL", url);
+	const normalized = validateApiBase(url);
+	if (!normalized) {
+		throw new Error(apiBaseValidationError(url));
+	}
+	localStorage.setItem("RUSSEL_API_URL", normalized);
 }
 
 export function setApiToken(token: string): void {
@@ -618,10 +716,38 @@ export function reduceDeployEvents(
 	return { success, sawError, complete, errorMessage };
 }
 
-/** Probe a host port via no-cors fetch. Returns up/down and latency in ms. */
+/**
+ * Resolve whether the configured API base points at a loopback host.
+ * Relative bases (`/api`) resolve against `window.location` (the operator browser).
+ */
+export function isApiBaseLoopback(apiBase: string = getApiBase()): boolean {
+	try {
+		let url: URL;
+		if (/^https?:\/\//i.test(apiBase)) {
+			url = new URL(apiBase);
+		} else if (typeof window !== "undefined") {
+			url = new URL(apiBase || "/", window.location.href);
+		} else {
+			return false;
+		}
+		return isLoopbackHost(url.hostname);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Probe a host port via no-cors fetch against 127.0.0.1.
+ * Only runs when the API base host is loopback — otherwise the service port
+ * lives on a remote machine, not the operator browser's localhost (#283).
+ * Returns `{ up: null, ms: null, skipped: true }` when probing is not applicable.
+ */
 export async function probeEndpointPort(
 	hostPort: number,
-): Promise<{ up: boolean; ms: number | null }> {
+): Promise<{ up: boolean | null; ms: number | null; skipped?: boolean }> {
+	if (!isApiBaseLoopback()) {
+		return { up: null, ms: null, skipped: true };
+	}
 	const url = `http://127.0.0.1:${hostPort}/`;
 	const t0 = performance.now();
 	try {

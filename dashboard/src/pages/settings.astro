@@ -113,7 +113,17 @@ import { isDemoMode } from '../lib/api';
 </Layout>
 
 <script>
-  import { getApiBase, getApiToken, setApiBase, setApiToken, setDemoMode, isDemoMode } from '../lib/api';
+  import {
+    getApiBase,
+    getApiToken,
+    setApiBase,
+    setApiToken,
+    setDemoMode,
+    isDemoMode,
+    validateApiBase,
+    apiBaseValidationError,
+    assertCleartextTokenOk,
+  } from '../lib/api';
 
   const apiUrlInput = document.getElementById('apiUrl') as HTMLInputElement | null;
   const apiTokenInput = document.getElementById('apiToken') as HTMLInputElement | null;
@@ -142,16 +152,35 @@ import { isDemoMode } from '../lib/api';
 
   form?.addEventListener('submit', (e) => {
     e.preventDefault();
-    if (apiUrlInput) setApiBase(apiUrlInput.value.trim());
-    if (apiTokenInput) setApiToken(apiTokenInput.value.trim());
-    showToast('API settings saved! Reload page to apply.');
+    try {
+      if (apiUrlInput) setApiBase(apiUrlInput.value.trim());
+      if (apiTokenInput) setApiToken(apiTokenInput.value.trim());
+      showToast('API settings saved! Reload page to apply.');
+    } catch (err: any) {
+      showToast(err?.message || 'Invalid API settings.', true);
+    }
   });
 
   btnTest?.addEventListener('click', async () => {
     btnTest.setAttribute('disabled', 'true');
     try {
-      const res = await fetch(`${getApiBase()}/vms`, {
-        headers: getApiToken() ? { Authorization: `Bearer ${getApiToken()}` } : {},
+      // Read form field values (not only saved storage) so unsaved edits are tested (#282)
+      const formBaseRaw = (apiUrlInput?.value ?? '').trim() || getApiBase();
+      const formToken = (apiTokenInput?.value ?? '').trim() || null;
+      const normalized = validateApiBase(formBaseRaw);
+      if (!normalized) {
+        showToast(apiBaseValidationError(formBaseRaw), true);
+        return;
+      }
+
+      // Cleartext Bearer policy against the form URL + form token
+      assertCleartextTokenOk(normalized, formToken);
+
+      const headers: Record<string, string> = {};
+      if (formToken) headers['Authorization'] = `Bearer ${formToken}`;
+
+      const res = await fetch(`${normalized}/vms`, {
+        headers,
         signal: AbortSignal.timeout(3000),
       });
       if (res.ok) {
@@ -163,8 +192,9 @@ import { isDemoMode } from '../lib/api';
       }
     } catch (e: any) {
       showToast(`Connection error: ${e.message || 'network unreachable'}`, true);
+    } finally {
+      btnTest.removeAttribute('disabled');
     }
-    btnTest.removeAttribute('disabled');
   });
 </script>
 
