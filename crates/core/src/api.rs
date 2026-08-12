@@ -62,6 +62,20 @@ pub struct PortMapping {
     pub guest: u16,
 }
 
+impl PortMapping {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.host == 0 {
+            return Err(
+                "port.host must not be 0 (ephemeral bind is not a fixed publish port)".into(),
+            );
+        }
+        if self.guest == 0 {
+            return Err("port.guest must not be 0".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StatusResponse {
     pub service_id: String,
@@ -267,6 +281,40 @@ pub struct AgentErrorResponse {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_mapping_rejects_host_zero() {
+        let err = PortMapping {
+            host: 0,
+            guest: 3000,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("host"));
+        assert!(err.contains("0"));
+    }
+
+    #[test]
+    fn port_mapping_rejects_guest_zero() {
+        let err = PortMapping {
+            host: 8080,
+            guest: 0,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("guest"));
+        assert!(err.contains("0"));
+    }
+
+    #[test]
+    fn port_mapping_valid() {
+        PortMapping {
+            host: 8080,
+            guest: 3000,
+        }
+        .validate()
+        .unwrap();
+    }
 
     #[test]
     fn deploy_event_progress_serializes_as_tagged() {

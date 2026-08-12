@@ -783,6 +783,9 @@ fn parse_port_mapping(value: &str) -> Result<PortMapping> {
     let guest: u16 = guest
         .parse()
         .with_context(|| format!("invalid guest port in {value}"))?;
+    if guest == 0 {
+        anyhow::bail!("guest port must not be 0 in {value}");
+    }
     Ok(PortMapping { host, guest })
 }
 
@@ -1111,6 +1114,12 @@ mod tests {
     #[test]
     fn parse_port_mapping_host_zero_rejected() {
         let err = parse_port_mapping("0:3000").unwrap_err();
+        assert!(err.to_string().contains("must not be 0"));
+    }
+
+    #[test]
+    fn parse_port_mapping_guest_zero_rejected() {
+        let err = parse_port_mapping("8080:0").unwrap_err();
         assert!(err.to_string().contains("must not be 0"));
     }
 

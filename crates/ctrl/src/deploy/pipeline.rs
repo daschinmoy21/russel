@@ -564,7 +564,8 @@ impl DeployPipeline {
 
         // H4: remember the fixed host port the operator requested so we can
         // try to re-claim it after dual-live cutover destroys the old gen.
-        let fixed_host = request.port.as_ref().map(|p| p.host).filter(|&h| h != 0);
+        // Port 0 is rejected at the deploy API / PortMapping::validate boundary.
+        let fixed_host = request.port.as_ref().map(|p| p.host);
 
         let mut port_reservation = None;
         let deploy_result = async {

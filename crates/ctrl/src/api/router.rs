@@ -154,6 +154,16 @@ async fn deploy(
     State(state): State<AppState>,
     Json(request): Json<DeployRequest>,
 ) -> axum::response::Response {
+    if let Some(err) = request.port.as_ref().and_then(|p| p.validate().err()) {
+        return axum::response::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(err))
+            .unwrap_or_else(|_| {
+                axum::response::Response::new(axum::body::Body::from("internal server error"))
+            });
+    }
+
     let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
 
     tracing::info!(
