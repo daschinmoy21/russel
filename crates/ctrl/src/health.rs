@@ -91,18 +91,6 @@ fn resolve_probe_target(
     Some(health_probe_addr(ip, guest))
 }
 
-/// Read optional `vm_ip` from on-disk service metadata (microVM TAP address).
-fn load_vm_ip_from_disk(service_id: &str) -> Option<String> {
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-    value
-        .get("vm_ip")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 /// Build a `PortMapping` for restart, rejecting zero ports.
 ///
 /// `host` of `None` or zero means "let the pipeline allocate". Guest defaults
@@ -113,9 +101,25 @@ fn restart_port_mapping(host: Option<u16>, guest: Option<u16>) -> Option<PortMap
     Some(PortMapping { host, guest })
 }
 
-/// Whether a deploy response indicates a successful restart.
-fn restart_outcome_log(status: &str, _message: &str) -> bool {
-    status == "deployed"
+/// Pure decision for how `try_auto_restart` should treat a deploy response.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartApply {
+    /// Deploy status `deployed` — restart succeeded.
+    Succeeded,
+    /// Status `rolled_back` — prior generation is live; do not `mark_failed`.
+    FailedKeepPrior,
+    /// Hard failure (`failed`, `error`, empty, unknown) — call `mark_failed`.
+    FailedMark,
+}
+
+fn apply_restart_response(status: &str, _message: &str) -> RestartApply {
+    if status == "deployed" {
+        RestartApply::Succeeded
+    } else if status == "rolled_back" {
+        RestartApply::FailedKeepPrior
+    } else {
+        RestartApply::FailedMark
+    }
 }
 
 /// Spawn the background health loop. Failures never take down the control plane.
@@ -155,11 +159,9 @@ pub fn spawn_health_loop(state: AppState) {
                 let guest_port = status
                     .guest_port
                     .or_else(|| disk.as_ref().and_then(|m| m.guest_port));
-                let vm_ip = load_vm_ip_from_disk(&id);
+                let vm_ip = disk.as_ref().and_then(|m| m.vm_ip.as_deref());
                 let bind = publish_bind_addr();
-                let Some(addr) =
-                    resolve_probe_target(host_port, guest_port, vm_ip.as_deref(), &bind)
-                else {
+                let Some(addr) = resolve_probe_target(host_port, guest_port, vm_ip, &bind) else {
                     if no_probe_warned.insert(id.clone()) {
                         tracing::warn!(
                             service_id = %id,
@@ -284,25 +286,35 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let response = pipeline.deploy(request, tx).await;
 
-    if restart_outcome_log(&response.status, &response.message) {
-        tracing::info!(
-            service_id,
-            status = %response.status,
-            message = %response.message,
-            "health restart succeeded"
-        );
-        RestartOutcome::Succeeded
-    } else {
-        tracing::error!(
-            service_id,
-            status = %response.status,
-            message = %response.message,
-            "health restart failed"
-        );
-        // Hard failures: pipeline already mark_failed; re-append with a clear
-        // restart prefix. Skip rolled_back — the prior generation is live again
-        // and must not be flipped to failed.
-        if response.status != "rolled_back" {
+    match apply_restart_response(&response.status, &response.message) {
+        RestartApply::Succeeded => {
+            tracing::info!(
+                service_id,
+                status = %response.status,
+                message = %response.message,
+                "health restart succeeded"
+            );
+            RestartOutcome::Succeeded
+        }
+        RestartApply::FailedKeepPrior => {
+            // Prior generation is live again — do not mark_failed.
+            tracing::error!(
+                service_id,
+                status = %response.status,
+                message = %response.message,
+                "health restart failed"
+            );
+            RestartOutcome::Failed
+        }
+        RestartApply::FailedMark => {
+            tracing::error!(
+                service_id,
+                status = %response.status,
+                message = %response.message,
+                "health restart failed"
+            );
+            // Hard failures: pipeline already mark_failed; re-append with a clear
+            // restart prefix.
             state.mark_failed(
                 service_id,
                 format!(
@@ -310,8 +322,8 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
                     response.status, response.message
                 ),
             );
+            RestartOutcome::Failed
         }
-        RestartOutcome::Failed
     }
 }
 
@@ -447,11 +459,52 @@ mod tests {
     }
 
     #[test]
-    fn restart_outcome_log_only_deployed() {
-        assert!(restart_outcome_log("deployed", "ok"));
-        assert!(!restart_outcome_log("failed", "boom"));
-        assert!(!restart_outcome_log("rolled_back", "restored prior"));
-        assert!(!restart_outcome_log("building", "in progress"));
+    fn apply_restart_response_succeeded() {
+        assert_eq!(
+            apply_restart_response("deployed", "ok"),
+            RestartApply::Succeeded
+        );
+        assert_eq!(
+            apply_restart_response("deployed", ""),
+            RestartApply::Succeeded
+        );
+        assert_eq!(
+            apply_restart_response("deployed", "any message is fine"),
+            RestartApply::Succeeded
+        );
+    }
+
+    #[test]
+    fn apply_restart_response_rolled_back_keeps_prior() {
+        assert_eq!(
+            apply_restart_response("rolled_back", "restored prior"),
+            RestartApply::FailedKeepPrior
+        );
+        assert_eq!(
+            apply_restart_response("rolled_back", ""),
+            RestartApply::FailedKeepPrior
+        );
+    }
+
+    #[test]
+    fn apply_restart_response_failed_mark_for_hard_failures() {
+        for status in [
+            "failed",
+            "error",
+            "",
+            "building",
+            "pending",
+            "unknown",
+            "DEPLOYED", // case-sensitive: only exact "deployed" succeeds
+            "rolled_back ",
+            " rolled_back",
+        ] {
+            assert_eq!(
+                apply_restart_response(status, "boom"),
+                RestartApply::FailedMark,
+                "status={status:?} should mark failed"
+            );
+        }
     }
 
     #[test]
