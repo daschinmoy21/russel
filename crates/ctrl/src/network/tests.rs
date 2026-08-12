@@ -15,6 +15,50 @@ fn subnet_for_is_deterministic() {
 }
 
 #[test]
+fn preferred_subnet_does_not_register_lease() {
+    // preferred_subnet is hash-only for teardown: it must not claim a
+    // registry slot the way subnet_for does.
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("pref-only-svc");
+        assert!(
+            lookup_subnet("pref-only-svc").is_none(),
+            "preferred_subnet must leave the registry empty for this service"
+        );
+        // Another service can still take the same preferred key via subnet_for
+        // because preferred_subnet left the registry empty.
+        let claimed = subnet_for("pref-only-svc").unwrap();
+        assert_eq!(preferred.tap_id, claimed.tap_id);
+        assert_eq!(preferred.host_ip, claimed.host_ip);
+        release_subnet("pref-only-svc");
+    });
+}
+
+#[test]
+fn preferred_subnet_matches_subnet_for_when_uncontended() {
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("uncontended-svc");
+        let allocated = subnet_for("uncontended-svc").unwrap();
+        assert_eq!(preferred.host_ip, allocated.host_ip);
+        assert_eq!(preferred.vm_ip, allocated.vm_ip);
+        assert_eq!(preferred.mac, allocated.mac);
+        assert_eq!(preferred.tap_id, allocated.tap_id);
+        release_subnet("uncontended-svc");
+    });
+}
+
+#[test]
+fn release_port_and_subnet_are_idempotent() {
+    super::subnet::test_with_empty_registry(|| {
+        let _ = subnet_for("idem-svc").unwrap();
+        PortAllocator::reserve("idem-svc", 4199).expect("reserve");
+        PortAllocator::release("idem-svc");
+        PortAllocator::release("idem-svc");
+        release_subnet("idem-svc");
+        release_subnet("idem-svc");
+    });
+}
+
+#[test]
 fn subnet_for_different_services_differ() {
     super::subnet::test_with_empty_registry(|| {
         let a = subnet_for("service-a").unwrap();

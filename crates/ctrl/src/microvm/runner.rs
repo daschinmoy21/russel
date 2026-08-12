@@ -963,22 +963,42 @@ impl MicrovmRunner {
     }
 
     /// Destroy all state for a microVM.
+    ///
+    /// Best-effort multi-stage cleanup: each step runs even if a prior step
+    /// failed. Port and subnet leases are always released (idempotent). Returns
+    /// `Ok` only when every step succeeded; otherwise aggregates failures.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
         Self::validate_service_id(service_id)?;
 
         // Metadata or registered lease only — never invent preferred TAP.
         let alloc = network_alloc_for_service(service_id);
+        let mut errors: Vec<String> = Vec::new();
 
-        self.stop(service_id).await?;
-
-        if let Some(ref a) = alloc {
-            crate::network::TapForwarder::teardown(a).await?;
-        } else {
-            tracing::warn!(
-                service_id,
-                "destroy: no TAP identity (incomplete metadata, no lease); skipping TAP teardown"
-            );
+        if let Err(e) = self.stop(service_id).await {
+            tracing::warn!(service_id, error = %e, "destroy: stop failed; continuing cleanup");
+            errors.push(format!("stop: {e}"));
         }
+
+        match alloc {
+            Some(ref alloc) => {
+                if let Err(e) = crate::network::TapForwarder::teardown(alloc).await {
+                    tracing::warn!(
+                        service_id,
+                        error = %e,
+                        "destroy: TAP teardown failed; continuing"
+                    );
+                    errors.push(format!("tap teardown: {e}"));
+                }
+            }
+            None => {
+                tracing::warn!(
+                    service_id,
+                    "destroy: no owned TAP identity (metadata/lease); skipping tap teardown"
+                );
+            }
+        }
+
+        // Always free network inventory — process teardown was attempted above.
         crate::network::PortAllocator::release(service_id);
         crate::network::release_subnet(service_id);
 
@@ -990,7 +1010,8 @@ impl MicrovmRunner {
             if path.exists() {
                 // F-46: use std::fs::remove_dir_all instead of subprocess rm -rf.
                 if let Err(e) = std::fs::remove_dir_all(path) {
-                    anyhow::bail!("failed to remove directory {dir}: {e}");
+                    tracing::warn!(service_id, dir, error = %e, "destroy: directory remove failed");
+                    errors.push(format!("remove {dir}: {e}"));
                 }
             }
         }
@@ -1002,10 +1023,19 @@ impl MicrovmRunner {
             if path.exists()
                 && let Err(e) = std::fs::remove_file(path)
             {
-                anyhow::bail!("failed to remove gcroot {file}: {e}");
+                tracing::warn!(service_id, file, error = %e, "destroy: gcroot remove failed");
+                errors.push(format!("remove gcroot {file}: {e}"));
             }
         }
-        Ok(())
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "destroy completed with partial failures: {}",
+                errors.join("; ")
+            ))
+        }
     }
 
     /// Validate service_id for safe filesystem use.
