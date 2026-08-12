@@ -169,7 +169,34 @@ impl DeployPipeline {
         tx: tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> DeployResponse {
         let started = Instant::now();
-        let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
+        // #300: require an explicit service id — never share the old "api" default.
+        let service_id = match request
+            .vm_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => id.to_string(),
+            None => {
+                tracing::error!(repo = %request.repo_url, "deploy rejected: vm_id required");
+                return DeployResponse {
+                    service_id: String::new(),
+                    vm_id: String::new(),
+                    status: "failed".to_string(),
+                    store_path: None,
+                    microvm_config_path: None,
+                    runner_path: None,
+                    port: None,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    timing: None,
+                    vm_ip: None,
+                    runtime: request.runtime,
+                    message: "vm_id is required; shared default \"api\" was removed".to_string(),
+                    route_host: None,
+                    backend_port: None,
+                };
+            }
+        };
         let vm_id = service_id.clone();
 
         tracing::info!(service_id = %service_id, repo = %request.repo_url, "deploy started");
