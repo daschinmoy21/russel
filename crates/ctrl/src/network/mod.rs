@@ -23,6 +23,9 @@ pub use tap::TapForwarder;
 
 #[cfg(test)]
 #[allow(unused_imports)]
+pub use ports::port_test_lock;
+#[cfg(test)]
+#[allow(unused_imports)]
 pub use subnet::{subnet_test_lock, test_clear_subnet_registry, test_with_empty_registry};
 
 #[cfg(test)]

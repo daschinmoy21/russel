@@ -222,17 +222,27 @@ fn network_alloc_ignores_preferred_key_owned_by_other_service() {
 /// inventory ownership ends with destroy even when runtime cleanup is a no-op
 /// or only partially successful — leases must not be retained for retry.
 /// Covers the contract that TAP teardown issues must not permanently hold
-/// inventory (release is unconditional after stop/TAP attempts).
+/// inventory (release is unconditional after stop/TAP attempts), including
+/// dropping any net-03 `TcpListener` hold so the OS port is bindable again.
 #[tokio::test]
 async fn destroy_releases_port_and_subnet_with_partial_state() {
     let svc = "destroy-partial-lease-svc";
-    // Setup under the test lock, then drop before await (clippy::await_holding_lock).
+    // Fixed port outside typical bind(0) ephemeral range; serialized via
+    // port_test_lock around setup/assert (not across .await — clippy).
+    const PORT: u16 = 4197;
     {
-        let _guard = crate::network::subnet_test_lock();
+        let _subnet = crate::network::subnet_test_lock();
+        let _port = crate::network::port_test_lock();
         crate::network::test_clear_subnet_registry();
+        PortAllocator::release(svc);
         let _ = subnet_for(svc).unwrap();
-        PortAllocator::reserve(svc, 4197).expect("reserve port");
+        PortAllocator::reserve(svc, PORT).expect("reserve port");
         assert!(lookup_subnet(svc).is_some(), "precondition: subnet leased");
+        assert_eq!(PortAllocator::allocated_port(svc), Some(PORT));
+        assert!(
+            PortAllocator::has_hold(svc),
+            "precondition: reserve must open a hold listener"
+        );
     }
 
     // No metadata under /var/lib/russel — stop is a no-op; TAP teardown targets
@@ -250,12 +260,22 @@ async fn destroy_releases_port_and_subnet_with_partial_state() {
     }
 
     {
-        let _guard = crate::network::subnet_test_lock();
+        let _subnet = crate::network::subnet_test_lock();
+        let _port = crate::network::port_test_lock();
         assert!(
             lookup_subnet(svc).is_none(),
             "subnet must be released after destroy (partial runtime state)"
         );
-        PortAllocator::reserve(svc, 4197)
+        assert!(
+            PortAllocator::allocated_port(svc).is_none(),
+            "port allocation must be cleared after destroy"
+        );
+        assert!(
+            !PortAllocator::has_hold(svc),
+            "port hold TcpListener must be dropped after destroy so the OS port is free"
+        );
+        // Re-claim proves registry + OS bind are free for a later deploy.
+        PortAllocator::reserve(svc, PORT)
             .expect("port must be free after destroy so a later deploy can claim it");
         PortAllocator::release(svc);
         release_subnet(svc);

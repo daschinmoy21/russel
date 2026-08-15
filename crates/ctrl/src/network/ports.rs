@@ -4,6 +4,9 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
 // ── Port allocator ────────────────────────────────────────────────────────────
 
 struct PortRegistry {
@@ -20,6 +23,19 @@ static PORT_REGISTRY: LazyLock<Mutex<PortRegistry>> = LazyLock::new(|| {
         holds: HashMap::new(),
     })
 });
+
+/// Process-wide lock for tests that mutate the global port registry / holds.
+#[cfg(test)]
+static PORT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Serialize tests that reserve fixed ports or inspect holds.
+#[cfg(test)]
+pub fn port_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PORT_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PortAllocator;
@@ -116,18 +132,46 @@ impl PortAllocator {
         Ok(())
     }
 
+    /// Free control-plane port ownership for `service_id`.
+    ///
+    /// Always drops any held `TcpListener` so the OS port is bindable again —
+    /// including residual holds left after `take_hold` was never called (e.g.
+    /// destroy before publish). Idempotent.
+    ///
+    /// The hold is removed from the registry under the lock, then dropped
+    /// *after* the lock is released so OS close is not deferred behind other
+    /// port-registry waiters.
     pub fn release(service_id: &str) {
-        let mut registry = port_registry();
-        if let Some(port) = registry.allocations.remove(service_id) {
-            registry.busy_ports.remove(&port);
-        }
-        drop(registry.holds.remove(service_id));
+        let hold = {
+            let mut registry = port_registry();
+            let hold = registry.holds.remove(service_id);
+            if let Some(port) = registry.allocations.remove(service_id) {
+                registry.busy_ports.remove(&port);
+            }
+            hold
+        };
+        // Close the listening socket outside the registry mutex.
+        drop(hold);
+    }
+
+    /// Port currently registered for `service_id`, if any.
+    pub fn allocated_port(service_id: &str) -> Option<u16> {
+        let registry = port_registry();
+        registry.allocations.get(service_id).copied()
+    }
+
+    /// Whether a hold listener is still open for `service_id`.
+    #[cfg(test)]
+    pub fn has_hold(service_id: &str) -> bool {
+        let registry = port_registry();
+        registry.holds.contains_key(service_id)
     }
 
     /// Release the held listener so socat/podman can bind the port.
     ///
     /// Residual race: another process may grab the port between this drop and
     /// the publisher bind. Holding until here still closes the long deploy window.
+    /// Does **not** clear allocation/`busy_ports` — call [`release`] for full free.
     pub fn take_hold(service_id: &str) -> Option<TcpListener> {
         let mut registry = port_registry();
         registry.holds.remove(service_id)
