@@ -292,7 +292,7 @@ async fn abort_lifecycle_restores_status_and_keeps_processes() {
         inner.services.get("svc-abort").unwrap().process_generation
     };
 
-    state.abort_lifecycle_operation("svc-abort", &prior_status, &prior_vm_state);
+    state.abort_lifecycle_operation("svc-abort", "stopping", &prior_status, &prior_vm_state);
 
     let status = state.status("svc-abort").unwrap();
     assert_eq!(status.status, "deployed");
@@ -317,6 +317,66 @@ async fn abort_lifecycle_restores_status_and_keeps_processes() {
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+}
+
+/// Overlapping stop: later success commits stopped/none and reaps children;
+/// earlier abort must not restore its stale deployed/running snapshot.
+#[tokio::test]
+async fn abort_lifecycle_skips_stale_restore_after_later_success() {
+    let state = AppState::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    state.mark_deployed_with_aux("svc-race", child, vec![]);
+
+    // First stop claim — snapshots deployed/running.
+    let first = state.begin_lifecycle_operation("svc-race", "stopping", "pending");
+    let LifecycleClaim::Claimed {
+        prior_status: first_prior_status,
+        prior_vm_state: first_prior_vm_state,
+    } = first
+    else {
+        panic!("expected Claimed for first stop");
+    };
+    assert_eq!(first_prior_status, "deployed");
+    assert_eq!(first_prior_vm_state, "running");
+
+    // Second stop re-enters while first is still in-flight.
+    let second = state.begin_lifecycle_operation("svc-race", "stopping", "pending");
+    assert!(matches!(second, LifecycleClaim::Claimed { .. }));
+
+    // Later stop succeeds: reap children and commit terminal status.
+    let (vm, aux) = state
+        .take_processes_for_reap("svc-race")
+        .expect("service present");
+    assert!(vm.is_some());
+    assert!(aux.is_empty());
+    state.set_status("svc-race", "stopped", "none");
+    if let Some(mut child) = vm {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    // Earlier abort must not overwrite stopped/none with deployed/running.
+    state.abort_lifecycle_operation(
+        "svc-race",
+        "stopping",
+        &first_prior_status,
+        &first_prior_vm_state,
+    );
+
+    let status = state.status("svc-race").unwrap();
+    assert_eq!(status.status, "stopped");
+    assert_eq!(status.vm_state, "none");
+    {
+        let inner = state.lock_inner();
+        let s = inner.services.get("svc-race").unwrap();
+        assert!(
+            s.vm_process.is_none(),
+            "children stay reaped after stale abort"
+        );
     }
 }
 

@@ -467,9 +467,11 @@ async fn vm_stop(
         }
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to stop service");
-            // Keep process ownership; restore prior status and re-supervise.
+            // Keep process ownership; restore prior status and re-supervise
+            // only if this claim's in-progress status is still current.
             state.abort_lifecycle_operation(
                 &service_id,
+                &handle.expected_status,
                 &handle.prior_status,
                 &handle.prior_vm_state,
             );
@@ -793,9 +795,11 @@ async fn vm_destroy(
         }
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
-            // Keep process ownership; restore prior status and re-supervise.
+            // Keep process ownership; restore prior status and re-supervise
+            // only if this claim's in-progress status is still current.
             state.abort_lifecycle_operation(
                 &service_id,
+                &handle.expected_status,
                 &handle.prior_status,
                 &handle.prior_vm_state,
             );
@@ -809,6 +813,8 @@ async fn vm_destroy(
 struct LifecycleClaimHandle {
     runtime: RuntimeKind,
     lifecycle: Arc<dyn RuntimeLifecycle>,
+    /// In-progress status this claim set (`stopping` / `destroying`).
+    expected_status: String,
     prior_status: String,
     prior_vm_state: String,
 }
@@ -850,6 +856,7 @@ fn claim_lifecycle_operation(
     let handle = LifecycleClaimHandle {
         runtime,
         lifecycle: runtime::lifecycle_for(runtime),
+        expected_status: target_status.to_string(),
         prior_status,
         prior_vm_state,
     };

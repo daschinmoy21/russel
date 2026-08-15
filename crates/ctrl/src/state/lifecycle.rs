@@ -578,9 +578,17 @@ impl AppState {
 
     /// Abort a failed lifecycle op: restore prior status/vm_state, re-bump
     /// generation, and re-spawn a process supervisor if children remain.
+    ///
+    /// `expected_status` is the in-progress status this claim set (e.g.
+    /// `"stopping"` / `"destroying"`). Restore is skipped when current status
+    /// no longer matches — a later overlapping stop/destroy may already have
+    /// committed `stopped`/`none` or removed the service, and a stale abort
+    /// must not resurrect a phantom `deployed`/`running` snapshot without
+    /// process handles.
     pub fn abort_lifecycle_operation(
         &self,
         service_id: &str,
+        expected_status: &str,
         prior_status: &str,
         prior_vm_state: &str,
     ) {
@@ -589,6 +597,17 @@ impl AppState {
             let Some(s) = inner.services.get_mut(service_id) else {
                 return;
             };
+            // Stale abort: a newer op completed, superseding claim advanced
+            // status, or remove_service already ran.
+            if s.status != expected_status {
+                tracing::debug!(
+                    service_id = %service_id,
+                    current = %s.status,
+                    expected = %expected_status,
+                    "skipping abort restore; lifecycle status already advanced"
+                );
+                return;
+            }
             s.status = prior_status.to_string();
             s.vm_state = prior_vm_state.to_string();
             s.process_generation = s.process_generation.wrapping_add(1);
