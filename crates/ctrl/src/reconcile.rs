@@ -604,7 +604,7 @@ mod tests {
             .arg("10")
             .spawn()
             .expect("spawn sleep");
-        state.mark_deployed_with_aux("live-svc", child, vec![]);
+        state.mark_deployed_with_aux("live-svc", child, vec![], None, None);
 
         let _report = reconcile_startup_in(&state, base).await;
 

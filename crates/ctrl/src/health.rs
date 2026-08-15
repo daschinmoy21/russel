@@ -1,9 +1,9 @@
 //! Periodic health monitoring and optional auto-restart of deployed services.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use russel_core::api::DeployRequest;
+use russel_core::api::{DeployRequest, PortMapping};
 
 use crate::api::deploy_semaphore;
 use crate::deploy::DeployPipeline;
@@ -72,6 +72,56 @@ fn health_probe_addr(bind: &str, port: u16) -> String {
     format!("{connect_host}:{port}")
 }
 
+/// Resolve a TCP probe target for a running service.
+///
+/// Prefer the published host port (on the publish bind). When that is absent,
+/// fall back to the microVM guest address (`vm_ip:guest_port`) so ingress-only
+/// workloads without a durable host_port in status are still covered.
+fn resolve_probe_target(
+    host_port: Option<u16>,
+    guest_port: Option<u16>,
+    vm_ip: Option<&str>,
+    bind: &str,
+) -> Option<String> {
+    if let Some(port) = host_port.filter(|p| *p > 0) {
+        return Some(health_probe_addr(bind, port));
+    }
+    let guest = guest_port.filter(|p| *p > 0)?;
+    let ip = vm_ip.filter(|s| !s.is_empty())?;
+    Some(health_probe_addr(ip, guest))
+}
+
+/// Build a `PortMapping` for restart, rejecting zero ports.
+///
+/// `host` of `None` or zero means "let the pipeline allocate". Guest defaults
+/// to 3000 when missing or zero.
+fn restart_port_mapping(host: Option<u16>, guest: Option<u16>) -> Option<PortMapping> {
+    let host = host.filter(|p| *p > 0)?;
+    let guest = guest.filter(|p| *p > 0).unwrap_or(3000);
+    Some(PortMapping { host, guest })
+}
+
+/// Pure decision for how `try_auto_restart` should treat a deploy response.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartApply {
+    /// Deploy status `deployed` — restart succeeded.
+    Succeeded,
+    /// Status `rolled_back` — prior generation is live; do not `mark_failed`.
+    FailedKeepPrior,
+    /// Hard failure (`failed`, `error`, empty, unknown) — call `mark_failed`.
+    FailedMark,
+}
+
+fn apply_restart_response(status: &str, _message: &str) -> RestartApply {
+    if status == "deployed" {
+        RestartApply::Succeeded
+    } else if status == "rolled_back" {
+        RestartApply::FailedKeepPrior
+    } else {
+        RestartApply::FailedMark
+    }
+}
+
 /// Spawn the background health loop. Failures never take down the control plane.
 pub fn spawn_health_loop(state: AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
@@ -79,6 +129,9 @@ pub fn spawn_health_loop(state: AppState) {
     }
     tokio::spawn(async move {
         let mut failures: HashMap<String, u32> = HashMap::new();
+        // Track services we already warned about (no probe target) to avoid spam;
+        // re-warn after the set is cleared when the service leaves deployed/running.
+        let mut no_probe_warned: HashSet<String> = HashSet::new();
         let mut interval = tokio::time::interval(probe_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::info!(
@@ -96,27 +149,39 @@ pub fn spawn_health_loop(state: AppState) {
                 };
                 if status.status != "deployed" || status.vm_state != "running" {
                     failures.remove(&id);
+                    no_probe_warned.remove(&id);
                     continue;
                 }
+                let disk = load_metadata_from_disk(&id);
                 let host_port = status
                     .host_port
-                    .or_else(|| load_metadata_from_disk(&id).and_then(|m| m.host_port));
-                let Some(port) = host_port else {
+                    .or_else(|| disk.as_ref().and_then(|m| m.host_port));
+                let guest_port = status
+                    .guest_port
+                    .or_else(|| disk.as_ref().and_then(|m| m.guest_port));
+                let vm_ip = disk.as_ref().and_then(|m| m.vm_ip.as_deref());
+                let bind = publish_bind_addr();
+                let Some(addr) = resolve_probe_target(host_port, guest_port, vm_ip, &bind) else {
+                    if no_probe_warned.insert(id.clone()) {
+                        tracing::warn!(
+                            service_id = %id,
+                            "health: skipped (no probe target — no host_port and no vm_ip:guest_port)"
+                        );
+                    }
                     continue;
                 };
-                let bind = publish_bind_addr();
+                no_probe_warned.remove(&id);
                 // Mirror network::wait_for_host_port: probe 127.0.0.1 when the
                 // publish bind is wildcard / loopback; otherwise probe the bind IP.
                 // Bracket IPv6 literals so `TcpStream::connect` parses correctly.
-                let addr = health_probe_addr(&bind, port);
                 checks.spawn(async move {
                     let reachable = HealthChecker.check(&addr).await;
-                    (id, addr, port, reachable)
+                    (id, addr, reachable)
                 });
             }
 
             while let Some(result) = checks.join_next().await {
-                let (id, addr, port, reachable) = match result {
+                let (id, addr, reachable) = match result {
                     Ok(result) => result,
                     Err(error) => {
                         tracing::error!(%error, "health probe task failed");
@@ -131,7 +196,7 @@ pub fn spawn_health_loop(state: AppState) {
                 *count += 1;
                 tracing::warn!(
                     service_id = %id,
-                    port,
+                    %addr,
                     consecutive_failures = *count,
                     "health check failed"
                 );
@@ -146,24 +211,15 @@ pub fn spawn_health_loop(state: AppState) {
                 if restart_enabled() {
                     let restart_state = state.clone();
                     let restart_id = id.clone();
-                    let log_id = restart_id.clone();
+                    // Single spawn: retry when the deploy semaphore is briefly full
+                    // so a concurrent deploy wave does not permanently drop the intent.
                     tokio::spawn(async move {
-                        let result = tokio::spawn(async move {
-                            try_auto_restart(&restart_state, &restart_id).await;
-                        })
-                        .await;
-                        if let Err(error) = result {
-                            if error.is_panic() {
-                                tracing::error!(
-                                    service_id = %log_id,
-                                    "health auto-restart panicked"
-                                );
-                            } else {
-                                tracing::error!(
-                                    service_id = %log_id,
-                                    %error,
-                                    "health auto-restart task was cancelled"
-                                );
+                        for attempt in 0u32..6 {
+                            match try_auto_restart(&restart_state, &restart_id).await {
+                                RestartOutcome::SkippedSemaphore if attempt + 1 < 6 => {
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                }
+                                _ => break,
                             }
                         }
                     });
@@ -173,13 +229,26 @@ pub fn spawn_health_loop(state: AppState) {
     });
 }
 
-async fn try_auto_restart(state: &AppState, service_id: &str) {
+/// Outcome of a health-driven redeploy attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartOutcome {
+    /// Redeploy finished with status `deployed`.
+    Succeeded,
+    /// Redeploy ran but did not land in `deployed`.
+    Failed,
+    /// No recorded source metadata to redeploy from.
+    SkippedNoSource,
+    /// Deploy concurrency limit hit; caller may retry later.
+    SkippedSemaphore,
+}
+
+async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome {
     let Some(meta) = load_source_from_metadata(service_id) else {
         tracing::warn!(
             service_id,
             "health restart skipped — no repo_url in metadata (redeploy once to record source)"
         );
-        return;
+        return RestartOutcome::SkippedNoSource;
     };
 
     // F-07: acquire the deploy semaphore so a health-driven restart does not
@@ -191,7 +260,7 @@ async fn try_auto_restart(state: &AppState, service_id: &str) {
                 service_id,
                 "health restart skipped — deploy semaphore exhausted"
             );
-            return;
+            return RestartOutcome::SkippedSemaphore;
         }
     };
 
@@ -207,10 +276,7 @@ async fn try_auto_restart(state: &AppState, service_id: &str) {
         repo_url: meta.repo_url,
         config_path: meta.config_path,
         vm_id: Some(service_id.to_string()),
-        port: meta.host_port.map(|host| russel_core::api::PortMapping {
-            host,
-            guest: meta.guest_port.unwrap_or(3000),
-        }),
+        port: restart_port_mapping(meta.host_port, meta.guest_port),
         runtime: meta.runtime,
         env: meta.env,
         podman_args: meta.podman_args,
@@ -218,7 +284,47 @@ async fn try_auto_restart(state: &AppState, service_id: &str) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     // Drain events so the channel never fills.
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let _ = pipeline.deploy(request, tx).await;
+    let response = pipeline.deploy(request, tx).await;
+
+    match apply_restart_response(&response.status, &response.message) {
+        RestartApply::Succeeded => {
+            tracing::info!(
+                service_id,
+                status = %response.status,
+                message = %response.message,
+                "health restart succeeded"
+            );
+            RestartOutcome::Succeeded
+        }
+        RestartApply::FailedKeepPrior => {
+            // Prior generation is live again — do not mark_failed.
+            tracing::error!(
+                service_id,
+                status = %response.status,
+                message = %response.message,
+                "health restart failed"
+            );
+            RestartOutcome::Failed
+        }
+        RestartApply::FailedMark => {
+            tracing::error!(
+                service_id,
+                status = %response.status,
+                message = %response.message,
+                "health restart failed"
+            );
+            // Hard failures: pipeline already mark_failed; re-append with a clear
+            // restart prefix.
+            state.mark_failed(
+                service_id,
+                format!(
+                    "health restart failed (status={}): {}",
+                    response.status, response.message
+                ),
+            );
+            RestartOutcome::Failed
+        }
+    }
 }
 
 struct SourceMeta {
@@ -330,5 +436,88 @@ mod tests {
         assert_eq!(health_probe_addr("10.0.0.5", 3000), "10.0.0.5:3000");
         assert_eq!(health_probe_addr("::", 7878), "127.0.0.1:7878");
         assert_eq!(health_probe_addr("0.0.0.0", 7878), "127.0.0.1:7878");
+    }
+
+    #[test]
+    fn resolve_probe_target_prefers_host_port() {
+        let addr = resolve_probe_target(Some(8080), Some(3000), Some("10.0.5.2"), "0.0.0.0");
+        assert_eq!(addr.as_deref(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn resolve_probe_target_falls_back_to_guest() {
+        let addr = resolve_probe_target(None, Some(3000), Some("10.0.5.2"), "0.0.0.0");
+        assert_eq!(addr.as_deref(), Some("10.0.5.2:3000"));
+    }
+
+    #[test]
+    fn resolve_probe_target_skips_zero_and_missing() {
+        assert!(resolve_probe_target(Some(0), Some(0), Some("10.0.5.2"), "0.0.0.0").is_none());
+        assert!(resolve_probe_target(None, Some(3000), None, "0.0.0.0").is_none());
+        assert!(resolve_probe_target(None, None, Some("10.0.5.2"), "0.0.0.0").is_none());
+        assert!(resolve_probe_target(None, Some(3000), Some(""), "0.0.0.0").is_none());
+    }
+
+    #[test]
+    fn apply_restart_response_succeeded() {
+        assert_eq!(
+            apply_restart_response("deployed", "ok"),
+            RestartApply::Succeeded
+        );
+        assert_eq!(
+            apply_restart_response("deployed", ""),
+            RestartApply::Succeeded
+        );
+        assert_eq!(
+            apply_restart_response("deployed", "any message is fine"),
+            RestartApply::Succeeded
+        );
+    }
+
+    #[test]
+    fn apply_restart_response_rolled_back_keeps_prior() {
+        assert_eq!(
+            apply_restart_response("rolled_back", "restored prior"),
+            RestartApply::FailedKeepPrior
+        );
+        assert_eq!(
+            apply_restart_response("rolled_back", ""),
+            RestartApply::FailedKeepPrior
+        );
+    }
+
+    #[test]
+    fn apply_restart_response_failed_mark_for_hard_failures() {
+        for status in [
+            "failed",
+            "error",
+            "",
+            "building",
+            "pending",
+            "unknown",
+            "DEPLOYED", // case-sensitive: only exact "deployed" succeeds
+            "rolled_back ",
+            " rolled_back",
+        ] {
+            assert_eq!(
+                apply_restart_response(status, "boom"),
+                RestartApply::FailedMark,
+                "status={status:?} should mark failed"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_port_mapping_rejects_zero_host_and_guest() {
+        assert!(restart_port_mapping(None, Some(3000)).is_none());
+        assert!(restart_port_mapping(Some(0), Some(3000)).is_none());
+        let m = restart_port_mapping(Some(8080), Some(0)).unwrap();
+        assert_eq!(m.host, 8080);
+        assert_eq!(m.guest, 3000);
+        let m = restart_port_mapping(Some(9000), Some(4000)).unwrap();
+        assert_eq!(m.host, 9000);
+        assert_eq!(m.guest, 4000);
+        let m = restart_port_mapping(Some(9000), None).unwrap();
+        assert_eq!(m.guest, 3000);
     }
 }

@@ -370,7 +370,7 @@ pub(crate) async fn attempt_microvm_rollback(
 
     let mut aux = vec![socat_child];
     aux.extend(virtiofsd_children);
-    state.mark_deployed_with_aux(service_id, vm_child, aux);
+    state.mark_deployed_with_aux(service_id, vm_child, aux, Some(host_port), Some(guest_port));
 
     Ok(())
 }
@@ -539,7 +539,12 @@ pub(crate) async fn attempt_container_rollback(
         );
     }
 
-    state.mark_deployed_container(service_id, &running.container_id);
+    state.mark_deployed_container(
+        service_id,
+        &running.container_id,
+        Some(old_host_port),
+        Some(old_guest_port),
+    );
 
     let old_store_path = old_meta["store_path"]
         .as_str()

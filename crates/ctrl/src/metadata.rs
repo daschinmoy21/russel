@@ -112,6 +112,8 @@ pub struct LoadedMetadata {
     pub host_port: Option<u16>,
     pub guest_port: Option<u16>,
     pub container_id: Option<String>,
+    /// microVM TAP guest address (absent for container-only metadata).
+    pub vm_ip: Option<String>,
 }
 
 /// Full on-disk record for a service, used by startup reconcile to rehydrate
@@ -174,6 +176,11 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
         container_id: value
             .get("container_id")
             .and_then(|v| v.as_str())
+            .map(str::to_string),
+        vm_ip: value
+            .get("vm_ip")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(str::to_string),
     })
 }

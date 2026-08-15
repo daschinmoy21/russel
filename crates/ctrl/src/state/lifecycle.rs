@@ -45,11 +45,17 @@ impl AppState {
     ///
     /// Spawns a background supervisor that marks the service failed if any
     /// tracked child exits unexpectedly (issue #32).
+    ///
+    /// When `host_port` / `guest_port` are provided they are stored on the
+    /// in-memory service state so status and health probes do not depend solely
+    /// on disk metadata.
     pub fn mark_deployed_with_aux(
         &self,
         service_id: &str,
         vm_child: Child,
         aux_children: Vec<Child>,
+        host_port: Option<u16>,
+        guest_port: Option<u16>,
     ) {
         let generation = {
             let mut inner = self.lock_inner();
@@ -62,6 +68,12 @@ impl AppState {
             s.container_id = None;
             s.runtime = Some(RuntimeKind::Microvm);
             s.aux_processes = aux_children;
+            if let Some(p) = host_port.filter(|p| *p > 0) {
+                s.host_port = Some(p);
+            }
+            if let Some(p) = guest_port.filter(|p| *p > 0) {
+                s.guest_port = Some(p);
+            }
             // Deploy succeeded — clear prebuild snapshot.
             s.prebuild_status = None;
             s.prebuild_vm_state = None;
@@ -243,7 +255,17 @@ impl AppState {
 
     /// Mark a container deployment as running (no VM child processes).
     /// Spawns a lightweight liveness supervisor that polls podman.
-    pub fn mark_deployed_container(&self, service_id: &str, container_id: &str) {
+    ///
+    /// When `host_port` / `guest_port` are provided they are stored on the
+    /// in-memory service state so status and health probes do not depend solely
+    /// on disk metadata.
+    pub fn mark_deployed_container(
+        &self,
+        service_id: &str,
+        container_id: &str,
+        host_port: Option<u16>,
+        guest_port: Option<u16>,
+    ) {
         let generation = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
@@ -255,6 +277,12 @@ impl AppState {
             s.container_id = Some(container_id.to_string());
             s.runtime = Some(RuntimeKind::Container);
             s.aux_processes.clear();
+            if let Some(p) = host_port.filter(|p| *p > 0) {
+                s.host_port = Some(p);
+            }
+            if let Some(p) = guest_port.filter(|p| *p > 0) {
+                s.guest_port = Some(p);
+            }
             push_capped(
                 &mut s.logs,
                 &format!("container running (id: {container_id})\n"),
