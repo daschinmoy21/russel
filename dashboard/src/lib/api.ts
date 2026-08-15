@@ -1119,8 +1119,26 @@ export class RusselClient {
 
 	async updateService(
 		id: string,
+		onEvent?: (event: DeployEvent) => void,
 	): Promise<{ success: boolean; message: string }> {
 		if (isDemoMode()) {
+			onEvent?.({
+				type: "Progress",
+				payload: {
+					phase: "demo",
+					description: `[Demo] Service ${id} update initiated.`,
+				},
+			});
+			onEvent?.({
+				type: "Complete",
+				payload: {
+					service_id: id,
+					vm_id: id,
+					status: "deployed",
+					elapsed_ms: 0,
+					message: `[Demo] Service ${id} update initiated.`,
+				},
+			});
 			return {
 				success: true,
 				message: `[Demo] Service ${id} update initiated.`,
@@ -1137,16 +1155,20 @@ export class RusselClient {
 			);
 			if (!res.ok) {
 				const body = await res.text().catch(() => "");
+				const msg = `Update failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`;
+				onEvent?.({ type: "Error", payload: msg });
 				return {
 					success: false,
-					message: `Update failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`,
+					message: msg,
 				};
 			}
 			// /update streams NDJSON like /deploy — consume incrementally
 			if (!res.body) {
+				const msg = `Update failed: empty response body for service ${id}.`;
+				onEvent?.({ type: "Error", payload: msg });
 				return {
 					success: false,
-					message: `Update failed: empty response body for service ${id}.`,
+					message: msg,
 				};
 			}
 			const state: {
@@ -1158,6 +1180,8 @@ export class RusselClient {
 			await consumeNdjsonStream(res.body, (line) => {
 				const event = parseDeployEventLine(line);
 				if (!event) return;
+				// Forward every parsed event to the caller (parity with deployService).
+				onEvent?.(event);
 				if (event.type === "Error") {
 					state.sawError = true;
 					state.errorMessage = event.payload;
@@ -1184,19 +1208,27 @@ export class RusselClient {
 				};
 			}
 			if (state.complete) {
+				const msg = `Update finished with status ${state.complete.status}.`;
+				// Complete already forwarded; surface a terminal Error for silent UIs.
+				onEvent?.({ type: "Error", payload: msg });
 				return {
 					success: false,
-					message: `Update finished with status ${state.complete.status}.`,
+					message: msg,
 				};
 			}
+			const closedMsg =
+				"Update failed: control plane closed stream before Complete.";
+			onEvent?.({ type: "Error", payload: closedMsg });
 			return {
 				success: false,
-				message: `Update failed: control plane closed stream before Complete.`,
+				message: closedMsg,
 			};
 		} catch (e: any) {
+			const msg = `Update request failed: ${e.message || "network error"}`;
+			onEvent?.({ type: "Error", payload: msg });
 			return {
 				success: false,
-				message: `Update request failed: ${e.message || "network error"}`,
+				message: msg,
 			};
 		}
 	}
