@@ -11,3 +11,4 @@ microvm.nix/
 .direnv/
 .opencode/
 dashboard/package-lock.json
+guide/
