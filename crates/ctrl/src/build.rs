@@ -49,7 +49,9 @@ pub async fn init_current_system() -> Result<()> {
              (expected e.g. x86_64-linux or aarch64-darwin)"
         );
     }
-    let _ = CURRENT_SYSTEM.set(sys);
+    CURRENT_SYSTEM
+        .set(sys)
+        .map_err(|_| anyhow::anyhow!("current Nix system already initialized (double init)"))?;
     Ok(())
 }
 

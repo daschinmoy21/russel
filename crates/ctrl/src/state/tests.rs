@@ -824,6 +824,38 @@ async fn test_adopt_running_container_does_not_overwrite_live_handle() {
 }
 
 #[test]
+fn mark_stopped_from_disk_marks_non_running_container() {
+    let state = AppState::default();
+    // Container is present but NOT running (vm_state != "running"), with no
+    // live vm_process — mark_stopped_from_disk must NOT protect it and must
+    // overwrite the in-memory entry with the disk-derived stopped state.
+    state.mark_deployed_container("ctr-idle", "cid-1", Some(9090), Some(3000));
+    state.set_status("ctr-idle", "stopped", "none");
+
+    state.mark_stopped_from_disk("ctr-idle", RuntimeKind::Container, Some(8080), Some(3000));
+
+    let status = state.status("ctr-idle").unwrap();
+    assert_eq!(status.status, "stopped");
+    assert_eq!(status.vm_state, "none");
+    assert_eq!(status.host_port, Some(8080), "disk-derived port must win");
+}
+
+#[test]
+fn mark_stopped_from_disk_preserves_running_container() {
+    let state = AppState::default();
+    // Container is present AND running (vm_state == "running") — the guard
+    // must protect the in-memory live deployment from being marked stopped.
+    state.mark_deployed_container("ctr-live", "cid-live", Some(9090), Some(3000));
+
+    state.mark_stopped_from_disk("ctr-live", RuntimeKind::Container, Some(8080), Some(3000));
+
+    let status = state.status("ctr-live").unwrap();
+    assert_eq!(status.status, "deployed");
+    assert_eq!(status.vm_state, "running");
+    assert_eq!(status.host_port, Some(9090), "live port must be preserved");
+}
+
+#[test]
 fn test_write_catalog_emits_valid_json() {
     let state = AppState::default();
     state.adopt_running_microvm("cat-svc", 4000, 3000, None, None);

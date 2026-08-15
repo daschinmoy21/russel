@@ -467,13 +467,19 @@ fn truncate_for_error(s: &str) -> String {
         return s.to_string();
     }
     let mut out = String::with_capacity(LIMIT + 64);
-    // Try to truncate at a valid char boundary.
-    let trunc = if let Some((idx, _)) = s.char_indices().nth(LIMIT) {
-        &s[..idx]
-    } else {
-        s
+    // Prefer the char boundary of the LIMIT-th char; for multibyte strings
+    // with fewer than LIMIT chars, fall back to the last char boundary at or
+    // before LIMIT bytes so truncation always shortens the output.
+    let end = match s.char_indices().nth(LIMIT) {
+        Some((idx, _)) => idx,
+        None => s
+            .char_indices()
+            .take_while(|&(idx, _)| idx <= LIMIT)
+            .map(|(idx, _)| idx)
+            .last()
+            .unwrap_or(LIMIT),
     };
-    out.push_str(trunc);
+    out.push_str(&s[..end]);
     out.push_str(&format!("…[{} bytes total]", s.len()));
     out
 }
@@ -1557,6 +1563,46 @@ mod tests {
         let truncated = truncate_for_error(&long);
         assert!(truncated.contains("…[300 bytes total]"));
         assert!(truncated.len() < 300);
+    }
+
+    #[test]
+    fn truncate_for_error_ascii_over_limit() {
+        // Pure ASCII, byte length > 256: truncation must shorten the output.
+        let long = "a".repeat(1000);
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.len() < long.len(), "must truncate ASCII input");
+        assert!(truncated.contains("…[1000 bytes total]"));
+    }
+
+    #[test]
+    fn truncate_for_error_multibyte_fewer_chars_than_limit() {
+        // 'é' is 2 bytes: 200 chars = 400 bytes > 256, but char count <= 256.
+        // The old code fell back to the whole string; truncation must happen.
+        let long = "é".repeat(200);
+        assert!(long.len() > 256);
+        assert!(long.chars().count() <= 256);
+        let truncated = truncate_for_error(&long);
+        assert!(
+            truncated.len() < long.len(),
+            "must truncate multibyte input with few chars"
+        );
+        assert!(truncated.contains("…[400 bytes total]"));
+    }
+
+    #[test]
+    fn truncate_for_error_multibyte_many_chars() {
+        // '日' is 3 bytes: 300 chars = 900 bytes > 256, char count > 256.
+        let long = "日".repeat(300);
+        let truncated = truncate_for_error(&long);
+        assert!(
+            truncated.len() < long.len(),
+            "must truncate multibyte input with many chars"
+        );
+        assert!(truncated.contains("…[900 bytes total]"));
+        // Must not slice into the middle of a char: the kept prefix ends on a
+        // char boundary, so re-encoding round-trips cleanly.
+        let kept = truncated.split('…').next().unwrap();
+        assert!(kept.is_char_boundary(kept.len()));
     }
 
     // ── F-05 / #189: loopback detection + cleartext policy ────────────────

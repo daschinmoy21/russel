@@ -30,6 +30,17 @@ pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a secret value: non-empty and at most 64 KiB.
+pub fn validate_secret_value(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("secret value must not be empty");
+    }
+    if value.len() > 64 * 1024 {
+        anyhow::bail!("secret value too large (max 64 KiB)");
+    }
+    Ok(())
+}
+
 fn secrets_dir() -> PathBuf {
     std::env::var("RUSSEL_SECRETS_DIR")
         .map(PathBuf::from)
@@ -43,12 +54,7 @@ fn secret_path(name: &str) -> anyhow::Result<PathBuf> {
 
 /// Persist a secret value (mode 0600). Overwrites if present via atomic rename.
 pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
-    if value.is_empty() {
-        anyhow::bail!("secret value must not be empty");
-    }
-    if value.len() > 64 * 1024 {
-        anyhow::bail!("secret value too large (max 64 KiB)");
-    }
+    validate_secret_value(value)?;
     let path = secret_path(name)?;
     let parent = path
         .parent()

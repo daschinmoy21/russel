@@ -99,13 +99,12 @@ impl WarmPool {
             return Ok(());
         }
 
-        // ponytail: mutex ensures a single prepare attempt even if main
-        // somehow spawns two tasks.  In practice only one spawn exists.
-        {
-            let _lock = self.restore_mutex.lock().await;
-            if self.is_ready() {
-                return Ok(());
-            }
+        // Hold the restore mutex across the entire prepare so a concurrent
+        // restore cannot race the golden snapshot being written, and a second
+        // prepare task cannot run prepare_inner concurrently.
+        let _lock = self.restore_mutex.lock().await;
+        if self.is_ready() {
+            return Ok(());
         }
 
         // Inner result — on any error, notify waiters so they never hang.
@@ -421,7 +420,7 @@ impl WarmPool {
         &self,
         service_id: &str,
         alloc: &SubnetAllocation,
-        _memory_mb: u16,
+        memory_mb: u16,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
         // ponytail: scope the lock so it's dropped before any await.
@@ -483,7 +482,7 @@ impl WarmPool {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
-            memory_mb: _memory_mb.max(256),
+            memory_mb: memory_mb.max(256),
             memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
                 .ok()
                 .and_then(|v| v.parse().ok())

@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::process::Command;
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
@@ -938,15 +937,27 @@ impl DeployPipeline {
             }
         } else {
             if has_backup {
-                let _ = Command::new("rm")
-                    .args(["-rf", &format!("{}.bak", russel_dir)])
-                    .output()
-                    .await;
-                if has_microvms_dir {
-                    let _ = Command::new("rm")
-                        .args(["-rf", &format!("{}.bak", microvms_dir)])
-                        .output()
-                        .await;
+                // Best-effort cleanup of the pre-deploy backup dirs. Use
+                // std::fs::remove_dir_all rather than shelling out to `rm -rf`
+                // (F-46). A missing dir (already cleaned) is not an error.
+                if let Err(e) = std::fs::remove_dir_all(&russel_bak)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        path = %russel_bak,
+                        error = %e,
+                        "failed to remove russel backup dir after deploy"
+                    );
+                }
+                if has_microvms_dir
+                    && let Err(e) = std::fs::remove_dir_all(&microvms_bak)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        path = %microvms_bak,
+                        error = %e,
+                        "failed to remove microvms backup dir after deploy"
+                    );
                 }
             }
             self.state.attach_flake_path(service_id, repo_path.clone());

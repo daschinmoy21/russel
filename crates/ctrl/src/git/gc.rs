@@ -6,17 +6,28 @@ use std::{
 
 use super::lease::active_checkouts;
 
-/// Claim an unleased checkout and delete it while holding the active-checkout
-/// mutex. A new lease therefore cannot appear between the eligibility check
-/// and the deletion.
+/// Claim an unleased checkout and delete it.
+///
+/// The eligibility check and `deleting` flag are set under the active-checkout
+/// mutex so a new lease cannot appear between the check and the deletion; the
+/// (potentially large) `remove_dir_all` then runs *outside* the lock, after
+/// which the map entry is removed.
 fn remove_unleased_checkout(path: &Path) -> std::io::Result<bool> {
-    let mut active = active_checkouts();
-    let state = active.entry(path.to_path_buf()).or_default();
-    if state.leases != 0 || state.deleting {
-        return Ok(false);
+    {
+        let mut active = active_checkouts();
+        let state = active.entry(path.to_path_buf()).or_default();
+        if state.leases != 0 || state.deleting {
+            return Ok(false);
+        }
+        state.deleting = true;
+        // Lock is dropped at the end of this scope; `deleting` stays set so no
+        // new lease can be claimed on this path while the deletion runs.
     }
-    state.deleting = true;
+
     let result = fs::remove_dir_all(path);
+
+    // Deletion finished — release the path from the active-checkout map.
+    let mut active = active_checkouts();
     active.remove(path);
     result.map(|()| true)
 }

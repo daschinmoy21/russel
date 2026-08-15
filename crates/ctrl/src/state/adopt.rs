@@ -127,8 +127,10 @@ impl AppState {
         {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-            // Do not clobber an in-memory live deployment.
-            if s.vm_process.is_some() || s.container_id.is_some() && s.vm_state == "running" {
+            // Do not clobber an in-memory live deployment. A live Child handle
+            // is always authoritative; a container is only authoritative while
+            // its vm_state is "running".
+            if s.vm_process.is_some() || (s.container_id.is_some() && s.vm_state == "running") {
                 return;
             }
             s.status = "stopped".to_string();
