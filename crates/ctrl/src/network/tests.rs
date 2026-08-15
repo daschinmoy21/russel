@@ -16,20 +16,47 @@ fn subnet_for_is_deterministic() {
 
 #[test]
 fn preferred_subnet_does_not_register_lease() {
-    // preferred_subnet is hash-only for teardown: it must not claim a
-    // registry slot the way subnet_for does.
+    // preferred_subnet is hash-only: it must not claim a registry slot.
+    // subnet_for("pref-only-svc") alone cannot prove this — it returns the
+    // preferred key both when no lease exists and when preferred_subnet
+    // incorrectly registered one for the same service.
     super::subnet::test_with_empty_registry(|| {
         let preferred = preferred_subnet("pref-only-svc");
         assert!(
             lookup_subnet("pref-only-svc").is_none(),
             "preferred_subnet must leave the registry empty for this service"
         );
-        // Another service can still take the same preferred key via subnet_for
-        // because preferred_subnet left the registry empty.
+        // Distinct service claims its own lease; preferred key for pref-only-svc
+        // remains free so subnet_for can still take it without collision on that
+        // service id.
+        let other = subnet_for("pref-other-svc").unwrap();
+        assert!(lookup_subnet("pref-only-svc").is_none());
         let claimed = subnet_for("pref-only-svc").unwrap();
         assert_eq!(preferred.tap_id, claimed.tap_id);
         assert_eq!(preferred.host_ip, claimed.host_ip);
+        assert_eq!(
+            lookup_subnet("pref-only-svc").map(|a| a.tap_id),
+            Some(claimed.tap_id.clone())
+        );
+        assert_ne!(other.tap_id, claimed.tap_id);
         release_subnet("pref-only-svc");
+        release_subnet("pref-other-svc");
+    });
+}
+
+#[test]
+fn lookup_subnet_is_read_only_and_returns_owned_lease() {
+    super::subnet::test_with_empty_registry(|| {
+        assert!(lookup_subnet("lookup-svc").is_none());
+        let allocated = subnet_for("lookup-svc").unwrap();
+        let looked = lookup_subnet("lookup-svc").expect("lease present");
+        assert_eq!(looked.tap_id, allocated.tap_id);
+        assert_eq!(looked.host_ip, allocated.host_ip);
+        // Second lookup must not mutate / re-register.
+        let again = lookup_subnet("lookup-svc").expect("lease still present");
+        assert_eq!(again.tap_id, allocated.tap_id);
+        release_subnet("lookup-svc");
+        assert!(lookup_subnet("lookup-svc").is_none());
     });
 }
 
