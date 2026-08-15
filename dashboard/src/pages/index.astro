@@ -66,6 +66,7 @@ const services: ServiceVM[] = [];
     api,
     escapeHtml,
     formatUptime,
+    isApiBaseLoopback,
     isServiceRunning,
     overviewMetricsForConnection,
     overviewServicesEmptyCopy,
@@ -86,7 +87,13 @@ const services: ServiceVM[] = [];
   function renderPortCell(svc: any): string {
     const hp = getHostPort(svc);
     if (!hp) return `<span class="mono-text">\u2014</span>`;
-    return `<div class="port-cell"><span class="mono-text">${escapeHtml(svc.ports || '\u2014')}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
+    const portsLabel = escapeHtml(svc.ports || '\u2014');
+    // Only link to localhost when the control plane is loopback — remote API
+    // host ports are not on the operator machine (#283).
+    if (isApiBaseLoopback()) {
+      return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
+    }
+    return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><span class="port-link port-link-remote" title="Host port is on the remote control-plane host, not this browser">port ${hp}</span></div>`;
   }
 
   // ---- localStorage sampling ----
@@ -149,6 +156,9 @@ const services: ServiceVM[] = [];
   // ---- Endpoint probing ----
 
   async function probeEndpoints(services: any[]): Promise<{ up: number; total: number; avgMs: number | null }> {
+    // Remote API: browser cannot probe operator-local ports for remote host mappings
+    if (!isApiBaseLoopback()) return { up: 0, total: 0, avgMs: null };
+
     const probeable = services.filter((s: any) =>
       (s.status === 'deployed' || s.status === 'running' || s.vm_state === 'running') &&
       typeof s.host_port === 'number'
@@ -156,7 +166,7 @@ const services: ServiceVM[] = [];
     if (probeable.length === 0) return { up: 0, total: 0, avgMs: null };
 
     const CONCURRENCY = 4;
-    const results: { up: boolean; ms: number | null }[] = [];
+    const results: { up: boolean | null; ms: number | null; skipped?: boolean }[] = [];
 
     for (let i = 0; i < probeable.length; i += CONCURRENCY) {
       const batch = probeable.slice(i, i + CONCURRENCY);
@@ -172,13 +182,14 @@ const services: ServiceVM[] = [];
       }
     }
 
-    const up = results.filter(r => r.up).length;
-    const upResults = results.filter(r => r.up && r.ms != null);
+    const measured = results.filter(r => !r.skipped && r.up !== null);
+    const up = measured.filter(r => r.up === true).length;
+    const upResults = measured.filter(r => r.up === true && r.ms != null);
     const avgMs = upResults.length > 0
       ? Math.round(upResults.reduce((sum, r) => sum + r.ms!, 0) / upResults.length)
       : null;
 
-    return { up, total: results.length, avgMs };
+    return { up, total: measured.length, avgMs };
   }
 
   // ---- Endpoint health: stacked sparklines (independent Y scales) ----

@@ -55,7 +55,7 @@ import Header from '../components/Header.astro';
 </Layout>
 
 <script>
-  import { api, escapeHtml, isDemoMode, isServiceRunning } from '../lib/api';
+  import { api, escapeHtml, isApiBaseLoopback, isDemoMode, isServiceRunning } from '../lib/api';
 
   const tableWrapper = document.getElementById('servicesTableWrapper');
   const btnRefresh = document.getElementById('btnRefresh');
@@ -85,7 +85,11 @@ import Header from '../components/Header.astro';
   function renderPortCell(svc: any): string {
     const hp = getHostPort(svc);
     if (!hp) return `<span class="mono-text">\u2014</span>`;
-    return `<div class="port-cell"><span class="mono-text">${escapeHtml(svc.ports || '\u2014')}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
+    const portsLabel = escapeHtml(svc.ports || '\u2014');
+    if (isApiBaseLoopback()) {
+      return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
+    }
+    return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><span class="port-link port-link-remote" title="Host port is on the remote control-plane host, not this browser">port ${hp}</span></div>`;
   }
 
   function showFeedback(msg: string, isError: boolean = false) {

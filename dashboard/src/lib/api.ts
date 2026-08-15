@@ -372,9 +372,124 @@ export function setDemoMode(on: boolean): void {
 	localStorage.setItem("RUSSEL_DEMO_MODE", on ? "1" : "0");
 }
 
+/**
+ * Join an API base with a path without producing protocol-relative URLs.
+ * Root base (`""` or `"/"`) yields a same-origin absolute path (e.g. `/vms`).
+ */
+export function joinApiUrl(base: string, path: string): string {
+	const p = path.startsWith("/") ? path : `/${path}`;
+	if (!base || base === "/") return p;
+	return `${base.replace(/\/+$/, "")}${p}`;
+}
+
+/**
+ * Validate and normalize an API base URL.
+ * Returns the normalized base on success, or `null` when invalid.
+ *
+ * Allowed:
+ * - Relative path starting with `/` (e.g. `/api`) — not protocol-relative `//`
+ * - Root `/` normalizes to `""` (same-origin root; join via `joinApiUrl`)
+ * - Absolute `http://` or `https://` URL without credentials in userinfo
+ *
+ * Rejected: empty, `javascript:`, `data:`, credentials (`user:pass@`),
+ * query (`?`) / fragment (`#`), bare host without scheme, whitespace garbage.
+ */
+export function validateApiBase(url: string): string | null {
+	const raw = url.trim();
+	if (!raw) return null;
+
+	// Relative path: must start with single `/`, not `//` (protocol-relative)
+	if (raw.startsWith("/")) {
+		if (raw.startsWith("//")) return null;
+		if (raw.includes("?") || raw.includes("#")) return null;
+		if (/[\s<>"'`\\]/.test(raw)) return null;
+		// Root → empty string so joinApiUrl("/", "/vms") never becomes "//vms"
+		if (raw === "/") return "";
+		return raw.replace(/\/+$/, "");
+	}
+
+	// Reject known-dangerous schemes before URL parse (parse may accept them)
+	const schemeMatch = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+	if (schemeMatch) {
+		const scheme = schemeMatch[1].toLowerCase();
+		if (scheme !== "http" && scheme !== "https") return null;
+	}
+
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		return null;
+	}
+
+	const protocol = parsed.protocol.toLowerCase();
+	if (protocol !== "http:" && protocol !== "https:") return null;
+
+	// Reject credentials in userinfo (user:pass@host)
+	if (parsed.username || parsed.password) return null;
+	if (!parsed.hostname) return null;
+	// Reject query and fragment on API base
+	if (parsed.search || parsed.hash) return null;
+
+	let path = parsed.pathname || "";
+	if (path !== "/" && path.endsWith("/")) {
+		path = path.replace(/\/+$/, "");
+	}
+	if (path === "/") path = "";
+	return `${parsed.origin}${path}`;
+}
+
+/** Human-readable reason when `validateApiBase` returns null. */
+export function apiBaseValidationError(url: string): string {
+	const raw = url.trim();
+	if (!raw) return "API base URL is required.";
+	if (raw.startsWith("//")) {
+		return "Protocol-relative URLs are not allowed; use http(s):// or a path starting with /.";
+	}
+	if (raw.startsWith("/")) {
+		if (raw.includes("?") || raw.includes("#")) {
+			return "API base path must not include a query string or fragment.";
+		}
+		if (/[\s<>"'`\\]/.test(raw)) {
+			return "API base path contains invalid characters.";
+		}
+		return "Invalid API base path.";
+	}
+	const schemeMatch = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+	if (schemeMatch) {
+		const scheme = schemeMatch[1].toLowerCase();
+		if (scheme !== "http" && scheme !== "https") {
+			return `Unsupported URL scheme "${schemeMatch[1]}:". Use http://, https://, or a relative path starting with /.`;
+		}
+	}
+	try {
+		const parsed = new URL(raw);
+		if (parsed.username || parsed.password) {
+			return "API base URL must not include credentials (user:pass@). Use the token field instead.";
+		}
+		if (!parsed.hostname) return "API base URL is missing a hostname.";
+		if (parsed.search || parsed.hash) {
+			return "API base URL must not include a query string or fragment.";
+		}
+	} catch {
+		/* fall through */
+	}
+	return "Invalid API base URL. Use a path like /api or an http(s):// URL.";
+}
+
 export function getApiBase(): string {
 	if (typeof window !== "undefined") {
-		return localStorage.getItem("RUSSEL_API_URL") || "/api";
+		// null = unset; "" = same-origin root (valid normalized base)
+		const stored = localStorage.getItem("RUSSEL_API_URL");
+		if (stored !== null) {
+			if (stored === "") return "";
+			const validated = validateApiBase(stored);
+			// null = invalid; "" = valid root — do not use truthiness
+			if (validated !== null) return validated;
+			// Invalid stored value — fall back rather than using garbage
+			return "/api";
+		}
+		return "/api";
 	}
 	return (import.meta as any).env?.PUBLIC_RUSSEL_API || "/api";
 }
@@ -402,9 +517,18 @@ export function getApiToken(): string | null {
 	return token || null;
 }
 
+/**
+ * Persist API base after validation. Throws Error with a user-facing message
+ * when the URL is invalid so Settings can show the toast without a separate check.
+ */
 export function setApiBase(url: string): void {
 	if (typeof window === "undefined") return;
-	localStorage.setItem("RUSSEL_API_URL", url);
+	const normalized = validateApiBase(url);
+	// "" is a valid same-origin root — only null is rejection
+	if (normalized === null) {
+		throw new Error(apiBaseValidationError(url));
+	}
+	localStorage.setItem("RUSSEL_API_URL", normalized);
 }
 
 export function setApiToken(token: string): void {
@@ -618,10 +742,38 @@ export function reduceDeployEvents(
 	return { success, sawError, complete, errorMessage };
 }
 
-/** Probe a host port via no-cors fetch. Returns up/down and latency in ms. */
+/**
+ * Resolve whether the configured API base points at a loopback host.
+ * Relative bases (`/api`) resolve against `window.location` (the operator browser).
+ */
+export function isApiBaseLoopback(apiBase: string = getApiBase()): boolean {
+	try {
+		let url: URL;
+		if (/^https?:\/\//i.test(apiBase)) {
+			url = new URL(apiBase);
+		} else if (typeof window !== "undefined") {
+			url = new URL(apiBase || "/", window.location.href);
+		} else {
+			return false;
+		}
+		return isLoopbackHost(url.hostname);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Probe a host port via no-cors fetch against 127.0.0.1.
+ * Only runs when the API base host is loopback — otherwise the service port
+ * lives on a remote machine, not the operator browser's localhost (#283).
+ * Returns `{ up: null, ms: null, skipped: true }` when probing is not applicable.
+ */
 export async function probeEndpointPort(
 	hostPort: number,
-): Promise<{ up: boolean; ms: number | null }> {
+): Promise<{ up: boolean | null; ms: number | null; skipped?: boolean }> {
+	if (!isApiBaseLoopback()) {
+		return { up: null, ms: null, skipped: true };
+	}
 	const url = `http://127.0.0.1:${hostPort}/`;
 	const t0 = performance.now();
 	try {
@@ -768,7 +920,7 @@ export class RusselClient {
 			const batch = ids.slice(i, i + concurrency);
 			const results = await Promise.allSettled(
 				batch.map((id) =>
-					fetch(`${getApiBase()}/vm/${encodeURIComponent(id)}/status`, {
+					fetch(joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/status`), {
 						headers: this.getHeaders(),
 						signal: AbortSignal.timeout(3000),
 					}).then((r) => (r.ok ? (r.json() as Promise<StatusResponse>) : null)),
@@ -791,7 +943,7 @@ export class RusselClient {
 		if (isDemoMode())
 			return { services: MOCK_SERVICES, connection: "demo", isDemo: true };
 		try {
-			const res = await fetch(`${getApiBase()}/vms`, {
+			const res = await fetch(joinApiUrl(getApiBase(), "/vms"), {
 				headers: this.getHeaders(),
 				signal: AbortSignal.timeout(3000),
 			});
@@ -855,7 +1007,7 @@ export class RusselClient {
 
 		const start = performance.now();
 		try {
-			const res = await fetch(`${getApiBase()}/vms`, {
+			const res = await fetch(joinApiUrl(getApiBase(), "/vms"), {
 				headers: this.getHeaders(),
 				signal: AbortSignal.timeout(3000),
 			});
@@ -944,7 +1096,7 @@ export class RusselClient {
 		}
 		try {
 			const res = await fetch(
-				`${getApiBase()}/vm/${encodeURIComponent(id)}/status`,
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/status`),
 				{
 					headers: this.getHeaders(),
 					signal: AbortSignal.timeout(3000),
@@ -991,7 +1143,7 @@ export class RusselClient {
 		}
 		try {
 			const res = await fetch(
-				`${getApiBase()}/vm/${encodeURIComponent(id)}/deployments`,
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/deployments`),
 				{ headers: this.getHeaders(), signal: AbortSignal.timeout(5000) },
 			);
 			if (res.status === 404) {
@@ -1019,7 +1171,7 @@ export class RusselClient {
 		try {
 			const body = version != null ? JSON.stringify({ version }) : "{}";
 			const res = await fetch(
-				`${getApiBase()}/vm/${encodeURIComponent(id)}/rollback`,
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/rollback`),
 				{
 					method: "POST",
 					headers: this.getHeaders(),
@@ -1065,7 +1217,7 @@ export class RusselClient {
 		}
 		try {
 			const res = await fetch(
-				`${getApiBase()}/vm/${encodeURIComponent(id)}/logs`,
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/logs`),
 				{
 					headers: this.getHeaders(),
 					signal: AbortSignal.timeout(5000),
@@ -1095,7 +1247,7 @@ export class RusselClient {
 		}
 		try {
 			const res = await fetch(
-				`${getApiBase()}/vm/${encodeURIComponent(id)}/stop`,
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/stop`),
 				{
 					method: "POST",
 					headers: this.getHeaders(),
@@ -1146,7 +1298,7 @@ export class RusselClient {
 		}
 		try {
 			const res = await fetch(
-				`${getApiBase()}/vm/${encodeURIComponent(id)}/update`,
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/update`),
 				{
 					method: "POST",
 					headers: this.getHeaders(),
@@ -1240,10 +1392,13 @@ export class RusselClient {
 			return { success: true, message: `[Demo] Service ${id} destroyed.` };
 		}
 		try {
-			const res = await fetch(`${getApiBase()}/vm/${encodeURIComponent(id)}`, {
-				method: "DELETE",
-				headers: this.getHeaders(),
-			});
+			const res = await fetch(
+				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}`),
+				{
+					method: "DELETE",
+					headers: this.getHeaders(),
+				},
+			);
 			if (!res.ok) {
 				const body = await res.text().catch(() => "");
 				return {
@@ -1312,7 +1467,7 @@ export class RusselClient {
 		}
 
 		try {
-			const res = await fetch(`${getApiBase()}/deploy`, {
+			const res = await fetch(joinApiUrl(getApiBase(), "/deploy"), {
 				method: "POST",
 				headers: this.getHeaders(),
 				body: JSON.stringify(payload),

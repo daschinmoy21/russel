@@ -113,7 +113,18 @@ import { isDemoMode } from '../lib/api';
 </Layout>
 
 <script>
-  import { getApiBase, getApiToken, setApiBase, setApiToken, setDemoMode, isDemoMode } from '../lib/api';
+  import {
+    getApiBase,
+    getApiToken,
+    setApiBase,
+    setApiToken,
+    setDemoMode,
+    isDemoMode,
+    validateApiBase,
+    apiBaseValidationError,
+    assertCleartextTokenOk,
+    joinApiUrl,
+  } from '../lib/api';
 
   const apiUrlInput = document.getElementById('apiUrl') as HTMLInputElement | null;
   const apiTokenInput = document.getElementById('apiToken') as HTMLInputElement | null;
@@ -122,7 +133,8 @@ import { isDemoMode } from '../lib/api';
   const btnTest = document.getElementById('btnTestConn');
   const toast = document.getElementById('settingsToast');
 
-  if (apiUrlInput) apiUrlInput.value = getApiBase();
+  // "" means same-origin root — show "/" so the field is not blank
+  if (apiUrlInput) apiUrlInput.value = getApiBase() || '/';
   if (apiTokenInput) apiTokenInput.value = getApiToken() || '';
   if (demoModeToggle) demoModeToggle.checked = isDemoMode();
 
@@ -142,16 +154,38 @@ import { isDemoMode } from '../lib/api';
 
   form?.addEventListener('submit', (e) => {
     e.preventDefault();
-    if (apiUrlInput) setApiBase(apiUrlInput.value.trim());
-    if (apiTokenInput) setApiToken(apiTokenInput.value.trim());
-    showToast('API settings saved! Reload page to apply.');
+    try {
+      if (apiUrlInput) setApiBase(apiUrlInput.value.trim());
+      if (apiTokenInput) setApiToken(apiTokenInput.value.trim());
+      showToast('API settings saved! Reload page to apply.');
+    } catch (err: any) {
+      showToast(err?.message || 'Invalid API settings.', true);
+    }
   });
 
   btnTest?.addEventListener('click', async () => {
     btnTest.setAttribute('disabled', 'true');
     try {
-      const res = await fetch(`${getApiBase()}/vms`, {
-        headers: getApiToken() ? { Authorization: `Bearer ${getApiToken()}` } : {},
+      // Read the form field as shown (no silent fallback to saved base). Empty
+      // input must fail validation the same way as submit — not test getApiBase().
+      // UI root representation "/" still normalizes via validateApiBase.
+      const formBaseRaw = (apiUrlInput?.value ?? '').trim();
+      const formToken = (apiTokenInput?.value ?? '').trim() || null;
+      const normalized = validateApiBase(formBaseRaw);
+      // "" is valid same-origin root — only null is rejection
+      if (normalized === null) {
+        showToast(apiBaseValidationError(formBaseRaw), true);
+        return;
+      }
+
+      // Cleartext Bearer policy against the form URL + form token
+      assertCleartextTokenOk(normalized, formToken);
+
+      const headers: Record<string, string> = {};
+      if (formToken) headers['Authorization'] = `Bearer ${formToken}`;
+
+      const res = await fetch(joinApiUrl(normalized, '/vms'), {
+        headers,
         signal: AbortSignal.timeout(3000),
       });
       if (res.ok) {
@@ -163,8 +197,9 @@ import { isDemoMode } from '../lib/api';
       }
     } catch (e: any) {
       showToast(`Connection error: ${e.message || 'network unreachable'}`, true);
+    } finally {
+      btnTest.removeAttribute('disabled');
     }
-    btnTest.removeAttribute('disabled');
   });
 </script>
 
