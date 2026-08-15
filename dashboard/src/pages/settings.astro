@@ -166,8 +166,10 @@ import { isDemoMode } from '../lib/api';
   btnTest?.addEventListener('click', async () => {
     btnTest.setAttribute('disabled', 'true');
     try {
-      // Read form field values (not only saved storage) so unsaved edits are tested (#282)
-      const formBaseRaw = (apiUrlInput?.value ?? '').trim() || getApiBase();
+      // Read the form field as shown (no silent fallback to saved base). Empty
+      // input must fail validation the same way as submit — not test getApiBase().
+      // UI root representation "/" still normalizes via validateApiBase.
+      const formBaseRaw = (apiUrlInput?.value ?? '').trim();
       const formToken = (apiTokenInput?.value ?? '').trim() || null;
       const normalized = validateApiBase(formBaseRaw);
       // "" is valid same-origin root — only null is rejection
