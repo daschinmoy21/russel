@@ -882,16 +882,23 @@ impl MicrovmRunner {
         };
 
         if !vm_stopped {
+            // Only pkill by TAP when we own the identity (metadata or registry).
+            // preferred_subnet can collide with another service's TAP.
             let tap = metadata
                 .as_ref()
                 .and_then(|m| m.tap_id.clone())
-                .unwrap_or_else(|| crate::network::subnet_for(service_id).tap_id);
-            self.pkill_service_process(
-                service_id,
-                "cloud-hypervisor",
-                &format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)",),
-            )
-            .await?;
+                .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.tap_id));
+            if let Some(tap) = tap {
+                self.pkill_service_process(
+                    service_id,
+                    "cloud-hypervisor",
+                    &format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)",),
+                )
+                .await?;
+            } else if let Some(pid) = vm_pid {
+                // No owned TAP: only terminate the recorded PID if ownership matches.
+                let _ = terminate_owned_process(pid, service_id).await;
+            }
             if let Some(pid) = vm_pid {
                 let _ = wait_for_process_exit(pid, Duration::from_secs(2)).await;
             }
@@ -955,12 +962,20 @@ impl MicrovmRunner {
         Self::validate_service_id(service_id)?;
 
         // Prefer on-disk network identity (generation-scoped TAP) before stop
-        // clears processes; fall back to deterministic subnet_for.
+        // clears processes; otherwise only a registry-owned lease (never
+        // preferred_subnet, which may target another service's TAP).
         let alloc = network_alloc_for_service(service_id);
 
         self.stop(service_id).await?;
 
-        crate::network::TapForwarder::teardown(&alloc).await?;
+        if let Some(ref alloc) = alloc {
+            crate::network::TapForwarder::teardown(alloc).await?;
+        } else {
+            tracing::warn!(
+                service_id,
+                "destroy: no owned TAP identity (metadata/lease); skipping tap teardown"
+            );
+        }
         crate::network::PortAllocator::release(service_id);
         crate::network::release_subnet(service_id);
 

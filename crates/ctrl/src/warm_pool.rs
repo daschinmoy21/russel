@@ -127,7 +127,7 @@ impl WarmPool {
         let agent_initramfs = self.runner.build_agent_initramfs().await?;
 
         // 3. Create template TAP + config dir.
-        let alloc = network::subnet_for(POOL_TEMPLATE_ID);
+        let alloc = network::subnet_for(POOL_TEMPLATE_ID)?;
         let sock_dir = format!("{POOL_BASE}/template");
         std::fs::create_dir_all(&sock_dir)?;
 

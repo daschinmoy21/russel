@@ -71,33 +71,49 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
 }
 
 /// Prefer generation-recorded TAP / IPs so destroy still works after promote.
-pub(super) fn network_alloc_for_service(service_id: &str) -> crate::network::SubnetAllocation {
-    let fallback = crate::network::subnet_for(service_id);
-    let Some(meta) = read_metadata(service_id) else {
-        return fallback;
-    };
-    match (meta.tap_id, meta.host_ip, meta.vm_ip) {
-        (Some(tap_id), Some(host_ip), Some(vm_ip)) => crate::network::SubnetAllocation {
+///
+/// Does not register a subnet lease. Metadata is the source of truth for
+/// teardown; without it, only a read-only registry lookup of an owned lease is
+/// used. Never falls back to preferred_subnet: that unregistered key may
+/// belong to another live service and would make destroy/stop target the wrong TAP.
+pub(super) fn network_alloc_for_service(
+    service_id: &str,
+) -> Option<crate::network::SubnetAllocation> {
+    if let Some(meta) = read_metadata(service_id)
+        && let (Some(tap_id), Some(host_ip), Some(vm_ip)) = (meta.tap_id, meta.host_ip, meta.vm_ip)
+    {
+        let mac = crate::network::network_key_from_host_ip(&host_ip)
+            .map(|k| crate::network::allocation_from_network_key(k).mac)
+            .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.mac))
+            .unwrap_or_default();
+        return Some(crate::network::SubnetAllocation {
             host_ip,
             vm_ip,
-            mac: fallback.mac,
+            mac,
             tap_id,
-        },
-        _ => fallback,
+        });
     }
+    crate::network::lookup_subnet(service_id)
 }
 
 /// Verify PID ownership via /proc/<pid>/cmdline.
 pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
     let cmdline_path = format!("/proc/{pid}/cmdline");
-    let tap_arg = format!("tap={}", crate::network::subnet_for(service_id).tap_id);
+    // Prefer owned TAP (metadata or registry lease); never preferred_subnet.
+    let tap_match = network_alloc_for_service(service_id).map(|a| {
+        let tap_arg = format!("tap={}", a.tap_id);
+        (tap_arg.clone(), format!("{tap_arg},"))
+    });
     std::fs::read(cmdline_path)
         .map(|cmdline| {
             cmdline.split(|byte| *byte == 0).any(|arg| {
                 let arg = String::from_utf8_lossy(arg);
-                arg == tap_arg
-                    || arg.starts_with(&format!("{tap_arg},"))
-                    || arg.contains(&format!("russel/{service_id}/"))
+                if let Some((ref tap_arg, ref tap_prefix)) = tap_match
+                    && (arg == *tap_arg || arg.starts_with(tap_prefix.as_str()))
+                {
+                    return true;
+                }
+                arg.contains(&format!("russel/{service_id}/"))
                     || arg.contains(&format!("socat-russel-{service_id}"))
             })
         })

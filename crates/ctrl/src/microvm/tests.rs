@@ -157,3 +157,60 @@ fn which_busybox() -> Option<PathBuf> {
         PathBuf::from("/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0/bin/busybox");
     store.is_file().then_some(store)
 }
+
+// ── network_alloc_for_service ownership contract ────────────────────────────
+
+#[test]
+fn network_alloc_none_without_metadata_or_lease() {
+    crate::network::test_with_empty_registry(|| {
+        let id = "net-alloc-none-svc";
+        assert!(
+            crate::network::lookup_subnet(id).is_none(),
+            "precondition: no lease"
+        );
+        // No on-disk metadata under /var/lib/russel in unit tests.
+        assert!(
+            super::process::network_alloc_for_service(id).is_none(),
+            "must not invent preferred_subnet when unowned"
+        );
+    });
+}
+
+#[test]
+fn network_alloc_uses_owned_registry_lease() {
+    crate::network::test_with_empty_registry(|| {
+        let id = "net-alloc-lease-svc";
+        let alloc = crate::network::subnet_for(id).unwrap();
+        let got = super::process::network_alloc_for_service(id)
+            .expect("owned registry lease must resolve");
+        assert_eq!(got.tap_id, alloc.tap_id);
+        assert_eq!(got.host_ip, alloc.host_ip);
+        assert_eq!(got.vm_ip, alloc.vm_ip);
+        crate::network::release_subnet(id);
+        assert!(
+            super::process::network_alloc_for_service(id).is_none(),
+            "after release, identity must clear"
+        );
+    });
+}
+
+#[test]
+fn network_alloc_ignores_preferred_key_owned_by_other_service() {
+    crate::network::test_with_empty_registry(|| {
+        let victim = "net-alloc-victim-svc";
+        let other = "net-alloc-other-svc";
+        let preferred = crate::network::preferred_subnet(victim);
+        let key = crate::network::network_key_from_host_ip(&preferred.host_ip)
+            .expect("preferred host_ip must parse");
+        // Other service owns victim's preferred TAP/IP identity.
+        crate::network::claim_subnet_key(other, key).unwrap();
+        assert!(
+            super::process::network_alloc_for_service(victim).is_none(),
+            "must not target another service's TAP via preferred_subnet"
+        );
+        // Owner still resolves via their lease.
+        let owner = super::process::network_alloc_for_service(other).expect("owner lease");
+        assert_eq!(owner.tap_id, preferred.tap_id);
+        crate::network::release_subnet(other);
+    });
+}

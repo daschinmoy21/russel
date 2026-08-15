@@ -301,7 +301,7 @@ async fn cleanup_stale_resources() {
 /// survive control-plane restarts (stable mapping, not rehash-from-id).
 fn live_service_tap_ids() -> std::collections::HashSet<String> {
     use russel_ctrl::network::{
-        allocation_from_network_key, claim_subnet_key, network_key_from_host_ip, subnet_for,
+        allocation_from_network_key, claim_subnet_key, network_key_from_host_ip, preferred_subnet,
     };
     let mut taps = std::collections::HashSet::new();
     let mut services = Vec::new();
@@ -355,7 +355,8 @@ fn live_service_tap_ids() -> std::collections::HashSet<String> {
             taps.insert(allocation_from_network_key(key).tap_id);
         } else {
             // Legacy metadata without a persisted network identity.
-            taps.insert(subnet_for(&name).tap_id);
+            // Prefer unregistered preferred key — do not allocate leases during cleanup.
+            taps.insert(preferred_subnet(&name).tap_id);
         }
     }
     taps

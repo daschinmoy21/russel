@@ -37,7 +37,7 @@ impl DeployPipeline {
         generation_id: Option<&str>,
         desired_state: Option<&serde_json::Value>,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
-        let alloc: SubnetAllocation = subnet_for(service_id);
+        let alloc: SubnetAllocation = subnet_for(service_id)?;
         tracing::info!(
             service_id,
             host = port.host,
