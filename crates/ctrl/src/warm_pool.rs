@@ -45,6 +45,22 @@ const POOL_TEMPLATE_ID: &str = "pooltpl";
 /// Timeout for the agent to write `.agent_ready` inside the template VM.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// `RUSSEL_CPU_MAX` (default 8) — upper bound for CPU hotplug topology.
+fn env_cpu_max() -> u8 {
+    std::env::var("RUSSEL_CPU_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
+/// `RUSSEL_MEM_HOTPLUG_MB` (default 2048) — memory hotplug headroom.
+fn env_mem_hotplug_mb() -> u16 {
+    std::env::var("RUSSEL_MEM_HOTPLUG_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048)
+}
+
 #[derive(Debug)]
 pub struct WarmPool {
     runner: MicrovmRunner,
@@ -134,15 +150,9 @@ impl WarmPool {
             initramfs: agent_initramfs,
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
-            cpus_max: std::env::var("RUSSEL_CPU_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+            cpus_max: env_cpu_max(),
             memory_mb: 256, // minimum viable; hotplug adds headroom
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            memory_hotplug_mb: env_mem_hotplug_mb(),
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket: api_socket.clone(),
@@ -355,11 +365,7 @@ impl WarmPool {
         let cfg_sock = PathBuf::from(format!("{sock_dir}/virtiofs-cfg.sock"));
         let api_socket = PathBuf::from(format!("{sock_dir}/cloud-hypervisor.sock"));
 
-        let cpus_max: u8 = std::env::var("RUSSEL_CPU_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
-            .max(cpus_boot);
+        let cpus_max: u8 = env_cpu_max().max(cpus_boot);
 
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
@@ -368,10 +374,7 @@ impl WarmPool {
             cpus_boot,
             cpus_max,
             memory_mb,
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            memory_hotplug_mb: env_mem_hotplug_mb(),
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket,
@@ -460,15 +463,9 @@ impl WarmPool {
             initramfs: PathBuf::from("/dev/null"),
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
-            cpus_max: std::env::var("RUSSEL_CPU_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+            cpus_max: env_cpu_max(),
             memory_mb: memory_mb.max(256),
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            memory_hotplug_mb: env_mem_hotplug_mb(),
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket: PathBuf::from(&api_socket_path),

@@ -1086,16 +1086,27 @@ fn with_allow_podman_args_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> 
 
 #[test]
 fn russel_allow_podman_args_zero_rejects_extras() {
-    with_allow_podman_args_env(Some("0"), || {
-        let err =
-            validate_podman_passthrough_args(&["--network".into(), "bridge".into()]).unwrap_err();
-        assert!(
-            err.to_string().contains("RUSSEL_ALLOW_PODMAN_ARGS"),
-            "expected disable message: {err}"
-        );
-        // Empty extras still ok.
-        validate_podman_passthrough_args(&[]).unwrap();
-    });
+    for falsy in ["0", "false", "no", "off", "disabled"] {
+        with_allow_podman_args_env(Some(falsy), || {
+            let err = validate_podman_passthrough_args(&["--network".into(), "bridge".into()])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("RUSSEL_ALLOW_PODMAN_ARGS"),
+                "expected disable message for {falsy:?}: {err}"
+            );
+            // Empty extras still ok.
+            validate_podman_passthrough_args(&[]).unwrap();
+        });
+    }
+}
+
+#[test]
+fn russel_allow_podman_args_truthy_allows_allowlisted() {
+    for truthy in ["1", "true", "yes", "on"] {
+        with_allow_podman_args_env(Some(truthy), || {
+            validate_podman_passthrough_args(&["--network".into(), "bridge".into()]).unwrap();
+        });
+    }
 }
 
 #[test]

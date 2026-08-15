@@ -96,19 +96,6 @@ fn hostname_for_node_id() -> Option<String> {
     }
 }
 
-/// Directories under `/var/lib/russel` (and peers) that are **not** user services.
-///
-/// Used by list/reconcile/cleanup discovery so internal layout never appears as
-/// deployable services (e.g. dashboard `GET /vms`).
-///
-/// - `*.bak` — dual-live / destroy backups
-/// - `traefik` — ingress dynamic config root
-/// - `secrets` — host secrets store
-/// - `_pool` — warm-pool snapshot state
-pub fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
-}
-
 /// Fields commonly loaded from on-disk metadata for API rehydration.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedMetadata {
@@ -134,6 +121,12 @@ pub struct ServiceDiskRecord {
     pub vm_pid: Option<u32>,
     pub socat_pid: Option<u32>,
     pub virtiofsd_pids: Vec<u32>,
+    /// TAP interface name (`rsl-<hex>`) recorded at deploy time.
+    pub tap_id: Option<String>,
+    /// Host-side TAP address.
+    pub host_ip: Option<String>,
+    /// RFC3339 deploy timestamp (used for uptime back-dating).
+    pub deployed_at: Option<String>,
 }
 
 /// Parse `runtime` from on-disk metadata JSON.
@@ -246,6 +239,18 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
             .and_then(|v| v.as_u64())
             .and_then(|p| u32::try_from(p).ok()),
         virtiofsd_pids,
+        tap_id: value
+            .get("tap_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        host_ip: value
+            .get("host_ip")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        deployed_at: value
+            .get("deployed_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -569,30 +574,7 @@ pub fn deployed_at_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    rfc3339_from_unix(secs)
-}
-
-fn rfc3339_from_unix(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let (y, m, d) = civil_from_days(days);
-    let h = (secs / 3_600) % 24;
-    let min = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
+    russel_core::timeutil::rfc3339_from_unix(secs)
 }
 
 #[cfg(test)]
@@ -909,18 +891,6 @@ mod tests {
     }
 
     // ── Catalog write / read tests ───────────────────────────────────────────
-
-    #[test]
-    fn reserved_service_dirs_are_recognized() {
-        assert!(is_reserved_service_dir("traefik"));
-        assert!(is_reserved_service_dir("secrets"));
-        assert!(is_reserved_service_dir("_pool"));
-        assert!(is_reserved_service_dir("api.bak"));
-        assert!(is_reserved_service_dir("svc.bak"));
-        assert!(!is_reserved_service_dir("basic-http-tester-another"));
-        assert!(!is_reserved_service_dir("api"));
-        assert!(!is_reserved_service_dir("pooltpl"));
-    }
 
     #[test]
     fn catalog_write_and_read_roundtrip() {

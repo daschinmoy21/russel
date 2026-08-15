@@ -427,6 +427,9 @@ fn forward_filter_enabled_by_default() {
     assert!(!forward_filter_disabled_from_env(Some("1"), None));
     assert!(!forward_filter_disabled_from_env(None, Some("0")));
     assert!(!forward_filter_disabled_from_env(None, Some("false")));
+    assert!(!forward_filter_disabled_from_env(None, Some("off")));
+    assert!(!forward_filter_disabled_from_env(None, Some("disabled")));
+    assert!(!forward_filter_disabled_from_env(None, Some("no")));
 }
 
 #[test]
@@ -443,7 +446,7 @@ fn forward_filter_disabled_via_russel_forward_allow() {
 
 #[test]
 fn forward_filter_disabled_via_disable_env() {
-    for v in ["1", "true", "yes", "on", "TRUE", " Yes "] {
+    for v in ["1", "true", "yes", "on", "TRUE", " Yes ", " On "] {
         assert!(
             forward_filter_disabled_from_env(None, Some(v)),
             "RUSSEL_DISABLE_FORWARD_FILTER={v:?} should disable filter"

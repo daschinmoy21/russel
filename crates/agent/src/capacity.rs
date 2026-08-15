@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use russel_core::api::NodeCapacity;
+use russel_core::reserved::is_reserved_service_dir;
 use tokio::process::Command;
 
 /// Default Russel data root (service dirs live under here).
@@ -39,11 +40,6 @@ fn probe_cache() -> &'static Mutex<ProbeCache> {
             last_nix: None,
         })
     })
-}
-
-/// Directories that are not user services (keep in sync with ctrl metadata).
-fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
 }
 
 /// Collect a capacity snapshot.

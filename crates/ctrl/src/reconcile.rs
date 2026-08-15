@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use russel_core::config::RuntimeKind;
+use russel_core::reserved::is_reserved_service_dir;
 
 use crate::metadata::{self, ServiceDiskRecord};
 use crate::network::PortAllocator;
@@ -55,7 +56,7 @@ pub async fn reconcile_startup_in(state: &AppState, base: &Path) -> ReconcileRep
         };
 
         // Skip backups and well-known non-service directories.
-        if crate::metadata::is_reserved_service_dir(&name) {
+        if is_reserved_service_dir(&name) {
             report.skipped += 1;
             continue;
         }
@@ -104,14 +105,10 @@ async fn reconcile_service(
         None => return Ok(ReconcileOutcome::Skipped),
     };
 
-    // Parse extra fields (tap_id, deployed_at) that ServiceDiskRecord
-    // does not expose (issue #137 uptime back-dating, F-06 identity).
-    let (tap_id, deployed_at) = parse_extra_metadata_fields(metadata_path);
-
     let runtime = record.runtime.unwrap_or(RuntimeKind::Microvm);
 
     let alive = match runtime {
-        RuntimeKind::Microvm => probe_microvm_alive(&record, tap_id.as_deref()),
+        RuntimeKind::Microvm => probe_microvm_alive(&record, record.tap_id.as_deref()),
         RuntimeKind::Container => probe_container_alive(&record).await,
     };
 
@@ -138,7 +135,7 @@ async fn reconcile_service(
                     host_port,
                     guest_port,
                     record.vm_pid,
-                    deployed_at.as_deref(),
+                    record.deployed_at.as_deref(),
                 );
             }
             RuntimeKind::Container => {
@@ -148,7 +145,7 @@ async fn reconcile_service(
                         container_id,
                         host_port,
                         guest_port,
-                        deployed_at.as_deref(),
+                        record.deployed_at.as_deref(),
                     );
                 } else {
                     // Container metadata without a container_id — treat as stopped.
@@ -170,28 +167,6 @@ async fn reconcile_service(
         state.mark_stopped_from_disk(service_id, runtime, record.host_port, record.guest_port);
         Ok(ReconcileOutcome::Stopped)
     }
-}
-
-/// Read `tap_id` and `deployed_at` from the metadata JSON directly, since
-/// `ServiceDiskRecord` does not expose them.
-fn parse_extra_metadata_fields(path: &Path) -> (Option<String>, Option<String>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return (None, None),
-    };
-    let value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return (None, None),
-    };
-    let tap_id = value
-        .get("tap_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let deployed_at = value
-        .get("deployed_at")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    (tap_id, deployed_at)
 }
 
 // ── Liveness probes ───────────────────────────────────────────────────────────

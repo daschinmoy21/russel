@@ -68,7 +68,7 @@ pub fn deployments_path_in(base: &Path, service_id: &str) -> PathBuf {
 
 /// Snapshot of desired deploy inputs stored alongside each history row so
 /// explicit rollback can redeploy without dual-live retain-N artifacts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DesiredStateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_url: Option<String>,
@@ -86,6 +86,67 @@ pub struct DesiredStateSnapshot {
     pub podman_args: Vec<String>,
 }
 
+/// Custom `Deserialize` so both on-disk shapes of `desired_state` decode:
+/// - the journal's flat `host_port` / `guest_port` (written by `Serialize`), and
+/// - metadata's nested `port: { host, guest }` (written by the deploy pipeline).
+///
+/// The nested form is folded into the flat fields; a nested value is only used
+/// when the flat field is absent so explicit flat values always win.
+impl<'de> Deserialize<'de> for DesiredStateSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            repo_url: Option<String>,
+            #[serde(default)]
+            config_path: Option<String>,
+            #[serde(default)]
+            runtime: Option<RuntimeKind>,
+            #[serde(default)]
+            host_port: Option<u16>,
+            #[serde(default)]
+            guest_port: Option<u16>,
+            #[serde(default)]
+            port: Option<RawPort>,
+            #[serde(default)]
+            env: std::collections::HashMap<String, String>,
+            #[serde(default)]
+            podman_args: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawPort {
+            #[serde(default)]
+            host: Option<u16>,
+            #[serde(default)]
+            guest: Option<u16>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let mut snap = Self {
+            repo_url: raw.repo_url,
+            config_path: raw.config_path,
+            runtime: raw.runtime,
+            host_port: raw.host_port,
+            guest_port: raw.guest_port,
+            env: raw.env,
+            podman_args: raw.podman_args,
+        };
+        if let Some(port) = raw.port {
+            if snap.host_port.is_none() {
+                snap.host_port = port.host;
+            }
+            if snap.guest_port.is_none() {
+                snap.guest_port = port.guest;
+            }
+        }
+        Ok(snap)
+    }
+}
+
 impl DesiredStateSnapshot {
     /// Build from the deploy pipeline's `desired_state` JSON object plus port.
     pub fn from_desired_json(
@@ -93,50 +154,28 @@ impl DesiredStateSnapshot {
         host_port: Option<u16>,
         guest_port: Option<u16>,
     ) -> Self {
-        let mut snap = Self {
-            host_port,
-            guest_port,
-            ..Default::default()
-        };
-        let Some(ds) = desired.and_then(|v| v.as_object()) else {
-            return snap;
-        };
-        snap.repo_url = ds
-            .get("repo_url")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        snap.config_path = ds
-            .get("config_path")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        snap.runtime = ds
-            .get("runtime")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok());
-        snap.env = ds
-            .get("env")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        let mut snap = desired
+            .and_then(|d| serde_json::from_value::<Self>(d.clone()).ok())
             .unwrap_or_default();
-        snap.podman_args = ds
-            .get("podman_args")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        // Prefer explicit port from desired_state when present.
-        if let Some(port) = ds.get("port").and_then(|p| p.as_object()) {
-            if snap.host_port.is_none() {
-                snap.host_port = port
-                    .get("host")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| u16::try_from(n).ok());
-            }
-            if snap.guest_port.is_none() {
-                snap.guest_port = port
-                    .get("guest")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| u16::try_from(n).ok());
-            }
+        // The deploy's actual ports take precedence over any port recorded in
+        // the desired_state blob (which only carries a port when -p was given).
+        if host_port.is_some() {
+            snap.host_port = host_port;
+        }
+        if guest_port.is_some() {
+            snap.guest_port = guest_port;
         }
         snap
+    }
+
+    /// Deserialize the `desired_state` blob of a `metadata.json` document.
+    ///
+    /// Best-effort: unrecognized/malformed content yields `Default` so callers
+    /// fall back to legacy top-level metadata fields.
+    pub fn from_metadata_desired_state(meta: &serde_json::Value) -> Self {
+        meta.get("desired_state")
+            .and_then(|v| serde_json::from_value::<Self>(v.clone()).ok())
+            .unwrap_or_default()
     }
 
     pub fn is_rollback_ready(&self) -> bool {
@@ -682,6 +721,55 @@ mod tests {
         assert_eq!(snap.host_port, Some(9000));
         assert_eq!(snap.env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
         assert!(snap.is_rollback_ready());
+    }
+
+    #[test]
+    fn from_metadata_desired_state_parses_nested_port() {
+        let meta = serde_json::json!({
+            "service_id": "api",
+            "desired_state": {
+                "repo_url": "https://example.com/app.git",
+                "config_path": "Russelfile.toml",
+                "runtime": "container",
+                "env": {"LOG_LEVEL": "info"},
+                "podman_args": ["--network", "bridge"],
+                "port": {"host": 9000, "guest": 3000}
+            }
+        });
+        let snap = DesiredStateSnapshot::from_metadata_desired_state(&meta);
+        assert_eq!(
+            snap.repo_url.as_deref(),
+            Some("https://example.com/app.git")
+        );
+        assert_eq!(snap.runtime, Some(RuntimeKind::Container));
+        assert_eq!(snap.host_port, Some(9000));
+        assert_eq!(snap.guest_port, Some(3000));
+        assert_eq!(snap.env.get("LOG_LEVEL").map(String::as_str), Some("info"));
+        assert_eq!(snap.podman_args, vec!["--network", "bridge"]);
+    }
+
+    #[test]
+    fn from_metadata_desired_state_malformed_is_default() {
+        let meta = serde_json::json!({ "desired_state": "not-an-object" });
+        let snap = DesiredStateSnapshot::from_metadata_desired_state(&meta);
+        assert!(snap.repo_url.is_none());
+        assert!(snap.host_port.is_none());
+        assert!(snap.env.is_empty());
+        assert!(snap.podman_args.is_empty());
+    }
+
+    #[test]
+    fn desired_state_deserializes_flat_ports() {
+        // Journal on-disk form serializes flat host_port/guest_port; ensure the
+        // custom Deserialize still reads them (regression for load_journal).
+        let json = serde_json::json!({
+            "repo_url": "https://example.com/app.git",
+            "host_port": 8080,
+            "guest_port": 3000
+        });
+        let snap: DesiredStateSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.host_port, Some(8080));
+        assert_eq!(snap.guest_port, Some(3000));
     }
 
     #[test]

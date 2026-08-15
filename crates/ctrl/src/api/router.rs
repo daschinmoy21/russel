@@ -1,6 +1,5 @@
 //! HTTP router and service lifecycle handlers.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use russel_core::api::{
     StatusResponse, VmsResponse,
 };
 use russel_core::config::RuntimeKind;
+use russel_core::reserved::is_reserved_service_dir;
 use tokio::process::Child;
 use tokio_stream::StreamExt;
 
@@ -26,10 +26,7 @@ use crate::{
     deploy::DeployPipeline,
     deployments,
     ingress::default_ingress,
-    metadata::{
-        is_reserved_service_dir, load_metadata_from_disk, prior_runtime_from_disk,
-        resolve_lifecycle_runtime,
-    },
+    metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     runtime::{self, RuntimeLifecycle},
@@ -691,59 +688,16 @@ async fn vm_update(
 
     // ── desired_state block (SHARED CONTRACT with deploy-desired-state agent)
     //
-    // All fields are optional; when absent we fall back to the legacy
-    // top-level metadata. The writer persists the user's original (pre-secret
-    // resolution) env plus the podman_args / runtime / port that the deploy
-    // ran with, so a later update can reproduce the request verbatim.
-    let desired = meta.get("desired_state").and_then(|v| v.as_object());
-    let ds_repo_url = desired
-        .and_then(|d| d.get("repo_url"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ds_config_path = desired
-        .and_then(|d| d.get("config_path"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ds_runtime: Option<RuntimeKind> = desired
-        .and_then(|d| d.get("runtime"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
-    let ds_env: HashMap<String, String> = desired
-        .and_then(|d| d.get("env"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let ds_podman_args: Vec<String> = desired
-        .and_then(|d| d.get("podman_args"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let ds_port = desired.and_then(|d| d.get("port").and_then(|p| p.as_object()));
-    let ds_host_port: Option<u16> = ds_port
-        .and_then(|p| p.get("host"))
-        .and_then(|v| v.as_u64())
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid desired_state.port.host: {e}"),
-            )
-        })?;
-    let ds_guest_port: Option<u16> = ds_port
-        .and_then(|p| p.get("guest"))
-        .and_then(|v| v.as_u64())
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid desired_state.port.guest: {e}"),
-            )
-        })?;
+    // Typed via DesiredStateSnapshot (serde(default)); when absent/malformed we
+    // fall back to the legacy top-level metadata. The writer persists the user's
+    // original (pre-secret resolution) env plus podman_args / runtime / port that
+    // the deploy ran with, so a later update can reproduce the request verbatim.
+    let ds = deployments::DesiredStateSnapshot::from_metadata_desired_state(&meta);
 
     // Precedence: request body > desired_state > legacy top-level.
     let repo_url = body
         .repo_url
-        .or(ds_repo_url)
+        .or(ds.repo_url.clone())
         .or(top_repo_url)
         .ok_or_else(|| {
             (
@@ -753,13 +707,13 @@ async fn vm_update(
         })?;
     let config_path = body
         .config_path
-        .or(ds_config_path)
+        .or(ds.config_path.clone())
         .or(top_config_path)
         .unwrap_or_else(|| "Russelfile.toml".into());
 
-    let host_port = ds_host_port.or(top_host_port);
-    let guest_port = ds_guest_port.or(top_guest_port).unwrap_or(3000);
-    let runtime = ds_runtime.or(top_runtime);
+    let host_port = ds.host_port.or(top_host_port);
+    let guest_port = ds.guest_port.or(top_guest_port).unwrap_or(3000);
+    let runtime = ds.runtime.or(top_runtime);
 
     let request = DeployRequest {
         repo_url,
@@ -770,8 +724,8 @@ async fn vm_update(
             guest: guest_port,
         }),
         runtime,
-        env: ds_env,
-        podman_args: ds_podman_args,
+        env: ds.env,
+        podman_args: ds.podman_args,
     };
 
     tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);

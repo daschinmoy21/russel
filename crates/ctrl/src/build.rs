@@ -93,13 +93,8 @@ pub struct NixBuilder;
 /// gate — not multi-tenant isolation. Host `nix.conf` (`trusted-users`,
 /// builders, substituters) still applies; trusted users can override sandbox.
 fn nix_restricted_enabled() -> bool {
-    match std::env::var("RUSSEL_NIX_RESTRICTED") {
-        Ok(v) => {
-            let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
+    russel_core::env_util::env_bool(std::env::var("RUSSEL_NIX_RESTRICTED").ok().as_deref())
+        .unwrap_or(false)
 }
 
 /// Extra `nix build` arguments when restricted mode is on.
@@ -473,12 +468,12 @@ mod tests {
             assert!(!nix_restricted_enabled());
         });
 
-        for truthy in ["1", "true", "TRUE", "yes", "Yes", " 1 "] {
+        for truthy in ["1", "true", "TRUE", "yes", "Yes", "on", "On", " 1 "] {
             with_nix_restricted_env(Some(truthy), || {
                 assert!(nix_restricted_enabled(), "expected truthy for {truthy:?}");
             });
         }
-        for falsy in ["0", "false", "no", "", "maybe"] {
+        for falsy in ["0", "false", "no", "off", "disabled", "", "maybe"] {
             with_nix_restricted_env(Some(falsy), || {
                 assert!(!nix_restricted_enabled(), "expected falsy for {falsy:?}");
             });

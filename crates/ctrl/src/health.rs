@@ -38,13 +38,8 @@ impl HealthChecker {
 
 /// Whether auto-restart is enabled (`RUSSEL_HEALTH_RESTART=1`).
 fn restart_enabled() -> bool {
-    matches!(
-        std::env::var("RUSSEL_HEALTH_RESTART")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    russel_core::env_util::env_bool(std::env::var("RUSSEL_HEALTH_RESTART").ok().as_deref())
+        .unwrap_or(false)
 }
 
 fn probe_interval() -> Duration {
@@ -364,52 +359,23 @@ fn load_source_from_metadata(service_id: &str) -> Option<SourceMeta> {
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok());
 
-    // desired_state block (SHARED CONTRACT). All fields are optional;
-    // when absent we fall back to legacy top-level fields.
-    let desired = value.get("desired_state").and_then(|v| v.as_object());
-    let ds_repo_url = desired
-        .and_then(|d| d.get("repo_url"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ds_config_path = desired
-        .and_then(|d| d.get("config_path"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ds_runtime = desired
-        .and_then(|d| d.get("runtime"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
-    let ds_env: HashMap<String, String> = desired
-        .and_then(|d| d.get("env"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let ds_podman_args: Vec<String> = desired
-        .and_then(|d| d.get("podman_args"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let ds_port = desired.and_then(|d| d.get("port").and_then(|p| p.as_object()));
-    let ds_host_port: Option<u16> = ds_port
-        .and_then(|p| p.get("host"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok());
-    let ds_guest_port: Option<u16> = ds_port
-        .and_then(|p| p.get("guest"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok());
+    // desired_state block — typed via DesiredStateSnapshot (serde(default)).
+    let ds = crate::deployments::DesiredStateSnapshot::from_metadata_desired_state(&value);
 
     // Precedence: desired_state > legacy top-level.
-    let repo_url = ds_repo_url.or(top_repo_url)?;
+    let repo_url = ds.repo_url.or(top_repo_url)?;
 
     Some(SourceMeta {
         repo_url,
-        config_path: ds_config_path
+        config_path: ds
+            .config_path
             .or(top_config_path)
             .unwrap_or_else(|| "Russelfile.toml".into()),
-        host_port: ds_host_port.or(top_host_port),
-        guest_port: ds_guest_port.or(top_guest_port),
-        runtime: ds_runtime.or(top_runtime),
-        env: ds_env,
-        podman_args: ds_podman_args,
+        host_port: ds.host_port.or(top_host_port),
+        guest_port: ds.guest_port.or(top_guest_port),
+        runtime: ds.runtime.or(top_runtime),
+        env: ds.env,
+        podman_args: ds.podman_args,
     })
 }
 
@@ -504,6 +470,50 @@ mod tests {
                 RestartApply::FailedMark,
                 "status={status:?} should mark failed"
             );
+        }
+    }
+
+    static HEALTH_RESTART_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_health_restart_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = HEALTH_RESTART_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("RUSSEL_HEALTH_RESTART").ok();
+        // SAFETY: exclusive lock held for the duration of the mutation + assertion.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("RUSSEL_HEALTH_RESTART", v),
+                None => std::env::remove_var("RUSSEL_HEALTH_RESTART"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("RUSSEL_HEALTH_RESTART", v),
+                None => std::env::remove_var("RUSSEL_HEALTH_RESTART"),
+            }
+        }
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn restart_enabled_parses_truthy_and_falsy() {
+        with_health_restart_env(None, || {
+            assert!(!restart_enabled());
+        });
+        for truthy in ["1", "true", "yes", "on", " On "] {
+            with_health_restart_env(Some(truthy), || {
+                assert!(restart_enabled(), "expected truthy for {truthy:?}");
+            });
+        }
+        for falsy in ["0", "false", "no", "off", "disabled", "maybe"] {
+            with_health_restart_env(Some(falsy), || {
+                assert!(!restart_enabled(), "expected falsy for {falsy:?}");
+            });
         }
     }
 

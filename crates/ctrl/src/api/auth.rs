@@ -35,19 +35,14 @@ pub fn check_api_token_min_length(token: &str) -> Result<(), String> {
     russel_core::tokens::check_token_min_length(token)
 }
 
-/// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, or `yes` (case-insensitive).
+/// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, `yes`, or `on`
+/// (case-insensitive).
 ///
 /// When enabled, the control plane refuses to start without a valid token even
 /// on loopback — use for production packaging that would otherwise default to
 /// loopback bind.
 pub fn require_auth_from_env(raw: Option<&str>) -> bool {
-    raw.map(|s| {
-        let s = s.trim();
-        s.eq_ignore_ascii_case("1")
-            || s.eq_ignore_ascii_case("true")
-            || s.eq_ignore_ascii_case("yes")
-    })
-    .unwrap_or(false)
+    russel_core::env_util::env_bool(raw).unwrap_or(false)
 }
 
 /// Non-empty RUSSEL_API_TOKEN after trim; None if unset/blank.

@@ -1056,7 +1056,7 @@ impl MicrovmRunner {
         }
         // Reject host state trees (secrets/traefik/_pool/*.bak) so deploy/destroy
         // cannot wipe /var/lib/russel/{secrets,traefik,_pool} or backup dirs.
-        if crate::metadata::is_reserved_service_dir(service_id) {
+        if russel_core::reserved::is_reserved_service_dir(service_id) {
             anyhow::bail!("service_id is reserved: {service_id}");
         }
         Ok(())
