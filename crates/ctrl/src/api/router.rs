@@ -11,8 +11,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use russel_core::api::{
-    DeployEvent, DeployRequest, DeploymentsResponse, LogsResponse, RollbackRequest, ServiceSummary,
-    StatusResponse, VmsResponse,
+    DeployEvent, DeployRequest, DeploymentsResponse, LogsResponse, RollbackRequest, ServiceStatus,
+    ServiceSummary, StatusResponse, VmState, VmsResponse,
 };
 use russel_core::config::RuntimeKind;
 use russel_core::reserved::is_reserved_service_dir;
@@ -218,8 +218,8 @@ async fn vm_status(
             .map_err(|e| (e.status, e.message))?;
         return Ok(Json(StatusResponse {
             service_id,
-            status: if agent_status.status == "running" {
-                "deployed".to_string()
+            status: if agent_status.status == ServiceStatus::Running.as_str() {
+                ServiceStatus::Deployed.as_str().to_string()
             } else {
                 agent_status.status
             },
@@ -466,7 +466,8 @@ async fn vm_stop(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
-    let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
+    let (runtime, handle) =
+        claim_lifecycle_operation(&state, &service_id, ServiceStatus::Stopping)?;
     let result = handle.lifecycle.stop(&service_id).await;
 
     let label = runtime_label(runtime);
@@ -485,7 +486,7 @@ async fn vm_stop(
                 tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during stop");
             }
             tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
-            state.set_status(&service_id, "stopped", "none");
+            state.set_status(&service_id, ServiceStatus::Stopped, VmState::None);
             Ok(Json(format!("stopped {label} {service_id}")))
         }
         Err(e) => {
@@ -495,9 +496,9 @@ async fn vm_stop(
             state.abort_lifecycle_operation(
                 &service_id,
                 handle.claim_generation,
-                &handle.expected_status,
-                &handle.prior_status,
-                &handle.prior_vm_state,
+                handle.expected_status,
+                handle.prior_status,
+                handle.prior_vm_state,
             );
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
@@ -741,7 +742,8 @@ async fn vm_destroy(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
-    let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
+    let (runtime, handle) =
+        claim_lifecycle_operation(&state, &service_id, ServiceStatus::Destroying)?;
     let result = handle.lifecycle.destroy(&service_id).await;
 
     let label = runtime_label(runtime);
@@ -790,7 +792,7 @@ async fn vm_destroy(
             {
                 reap_children(vm, aux).await;
             }
-            state.set_status(&service_id, "failed", "failed");
+            state.set_status(&service_id, ServiceStatus::Failed, VmState::Failed);
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
@@ -804,9 +806,9 @@ struct LifecycleClaimHandle {
     /// Process generation at claim time; abort must match to restore.
     claim_generation: u64,
     /// In-progress status this claim set (`stopping` / `destroying`).
-    expected_status: String,
-    prior_status: String,
-    prior_vm_state: String,
+    expected_status: ServiceStatus,
+    prior_status: ServiceStatus,
+    prior_vm_state: VmState,
 }
 
 pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
@@ -819,12 +821,12 @@ pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
 fn claim_lifecycle_operation(
     state: &AppState,
     service_id: &str,
-    target_status: &str,
+    target_status: ServiceStatus,
 ) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
     let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
 
     let (prior_status, prior_vm_state, claim_generation) =
-        match state.begin_lifecycle_operation(service_id, target_status, "pending") {
+        match state.begin_lifecycle_operation(service_id, target_status, VmState::Pending) {
             LifecycleClaim::Claimed {
                 prior_status,
                 prior_vm_state,
@@ -848,7 +850,7 @@ fn claim_lifecycle_operation(
         runtime,
         lifecycle: runtime::lifecycle_for(runtime),
         claim_generation,
-        expected_status: target_status.to_string(),
+        expected_status: target_status,
         prior_status,
         prior_vm_state,
     };

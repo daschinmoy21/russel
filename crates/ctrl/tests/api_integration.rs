@@ -22,6 +22,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
+use russel_core::api::{ServiceStatus, VmState};
 use russel_ctrl::api::router;
 use russel_ctrl::state::AppState;
 use serde_json::{Value, json};
@@ -216,7 +217,7 @@ async fn delete_req(router: axum::Router, uri: &str) -> axum::response::Response
 /// Seed a service that appears in inventory without a real runtime process.
 fn seed_service(state: &AppState, id: &str) {
     state.mark_building(id).expect("mark_building");
-    state.set_status(id, "deployed", "running");
+    state.set_status(id, ServiceStatus::Deployed, VmState::Running);
 }
 
 const STRONG_TOKEN: &str = "integration-test-token-32chars!!"; // 32 chars

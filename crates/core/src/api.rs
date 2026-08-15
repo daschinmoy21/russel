@@ -75,6 +75,158 @@ impl PortMapping {
     }
 }
 
+/// Control-plane service status vocabulary.
+///
+/// This is the shared machine for the `status` / `vm_state` strings used across
+/// ctrl's in-memory state and the wire API. It serializes as snake_case so the
+/// JSON contract stays byte-identical to the historical string literals.
+///
+/// ctrl's `ServiceState.status` uses the lifecycle subset (`building`,
+/// `deployed`, `failed`, `stopping`, `destroying`, `stopped`, `detached`,
+/// `idle`); `ServiceState.vm_state` uses the liveness subset (`running`,
+/// `failed`, `pending`, `orphaned`) plus [`VmState::None`]. The agent wire
+/// status additionally reports `"running"` / `"stopped"` / `"destroyed"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatus {
+    Pending,
+    Building,
+    Deployed,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+    Detached,
+    Orphaned,
+    Destroying,
+    #[default]
+    Idle,
+}
+
+impl ServiceStatus {
+    /// The snake_case wire string for this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Building => "building",
+            Self::Deployed => "deployed",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Detached => "detached",
+            Self::Orphaned => "orphaned",
+            Self::Destroying => "destroying",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<ServiceStatus> for &'static str {
+    fn from(s: ServiceStatus) -> &'static str {
+        s.as_str()
+    }
+}
+
+impl std::str::FromStr for ServiceStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "building" => Ok(Self::Building),
+            "deployed" => Ok(Self::Deployed),
+            "running" => Ok(Self::Running),
+            "stopping" => Ok(Self::Stopping),
+            "stopped" => Ok(Self::Stopped),
+            "failed" => Ok(Self::Failed),
+            "detached" => Ok(Self::Detached),
+            "orphaned" => Ok(Self::Orphaned),
+            "destroying" => Ok(Self::Destroying),
+            "idle" => Ok(Self::Idle),
+            _ => Err(format!("unknown service status: {s}")),
+        }
+    }
+}
+
+impl TryFrom<&str> for ServiceStatus {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+/// Control-plane VM liveness vocabulary (`ServiceState.vm_state`).
+///
+/// Distinct from [`ServiceStatus`] because the liveness machine has its own
+/// values: [`VmState::None`] means "no VM process state at all" (e.g. a stopped
+/// or never-booted service), which is not a valid `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmState {
+    #[default]
+    None,
+    Running,
+    Failed,
+    Pending,
+    Orphaned,
+}
+
+impl VmState {
+    /// The snake_case wire string for this VM state.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Pending => "pending",
+            Self::Orphaned => "orphaned",
+        }
+    }
+}
+
+impl std::fmt::Display for VmState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<VmState> for &'static str {
+    fn from(s: VmState) -> &'static str {
+        s.as_str()
+    }
+}
+
+impl std::str::FromStr for VmState {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "running" => Ok(Self::Running),
+            "failed" => Ok(Self::Failed),
+            "pending" => Ok(Self::Pending),
+            "orphaned" => Ok(Self::Orphaned),
+            _ => Err(format!("unknown vm_state: {s}")),
+        }
+    }
+}
+
+impl TryFrom<&str> for VmState {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StatusResponse {
     pub service_id: String,
@@ -663,5 +815,101 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let parsed: AgentErrorResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, err);
+    }
+
+    #[test]
+    fn service_status_serde_roundtrip_every_variant() {
+        let variants = [
+            ServiceStatus::Pending,
+            ServiceStatus::Building,
+            ServiceStatus::Deployed,
+            ServiceStatus::Running,
+            ServiceStatus::Stopping,
+            ServiceStatus::Stopped,
+            ServiceStatus::Failed,
+            ServiceStatus::Detached,
+            ServiceStatus::Orphaned,
+            ServiceStatus::Destroying,
+            ServiceStatus::Idle,
+        ];
+        let expected = [
+            "pending",
+            "building",
+            "deployed",
+            "running",
+            "stopping",
+            "stopped",
+            "failed",
+            "detached",
+            "orphaned",
+            "destroying",
+            "idle",
+        ];
+        for (variant, wire) in variants.iter().zip(expected) {
+            let json = serde_json::to_string(variant).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{wire}\""),
+                "wire format must stay snake_case"
+            );
+            assert_eq!(variant.as_str(), wire);
+            let parsed: ServiceStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, *variant);
+        }
+    }
+
+    #[test]
+    fn service_status_from_str_roundtrip_and_unknown() {
+        for s in [
+            "pending",
+            "building",
+            "deployed",
+            "running",
+            "stopping",
+            "stopped",
+            "failed",
+            "detached",
+            "orphaned",
+            "destroying",
+            "idle",
+        ] {
+            let parsed: ServiceStatus = s.parse().unwrap();
+            assert_eq!(parsed.as_str(), s);
+            assert_eq!(parsed.to_string(), s);
+            assert_eq!(ServiceStatus::try_from(s).unwrap(), parsed);
+        }
+        assert!("rolled_back".parse::<ServiceStatus>().is_err());
+        assert!(ServiceStatus::try_from("rolled_back").is_err());
+    }
+
+    #[test]
+    fn vm_state_serde_roundtrip_every_variant() {
+        let variants = [
+            VmState::None,
+            VmState::Running,
+            VmState::Failed,
+            VmState::Pending,
+            VmState::Orphaned,
+        ];
+        let expected = ["none", "running", "failed", "pending", "orphaned"];
+        for (variant, wire) in variants.iter().zip(expected) {
+            let json = serde_json::to_string(variant).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{wire}\""),
+                "wire format must stay snake_case"
+            );
+            assert_eq!(variant.as_str(), wire);
+            let parsed: VmState = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, *variant);
+        }
+    }
+
+    #[test]
+    fn vm_state_from_str_unknown_is_err() {
+        assert!("deployed".parse::<VmState>().is_err());
+        assert!("".parse::<VmState>().is_err());
+        assert!("NONE".parse::<VmState>().is_err());
+        assert!(VmState::try_from("orphaned").is_ok());
     }
 }

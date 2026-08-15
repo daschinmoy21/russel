@@ -1,0 +1,11 @@
+---
+import { renderOfflineState } from '../lib/offline_state';
+
+interface Props {
+  message?: string;
+}
+
+const { message } = Astro.props;
+---
+
+<Fragment set:html={renderOfflineState(message)} />

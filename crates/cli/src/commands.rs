@@ -10,8 +10,8 @@ use reqwest::header::{AUTHORIZATION, HeaderMap};
 use russel_core::{
     RuntimeKind,
     api::{
-        DeployEvent, DeployRequest, DeployResponse, LogsResponse, PortMapping, StatusResponse,
-        VmsResponse,
+        DeployEvent, DeployRequest, DeployResponse, LogsResponse, PortMapping, ServiceStatus,
+        StatusResponse, VmsResponse,
     },
     config::{Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
@@ -421,7 +421,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
 /// Anything other than exact `"deployed"` is treated as failure so CI/scripts
 /// get a non-zero process exit code (see issue #68).
 fn deploy_status_is_success(status: &str) -> bool {
-    status == "deployed"
+    status == ServiceStatus::Deployed.as_str()
 }
 
 fn step(label: &str, value: &str, suffix: &str) {
@@ -494,7 +494,7 @@ fn is_terminal_control(c: char) -> bool {
 }
 
 fn print_deploy_response(r: DeployResponse, wall: Duration) {
-    let ok = r.status == "deployed";
+    let ok = r.status == ServiceStatus::Deployed.as_str();
     let rolled_back = r.status == "rolled_back";
     let icon = if ok {
         "\x1b[1;32m✓\x1b[0m"
@@ -1039,61 +1039,92 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
     Ok(())
 }
 
+/// Maximum accepted length (bytes) for a single NDJSON line from the control
+/// plane before we refuse it as hostile/buggy output.
+const MAX_NDJSON_LINE: usize = 8 * 1024 * 1024;
+
+/// Append one chunk to the NDJSON buffer and emit every complete
+/// (`\n`-terminated) line through `on_line`, newline stripped. Empty and
+/// whitespace-only lines (keepalives) are skipped. A partial trailing line is
+/// left in `buffer`. Errors when any line exceeds `max_line` bytes or is not
+/// valid UTF-8.
+fn consume_ndjson_chunk(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    max_line: usize,
+    on_line: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    buffer.extend_from_slice(chunk);
+    while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+        if i > max_line {
+            anyhow::bail!("control plane NDJSON line exceeded {max_line} bytes");
+        }
+        let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+        let line_bytes = &line_bytes[..line_bytes.len() - 1];
+        if line_bytes.is_empty() || line_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        let line =
+            std::str::from_utf8(line_bytes).context("control plane sent non-UTF-8 NDJSON line")?;
+        on_line(line)?;
+    }
+    if buffer.len() > max_line {
+        anyhow::bail!("control plane NDJSON line exceeded {max_line} bytes without a newline");
+    }
+    Ok(())
+}
+
+/// Emit the trailing partial record (no newline) left in `buffer` after the
+/// stream ends, if any. Mirror of the loop in [`consume_ndjson_chunk`]: the
+/// final record is trimmed before UTF-8/JSON handling.
+fn consume_ndjson_final(
+    buffer: &mut [u8],
+    max_line: usize,
+    on_line: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    if buffer.len() > max_line {
+        anyhow::bail!("control plane NDJSON line exceeded {max_line} bytes without a newline");
+    }
+    let line = std::str::from_utf8(buffer)
+        .context("control plane sent non-UTF-8 final NDJSON record")?
+        .trim();
+    if !line.is_empty() {
+        on_line(line)?;
+    }
+    Ok(())
+}
+
 async fn stream_deploy_events(
     response: &mut reqwest::Response,
     operation: &str,
 ) -> Result<DeployResponse> {
-    const MAX_NDJSON_LINE: usize = 8 * 1024 * 1024;
     let mut buffer = Vec::new();
     let mut final_response = None;
 
     while let Some(chunk) = response.chunk().await? {
-        buffer.extend_from_slice(&chunk);
-        while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
-            if i > MAX_NDJSON_LINE {
-                anyhow::bail!("control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes");
-            }
-            let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-            if line_bytes.is_empty() || line_bytes.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            let line = std::str::from_utf8(line_bytes)
-                .context("control plane sent non-UTF-8 NDJSON line")?;
+        consume_ndjson_chunk(&mut buffer, &chunk, MAX_NDJSON_LINE, &mut |line| {
             let event: DeployEvent = serde_json::from_str(line).with_context(|| {
                 format!(
                     "failed to parse event from control plane: {}",
                     truncate_for_error(line)
                 )
             })?;
-            handle_deploy_event(event, operation, &mut final_response)?;
-        }
-        if buffer.len() > MAX_NDJSON_LINE {
-            anyhow::bail!(
-                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
-            );
-        }
+            handle_deploy_event(event, operation, &mut final_response)
+        })?;
     }
 
-    if !buffer.is_empty() {
-        if buffer.len() > MAX_NDJSON_LINE {
-            anyhow::bail!(
-                "control plane NDJSON line exceeded {MAX_NDJSON_LINE} bytes without a newline"
-            );
-        }
-        let line = std::str::from_utf8(&buffer)
-            .context("control plane sent non-UTF-8 final NDJSON record")?
-            .trim();
-        if !line.is_empty() {
-            let event: DeployEvent = serde_json::from_str(line).with_context(|| {
-                format!(
-                    "failed to parse final event from control plane: {}",
-                    truncate_for_error(line)
-                )
-            })?;
-            handle_deploy_event(event, operation, &mut final_response)?;
-        }
-    }
+    consume_ndjson_final(&mut buffer, MAX_NDJSON_LINE, &mut |line| {
+        let event: DeployEvent = serde_json::from_str(line).with_context(|| {
+            format!(
+                "failed to parse final event from control plane: {}",
+                truncate_for_error(line)
+            )
+        })?;
+        handle_deploy_event(event, operation, &mut final_response)
+    })?;
 
     final_response
         .map(|response| *response)
@@ -1766,5 +1797,123 @@ mod tests {
             }
             _ => panic!("expected deploy subcommand"),
         }
+    }
+
+    // ── stream_deploy_events NDJSON buffering (pure) ────────────────────────
+
+    fn collect_lines(chunks: &[&[u8]], trailing: bool) -> Vec<String> {
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+        for chunk in chunks {
+            consume_ndjson_chunk(&mut buffer, chunk, MAX_NDJSON_LINE, &mut |line| {
+                lines.push(line.to_string());
+                Ok(())
+            })
+            .unwrap();
+        }
+        if trailing {
+            consume_ndjson_final(&mut buffer, MAX_NDJSON_LINE, &mut |line| {
+                lines.push(line.to_string());
+                Ok(())
+            })
+            .unwrap();
+        }
+        lines
+    }
+
+    #[test]
+    fn ndjson_complete_lines_in_one_chunk() {
+        let lines = collect_lines(&[b"{\"a\":1}\n{\"b\":2}\n".as_slice()], false);
+        assert_eq!(lines, vec!["{\"a\":1}", "{\"b\":2}"]);
+    }
+
+    #[test]
+    fn ndjson_line_split_across_chunks() {
+        let lines = collect_lines(
+            &[b"{\"ph".as_slice(), b"ase\":\"build\"}\n".as_slice()],
+            false,
+        );
+        assert_eq!(lines, vec!["{\"phase\":\"build\"}"]);
+    }
+
+    #[test]
+    fn ndjson_split_mid_crlf_boundary() {
+        // Split inside the `\r\n` pair that terminates a line (and the JSON).
+        // The splitter strips only `\n`; a trailing `\r` is preserved and left
+        // for serde_json (which treats `\r` as JSON whitespace), matching the
+        // pre-existing wire behavior.
+        let full = "{\"x\":1}\r\n{\"y\":2}\n".as_bytes();
+        let lines = collect_lines(&[&full[..8], &full[8..]], false);
+        assert_eq!(lines, vec!["{\"x\":1}\r", "{\"y\":2}"]);
+    }
+
+    #[test]
+    fn ndjson_trailing_partial_line_without_newline() {
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+        consume_ndjson_chunk(
+            &mut buffer,
+            b"{\"x\":1}\n{\"z\":".as_slice(),
+            MAX_NDJSON_LINE,
+            &mut |l| {
+                lines.push(l.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        // Trailing partial record is not emitted until the stream ends.
+        assert_eq!(lines, vec!["{\"x\":1}"]);
+        consume_ndjson_final(&mut buffer, MAX_NDJSON_LINE, &mut |l| {
+            lines.push(l.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lines, vec!["{\"x\":1}", "{\"z\":"]);
+    }
+
+    #[test]
+    fn ndjson_empty_keepalives_are_skipped() {
+        let lines = collect_lines(&[b"\n\n   \n{\"ok\":true}\n\t\n".as_slice()], false);
+        assert_eq!(lines, vec!["{\"ok\":true}"]);
+    }
+
+    #[test]
+    fn ndjson_oversized_line_rejected() {
+        // A small max reproduces the same guard as the 8 MiB production limit.
+        let mut buffer = Vec::new();
+        let err = consume_ndjson_chunk(
+            &mut buffer,
+            b"{\"long\":\"xxxxxxxxxxxxxxxx\"}\n".as_slice(),
+            16,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn ndjson_oversized_partial_without_newline_rejected() {
+        let mut buffer = Vec::new();
+        let err = consume_ndjson_chunk(
+            &mut buffer,
+            b"xxxxxxxxxxxxxxxxx".as_slice(),
+            16,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("without a newline"), "got: {err}");
+    }
+
+    #[test]
+    fn ndjson_non_utf8_line_rejected() {
+        let mut buffer = Vec::new();
+        let err = consume_ndjson_chunk(
+            &mut buffer,
+            &[0xff, 0xfe, b'\n'],
+            MAX_NDJSON_LINE,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-UTF-8"), "got: {err}");
     }
 }

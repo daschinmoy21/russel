@@ -3,6 +3,7 @@ import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import MetricCard from '../components/MetricCard.astro';
 import ActivityChart from '../components/ActivityChart.astro';
+import OfflineState from '../components/OfflineState.astro';
 import { STATIC_FLEET_STATUS, type ServiceVM } from '../lib/api';
 
 // Static shell only — no build-time control-plane fetch (#306).
@@ -58,6 +59,7 @@ const services: ServiceVM[] = [];
     <div class="card-panel empty-state">
       <p>Loading…</p>
     </div>
+    <noscript><OfflineState /></noscript>
   </section>
 </Layout>
 
@@ -72,29 +74,14 @@ const services: ServiceVM[] = [];
     overviewServicesEmptyCopy,
     probeEndpointPort,
   } from '../lib/api';
+  import { renderOfflineState, renderEmptyState } from '../lib/offline_state';
+  import { renderPortCell } from '../lib/ports';
+  import type { FleetStatus, ServiceVM } from '../lib/api';
 
   const SAMPLE_KEY = 'RUSSEL_FLEET_SAMPLES';
   const MAX_SAMPLES = 48;
   const MIN_SAMPLE_INTERVAL_MS = 30_000;
   const POLL_INTERVAL_MS = 10_000;
-
-  function getHostPort(svc: any): number | null {
-    if (typeof svc.host_port === 'number') return svc.host_port;
-    const m = typeof svc.ports === 'string' ? svc.ports.match(/^\d+/) : null;
-    return m ? parseInt(m[0], 10) : null;
-  }
-
-  function renderPortCell(svc: any): string {
-    const hp = getHostPort(svc);
-    if (!hp) return `<span class="mono-text">\u2014</span>`;
-    const portsLabel = escapeHtml(svc.ports || '\u2014');
-    // Only link to localhost when the control plane is loopback — remote API
-    // host ports are not on the operator machine (#283).
-    if (isApiBaseLoopback()) {
-      return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
-    }
-    return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><span class="port-link port-link-remote" title="Host port is on the remote control-plane host, not this browser">port ${hp}</span></div>`;
-  }
 
   // ---- localStorage sampling ----
 
@@ -155,11 +142,11 @@ const services: ServiceVM[] = [];
 
   // ---- Endpoint probing ----
 
-  async function probeEndpoints(services: any[]): Promise<{ up: number; total: number; avgMs: number | null }> {
+  async function probeEndpoints(services: ServiceVM[]): Promise<{ up: number; total: number; avgMs: number | null }> {
     // Remote API: browser cannot probe operator-local ports for remote host mappings
     if (!isApiBaseLoopback()) return { up: 0, total: 0, avgMs: null };
 
-    const probeable = services.filter((s: any) =>
+    const probeable = services.filter((s) =>
       (s.status === 'deployed' || s.status === 'running' || s.vm_state === 'running') &&
       typeof s.host_port === 'number'
     );
@@ -171,7 +158,7 @@ const services: ServiceVM[] = [];
     for (let i = 0; i < probeable.length; i += CONCURRENCY) {
       const batch = probeable.slice(i, i + CONCURRENCY);
       const batchResults = await Promise.allSettled(
-        batch.map((s: any) => probeEndpointPort(s.host_port as number))
+        batch.map((s) => probeEndpointPort(s.host_port as number))
       );
       for (const r of batchResults) {
         if (r.status === 'fulfilled') {
@@ -417,10 +404,6 @@ const services: ServiceVM[] = [];
     if (empty) empty.style.display = any ? 'none' : '';
   }
 
-  function updateLiveSummary(): void {
-    // Values live on each spark row now; keep as no-op for call sites
-  }
-
   // ---- Bar updater ----
 
   function updateBar(id: string, count: number, max: number): void {
@@ -432,9 +415,9 @@ const services: ServiceVM[] = [];
     if (countEl) countEl.textContent = String(count);
   }
 
-  function updateComposition(status: any, services: any[]): void {
-    const microvmCount = services.filter((s: any) => s.runtime === 'microvm').length;
-    const containerCount = services.filter((s: any) => s.runtime === 'container').length;
+  function updateComposition(status: FleetStatus, services: ServiceVM[]): void {
+    const microvmCount = services.filter((s) => s.runtime === 'microvm').length;
+    const containerCount = services.filter((s) => s.runtime === 'container').length;
     const barMax = Math.max(status.running_vms, status.stopped_vms, status.failed_vms, 1);
     const runtimeMax = Math.max(microvmCount, containerCount, 1);
     const hasFleet = (status.total_vms ?? services.length) > 0;
@@ -480,7 +463,7 @@ const services: ServiceVM[] = [];
       epAvgMs = probeResults.avgMs;
     } else if (connection === 'demo') {
       // Synthesize mild demo endpoint samples (real probes would be CORS noise)
-      const probeable = services.filter((s: any) =>
+      const probeable = services.filter((s) =>
         (s.status === 'deployed' || s.status === 'running' || s.vm_state === 'running') &&
         typeof s.host_port === 'number'
       );
@@ -493,7 +476,6 @@ const services: ServiceVM[] = [];
 
     appendSample(status, apiMs, epUp, epTotal, epAvgMs);
     renderEndpointChart();
-    updateLiveSummary();
 
     // Update composition bars
     if (connection === 'live' || connection === 'demo') {
@@ -529,7 +511,7 @@ const services: ServiceVM[] = [];
     if (section) {
       const headerRow = section.querySelector('.section-header');
       if (services.length > 0) {
-        const rows = services.slice(0, 4).map((svc: any) => {
+        const rows = services.slice(0, 4).map((svc) => {
           const statusClass = isServiceRunning(svc) ? 'badge-running' : 'badge-stopped';
           const idAttr = encodeURIComponent(svc.id);
           const label = escapeHtml(svc.name || svc.id);
@@ -553,9 +535,9 @@ const services: ServiceVM[] = [];
         if (afterHeader) afterHeader.remove();
         if (headerRow) {
           if (empty.kind === 'offline') {
-            headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>${escapeHtml(empty.primary)}</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`);
+            headerRow.insertAdjacentHTML('afterend', renderOfflineState(empty.primary));
           } else {
-            headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>${escapeHtml(empty.primary)}</p><a href="/deploy" class="btn btn-primary" style="margin-top:0.75rem">Deploy your first service</a></div>`);
+            headerRow.insertAdjacentHTML('afterend', renderEmptyState(empty.primary));
           }
         }
       }
@@ -564,7 +546,6 @@ const services: ServiceVM[] = [];
 
   // Paint cached samples immediately; hydrate refreshes after probes
   renderEndpointChart();
-  updateLiveSummary();
   hydrate();
   setInterval(hydrate, POLL_INTERVAL_MS);
 </script>

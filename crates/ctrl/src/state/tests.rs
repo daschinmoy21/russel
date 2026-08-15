@@ -3,6 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use russel_core::api::{ServiceStatus, VmState};
 use russel_core::config::RuntimeKind;
 
 use super::*;
@@ -62,8 +63,8 @@ async fn test_detach_all_processes_nonempty() {
         "aux_processes should be empty"
     );
     assert!(svc.vm_pid.is_none(), "vm_pid should be None");
-    assert_eq!(svc.status, "detached");
-    assert_eq!(svc.vm_state, "orphaned");
+    assert_eq!(svc.status, ServiceStatus::Detached);
+    assert_eq!(svc.vm_state, VmState::Orphaned);
 }
 
 #[test]
@@ -105,9 +106,9 @@ fn test_mark_building_rejects_conflicting_lifecycle() {
     assert!(err.to_string().contains("already in lifecycle state"));
 
     // stopping / destroying also rejected.
-    state.set_status("svc-1", "stopping", "pending");
+    state.set_status("svc-1", ServiceStatus::Stopping, VmState::Pending);
     assert!(state.mark_building("svc-1").is_err());
-    state.set_status("svc-1", "destroying", "pending");
+    state.set_status("svc-1", ServiceStatus::Destroying, VmState::Pending);
     assert!(state.mark_building("svc-1").is_err());
 
     // A fresh service still works alongside the conflicting one.
@@ -177,12 +178,12 @@ fn test_begin_lifecycle_operation() {
     state.mark_building("svc-1").unwrap();
     // While status is "building" the claim is Busy (not NotFound).
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+        state.begin_lifecycle_operation("svc-1", ServiceStatus::Stopping, VmState::Pending),
         LifecycleClaim::Busy
     ));
     // Unknown service is NotFound, distinct from Busy.
     assert!(matches!(
-        state.begin_lifecycle_operation("nope", "stopping", "pending"),
+        state.begin_lifecycle_operation("nope", ServiceStatus::Stopping, VmState::Pending),
         LifecycleClaim::NotFound
     ));
 }
@@ -191,28 +192,28 @@ fn test_begin_lifecycle_operation() {
 fn test_begin_lifecycle_same_op_reentry_is_busy() {
     let state = AppState::default();
     state.mark_building("svc-1").unwrap();
-    state.set_status("svc-1", "deployed", "running");
+    state.set_status("svc-1", ServiceStatus::Deployed, VmState::Running);
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+        state.begin_lifecycle_operation("svc-1", ServiceStatus::Stopping, VmState::Pending),
         LifecycleClaim::Claimed { .. }
     ));
     // Second stop while already stopping — Busy (no overlapping claims).
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+        state.begin_lifecycle_operation("svc-1", ServiceStatus::Stopping, VmState::Pending),
         LifecycleClaim::Busy
     ));
     // Destroy may supersede stuck stop.
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
+        state.begin_lifecycle_operation("svc-1", ServiceStatus::Destroying, VmState::Pending),
         LifecycleClaim::Claimed { .. }
     ));
     // Same-op destroy re-entry and stop-while-destroying are both Busy.
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-1", "destroying", "pending"),
+        state.begin_lifecycle_operation("svc-1", ServiceStatus::Destroying, VmState::Pending),
         LifecycleClaim::Busy
     ));
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-1", "stopping", "pending"),
+        state.begin_lifecycle_operation("svc-1", ServiceStatus::Stopping, VmState::Pending),
         LifecycleClaim::Busy
     ));
 }
@@ -232,15 +233,16 @@ async fn begin_lifecycle_keeps_processes_until_take() {
         inner.services.get("svc-keep").unwrap().process_generation
     };
 
-    let claim = state.begin_lifecycle_operation("svc-keep", "stopping", "pending");
+    let claim =
+        state.begin_lifecycle_operation("svc-keep", ServiceStatus::Stopping, VmState::Pending);
     match claim {
         LifecycleClaim::Claimed {
             prior_status,
             prior_vm_state,
             claim_generation,
         } => {
-            assert_eq!(prior_status, "deployed");
-            assert_eq!(prior_vm_state, "running");
+            assert_eq!(prior_status, ServiceStatus::Deployed);
+            assert_eq!(prior_vm_state, VmState::Running);
             assert_ne!(claim_generation, gen_before);
         }
         other => panic!("expected Claimed, got non-Claimed: {other:?}"),
@@ -250,8 +252,8 @@ async fn begin_lifecycle_keeps_processes_until_take() {
     {
         let inner = state.lock_inner();
         let s = inner.services.get("svc-keep").unwrap();
-        assert_eq!(s.status, "stopping");
-        assert_eq!(s.vm_state, "pending");
+        assert_eq!(s.status, ServiceStatus::Stopping);
+        assert_eq!(s.vm_state, VmState::Pending);
         assert!(s.vm_process.is_some(), "children must remain after claim");
         assert_eq!(s.vm_pid, expected_pid);
         assert_ne!(
@@ -286,7 +288,8 @@ async fn abort_lifecycle_restores_status_and_keeps_processes() {
         .expect("spawn sleep");
     state.mark_deployed_with_aux("svc-abort", child, vec![], None, None);
 
-    let claim = state.begin_lifecycle_operation("svc-abort", "stopping", "pending");
+    let claim =
+        state.begin_lifecycle_operation("svc-abort", ServiceStatus::Stopping, VmState::Pending);
     let LifecycleClaim::Claimed {
         prior_status,
         prior_vm_state,
@@ -305,9 +308,9 @@ async fn abort_lifecycle_restores_status_and_keeps_processes() {
     state.abort_lifecycle_operation(
         "svc-abort",
         claim_generation,
-        "stopping",
-        &prior_status,
-        &prior_vm_state,
+        ServiceStatus::Stopping,
+        prior_status,
+        prior_vm_state,
     );
 
     let status = state.status("svc-abort").unwrap();
@@ -347,7 +350,8 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
         .expect("spawn sleep");
     state.mark_deployed_with_aux("svc-race", child, vec![], None, None);
 
-    let first = state.begin_lifecycle_operation("svc-race", "stopping", "pending");
+    let first =
+        state.begin_lifecycle_operation("svc-race", ServiceStatus::Stopping, VmState::Pending);
     let LifecycleClaim::Claimed {
         prior_status: first_prior_status,
         prior_vm_state: first_prior_vm_state,
@@ -356,12 +360,12 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
     else {
         panic!("expected Claimed for first stop");
     };
-    assert_eq!(first_prior_status, "deployed");
-    assert_eq!(first_prior_vm_state, "running");
+    assert_eq!(first_prior_status, ServiceStatus::Deployed);
+    assert_eq!(first_prior_vm_state, VmState::Running);
 
     // Same-op re-entry is Busy (no overlapping stop claims).
     assert!(matches!(
-        state.begin_lifecycle_operation("svc-race", "stopping", "pending"),
+        state.begin_lifecycle_operation("svc-race", ServiceStatus::Stopping, VmState::Pending),
         LifecycleClaim::Busy
     ));
 
@@ -371,7 +375,7 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
         .expect("service present");
     assert!(vm.is_some());
     assert!(aux.is_empty());
-    state.set_status("svc-race", "stopped", "none");
+    state.set_status("svc-race", ServiceStatus::Stopped, VmState::None);
     if let Some(mut child) = vm {
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -381,9 +385,9 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
     state.abort_lifecycle_operation(
         "svc-race",
         first_gen,
-        "stopping",
-        &first_prior_status,
-        &first_prior_vm_state,
+        ServiceStatus::Stopping,
+        first_prior_status,
+        first_prior_vm_state,
     );
 
     let status = state.status("svc-race").unwrap();
@@ -405,9 +409,10 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
 fn abort_lifecycle_skips_restore_when_destroy_supersedes_stop() {
     let state = AppState::default();
     state.mark_building("svc-super").unwrap();
-    state.set_status("svc-super", "deployed", "running");
+    state.set_status("svc-super", ServiceStatus::Deployed, VmState::Running);
 
-    let stop = state.begin_lifecycle_operation("svc-super", "stopping", "pending");
+    let stop =
+        state.begin_lifecycle_operation("svc-super", ServiceStatus::Stopping, VmState::Pending);
     let LifecycleClaim::Claimed {
         prior_status,
         prior_vm_state,
@@ -417,7 +422,8 @@ fn abort_lifecycle_skips_restore_when_destroy_supersedes_stop() {
         panic!("expected Claimed for stop");
     };
 
-    let destroy = state.begin_lifecycle_operation("svc-super", "destroying", "pending");
+    let destroy =
+        state.begin_lifecycle_operation("svc-super", ServiceStatus::Destroying, VmState::Pending);
     let LifecycleClaim::Claimed {
         claim_generation: destroy_gen,
         ..
@@ -430,9 +436,9 @@ fn abort_lifecycle_skips_restore_when_destroy_supersedes_stop() {
     state.abort_lifecycle_operation(
         "svc-super",
         stop_gen,
-        "stopping",
-        &prior_status,
-        &prior_vm_state,
+        ServiceStatus::Stopping,
+        prior_status,
+        prior_vm_state,
     );
 
     let status = state.status("svc-super").unwrap();
@@ -485,7 +491,7 @@ fn test_mark_building_preserves_running_vm_state() {
     // without a process handle, "running" → "pending" here.
     let state = AppState::default();
     state.mark_building("svc-1").unwrap();
-    state.set_status("svc-1", "deployed", "running");
+    state.set_status("svc-1", ServiceStatus::Deployed, VmState::Running);
 
     state.mark_building("svc-1").unwrap();
     let status = state.status("svc-1").unwrap();
@@ -502,7 +508,7 @@ fn test_mark_failed_preserves_prior_running_state() {
     let state = AppState::default();
     // Set up a deployed service
     state.mark_building("svc-1").unwrap();
-    state.set_status("svc-1", "deployed", "running");
+    state.set_status("svc-1", ServiceStatus::Deployed, VmState::Running);
 
     // Redeploy: mark_building captures prebuild snapshot
     state.mark_building("svc-1").unwrap();
@@ -534,7 +540,7 @@ fn test_mark_failed_after_take_processes_sets_failed() {
     // is cleared, so mark_failed should set failed/failed.
     let state = AppState::default();
     state.mark_building("svc-1").unwrap();
-    state.set_status("svc-1", "deployed", "running");
+    state.set_status("svc-1", ServiceStatus::Deployed, VmState::Running);
     state.mark_building("svc-1").unwrap();
 
     // Simulate processes being taken (clears snapshot)
@@ -568,11 +574,11 @@ fn test_status_uptime_zero_when_not_running() {
     let status = state.status("stopped-svc").unwrap();
     assert_eq!(status.uptime_seconds, 0);
 
-    state.set_status("stopped-svc", "deployed", "running");
+    state.set_status("stopped-svc", ServiceStatus::Deployed, VmState::Running);
     let status = state.status("stopped-svc").unwrap();
     // Running may be 0 if just set, but must not error; then stop clears uptime.
     let _ = status.uptime_seconds;
-    state.set_status("stopped-svc", "stopped", "none");
+    state.set_status("stopped-svc", ServiceStatus::Stopped, VmState::None);
     let status = state.status("stopped-svc").unwrap();
     assert_eq!(status.uptime_seconds, 0);
     assert_eq!(status.status, "stopped");
@@ -583,7 +589,7 @@ fn test_status_uptime_zero_when_not_running() {
 fn test_ensure_service_does_not_overwrite_existing() {
     let state = AppState::default();
     state.mark_building("svc-1").unwrap();
-    state.set_status("svc-1", "deployed", "running");
+    state.set_status("svc-1", ServiceStatus::Deployed, VmState::Running);
 
     // ensure_service should not overwrite existing state
     state.ensure_service("svc-1");
@@ -830,7 +836,7 @@ fn mark_stopped_from_disk_marks_non_running_container() {
     // live vm_process — mark_stopped_from_disk must NOT protect it and must
     // overwrite the in-memory entry with the disk-derived stopped state.
     state.mark_deployed_container("ctr-idle", "cid-1", Some(9090), Some(3000));
-    state.set_status("ctr-idle", "stopped", "none");
+    state.set_status("ctr-idle", ServiceStatus::Stopped, VmState::None);
 
     state.mark_stopped_from_disk("ctr-idle", RuntimeKind::Container, Some(8080), Some(3000));
 

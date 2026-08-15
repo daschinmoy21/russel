@@ -9,6 +9,7 @@ use std::{
     time::Instant,
 };
 
+use russel_core::api::{ServiceStatus, VmState};
 use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 use tokio::sync::Notify;
@@ -22,8 +23,8 @@ pub enum LifecycleClaim {
     /// `claim_generation` is the process generation after this claim; abort
     /// must supply the same value so a superseded claim cannot restore.
     Claimed {
-        prior_status: String,
-        prior_vm_state: String,
+        prior_status: ServiceStatus,
+        prior_vm_state: VmState,
         claim_generation: u64,
     },
     /// No such service in state.
@@ -65,8 +66,8 @@ pub(crate) struct StateInner {
 
 #[derive(Debug)]
 pub(crate) struct ServiceState {
-    pub(crate) status: String,
-    pub(crate) vm_state: String,
+    pub(crate) status: ServiceStatus,
+    pub(crate) vm_state: VmState,
     pub(crate) logs: String,
     pub(crate) started_at: Instant,
     pub(crate) flake_path: Option<std::path::PathBuf>,
@@ -80,8 +81,8 @@ pub(crate) struct ServiceState {
     pub(crate) aux_processes: Vec<Child>,
     /// Prior state captured when mark_building is called, for restoring the
     /// previous deployment if the build fails before take_processes.
-    pub(crate) prebuild_status: Option<String>,
-    pub(crate) prebuild_vm_state: Option<String>,
+    pub(crate) prebuild_status: Option<ServiceStatus>,
+    pub(crate) prebuild_vm_state: Option<VmState>,
     /// Bumped when process ownership changes so the matching supervisor exits.
     pub(crate) process_generation: u64,
 }
@@ -89,8 +90,8 @@ pub(crate) struct ServiceState {
 impl Default for ServiceState {
     fn default() -> Self {
         Self {
-            status: "idle".into(),
-            vm_state: "none".into(),
+            status: ServiceStatus::Idle,
+            vm_state: VmState::None,
             logs: String::new(),
             started_at: Instant::now(),
             flake_path: None,

@@ -1073,15 +1073,6 @@ export class RusselClient {
 		}
 	}
 
-	// Legacy alias for pages that call getStatus()
-	async getStatus(): Promise<{
-		status: FleetStatus;
-		connection: ConnectionState;
-		isDemo: boolean;
-	}> {
-		return this.getFleetStatus();
-	}
-
 	async getServiceDetail(id: string): Promise<{
 		service: ServiceVM | null;
 		connection: ConnectionState;

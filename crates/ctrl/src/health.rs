@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use russel_core::api::{DeployRequest, PortMapping};
+use russel_core::api::{DeployRequest, PortMapping, ServiceStatus, VmState};
 
 use crate::api::deploy_semaphore;
 use crate::deploy::DeployPipeline;
@@ -142,7 +142,9 @@ pub fn spawn_health_loop(state: AppState) {
                 let Some(status) = state.status(&id) else {
                     continue;
                 };
-                if status.status != "deployed" || status.vm_state != "running" {
+                if status.status != ServiceStatus::Deployed.as_str()
+                    || status.vm_state != VmState::Running.as_str()
+                {
                     failures.remove(&id);
                     no_probe_warned.remove(&id);
                     continue;

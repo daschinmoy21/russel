@@ -247,6 +247,8 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    use russel_core::api::{ServiceStatus, VmState};
+
     /// Returns true if the PID exists *and* its cmdline matches expected identity.
     ///
     /// `kill(pid, 0)` alone is subject to PID reuse; we also require that
@@ -541,8 +543,8 @@ mod tests {
         let inner = state.lock_inner();
         let svc = inner.services.get("live-svc").unwrap();
         assert!(svc.vm_process.is_some(), "live Child handle preserved");
-        assert_eq!(svc.status, "deployed");
-        assert_eq!(svc.vm_state, "running");
+        assert_eq!(svc.status, ServiceStatus::Deployed);
+        assert_eq!(svc.vm_state, VmState::Running);
         drop(inner);
         let _ = fake.kill();
         let _ = fake.wait();

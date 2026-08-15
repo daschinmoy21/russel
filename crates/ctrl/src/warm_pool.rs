@@ -544,3 +544,143 @@ static WARM_POOL: LazyLock<WarmPool> = LazyLock::new(|| WarmPool::new(microvm::s
 pub fn shared_warm_pool() -> &'static WarmPool {
     &WARM_POOL
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn pool() -> WarmPool {
+        WarmPool::new(MicrovmRunner::new())
+    }
+
+    /// Representative Cloud Hypervisor `config.json` (golden snapshot).
+    const GOLDEN_CONFIG: &str = r#"{
+        "cpus": {"boot_vcpus": 1, "max_vcpus": 8},
+        "memory": {"size": 268435456},
+        "net": [
+            {"id": "net0", "tap": "pooltpl-tap0", "mac": "aa:bb:cc:dd:ee:ff"}
+        ],
+        "fs": [
+            {"tag": "nixstore", "socket": "/var/lib/russel/_pool/template/virtiofs-nixstore.sock"},
+            {"tag": "russelcfg", "socket": "/var/lib/russel/_pool/template/virtiofs-cfg.sock"},
+            {"tag": "other", "socket": "/keep/me.sock"}
+        ],
+        "api_socket": "/var/lib/russel/_pool/template/cloud-hypervisor.sock",
+        "console": {"mode": "tty"}
+    }"#;
+
+    #[test]
+    fn patch_config_json_rewrites_service_resources() {
+        let patched = pool()
+            .patch_config_json(
+                GOLDEN_CONFIG,
+                "svc-1",
+                "svc-1-tap0",
+                "02:00:00:00:00:01",
+                "/var/lib/russel/svc-1/virtiofs-nixstore.sock",
+                "/var/lib/russel/svc-1/virtiofs-cfg.sock",
+                "/var/lib/russel/svc-1/cloud-hypervisor.sock",
+            )
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
+
+        assert_eq!(config["net"][0]["tap"], "svc-1-tap0");
+        assert_eq!(config["net"][0]["mac"], "02:00:00:00:00:01");
+        assert_eq!(
+            config["fs"][0]["socket"],
+            "/var/lib/russel/svc-1/virtiofs-nixstore.sock"
+        );
+        assert_eq!(
+            config["fs"][1]["socket"],
+            "/var/lib/russel/svc-1/virtiofs-cfg.sock"
+        );
+        // Unrelated fs tags are left untouched.
+        assert_eq!(config["fs"][2]["socket"], "/keep/me.sock");
+        assert_eq!(
+            config["api_socket"],
+            "/var/lib/russel/svc-1/cloud-hypervisor.sock"
+        );
+        assert_eq!(config["console"]["mode"], "null");
+    }
+
+    #[test]
+    fn patch_config_json_preserves_cpu_and_memory() {
+        // CPU/memory are configured on VmSpec (cpus_boot / memory_mb), not in
+        // the snapshot config.json; the patch must not corrupt either field.
+        let patched = pool()
+            .patch_config_json(
+                GOLDEN_CONFIG,
+                "svc-1",
+                "tap",
+                "02:00:00:00:00:01",
+                "/nix.sock",
+                "/cfg.sock",
+                "/ch.sock",
+            )
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(config["cpus"]["boot_vcpus"], 1);
+        assert_eq!(config["cpus"]["max_vcpus"], 8);
+        assert_eq!(config["memory"]["size"], 268435456);
+    }
+
+    #[test]
+    fn patch_config_json_is_idempotent() {
+        let once = pool()
+            .patch_config_json(
+                GOLDEN_CONFIG,
+                "svc-1",
+                "svc-1-tap0",
+                "02:00:00:00:00:01",
+                "/nix.sock",
+                "/cfg.sock",
+                "/ch.sock",
+            )
+            .unwrap();
+        let twice = pool()
+            .patch_config_json(
+                &once,
+                "svc-1",
+                "svc-1-tap0",
+                "02:00:00:00:00:01",
+                "/nix.sock",
+                "/cfg.sock",
+                "/ch.sock",
+            )
+            .unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn patch_config_json_tolerates_missing_fields() {
+        let minimal = r#"{"net": [{"tap": "a", "mac": "b"}]}"#;
+        let patched = pool()
+            .patch_config_json(minimal, "svc-1", "tap", "mac", "/n", "/c", "/ch")
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(config["net"][0]["tap"], "tap");
+        assert_eq!(config["net"][0]["mac"], "mac");
+        // No fs / api_socket / console keys present — nothing to patch, no panic.
+        assert!(config.get("fs").is_none());
+        assert!(config.get("api_socket").is_none());
+    }
+
+    #[test]
+    fn patch_config_json_rejects_invalid_json() {
+        assert!(
+            pool()
+                .patch_config_json("not json", "svc-1", "t", "m", "/n", "/c", "/ch")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn golden_dir_layout_is_stable() {
+        // The pool + golden snapshot live under a reserved `_pool` service dir;
+        // a template id must pass `validate_service_id`.
+        assert_eq!(POOL_BASE, "/var/lib/russel/_pool");
+        assert_eq!(GOLDEN_DIR, "/var/lib/russel/_pool/golden");
+        assert_eq!(POOL_TEMPLATE_ID, "pooltpl");
+    }
+}

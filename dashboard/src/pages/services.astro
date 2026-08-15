@@ -1,6 +1,7 @@
 ---
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
+import OfflineState from '../components/OfflineState.astro';
 
 // Static shell only — no build-time control-plane fetch (#306).
 // Client hydrate() fills the table from the browser.
@@ -51,11 +52,15 @@ import Header from '../components/Header.astro';
     <div class="card-panel empty-state">
       <p>Loading…</p>
     </div>
+    <noscript><OfflineState /></noscript>
   </section>
 </Layout>
 
 <script>
-  import { api, escapeHtml, isApiBaseLoopback, isDemoMode, isServiceRunning } from '../lib/api';
+  import { api, escapeHtml, isDemoMode, isServiceRunning } from '../lib/api';
+  import { renderOfflineState, renderEmptyState } from '../lib/offline_state';
+  import { renderPortCell } from '../lib/ports';
+  import type { ConnectionState, ServiceVM } from '../lib/api';
 
   const tableWrapper = document.getElementById('servicesTableWrapper');
   const btnRefresh = document.getElementById('btnRefresh');
@@ -65,7 +70,7 @@ import Header from '../components/Header.astro';
   let currentFilter = 'all';
   let searchQuery = '';
 
-  function updateFilterCounts(services: any[]) {
+  function updateFilterCounts(services: ServiceVM[]) {
     const countAll = document.getElementById('countAll');
     const countMicrovm = document.getElementById('countMicrovm');
     const countContainer = document.getElementById('countContainer');
@@ -76,22 +81,6 @@ import Header from '../components/Header.astro';
     if (countRunning) countRunning.textContent = String(services.filter(s => isServiceRunning(s)).length);
   }
 
-  function getHostPort(svc: any): number | null {
-    if (typeof svc.host_port === 'number') return svc.host_port;
-    const m = typeof svc.ports === 'string' ? svc.ports.match(/^\d+/) : null;
-    return m ? parseInt(m[0], 10) : null;
-  }
-
-  function renderPortCell(svc: any): string {
-    const hp = getHostPort(svc);
-    if (!hp) return `<span class="mono-text">\u2014</span>`;
-    const portsLabel = escapeHtml(svc.ports || '\u2014');
-    if (isApiBaseLoopback()) {
-      return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">localhost:${hp}</a></div>`;
-    }
-    return `<div class="port-cell"><span class="mono-text">${portsLabel}</span><span class="port-link port-link-remote" title="Host port is on the remote control-plane host, not this browser">port ${hp}</span></div>`;
-  }
-
   function showFeedback(msg: string, isError: boolean = false) {
     const fb = document.getElementById('actionFeedback');
     if (!fb) return;
@@ -100,13 +89,13 @@ import Header from '../components/Header.astro';
     setTimeout(() => { if (fb.textContent === msg) { fb.textContent = ''; fb.className = 'action-feedback'; } }, 4000);
   }
 
-  function renderTable(services: any[], conn: string) {
+  function renderTable(services: ServiceVM[], conn: ConnectionState) {
     if (!tableWrapper) return;
     if (services.length === 0) {
       if (conn === 'offline') {
-        tableWrapper.innerHTML = `<div class="card-panel empty-state" style="text-align:center;padding:2rem;color:var(--text-muted)"><p>Control plane offline.</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`;
+        tableWrapper.innerHTML = renderOfflineState();
       } else {
-        tableWrapper.innerHTML = `<div class="card-panel empty-state" style="text-align:center;padding:2rem;color:var(--text-muted)"><p>No services configured.</p><a href="/deploy" class="btn btn-primary" style="margin-top:0.75rem">Deploy your first service</a></div>`;
+        tableWrapper.innerHTML = renderEmptyState();
       }
       return;
     }

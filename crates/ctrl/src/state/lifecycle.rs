@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use russel_core::api::{LogsResponse, StatusResponse};
+use russel_core::api::{LogsResponse, ServiceStatus, StatusResponse, VmState};
 use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 
@@ -16,7 +16,9 @@ impl AppState {
     pub fn mark_building(&self, service_id: &str) -> anyhow::Result<()> {
         let mut inner = self.lock_inner();
         if let Some(s) = inner.services.get(service_id)
-            && (s.status == "building" || s.status == "stopping" || s.status == "destroying")
+            && (s.status == ServiceStatus::Building
+                || s.status == ServiceStatus::Stopping
+                || s.status == ServiceStatus::Destroying)
         {
             anyhow::bail!(
                 "service {} is already in lifecycle state '{}'",
@@ -26,15 +28,14 @@ impl AppState {
         }
         let s = inner.services.entry(service_id.to_string()).or_default();
         // Capture prior state for failure recovery during redeployment.
-        s.prebuild_status = Some(s.status.clone());
-        s.prebuild_vm_state = Some(s.vm_state.clone());
-        s.status = "building".to_string();
-        // Reset stale vm_state: "failed" → "pending", preserve "running" for
-        // an existing VM process, set new entries to "pending".
-        match s.vm_state.as_str() {
-            "failed" => s.vm_state = "pending".to_string(),
-            "none" => s.vm_state = "pending".to_string(),
-            "running" if s.vm_process.is_none() => s.vm_state = "pending".to_string(),
+        s.prebuild_status = Some(s.status);
+        s.prebuild_vm_state = Some(s.vm_state);
+        s.status = ServiceStatus::Building;
+        // Reset stale vm_state: "failed"/"none" → "pending", preserve "running"
+        // for an existing VM process, set new entries to "pending".
+        match s.vm_state {
+            VmState::Failed | VmState::None => s.vm_state = VmState::Pending,
+            VmState::Running if s.vm_process.is_none() => s.vm_state = VmState::Pending,
             _ => {}
         }
         Ok(())
@@ -60,8 +61,8 @@ impl AppState {
         let generation = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-            s.status = "deployed".to_string();
-            s.vm_state = "running".to_string();
+            s.status = ServiceStatus::Deployed;
+            s.vm_state = VmState::Running;
             s.started_at = Instant::now();
             s.vm_pid = vm_child.id();
             s.vm_process = Some(vm_child);
@@ -147,7 +148,7 @@ impl AppState {
                     if s.process_generation != generation {
                         return;
                     }
-                    if s.status != "deployed" || s.vm_state != "running" {
+                    if s.status != ServiceStatus::Deployed || s.vm_state != VmState::Running {
                         return;
                     }
                     s.vm_pid
@@ -181,7 +182,7 @@ impl AppState {
         if s.process_generation != generation {
             return SupervisePoll::Stopped;
         }
-        if s.status != "deployed" || s.vm_state != "running" {
+        if s.status != ServiceStatus::Deployed || s.vm_state != VmState::Running {
             return SupervisePoll::Stopped;
         }
 
@@ -237,8 +238,8 @@ impl AppState {
             let vm = s.vm_process.take();
             let aux = std::mem::take(&mut s.aux_processes);
             s.vm_pid = None;
-            s.status = "failed".to_string();
-            s.vm_state = "failed".to_string();
+            s.status = ServiceStatus::Failed;
+            s.vm_state = VmState::Failed;
             push_capped(&mut s.logs, &format!("PROCESS EXIT: {reason}\n"));
             (vm, aux)
         };
@@ -269,8 +270,8 @@ impl AppState {
         let generation = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-            s.status = "deployed".to_string();
-            s.vm_state = "running".to_string();
+            s.status = ServiceStatus::Deployed;
+            s.vm_state = VmState::Running;
             s.started_at = Instant::now();
             s.vm_pid = None;
             s.vm_process = None;
@@ -333,7 +334,7 @@ impl AppState {
                     if s.process_generation != generation {
                         return;
                     }
-                    if s.status != "deployed" || s.vm_state != "running" {
+                    if s.status != ServiceStatus::Deployed || s.vm_state != VmState::Running {
                         return;
                     }
                 }
@@ -412,7 +413,7 @@ impl AppState {
             if s.process_generation != expected_generation {
                 return false;
             }
-            if s.status != "deployed" || s.vm_state != "running" {
+            if s.status != ServiceStatus::Deployed || s.vm_state != VmState::Running {
                 return false;
             }
             Self::apply_failure_transition(s, &error)
@@ -435,7 +436,7 @@ impl AppState {
     /// restores that state and returns the new generation for supervisor
     /// restart. Otherwise sets standard `failed`/`failed` state.
     fn apply_failure_transition(s: &mut ServiceState, error: &str) -> Option<u64> {
-        if s.prebuild_vm_state.as_deref() == Some("running") {
+        if s.prebuild_vm_state == Some(VmState::Running) {
             let prev_status = s.prebuild_status.take().unwrap_or_default();
             let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
             s.status = prev_status;
@@ -452,8 +453,8 @@ impl AppState {
             // No prior VM to restore — standard failure.
             s.prebuild_status = None;
             s.prebuild_vm_state = None;
-            s.status = "failed".to_string();
-            s.vm_state = "failed".to_string();
+            s.status = ServiceStatus::Failed;
+            s.vm_state = VmState::Failed;
             s.vm_pid = None;
             push_capped(&mut s.logs, error);
             push_capped(&mut s.logs, "\n");
@@ -483,7 +484,7 @@ impl AppState {
             .entry(service_id.to_string())
             .or_insert_with(|| {
                 let mut s = ServiceState {
-                    status: "stopped".to_string(),
+                    status: ServiceStatus::Stopped,
                     ..Default::default()
                 };
                 if let Some(meta) = disk_meta {
@@ -544,25 +545,25 @@ impl AppState {
     pub fn begin_lifecycle_operation(
         &self,
         service_id: &str,
-        status: &str,
-        vm_state: &str,
+        status: ServiceStatus,
+        vm_state: VmState,
     ) -> LifecycleClaim {
         let mut inner = self.lock_inner();
         let Some(s) = inner.services.get_mut(service_id) else {
             return LifecycleClaim::NotFound;
         };
-        let busy = match s.status.as_str() {
-            "building" | "destroying" => true,
-            "stopping" => status != "destroying",
+        let busy = match s.status {
+            ServiceStatus::Building | ServiceStatus::Destroying => true,
+            ServiceStatus::Stopping => status != ServiceStatus::Destroying,
             _ => false,
         };
         if busy {
             return LifecycleClaim::Busy;
         }
-        let prior_status = s.status.clone();
-        let prior_vm_state = s.vm_state.clone();
-        s.status = status.to_string();
-        s.vm_state = vm_state.to_string();
+        let prior_status = s.status;
+        let prior_vm_state = s.vm_state;
+        s.status = status;
+        s.vm_state = vm_state;
         // Invalidate supervisor so intentional stop/destroy is not reported as crash.
         // Children remain owned by this ServiceState until take_processes_for_reap.
         // claim_generation identity is this bumped process_generation.
@@ -602,9 +603,9 @@ impl AppState {
         &self,
         service_id: &str,
         claim_generation: u64,
-        expected_status: &str,
-        prior_status: &str,
-        prior_vm_state: &str,
+        expected_status: ServiceStatus,
+        prior_status: ServiceStatus,
+        prior_vm_state: VmState,
     ) {
         let needs_supervisor = {
             let mut inner = self.lock_inner();
@@ -629,8 +630,8 @@ impl AppState {
                 );
                 return;
             }
-            s.status = prior_status.to_string();
-            s.vm_state = prior_vm_state.to_string();
+            s.status = prior_status;
+            s.vm_state = prior_vm_state;
             s.process_generation = s.process_generation.wrapping_add(1);
             let generation = s.process_generation;
             let has_children = s.vm_process.is_some() || !s.aux_processes.is_empty();
@@ -644,12 +645,12 @@ impl AppState {
         }
     }
 
-    pub fn set_status(&self, service_id: &str, status: &str, vm_state: &str) {
+    pub fn set_status(&self, service_id: &str, status: ServiceStatus, vm_state: VmState) {
         {
             let mut inner = self.lock_inner();
             if let Some(s) = inner.services.get_mut(service_id) {
-                s.status = status.to_string();
-                s.vm_state = vm_state.to_string();
+                s.status = status;
+                s.vm_state = vm_state;
             }
         }
         // Catalog write after releasing the state lock (Mutex is not reentrant).
@@ -710,9 +711,9 @@ impl AppState {
                 // Keep the service id so a future reconciler can re-adopt it;
                 // status reflects that this controller no longer owns the PIDs.
                 s.vm_pid = None;
-                if s.status == "deployed" || s.vm_state == "running" {
-                    s.status = "detached".to_string();
-                    s.vm_state = "orphaned".to_string();
+                if s.status == ServiceStatus::Deployed || s.vm_state == VmState::Running {
+                    s.status = ServiceStatus::Detached;
+                    s.vm_state = VmState::Orphaned;
                 }
                 tracing::info!(
                     service_id = %service_id,
@@ -734,14 +735,14 @@ impl AppState {
             let s = inner.services.get(service_id)?;
             // Only count wall-clock uptime while the workload is actually running.
             // Stopped/failed services must not report a growing timer from started_at.
-            let uptime_seconds = if s.vm_state == "running" {
+            let uptime_seconds = if s.vm_state == VmState::Running {
                 s.started_at.elapsed().as_secs()
             } else {
                 0
             };
             (
-                s.status.clone(),
-                s.vm_state.clone(),
+                s.status.as_str().to_string(),
+                s.vm_state.as_str().to_string(),
                 s.runtime,
                 s.host_port,
                 s.guest_port,
@@ -816,7 +817,14 @@ impl AppState {
             inner
                 .services
                 .iter()
-                .map(|(id, s)| (id.clone(), s.status.clone(), s.runtime, s.host_port))
+                .map(|(id, s)| {
+                    (
+                        id.clone(),
+                        s.status.as_str().to_string(),
+                        s.runtime,
+                        s.host_port,
+                    )
+                })
                 .collect()
         };
 
