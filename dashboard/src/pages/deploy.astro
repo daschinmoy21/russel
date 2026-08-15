@@ -114,10 +114,37 @@ import { isDemoMode } from '../lib/api';
     const guestPortStr = (document.getElementById('guestPort') as HTMLInputElement).value.trim();
     const envRaw = (document.getElementById('envVars') as HTMLTextAreaElement).value.trim();
 
-    const port = (hostPortStr || guestPortStr) ? {
-      host: parseInt(hostPortStr) || 0,
-      guest: parseInt(guestPortStr) || 0,
-    } : undefined;
+    /** Parse a port field: integer 1–65535, or null if empty/invalid. */
+    function parsePortField(raw: string): number | null {
+      if (!raw) return null;
+      if (!/^\d+$/.test(raw)) return null;
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
+      return n;
+    }
+
+    // Port mapping: omit when both empty; both required (and valid) if either is set.
+    // Never coerce empty/invalid to 0 (see #285).
+    let port: { host: number; guest: number } | undefined;
+    if (hostPortStr || guestPortStr) {
+      if (!hostPortStr || !guestPortStr) {
+        deployConsole.textContent = '[Error] Both host and guest ports are required when either is set (valid range 1–65535).\n';
+        streamStatus.textContent = 'Failed';
+        streamStatus.className = 'badge badge-stopped';
+        btnSubmit.removeAttribute('disabled');
+        return;
+      }
+      const host = parsePortField(hostPortStr);
+      const guest = parsePortField(guestPortStr);
+      if (host == null || guest == null) {
+        deployConsole.textContent = '[Error] Ports must be integers in the range 1–65535.\n';
+        streamStatus.textContent = 'Failed';
+        streamStatus.className = 'badge badge-stopped';
+        btnSubmit.removeAttribute('disabled');
+        return;
+      }
+      port = { host, guest };
+    }
 
     const env: Record<string, string> = {};
     if (envRaw) {
@@ -135,7 +162,7 @@ import { isDemoMode } from '../lib/api';
         deployConsole.textContent += `[${ts}] ${ev.payload.phase}: ${ev.payload.description}\n`;
       } else if (ev.type === 'Complete') {
         const p = ev.payload;
-        deployConsole.textContent += `[${ts}] COMPLETE: ${p.message} (${p.elapsed_ms}ms, service_id=${p.service_id})\n`;
+        deployConsole.textContent += `[${ts}] COMPLETE: ${p.message} (${p.elapsed_ms}ms, service_id=${p.service_id}, status=${p.status})\n`;
       } else if (ev.type === 'Error') {
         deployConsole.textContent += `[${ts}] ERROR: ${ev.payload}\n`;
       }

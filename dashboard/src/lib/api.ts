@@ -487,6 +487,137 @@ export function formatUptime(seconds?: number): string {
 	return `${m}m ${seconds % 60}s`;
 }
 
+/** Align with CLI: only exact `"deployed"` is a successful Complete status. */
+export function isDeployStatusSuccess(status: string): boolean {
+	return status === "deployed";
+}
+
+/**
+ * Parse one NDJSON line into a DeployEvent.
+ * Accepts tagged events (`{type,payload}`) and a bare DeployResponse shape.
+ */
+export function parseDeployEventLine(line: string): DeployEvent | null {
+	const trimmed = line.trim();
+	if (!trimmed) return null;
+	try {
+		const parsed = JSON.parse(trimmed);
+		if (parsed?.type === "Progress") {
+			const p = parsed.payload ?? parsed;
+			return {
+				type: "Progress",
+				payload: {
+					phase: String(p.phase ?? "unknown"),
+					description: String(p.description ?? p.message ?? ""),
+				},
+			};
+		}
+		if (parsed?.type === "Complete") {
+			const p = parsed.payload ?? parsed;
+			return { type: "Complete", payload: p as DeployResponse };
+		}
+		if (parsed?.type === "Error") {
+			const p = parsed.payload;
+			const msg =
+				typeof p === "string"
+					? p
+					: p?.message || parsed.message || trimmed;
+			return { type: "Error", payload: String(msg) };
+		}
+		// Bare DeployResponse (no type tag)
+		if (parsed?.service_id && parsed?.status) {
+			return { type: "Complete", payload: parsed as DeployResponse };
+		}
+		if (parsed?.phase) {
+			return {
+				type: "Progress",
+				payload: {
+					phase: String(parsed.phase),
+					description: String(parsed.description || parsed.message || ""),
+				},
+			};
+		}
+		return {
+			type: "Progress",
+			payload: { phase: "raw", description: trimmed },
+		};
+	} catch {
+		return {
+			type: "Progress",
+			payload: { phase: "raw", description: trimmed },
+		};
+	}
+}
+
+/**
+ * Stream a response body as NDJSON: call onLine for each complete line
+ * (including a final trailing line without newline).
+ */
+export async function consumeNdjsonStream(
+	body: ReadableStream<Uint8Array>,
+	onLine: (line: string) => void,
+): Promise<void> {
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			let nl: number;
+			while ((nl = buffer.indexOf("\n")) >= 0) {
+				const line = buffer.slice(0, nl);
+				buffer = buffer.slice(nl + 1);
+				if (line.trim()) onLine(line);
+			}
+		}
+		buffer += decoder.decode();
+		if (buffer.trim()) onLine(buffer);
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+/** Result of consuming a deploy/update NDJSON event stream. */
+export interface NdjsonDeployOutcome {
+	success: boolean;
+	sawError: boolean;
+	complete: DeployResponse | null;
+	errorMessage: string | null;
+}
+
+/**
+ * Feed NDJSON lines through parseDeployEventLine, invoke onEvent, and decide
+ * success only when Complete has status === "deployed" and no Error events.
+ */
+export function reduceDeployEvents(
+	lines: Iterable<string>,
+	onEvent?: (event: DeployEvent) => void,
+): NdjsonDeployOutcome {
+	let sawError = false;
+	let complete: DeployResponse | null = null;
+	let errorMessage: string | null = null;
+
+	for (const line of lines) {
+		const event = parseDeployEventLine(line);
+		if (!event) continue;
+		onEvent?.(event);
+		if (event.type === "Error") {
+			sawError = true;
+			errorMessage = event.payload;
+		} else if (event.type === "Complete") {
+			complete = event.payload;
+		}
+	}
+
+	const success =
+		!sawError &&
+		complete != null &&
+		isDeployStatusSuccess(complete.status);
+
+	return { success, sawError, complete, errorMessage };
+}
+
 /** Probe a host port via no-cors fetch. Returns up/down and latency in ms. */
 export async function probeEndpointPort(
 	hostPort: number,
@@ -627,7 +758,7 @@ export class RusselClient {
 		return headers;
 	}
 
-	// ponyail: shared concurrency-4 batched status fetcher, used by getServices + getFleetStatus
+	// Shared concurrency-4 batched status fetcher for getServices + getFleetStatus
 	private async fetchStatuses(
 		ids: string[],
 	): Promise<Map<string, StatusResponse>> {
@@ -988,8 +1119,26 @@ export class RusselClient {
 
 	async updateService(
 		id: string,
+		onEvent?: (event: DeployEvent) => void,
 	): Promise<{ success: boolean; message: string }> {
 		if (isDemoMode()) {
+			onEvent?.({
+				type: "Progress",
+				payload: {
+					phase: "demo",
+					description: `[Demo] Service ${id} update initiated.`,
+				},
+			});
+			onEvent?.({
+				type: "Complete",
+				payload: {
+					service_id: id,
+					vm_id: id,
+					status: "deployed",
+					elapsed_ms: 0,
+					message: `[Demo] Service ${id} update initiated.`,
+				},
+			});
 			return {
 				success: true,
 				message: `[Demo] Service ${id} update initiated.`,
@@ -1006,16 +1155,80 @@ export class RusselClient {
 			);
 			if (!res.ok) {
 				const body = await res.text().catch(() => "");
+				const msg = `Update failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`;
+				onEvent?.({ type: "Error", payload: msg });
 				return {
 					success: false,
-					message: `Update failed: HTTP ${res.status}${body ? ` — ${body}` : ""}`,
+					message: msg,
 				};
 			}
-			return { success: true, message: `Service ${id} updated.` };
-		} catch (e: any) {
+			// /update streams NDJSON like /deploy — consume incrementally
+			if (!res.body) {
+				const msg = `Update failed: empty response body for service ${id}.`;
+				onEvent?.({ type: "Error", payload: msg });
+				return {
+					success: false,
+					message: msg,
+				};
+			}
+			const state: {
+				sawError: boolean;
+				complete: DeployResponse | null;
+				errorMessage: string | null;
+			} = { sawError: false, complete: null, errorMessage: null };
+
+			await consumeNdjsonStream(res.body, (line) => {
+				const event = parseDeployEventLine(line);
+				if (!event) return;
+				// Forward every parsed event to the caller (parity with deployService).
+				onEvent?.(event);
+				if (event.type === "Error") {
+					state.sawError = true;
+					state.errorMessage = event.payload;
+				} else if (event.type === "Complete") {
+					state.complete = event.payload;
+				}
+			});
+
+			const success =
+				!state.sawError &&
+				state.complete != null &&
+				isDeployStatusSuccess(state.complete.status);
+
+			if (success) {
+				return {
+					success: true,
+					message: state.complete?.message || `Service ${id} updated.`,
+				};
+			}
+			if (state.errorMessage) {
+				return {
+					success: false,
+					message: `Update failed: ${state.errorMessage}`,
+				};
+			}
+			if (state.complete) {
+				const msg = `Update finished with status ${state.complete.status}.`;
+				// Complete already forwarded; surface a terminal Error for silent UIs.
+				onEvent?.({ type: "Error", payload: msg });
+				return {
+					success: false,
+					message: msg,
+				};
+			}
+			const closedMsg =
+				"Update failed: control plane closed stream before Complete.";
+			onEvent?.({ type: "Error", payload: closedMsg });
 			return {
 				success: false,
-				message: `Update request failed: ${e.message || "network error"}`,
+				message: closedMsg,
+			};
+		} catch (e: any) {
+			const msg = `Update request failed: ${e.message || "network error"}`;
+			onEvent?.({ type: "Error", payload: msg });
+			return {
+				success: false,
+				message: msg,
 			};
 		}
 	}
@@ -1092,7 +1305,7 @@ export class RusselClient {
 				},
 			];
 			for (const ev of demoEvents) {
-				if (onEvent) onEvent(ev);
+				onEvent?.(ev);
 				await new Promise((r) => setTimeout(r, 400));
 			}
 			return { success: true };
@@ -1106,61 +1319,56 @@ export class RusselClient {
 			});
 			if (!res.ok) {
 				const body = await res.text().catch(() => "");
-				if (onEvent)
-					onEvent({ type: "Error", payload: `HTTP ${res.status}: ${body}` });
+				onEvent?.({ type: "Error", payload: `HTTP ${res.status}: ${body}` });
 				return { success: false };
 			}
-			// Parse NDJSON stream
-			const text = await res.text();
-			const lines = text.split("\n").filter((l) => l.trim());
-			for (const line of lines) {
-				try {
-					const parsed = JSON.parse(line);
-					// Determine event type from shape
-					if (parsed.type === "Progress") {
-						if (onEvent)
-							onEvent({ type: "Progress", payload: parsed.payload || parsed });
-					} else if (parsed.type === "Complete") {
-						if (onEvent)
-							onEvent({ type: "Complete", payload: parsed.payload || parsed });
-					} else if (parsed.type === "Error") {
-						if (onEvent)
-							onEvent({
-								type: "Error",
-								payload: parsed.payload || parsed.message || line,
-							});
-					} else if (parsed.service_id && parsed.status) {
-						// Bare DeployResponse
-						if (onEvent) onEvent({ type: "Complete", payload: parsed });
-					} else if (parsed.phase) {
-						if (onEvent)
-							onEvent({
-								type: "Progress",
-								payload: {
-									phase: parsed.phase,
-									description: parsed.description || parsed.message || "",
-								},
-							});
-					} else {
-						// Unknown, show raw
-						if (onEvent)
-							onEvent({
-								type: "Progress",
-								payload: { phase: "unknown", description: line },
-							});
-					}
-				} catch {
-					if (onEvent)
-						onEvent({
-							type: "Progress",
-							payload: { phase: "raw", description: line },
-						});
-				}
+			if (!res.body) {
+				onEvent?.({ type: "Error", payload: "Empty response body from /deploy" });
+				return { success: false };
 			}
-			return { success: true };
+
+			// Stream NDJSON: fire onEvent per complete line; success only on Complete(deployed) without Error
+			const state: {
+				sawError: boolean;
+				complete: DeployResponse | null;
+			} = { sawError: false, complete: null };
+
+			await consumeNdjsonStream(res.body, (line) => {
+				const event = parseDeployEventLine(line);
+				if (!event) return;
+				onEvent?.(event);
+				if (event.type === "Error") {
+					state.sawError = true;
+				} else if (event.type === "Complete") {
+					state.complete = event.payload;
+				}
+			});
+
+			const success =
+				!state.sawError &&
+				state.complete != null &&
+				isDeployStatusSuccess(state.complete.status);
+
+			if (!success && !state.sawError && state.complete == null) {
+				onEvent?.({
+					type: "Error",
+					payload: "Control plane closed stream before Complete",
+				});
+			} else if (
+				!success &&
+				!state.sawError &&
+				state.complete != null &&
+				!isDeployStatusSuccess(state.complete.status)
+			) {
+				onEvent?.({
+					type: "Error",
+					payload: `Deploy finished with status ${state.complete.status}`,
+				});
+			}
+
+			return { success };
 		} catch (e: any) {
-			if (onEvent)
-				onEvent({ type: "Error", payload: e.message || "network error" });
+			onEvent?.({ type: "Error", payload: e.message || "network error" });
 			return { success: false };
 		}
 	}
