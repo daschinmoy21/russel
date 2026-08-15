@@ -24,13 +24,7 @@ set -euo pipefail
 # RUSSEL_KERNEL_PATH to an existing bzImage; it must exist or microVM is skipped.
 # ──────────────────────────────────────────────────────────────────────────────
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+source "$(dirname "$(readlink -f "$0")")/bench-common.sh"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 COLD=0
@@ -59,11 +53,8 @@ done
 
 bench_start=$(date +%s%N)
 
-header() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
-pass() { echo -e "  ${GREEN}✓${NC} $1"; }
-info() { echo -e "  ${DIM}→${NC} $1"; }
-warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
-fail() { echo -e "  ${RED}✗${NC} $1"; }
+# One bench run at a time: they swap the host's /var/lib state.
+bench_run_lock
 
 echo -e "${BOLD}
   ┌──────────────────────────────────────────────┐
@@ -113,46 +104,15 @@ cleanup() {
 		wait "$CTRL_PID" 2>/dev/null || true
 	fi
 	# Restore original /var/lib/{russel,microvms} if we moved them
-	if [ "$VAR_LIB_REDIRECTED" -eq 1 ]; then
-		rm -f /var/lib/russel /var/lib/microvms
-		if [ -n "$RUSSEL_STATE_BAK" ] && [ -e "$RUSSEL_STATE_BAK" ]; then
-			mv "$RUSSEL_STATE_BAK" /var/lib/russel
-		fi
-		if [ -n "$MICROVMS_STATE_BAK" ] && [ -e "$MICROVMS_STATE_BAK" ]; then
-			mv "$MICROVMS_STATE_BAK" /var/lib/microvms
-		fi
-	fi
+	bench_restore_var_lib
 	# Remove temp files
-	if [ -n "${RUSSEL_STATE_DIR:-}" ] && [ -d "$RUSSEL_STATE_DIR" ]; then
-		rm -rf "$RUSSEL_STATE_DIR"
-	fi
-	if [ -n "$BENCH_CARGO_TARGET" ] && [ -d "$BENCH_CARGO_TARGET" ]; then
-		rm -rf "$BENCH_CARGO_TARGET"
-	fi
-	if [ -n "${RUSSEL_LOG:-}" ] && [ -f "$RUSSEL_LOG" ]; then
-		rm -f "$RUSSEL_LOG"
+	bench_cleanup_tmp_paths
+	# Remove the bench secret if this run set it (best effort)
+	if [ "${BENCH_SECRET_SET:-0}" -eq 1 ] && command -v russel-cli &>/dev/null; then
+		russel-cli secrets delete DEMO_SECRET &>/dev/null || warn "failed to delete DEMO_SECRET"
 	fi
 }
 trap cleanup EXIT
-
-# ── Podman identity helper (Issue #278598) ────────────────────────────────────
-# When root via sudo, check SUDO_USER's rootless podman (not root's rootful).
-podman_as_deploy_user() {
-	if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-		local uid home
-		uid=$(id -u "$SUDO_USER" 2>/dev/null) || return 1
-		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-		[ -n "$home" ] || home="/home/$SUDO_USER"
-		# XDG_RUNTIME_DIR required for rootless
-		sudo -u "$SUDO_USER" -H env \
-			"HOME=$home" \
-			"XDG_RUNTIME_DIR=/run/user/$uid" \
-			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-			podman "$@"
-	else
-		podman "$@"
-	fi
-}
 
 # ponytail: results arrays — indexed by example order
 declare -a EXAMPLES=()
@@ -389,6 +349,7 @@ else
 			return 0
 		fi
 		if printf '%s' 'bench-secret' | russel-cli secrets set DEMO_SECRET &>/dev/null; then
+			BENCH_SECRET_SET=1
 			info "env-config: set DEMO_SECRET for secret:// resolution"
 		else
 			warn "env-config: failed to set DEMO_SECRET (deploy may fail)"
@@ -415,8 +376,9 @@ else
 		ensure_bench_secrets "$example"
 
 		if [ "$COLD" -eq 1 ]; then
-			local_result="examples/$example/result"
+			local local_result="examples/$example/result"
 			if [ -L "$local_result" ]; then
+				local result_path
 				result_path=$(readlink -f "$local_result")
 				rm -f "$local_result"
 				nix-store --delete "$result_path" 2>/dev/null || true
@@ -425,8 +387,8 @@ else
 
 		# Inject type under [service] so each race path is forced (microvm|container),
 		# independent of the example's committed type default.
-		cfg_name="Russelfile.bench-${runtime_kind}.toml"
-		cfg_path="$repo_path/$cfg_name"
+		local cfg_name="Russelfile.bench-${runtime_kind}.toml"
+		local cfg_path="$repo_path/$cfg_name"
 		awk -v rt="$runtime_kind" '
 			BEGIN { in_service=0; injected=0 }
 			/^type[[:space:]]*=/ { next }

@@ -13,13 +13,7 @@ set -euo pipefail
 # All paths pinned: configurable VCPUs (default 1), 256 MiB memory.
 # ──────────────────────────────────────────────────────────────────────────────
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+source "$(dirname "$(readlink -f "$0")")/bench-common.sh"
 
 # ── Defaults (overridable via env) ───────────────────────────────────────────
 : "${LOAD_DURATION:=30s}"
@@ -80,12 +74,6 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-header() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
-pass() { echo -e "  ${GREEN}✓${NC} $1"; }
-info() { echo -e "  ${DIM}→${NC} $1"; }
-warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
-fail() { echo -e "  ${RED}✗${NC} $1"; }
-
 # ── Duration normalisation (hey accepts original via -z, sampler needs int secs) ─
 duration_to_seconds() {
 	local d="$1" secs=0
@@ -116,6 +104,9 @@ LOAD_DURATION_SECS=$(duration_to_seconds "$LOAD_DURATION") || {
 	fail "Invalid LOAD_DURATION: '$LOAD_DURATION' (expected e.g. 30, 30s, 3m, 500ms, 1m30s)"
 	exit 1
 }
+
+# One bench run at a time: they swap the host's /var/lib state.
+bench_run_lock
 
 echo -e "${BOLD}
   ┌──────────────────────────────────────────────┐
@@ -167,34 +158,13 @@ cleanup() {
 	fi
 
 	# Restore /var/lib
-	if [ "$VAR_LIB_REDIRECTED" -eq 1 ]; then
-		rm -f /var/lib/russel /var/lib/microvms
-		[ -n "$RUSSEL_STATE_BAK" ] && [ -e "$RUSSEL_STATE_BAK" ] && mv "$RUSSEL_STATE_BAK" /var/lib/russel || true
-		[ -n "$MICROVMS_STATE_BAK" ] && [ -e "$MICROVMS_STATE_BAK" ] && mv "$MICROVMS_STATE_BAK" /var/lib/microvms || true
-	fi
+	bench_restore_var_lib
 
-	[ -n "$RUSSEL_STATE_DIR" ] && [ -d "$RUSSEL_STATE_DIR" ] && rm -rf "$RUSSEL_STATE_DIR" || true
-	[ -n "$BENCH_CARGO_TARGET" ] && [ -d "$BENCH_CARGO_TARGET" ] && rm -rf "$BENCH_CARGO_TARGET" || true
-	[ -n "${RUSSEL_LOG:-}" ] && [ -f "$RUSSEL_LOG" ] && rm -f "$RUSSEL_LOG" || true
+	bench_cleanup_tmp_paths
 }
 trap cleanup EXIT
 
-# ── podman identity helper ───────────────────────────────────────────────────
-podman_as_deploy_user() {
-	if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-		local uid home
-		uid=$(id -u "$SUDO_USER" 2>/dev/null) || return 1
-		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-		[ -n "$home" ] || home="/home/$SUDO_USER"
-		sudo -u "$SUDO_USER" -H env \
-			"HOME=$home" \
-			"XDG_RUNTIME_DIR=/run/user/$uid" \
-			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-			podman "$@"
-	else
-		podman "$@"
-	fi
-}
+# (podman_as_deploy_user lives in bench-common.sh)
 
 # ── Result accumulators ──────────────────────────────────────────────────────
 declare -A PATH_RPS PATH_P50 PATH_P95 PATH_P99 PATH_MEAN PATH_MAX_LAT PATH_ERR_PCT
