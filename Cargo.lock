@@ -958,6 +958,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "http-body-util",
  "libc",
  "reqwest",
  "russel-core",
@@ -966,6 +967,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

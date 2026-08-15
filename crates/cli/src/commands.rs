@@ -801,10 +801,12 @@ fn parse_port_mapping(value: &str) -> Result<PortMapping> {
 
 /// Derive a stable service id from a repo path or URL when `--vm-id` is omitted.
 ///
-/// Uses `owner-repo` when both segments are available so different owners/hosts
-/// that share a basename do not collapse to the same id. Sanitizes to the
-/// control-plane `validate_service_id` charset, truncates to 128 chars, and
-/// avoids reserved names (`secrets`, `traefik`, `_pool`, `*.bak`).
+/// Joins the full repository namespace path (all segments after a remote host,
+/// or all local path segments) so nested groups cannot collapse — e.g.
+/// `gitlab.example/a/team/app` → `a-team-app` vs `gitlab.example/b/team/app` →
+/// `b-team-app`. Sanitizes to the control-plane `validate_service_id` charset,
+/// truncates to 128 chars, and avoids reserved names (`secrets`, `traefik`,
+/// `_pool`, `*.bak`).
 fn default_service_id_from_repo(repo: &str) -> Option<String> {
     const MAX_SERVICE_ID_LEN: usize = 128;
 
@@ -821,6 +823,11 @@ fn default_service_id_from_repo(repo: &str) -> Option<String> {
         .strip_suffix(".git")
         .unwrap_or(trimmed)
         .trim_end_matches('/');
+
+    let is_remote = without_git.starts_with("git@")
+        || without_git.starts_with("https://")
+        || without_git.starts_with("http://")
+        || without_git.starts_with("ssh://");
 
     let path_like = if let Some(rest) = without_git.strip_prefix("git@") {
         // scp-like: git@host:owner/repo
@@ -844,25 +851,27 @@ fn default_service_id_from_repo(repo: &str) -> Option<String> {
         return None;
     }
 
-    // Prefer owner-repo (last two segments). For remotes the last two are
-    // owner/repo after the host; for local paths parent/basename. Single
-    // segment falls back to basename only.
-    let raw_id = if segments.len() >= 2 {
-        let owner = segments[segments.len() - 2];
-        let name = segments[segments.len() - 1];
-        // Skip host-only pairing like "github.com-myapp" when there is no owner
-        // segment (rare bare host/repo). Prefer owner-repo when host-looking.
-        if segments.len() >= 3 {
-            format!("{owner}-{name}")
-        } else if owner.contains('.') {
-            // two segments and first looks like a host → basename only
-            name.to_string()
+    // Remotes: drop the host segment and join the full owner/group/repo path so
+    // nested namespaces stay distinct. Local paths: join every segment.
+    // Host-only remote (no path) falls back to sanitized host basename.
+    let id_segments: &[&str] = if is_remote {
+        if segments.len() >= 2 {
+            &segments[1..]
         } else {
-            format!("{owner}-{name}")
+            // rare: host only — use host basename (strip domain noise later)
+            &segments[..]
         }
+    } else if segments.len() >= 2 && segments[0].contains('.') {
+        // path-like host/repo without a scheme
+        &segments[1..]
     } else {
-        segments[0].to_string()
+        &segments[..]
     };
+
+    if id_segments.is_empty() {
+        return None;
+    }
+    let raw_id = id_segments.join("-");
 
     let mut out = String::with_capacity(raw_id.len());
     for c in raw_id.chars() {
@@ -1279,6 +1288,19 @@ mod tests {
         assert_eq!(
             default_service_id_from_repo("https://github.com/bob/app.git"),
             Some("bob-app".into())
+        );
+        // Nested namespaces: same final two segments under different groups.
+        assert_eq!(
+            default_service_id_from_repo("https://gitlab.example/a/team/app.git"),
+            Some("a-team-app".into())
+        );
+        assert_eq!(
+            default_service_id_from_repo("https://gitlab.example/b/team/app.git"),
+            Some("b-team-app".into())
+        );
+        assert_ne!(
+            default_service_id_from_repo("https://gitlab.example/a/team/app.git"),
+            default_service_id_from_repo("https://gitlab.example/b/team/app.git"),
         );
         // Reserved basenames get a safe suffix so validate_service_id accepts them.
         assert_eq!(
