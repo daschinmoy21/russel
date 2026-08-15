@@ -11,6 +11,8 @@
 //! `RUSSEL_AGENT_URL` cannot recurse back into itself over HTTP.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use russel_core::api::{AgentLifecycleResponse, AgentStatusResponse};
@@ -290,6 +292,41 @@ fn boot_time_epoch_secs() -> Option<u64> {
         .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
 }
 
+/// Bound for each `podman` subprocess in lifecycle status probes.
+///
+/// Mirrors the timeout+`kill_on_drop` pattern in [`crate::capacity`]: a wedged
+/// `podman` must not hang `/agent/v1/status/{id}` indefinitely.
+const PODMAN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a single `podman` invocation bounded by [`PODMAN_TIMEOUT`].
+///
+/// `what` names the operation for diagnostics. Errors and timeouts return
+/// `None`; the caller reports the workload as `stopped` (best-effort probe).
+async fn podman_output(what: &str, args: &[&str]) -> Option<std::process::Output> {
+    let child = tokio::process::Command::new("podman")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    match tokio::time::timeout(PODMAN_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, what, "podman subprocess wait error");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                what,
+                timeout_secs = PODMAN_TIMEOUT.as_secs(),
+                "podman subprocess timed out"
+            );
+            None
+        }
+    }
+}
+
 /// Podman container state for an exact name **or** container id.
 ///
 /// When `target` looks like a name (contains no `/` and is not a long hex id),
@@ -298,11 +335,11 @@ fn boot_time_epoch_secs() -> Option<u64> {
 /// via `podman inspect` (exact key).
 async fn container_state(target: &str) -> Option<String> {
     // Prefer inspect: works for id *and* exact name including gen-scoped.
-    let output = tokio::process::Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Status}}", target])
-        .output()
-        .await
-        .ok()?;
+    let output = podman_output(
+        "inspect",
+        &["inspect", "--format", "{{.State.Status}}", target],
+    )
+    .await?;
     if output.status.success() {
         let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !state.is_empty() {
@@ -310,18 +347,19 @@ async fn container_state(target: &str) -> Option<String> {
         }
     }
     // Fallback: anchored name filter (canonical names only).
-    let output = tokio::process::Command::new("podman")
-        .args([
+    let filter = format!("name=^{target}$");
+    let output = podman_output(
+        "ps -a",
+        &[
             "ps",
             "-a",
             "--filter",
-            &format!("name=^{target}$"),
+            filter.as_str(),
             "--format",
             "{{.State}}",
-        ])
-        .output()
-        .await
-        .ok()?;
+        ],
+    )
+    .await?;
     if !output.status.success() {
         return None;
     }
@@ -335,11 +373,11 @@ async fn container_state(target: &str) -> Option<String> {
 
 /// Uptime of the podman container's main process (`{{.State.Pid}}`).
 async fn container_pid_uptime(target: &str) -> Option<u64> {
-    let output = tokio::process::Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Pid}}", target])
-        .output()
-        .await
-        .ok()?;
+    let output = podman_output(
+        "inspect pid",
+        &["inspect", "--format", "{{.State.Pid}}", target],
+    )
+    .await?;
     if !output.status.success() {
         return None;
     }

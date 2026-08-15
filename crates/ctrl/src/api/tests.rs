@@ -4,11 +4,11 @@ use http_body_util::BodyExt;
 use russel_core::config::RuntimeKind;
 use tower::ServiceExt;
 
-use super::auth::constant_time_eq;
 use super::router::runtime_label;
 use super::*;
 use crate::metadata::resolve_lifecycle_runtime;
 use crate::state::AppState;
+use russel_core::tokens::constant_time_eq;
 
 // ── auth / concurrency helpers ─────────────────────────────────────
 

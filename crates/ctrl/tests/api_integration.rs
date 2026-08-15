@@ -414,6 +414,30 @@ async fn auth_accepts_correct_bearer() {
     assert!(vms.iter().any(|v| v.as_str() == Some("authed")));
 }
 
+#[tokio::test]
+async fn auth_accepts_case_insensitive_bearer_scheme() {
+    // RFC 7235: the auth scheme is case-insensitive. Lowercase "bearer " must
+    // be accepted just like "Bearer ".
+    let _env = EnvGuard::with_token(STRONG_TOKEN);
+    let state = AppState::default();
+    seed_service(&state, "authed");
+
+    let res = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/vms")
+                .header(header::AUTHORIZATION, format!("bearer {STRONG_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    let vms = body["vms"].as_array().unwrap();
+    assert!(vms.iter().any(|v| v.as_str() == Some("authed")));
+}
+
 // ── secrets ──────────────────────────────────────────────────────────
 
 #[tokio::test]

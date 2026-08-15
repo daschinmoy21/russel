@@ -27,6 +27,10 @@ use russel_core::config::RuntimeKind;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+/// Process-local counter for unique temp file names, avoiding collisions
+/// between concurrent atomic writes and stale temp files from a crashed writer.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Env override for stable node identity (horizontal scaling Phase 0 / #212).
@@ -259,52 +263,87 @@ pub fn write_ctrl_catalog(catalog: &serde_json::Value) -> anyhow::Result<()> {
 
 /// Atomic write of the control plane catalog JSON to an arbitrary path.
 pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create catalog parent {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-
     let content = serde_json::to_string_pretty(catalog)
         .map_err(|e| anyhow::anyhow!("failed to serialize catalog: {}", e))?;
+    atomic_write(path, content.as_bytes())
+}
 
-    // Write to temp file with mode 0600
-    #[cfg(unix)]
-    {
+/// Sibling temp path for `path`, in the same directory so the final rename
+/// stays atomic on the same filesystem.
+///
+/// Unlike `Path::with_extension("json.tmp")`, this appends `.tmp.<nonce>` to
+/// the **full** file name, so non-`.json`-named destinations keep their name
+/// and two sibling paths that differ only by extension cannot collide.
+fn temp_sibling_path(path: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64
+        ^ TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    path.with_file_name(format!(".{file_name}.tmp.{nonce:x}"))
+}
+
+/// Atomically write `content` to `path` (temp file + rename), modeled on the
+/// `secrets::secure_write` semantics:
+///
+/// - temp file in the same directory (`create_new`) so the rename is atomic,
+/// - `O_NOFOLLOW` + `O_CLOEXEC` + mode `0600` applied at `open(2)` time,
+/// - `write` + `sync_all` before `fs::rename` over the destination,
+/// - best-effort `sync_all` of the parent directory so the rename is durable.
+///
+/// A failed write is cleaned up (temp file removed) and never clobbers the
+/// destination.
+fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create metadata parent {}: {}",
+            parent.display(),
+            e
+        )
+    })?;
+
+    let tmp = temp_sibling_path(path);
+    let write_result = (|| -> anyhow::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| anyhow::anyhow!("failed to open catalog tmp: {}", e))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
-        file.flush()
-            .map_err(|e| anyhow::anyhow!("failed to flush catalog tmp: {}", e))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            // Apply at open(2) time — not after write — so there is no umask
+            // window (0o600), no fd inheritance to children (O_CLOEXEC), and
+            // no symlink-replace race on the tmp path (O_NOFOLLOW).
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("failed to open tmp {}: {}", tmp.display(), e))?;
+        file.write_all(content)
+            .map_err(|e| anyhow::anyhow!("failed to write tmp {}: {}", tmp.display(), e))?;
         file.sync_all()
-            .map_err(|e| anyhow::anyhow!("failed to fsync catalog tmp: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("failed to fsync tmp {}: {}", tmp.display(), e))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
-    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("failed to rename tmp into place {}: {}", path.display(), e)
+    })?;
 
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| anyhow::anyhow!("failed to rename catalog tmp: {}", e))?;
-
-    // fsync parent directory so the rename is durable
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
+    // fsync parent directory so the rename is durable.
+    if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
 
@@ -524,49 +563,12 @@ pub fn rewrite_metadata_service_id(path: impl AsRef<Path>, service_id: &str) -> 
 }
 
 pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> anyhow::Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create metadata parent {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
     let content = serde_json::to_string_pretty(metadata)
         .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-
-    // Mode 0600 so non-root (e.g. podman user) cannot read/rewrite control
-    // plane metadata even if they can traverse the service dir (Issue #193).
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| anyhow::anyhow!("failed to open metadata {}: {}", path.display(), e))?;
-        file.write_all(content.as_bytes()).map_err(|e| {
-            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
-        })?;
-        file.sync_all()
-            .map_err(|e| anyhow::anyhow!("failed to fsync metadata {}: {}", path.display(), e))?;
-        // Re-assert mode if the file already existed with looser permissions.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!("failed to chmod 0600 metadata {}: {}", path.display(), e)
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, content).map_err(|e| {
-            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
-        })?;
-    }
-    Ok(())
+    // Atomic temp-file + rename write; mode 0600 is applied at open(2) time so
+    // non-root (e.g. podman user) cannot read/rewrite control plane metadata
+    // even if they can traverse the service dir (Issue #193).
+    atomic_write(path.as_ref(), content.as_bytes())
 }
 
 /// Current UTC time as RFC3339 (second precision).
@@ -951,5 +953,73 @@ mod tests {
         assert_eq!(read["schema_version"], 1);
         assert_eq!(read["services"]["api"]["status"], "deployed");
         assert_eq!(read["services"]["api"]["host_port"], 3100);
+    }
+
+    // ── Atomic write tests (C-3) ────────────────────────────────────────────
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn atomic_write_produces_correct_final_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("metadata.json");
+        let meta = serde_json::json!({"service_id": "api", "host_port": 3100});
+        write_metadata(&dest, &meta).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(read, meta);
+        // The temp file is renamed into place — no `.tmp` siblings remain.
+        assert_eq!(dir_entries(tmp.path()), vec!["metadata.json".to_string()]);
+    }
+
+    #[test]
+    fn atomic_write_keeps_non_json_filename() {
+        // Regression for `with_extension("json.tmp")`: a non-`.json` name must
+        // keep its full filename (and must not lose its real extension).
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("catalog.data");
+        let catalog = serde_json::json!({"schema_version": 1});
+        write_ctrl_catalog_to(&dest, &catalog).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(read, catalog);
+        assert_eq!(dir_entries(tmp.path()), vec!["catalog.data".to_string()]);
+    }
+
+    #[test]
+    fn atomic_write_failure_does_not_clobber_destination() {
+        // Simulate failure: an ancestor is a regular file, so `create_dir_all`
+        // fails before any write — the destination must remain untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "i am a file").unwrap();
+        let dest = blocker.join("sub").join("metadata.json");
+
+        let res = write_metadata(&dest, &serde_json::json!({"x": 1}));
+        assert!(res.is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("metadata.json");
+        write_metadata(&dest, &serde_json::json!({"n": 1})).unwrap();
+        write_metadata(&dest, &serde_json::json!({"n": 2})).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(read, serde_json::json!({"n": 2}));
+        // Only the destination remains — no stale temp files.
+        assert_eq!(dir_entries(tmp.path()), vec!["metadata.json".to_string()]);
     }
 }

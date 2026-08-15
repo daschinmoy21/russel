@@ -465,6 +465,18 @@ impl AppState {
     /// Used to rehydrate disk-discovered VMs after restart so lifecycle
     /// endpoints (status, stop, destroy) can find them.
     pub fn ensure_service(&self, service_id: &str) {
+        // Read disk metadata before acquiring the state lock so filesystem I/O
+        // is never performed while holding the global mutex. A concurrent
+        // insert between the check and the re-acquire is benign: `entry` then
+        // no-ops and this thread's disk read is simply discarded.
+        let disk_meta = {
+            let inner = self.lock_inner();
+            if inner.services.contains_key(service_id) {
+                return;
+            }
+            crate::metadata::load_metadata_from_disk(service_id)
+        };
+
         let mut inner = self.lock_inner();
         inner
             .services
@@ -474,7 +486,7 @@ impl AppState {
                     status: "stopped".to_string(),
                     ..Default::default()
                 };
-                if let Some(meta) = crate::metadata::load_metadata_from_disk(service_id) {
+                if let Some(meta) = disk_meta {
                     s.runtime = meta.runtime;
                     if let Some(id) = meta.container_id {
                         s.container_id = Some(id);
@@ -713,28 +725,39 @@ impl AppState {
     }
 
     pub fn status(&self, service_id: &str) -> Option<StatusResponse> {
-        let inner = self.lock_inner();
-        let s = inner.services.get(service_id)?;
-        let disk = crate::metadata::load_metadata_from_disk(service_id);
-        // Only count wall-clock uptime while the workload is actually running.
-        // Stopped/failed services must not report a growing timer from started_at.
-        let uptime_seconds = if s.vm_state == "running" {
-            s.started_at.elapsed().as_secs()
-        } else {
-            0
+        // Snapshot needed fields under the lock, then release before the disk
+        // read (same pattern as `logs`). `started_at.elapsed()` is wall-clock
+        // and cheap, so it is computed inside the critical section alongside
+        // the `vm_state` check it depends on.
+        let (status, vm_state, runtime, host_port, guest_port, uptime_seconds) = {
+            let inner = self.lock_inner();
+            let s = inner.services.get(service_id)?;
+            // Only count wall-clock uptime while the workload is actually running.
+            // Stopped/failed services must not report a growing timer from started_at.
+            let uptime_seconds = if s.vm_state == "running" {
+                s.started_at.elapsed().as_secs()
+            } else {
+                0
+            };
+            (
+                s.status.clone(),
+                s.vm_state.clone(),
+                s.runtime,
+                s.host_port,
+                s.guest_port,
+                uptime_seconds,
+            )
         };
+
+        let disk = crate::metadata::load_metadata_from_disk(service_id);
         Some(StatusResponse {
             service_id: service_id.to_string(),
-            status: s.status.clone(),
-            vm_state: s.vm_state.clone(),
+            status,
+            vm_state,
             uptime_seconds,
-            runtime: s.runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime)),
-            host_port: s
-                .host_port
-                .or_else(|| disk.as_ref().and_then(|m| m.host_port)),
-            guest_port: s
-                .guest_port
-                .or_else(|| disk.as_ref().and_then(|m| m.guest_port)),
+            runtime: runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime)),
+            host_port: host_port.or_else(|| disk.as_ref().and_then(|m| m.host_port)),
+            guest_port: guest_port.or_else(|| disk.as_ref().and_then(|m| m.guest_port)),
         })
     }
 
