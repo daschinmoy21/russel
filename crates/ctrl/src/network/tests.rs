@@ -40,8 +40,7 @@ fn release_subnet_frees_lease() {
 #[test]
 fn subnet_for_produces_valid_tap_id() {
     super::subnet::test_with_empty_registry(|| {
-        let a =
-            subnet_for("a-service-id-that-is-much-longer-than-a-linux-interface-name").unwrap();
+        let a = subnet_for("a-service-id-that-is-much-longer-than-a-linux-interface-name").unwrap();
         assert!(a.tap_id.starts_with("rsl-"));
         assert!(a.tap_id.len() <= 15);
         assert!(a.tap_id.bytes().all(|byte| byte.is_ascii_hexdigit()

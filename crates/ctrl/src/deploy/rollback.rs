@@ -16,9 +16,7 @@ use crate::{
         build_container_metadata, build_microvm_metadata, prior_runtime_from_disk, write_metadata,
     },
     microvm::{BootOutput, MicrovmRunner},
-    network::{
-        PortAllocator, SubnetAllocation, TapForwarder, lookup_subnet, preferred_subnet, subnet_for,
-    },
+    network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
     state::AppState,
     warm_pool::shared_warm_pool,
 };
@@ -238,23 +236,9 @@ pub(crate) async fn attempt_microvm_rollback(
 
     // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick.
     //    Include user env from desired_state (F-04: env restored on rollback).
-    // After dirs are restored, do not abort on subnet_for failure (half-restored
-    // service). Prefer an existing lease, else best-effort preferred identity.
-    let alloc = match subnet_for(service_id) {
-        Ok(a) => a,
-        Err(e) => {
-            let fallback = lookup_subnet(service_id)
-                .unwrap_or_else(|| preferred_subnet(service_id));
-            tracing::error!(
-                service_id,
-                error = %e,
-                tap_id = %fallback.tap_id,
-                "subnet_for failed during microVM rollback after dirs restored; \
-                 continuing with lookup/preferred identity"
-            );
-            fallback
-        }
-    };
+    // Fail closed: never persist preferred_subnet (unregistered) identities that
+    // may collide with another service after probe exhaustion.
+    let alloc = subnet_for(service_id)?;
     let cfg_dir = format!("{}/cfg", russel_dir);
     std::fs::create_dir_all(&cfg_dir)?;
     #[cfg(unix)]
