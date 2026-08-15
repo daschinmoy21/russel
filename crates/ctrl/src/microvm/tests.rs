@@ -1,7 +1,7 @@
 use super::agent::{
     AGENT_BUSYBOX_APPLETS, AGENT_INIT_SCRIPT, AGENT_INITRAMFS_BASENAME, pack_cpio_blocking,
 };
-use super::process::{cloud_hypervisor_stop_pattern, stop_tap_identity};
+use super::process::{cloud_hypervisor_stop_pattern, escape_pkill_literal, stop_tap_identity};
 use super::runner::{MicrovmRunner, select_kernel_version};
 use crate::network::{PortAllocator, lookup_subnet, release_subnet, subnet_for};
 use std::path::PathBuf;
@@ -69,6 +69,32 @@ fn stop_pattern_falls_back_to_service_path_without_identity() {
             "must not invent a preferred TAP identity: {pattern}"
         );
     });
+}
+
+#[test]
+fn cloud_hypervisor_stop_pattern_escapes_service_id_metacharacters() {
+    // Even if an invalid ID reaches the helper, metacharacters must not
+    // broaden the pkill match to other services.
+    let evil = "svc.a*b|c";
+    let escaped = escape_pkill_literal(evil);
+    assert_eq!(escaped, r"svc\.a\*b\|c");
+
+    let pattern = cloud_hypervisor_stop_pattern(evil, None);
+    assert!(
+        pattern.contains(r"russel/svc\.a\*b\|c/"),
+        "expected escaped service path in pattern: {pattern}"
+    );
+    assert!(
+        !pattern.contains("russel/svc.a*b|c/"),
+        "raw metacharacters must not appear unescaped: {pattern}"
+    );
+
+    // TAP branch also escapes the TAP token.
+    let tap_pattern = cloud_hypervisor_stop_pattern("ok-svc", Some("rsl-ab.cd"));
+    assert!(
+        tap_pattern.contains(r"tap=rsl-ab\.cd"),
+        "expected escaped TAP in pattern: {tap_pattern}"
+    );
 }
 
 #[test]

@@ -107,15 +107,42 @@ pub(super) fn stop_tap_identity(service_id: &str, metadata_tap: Option<&str>) ->
     crate::network::lookup_subnet(service_id).map(|a| a.tap_id)
 }
 
+/// Escape a literal for embedding in a `pkill -f` ERE pattern.
+///
+/// Service IDs are normally constrained by `validate_service_id`, but this
+/// helper is independently callable — unescaped metacharacters could broaden
+/// the match and terminate another Cloud Hypervisor process.
+pub(super) fn escape_pkill_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            // POSIX ERE metacharacters (and common GNU extensions).
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// `pkill -f` pattern for Cloud Hypervisor stop fallback.
 ///
-/// - With a known TAP: match that TAP only.
+/// - With a known TAP: match that TAP only (literal-escaped).
 /// - Without: match the service path marker under `russel/{service_id}/` so
 ///   cleanup cannot select another service's CH process via preferred hash.
+///   `service_id` is regex-escaped so metacharacters cannot broaden the match.
 pub(super) fn cloud_hypervisor_stop_pattern(service_id: &str, tap: Option<&str>) -> String {
     match tap {
-        Some(tap) => format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)"),
-        None => format!("(^|[[:space:]])cloud-hypervisor .*russel/{service_id}/"),
+        Some(tap) => {
+            let tap = escape_pkill_literal(tap);
+            format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)")
+        }
+        None => {
+            let sid = escape_pkill_literal(service_id);
+            format!("(^|[[:space:]])cloud-hypervisor .*russel/{sid}/")
+        }
     }
 }
 
