@@ -90,6 +90,14 @@ fn port_allocator_reserve_and_release() {
 }
 
 #[test]
+fn port_allocator_rejects_port_zero() {
+    let err = PortAllocator::reserve("zero-svc", 0).unwrap_err();
+    assert!(err.to_string().contains("port 0"), "unexpected err: {err}");
+    let err = PortAllocator::claim_existing("zero-svc", 0).unwrap_err();
+    assert!(err.to_string().contains("port 0"), "unexpected err: {err}");
+}
+
+#[test]
 fn fnv1a_is_xor_then_multiply() {
     // Verify FNV-1a uses XOR-then-MULTIPLY, not MULTIPLY-then-XOR (FNV-1).
     // Also check known-answer test vectors for the 32-bit variant.

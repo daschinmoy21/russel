@@ -52,12 +52,14 @@ impl PortAllocator {
             registry.busy_ports.remove(&old_port);
         }
 
+        // Port 0 is never a fixed publish port (bind(0) is ephemeral).
         let mut port: u32 = 3100;
         loop {
             if port > u16::MAX as u32 {
                 anyhow::bail!("Port exhaustion: no ports available between 3100 and 65535");
             }
             let port_u16 = port as u16;
+            // Starts at 3100; try_bind / port_is_available already reject 0.
             if !registry.busy_ports.contains(&port_u16) && port_is_available(port_u16) {
                 // #40: re-verify availability to narrow the TOCTOU window.
                 if port_is_available(port_u16) {
@@ -73,21 +75,25 @@ impl PortAllocator {
     }
 
     pub fn reserve(service_id: &str, port: u16) -> anyhow::Result<()> {
+        if port == 0 {
+            anyhow::bail!("port 0 is not a fixed publish port (ephemeral bind is not supported)");
+        }
+        let bind = publish_bind_addr();
         let mut registry = port_registry();
         let existing_port = registry.allocations.get(service_id).copied();
         if existing_port == Some(port) {
             // Do not trust the registry alone: the listener may have disappeared,
             // or another process may have claimed the port since the last deploy.
             if !port_is_available(port) {
-                anyhow::bail!("Port {} is reserved but cannot be bound on 0.0.0.0", port);
+                anyhow::bail!("Port {port} is reserved but cannot be bound on {bind}");
             }
             return Ok(());
         }
         if registry.busy_ports.contains(&port) {
-            anyhow::bail!("Port {} is already reserved or in use", port);
+            anyhow::bail!("Port {port} is already reserved or in use");
         }
         if !port_is_available(port) {
-            anyhow::bail!("Port {} cannot be bound on 0.0.0.0", port);
+            anyhow::bail!("Port {port} cannot be bound on {bind}");
         }
         if let Some(old_port) = registry.allocations.remove(service_id) {
             registry.busy_ports.remove(&old_port);
@@ -107,6 +113,9 @@ impl PortAllocator {
     /// Register a port that is already bound by a live container (e.g. after ctrl
     /// restart). Does NOT check port_is_available — the port is already in use.
     pub fn claim_existing(service_id: &str, port: u16) -> anyhow::Result<()> {
+        if port == 0 {
+            anyhow::bail!("port 0 is not a fixed publish port (ephemeral bind is not supported)");
+        }
         let mut registry = port_registry();
         // Reject if a different service already owns this port.
         if let Some(other_id) = registry.allocations.iter().find_map(|(id, &p)| {
