@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 use super::forward::{ensure_forward_filter, restore_ip_forward, sysctl};
-use super::ports::publish_bind_addr;
+use super::ports::{PortAllocator, publish_bind_addr};
 use super::subnet::SubnetAllocation;
 
 pub struct TapForwarder;
@@ -71,6 +71,10 @@ impl TapForwarder {
             guest_port,
             "spawning socat: {listen} -> {connect}"
         );
+
+        // Free the held port immediately before socat binds.
+        // Residual race: another process may grab the port between drop and bind.
+        drop(PortAllocator::take_hold(service_id));
 
         let child = Command::new("socat")
             .arg0(format!("socat-russel-{service_id}"))

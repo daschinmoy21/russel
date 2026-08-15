@@ -114,6 +114,66 @@ fn port_allocator_rejects_port_zero() {
 }
 
 #[test]
+fn port_allocator_hold_blocks_external_bind() {
+    PortAllocator::release("hold-svc");
+    PortAllocator::reserve("hold-svc", 4010).unwrap();
+    let bind = publish_bind_addr();
+    let second = std::net::TcpListener::bind((bind.as_str(), 4010u16));
+    assert!(
+        second.is_err(),
+        "held port must not be bindable by another listener"
+    );
+    // take_hold drops the reservation socket so the publisher can bind.
+    let held = PortAllocator::take_hold("hold-svc");
+    assert!(held.is_some());
+    drop(held);
+    let after = std::net::TcpListener::bind((bind.as_str(), 4010u16));
+    assert!(after.is_ok(), "port must be free after take_hold");
+    drop(after);
+    // Registry still owns the port until release.
+    assert!(PortAllocator::reserve("other-hold-svc", 4010).is_err());
+    PortAllocator::release("hold-svc");
+    PortAllocator::reserve("other-hold-svc", 4010).unwrap();
+    PortAllocator::release("other-hold-svc");
+}
+
+#[test]
+fn port_allocator_release_drops_hold() {
+    PortAllocator::release("release-hold-svc");
+    PortAllocator::reserve("release-hold-svc", 4011).unwrap();
+    let bind = publish_bind_addr();
+    assert!(std::net::TcpListener::bind((bind.as_str(), 4011u16)).is_err());
+    PortAllocator::release("release-hold-svc");
+    assert!(std::net::TcpListener::bind((bind.as_str(), 4011u16)).is_ok());
+}
+
+#[test]
+fn claim_existing_same_port_drops_residual_hold() {
+    // reserve holds a TcpListener; claim_existing means the live publisher
+    // already owns the port, so any residual hold must be released.
+    PortAllocator::release("claim-hold-svc");
+    PortAllocator::reserve("claim-hold-svc", 4012).unwrap();
+    let bind = publish_bind_addr();
+    assert!(
+        std::net::TcpListener::bind((bind.as_str(), 4012u16)).is_err(),
+        "port must be held after reserve"
+    );
+    PortAllocator::claim_existing("claim-hold-svc", 4012).unwrap();
+    // Hold should be gone so the publisher (or a test bind) can take the port.
+    assert!(
+        PortAllocator::take_hold("claim-hold-svc").is_none(),
+        "claim_existing must clear residual hold for same port"
+    );
+    let after = std::net::TcpListener::bind((bind.as_str(), 4012u16));
+    assert!(
+        after.is_ok(),
+        "port must be free for bind after claim_existing same port"
+    );
+    drop(after);
+    PortAllocator::release("claim-hold-svc");
+}
+
+#[test]
 fn fnv1a_is_xor_then_multiply() {
     // Verify FNV-1a uses XOR-then-MULTIPLY, not MULTIPLY-then-XOR (FNV-1).
     // Also check known-answer test vectors for the 32-bit variant.
