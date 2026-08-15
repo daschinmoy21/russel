@@ -13,6 +13,7 @@ set -euo pipefail
 # All paths pinned: configurable VCPUs (default 1), 256 MiB memory.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# shellcheck source=bench-common.sh disable=SC1091
 source "$(dirname "$(readlink -f "$0")")/bench-common.sh"
 
 # ── Defaults (overridable via env) ───────────────────────────────────────────
@@ -84,13 +85,13 @@ duration_to_seconds() {
 			if [ "$ms" -gt 0 ] 2>/dev/null; then
 				secs=$((secs + (ms + 999) / 1000))
 			fi
-			rest="${rest#${BASH_REMATCH[0]}}"
+			rest="${rest#"${BASH_REMATCH[0]}"}"
 		elif [[ "$rest" =~ ^([0-9]+)s ]]; then
-			secs=$((secs + ${BASH_REMATCH[1]}))
-			rest="${rest#${BASH_REMATCH[0]}}"
+			secs=$((secs + BASH_REMATCH[1]))
+			rest="${rest#"${BASH_REMATCH[0]}"}"
 		elif [[ "$rest" =~ ^([0-9]+)m ]]; then
-			secs=$((secs + ${BASH_REMATCH[1]} * 60))
-			rest="${rest#${BASH_REMATCH[0]}}"
+			secs=$((secs + BASH_REMATCH[1] * 60))
+			rest="${rest#"${BASH_REMATCH[0]}"}"
 		elif [[ "$rest" =~ ^[0-9]+$ ]]; then
 			secs=$((secs + rest))
 			rest=""
@@ -247,8 +248,12 @@ command -v nix &>/dev/null && has_nix=1
 
 # Inject flake devShell PATH for cloud-hypervisor/virtiofsd/socat
 if [ "$has_nix" -eq 1 ] && ! command -v cloud-hypervisor >/dev/null 2>&1; then
+	# PATH must expand inside the nix develop shell, not here.
+	# shellcheck disable=SC2016
 	FLAKE_PATH=$(nix develop -c sh -c 'printf %s "$PATH"' 2>/dev/null || echo "")
-	[ -n "$FLAKE_PATH" ] && export PATH="$FLAKE_PATH:$PATH"
+	if [ -n "$FLAKE_PATH" ]; then
+		export PATH="$FLAKE_PATH:$PATH"
+	fi
 fi
 
 command -v cloud-hypervisor &>/dev/null && has_ch=1
@@ -264,7 +269,11 @@ if [ "$has_kvm" -eq 1 ] && [ "$HAS_ROOT" -eq 1 ] && [ "$has_nix" -eq 1 ] &&
 	HAS_MICROVM=1
 fi
 
-[ "$HAS_MICROVM" -eq 1 ] && pass "microVM prereqs: ok" || warn "microVM prereqs missing (need KVM+root+nix+cloud-hypervisor+socat+ip)"
+if [ "$HAS_MICROVM" -eq 1 ]; then
+	pass "microVM prereqs: ok"
+else
+	warn "microVM prereqs missing (need KVM+root+nix+cloud-hypervisor+socat+ip)"
+fi
 
 # ── 1. Hey available? ────────────────────────────────────────────────────────
 if [ "$HAS_HEY" -eq 0 ]; then
@@ -328,6 +337,8 @@ if [ "$NEED_CTRL" -eq 1 ]; then
 		chmod 755 "$RUSSEL_STATE_DIR" "$RUSSEL_STATE_DIR/lib" \
 			"$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
 
+		# Consumed by bench_restore_var_lib in the EXIT trap (bench-common.sh).
+		# shellcheck disable=SC2034
 		VAR_LIB_REDIRECTED=1
 		if [ -e /var/lib/russel ] || [ -L /var/lib/russel ]; then
 			RUSSEL_STATE_BAK=$(mktemp /tmp/russel-var-lib-bak-XXXXXX)
@@ -455,6 +466,8 @@ run_load_cycle() {
 					stat_line=$(cat "/proc/$ch_pid/stat" 2>/dev/null || echo "")
 					if [ -n "$stat_line" ]; then
 						after_comm="${stat_line##*)}"
+						# Intentional word-split of /proc/<pid>/stat fields after comm.
+						# shellcheck disable=SC2086
 						set -- $after_comm
 						utime=${12:-0}
 						stime=${13:-0}

@@ -466,17 +466,20 @@ impl AppState {
     /// Used to rehydrate disk-discovered VMs after restart so lifecycle
     /// endpoints (status, stop, destroy) can find them.
     pub fn ensure_service(&self, service_id: &str) {
-        // Read disk metadata before acquiring the state lock so filesystem I/O
-        // is never performed while holding the global mutex. A concurrent
-        // insert between the check and the re-acquire is benign: `entry` then
-        // no-ops and this thread's disk read is simply discarded.
-        let disk_meta = {
+        // Fast path: already present. Hold the mutex only for the contains_key
+        // check — never across the metadata disk read below.
+        {
             let inner = self.lock_inner();
             if inner.services.contains_key(service_id) {
                 return;
             }
-            crate::metadata::load_metadata_from_disk(service_id)
-        };
+        }
+
+        // Filesystem I/O outside the global mutex (same pattern as `status` /
+        // `logs` / `build_catalog`). A concurrent insert between this read and
+        // the re-acquire is benign: `entry` then no-ops and this thread's disk
+        // read is simply discarded.
+        let disk_meta = crate::metadata::load_metadata_from_disk(service_id);
 
         let mut inner = self.lock_inner();
         inner

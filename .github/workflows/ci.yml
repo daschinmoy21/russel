@@ -104,5 +104,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ludeeus/action-shellcheck@master
+        env:
+          # Follow `source` so library vars (BOLD, VAR_LIB_REDIRECTED, …) resolve.
+          SHELLCHECK_OPTS: -x
         with:
           ignore_paths: guide dashboard examples

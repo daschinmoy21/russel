@@ -24,6 +24,7 @@ set -euo pipefail
 # RUSSEL_KERNEL_PATH to an existing bzImage; it must exist or microVM is skipped.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# shellcheck source=bench-common.sh disable=SC1091
 source "$(dirname "$(readlink -f "$0")")/bench-common.sh"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -290,6 +291,8 @@ command -v nix &>/dev/null && has_nix=1
 # without a global install. Works under sudo when run from the repo root.
 # ponytail: one-shot inject; run `sudo nix develop -c ./bench.sh` alternative.
 if [ "$has_nix" -eq 1 ] && ! command -v cloud-hypervisor >/dev/null 2>&1; then
+	# PATH must expand inside the nix develop shell, not here.
+	# shellcheck disable=SC2016
 	FLAKE_PATH=$(nix develop -c sh -c 'printf %s "$PATH"' 2>/dev/null || echo "")
 	if [ -n "$FLAKE_PATH" ]; then
 		export PATH="$FLAKE_PATH:$PATH"
@@ -472,7 +475,6 @@ else
 	}
 
 	# ── 10a. Russel setup ──────────────────────────────────────────────────────
-	RUSSEL_SKIPPED=0
 	RUSSEL_MICROVM_SKIPPED=0
 	RUSSEL_CONTAINER_SKIPPED=0
 
@@ -547,6 +549,8 @@ else
 		chmod 755 "$RUSSEL_STATE_DIR" "$RUSSEL_STATE_DIR/lib" \
 			"$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
 		# ponytail: redirect /var/lib/{russel,microvms} to temp dir (requires root)
+		# Consumed by bench_restore_var_lib in the EXIT trap (bench-common.sh).
+		# shellcheck disable=SC2034
 		VAR_LIB_REDIRECTED=1
 		if [ -e /var/lib/russel ] || [ -L /var/lib/russel ]; then
 			RUSSEL_STATE_BAK=$(mktemp /tmp/russel-var-lib-bak-XXXXXX)
@@ -577,7 +581,6 @@ else
 		done
 		if [ "$ctrl_ready" -eq 0 ]; then
 			warn "russel-ctrl did not start within 30s (check $RUSSEL_LOG)"
-			RUSSEL_SKIPPED=1
 			RUSSEL_MICROVM_SKIPPED=1
 			RUSSEL_CONTAINER_SKIPPED=1
 		else
@@ -596,7 +599,6 @@ else
 		[ "$has_socat" -eq 0 ] && info "  ✗ socat (microVM)"
 		[ "$has_ip" -eq 0 ] && info "  ✗ ip (microVM)"
 		[ "$HAS_ROOTLESS_PODMAN" -eq 0 ] && info "  ✗ rootless podman (container)"
-		RUSSEL_SKIPPED=1
 		RUSSEL_MICROVM_SKIPPED=1
 		RUSSEL_CONTAINER_SKIPPED=1
 	fi

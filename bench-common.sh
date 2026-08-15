@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # bench-common.sh — shared library for the russel bench scripts.
 #
 # Source from bench.sh / bench-load.sh (NOT executable on its own):
@@ -16,6 +17,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
+# BOLD is used by bench.sh / bench-load.sh (not by helpers in this file).
+# shellcheck disable=SC2034
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
