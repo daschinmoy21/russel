@@ -108,10 +108,10 @@ pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
         .map(|cmdline| {
             cmdline.split(|byte| *byte == 0).any(|arg| {
                 let arg = String::from_utf8_lossy(arg);
-                if let Some((ref tap_arg, ref tap_prefix)) = tap_match {
-                    if arg == *tap_arg || arg.starts_with(tap_prefix.as_str()) {
-                        return true;
-                    }
+                if let Some((ref tap_arg, ref tap_prefix)) = tap_match
+                    && (arg == *tap_arg || arg.starts_with(tap_prefix.as_str()))
+                {
+                    return true;
                 }
                 arg.contains(&format!("russel/{service_id}/"))
                     || arg.contains(&format!("socat-russel-{service_id}"))
