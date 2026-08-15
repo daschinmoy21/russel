@@ -445,14 +445,17 @@ async fn vm_stop(
 
     let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
     let result = handle.lifecycle.stop(&service_id).await;
-    if handle.runtime == RuntimeKind::Microvm {
-        reap_children(handle.vm_child, handle.aux_processes).await;
-    }
 
     let label = runtime_label(runtime);
 
     match result {
         Ok(_) => {
+            // Reap only after successful stop — handles stayed in state during the op.
+            if handle.runtime == RuntimeKind::Microvm
+                && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
+            {
+                reap_children(vm, aux).await;
+            }
             // Deregister from ingress so the proxy stops routing to this backend.
             let ingress = default_ingress();
             if let Err(e) = ingress.deregister(&service_id).await {
@@ -464,7 +467,15 @@ async fn vm_stop(
         }
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to stop service");
-            state.set_status(&service_id, "failed", "failed");
+            // Keep process ownership; restore prior status and re-supervise
+            // only if this claim still owns the lifecycle generation.
+            state.abort_lifecycle_operation(
+                &service_id,
+                handle.claim_generation,
+                &handle.expected_status,
+                &handle.prior_status,
+                &handle.prior_vm_state,
+            );
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
@@ -752,22 +763,25 @@ async fn vm_destroy(
 
     let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
     let result = handle.lifecycle.destroy(&service_id).await;
-    if handle.runtime == RuntimeKind::Microvm {
-        reap_children(handle.vm_child, handle.aux_processes).await;
-    }
-    // container destroy still does base-dir cleanup on success as today
-    if handle.runtime == RuntimeKind::Container && result.is_ok() {
-        PortAllocator::release(&service_id);
-        let base = crate::container::default_base_dir(&service_id);
-        if base.exists() {
-            let _ = tokio::fs::remove_dir_all(&base).await;
-        }
-    }
 
     let label = runtime_label(runtime);
 
     match result {
         Ok(_) => {
+            // Reap only after successful destroy — handles stayed in state during the op.
+            if handle.runtime == RuntimeKind::Microvm
+                && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
+            {
+                reap_children(vm, aux).await;
+            }
+            // container destroy still does base-dir cleanup on success as today
+            if handle.runtime == RuntimeKind::Container {
+                PortAllocator::release(&service_id);
+                let base = crate::container::default_base_dir(&service_id);
+                if base.exists() {
+                    let _ = tokio::fs::remove_dir_all(&base).await;
+                }
+            }
             // Deregister from ingress so the proxy stops routing to this (now destroyed) backend.
             let ingress = default_ingress();
             if let Err(e) = ingress.deregister(&service_id).await {
@@ -782,21 +796,31 @@ async fn vm_destroy(
         }
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
-            state.set_status(&service_id, "failed", "failed");
+            // Keep process ownership; restore prior status and re-supervise
+            // only if this claim still owns the lifecycle generation.
+            state.abort_lifecycle_operation(
+                &service_id,
+                handle.claim_generation,
+                &handle.expected_status,
+                &handle.prior_status,
+                &handle.prior_vm_state,
+            );
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
 }
 
 /// Handle returned by `claim_lifecycle_operation` — holds a swappable
-/// lifecycle provider plus any microVM child processes to reap after
-/// stop/destroy.
+/// lifecycle provider plus prior status for failure recovery.
 struct LifecycleClaimHandle {
     runtime: RuntimeKind,
     lifecycle: Arc<dyn RuntimeLifecycle>,
-    /// Only microvm carries claimed children to reap after stop/destroy
-    vm_child: Option<Child>,
-    aux_processes: Vec<Child>,
+    /// Process generation at claim time; abort must match to restore.
+    claim_generation: u64,
+    /// In-progress status this claim set (`stopping` / `destroying`).
+    expected_status: String,
+    prior_status: String,
+    prior_vm_state: String,
 }
 
 pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
@@ -813,9 +837,13 @@ fn claim_lifecycle_operation(
 ) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
     let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
 
-    let (vm_child, aux_processes) =
+    let (prior_status, prior_vm_state, claim_generation) =
         match state.begin_lifecycle_operation(service_id, target_status, "pending") {
-            LifecycleClaim::Claimed(vm, aux) => (vm, aux),
+            LifecycleClaim::Claimed {
+                prior_status,
+                prior_vm_state,
+                claim_generation,
+            } => (prior_status, prior_vm_state, claim_generation),
             LifecycleClaim::NotFound => {
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -833,8 +861,10 @@ fn claim_lifecycle_operation(
     let handle = LifecycleClaimHandle {
         runtime,
         lifecycle: runtime::lifecycle_for(runtime),
-        vm_child,
-        aux_processes,
+        claim_generation,
+        expected_status: target_status.to_string(),
+        prior_status,
+        prior_vm_state,
     };
 
     Ok((runtime, handle))
