@@ -965,10 +965,11 @@ impl MicrovmRunner {
     /// Destroy all state for a microVM.
     ///
     /// Best-effort multi-stage cleanup: each step runs even if a prior step
-    /// failed. Port and subnet leases are released only after stop and TAP
-    /// teardown both succeed — releasing earlier can free live resources for
-    /// another deploy while the VM/TAP still holds them. Returns `Ok` only
-    /// when every step succeeded; otherwise aggregates failures.
+    /// failed. Port and subnet leases are **always** released (idempotent
+    /// inventory ownership) even when stop or TAP teardown fails — partial
+    /// destroy must not permanently hold the service's port/subnet. Returns
+    /// `Ok` only when every step succeeded; otherwise aggregates failures so
+    /// callers can leave status `failed` for retry of remaining cleanup.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
         Self::validate_service_id(service_id)?;
 
@@ -976,13 +977,10 @@ impl MicrovmRunner {
         // hash-preferred TAP that may belong to another collision owner.
         let alloc = network_alloc_for_service(service_id);
         let mut errors: Vec<String> = Vec::new();
-        let mut stop_ok = true;
-        let mut tap_ok = true;
 
         if let Err(e) = self.stop(service_id).await {
             tracing::warn!(service_id, error = %e, "destroy: stop failed; continuing cleanup");
             errors.push(format!("stop: {e}"));
-            stop_ok = false;
         }
 
         match alloc {
@@ -994,7 +992,6 @@ impl MicrovmRunner {
                         "destroy: TAP teardown failed; continuing"
                     );
                     errors.push(format!("tap teardown: {e}"));
-                    tap_ok = false;
                 }
             }
             None => {
@@ -1005,20 +1002,12 @@ impl MicrovmRunner {
             }
         }
 
-        // Only free network inventory after confirmed process + TAP cleanup.
-        // A failed stop/teardown leaves runtime resources active; releasing
-        // would let a later deploy claim the same subnet/port and disrupt them.
-        if stop_ok && tap_ok {
-            crate::network::PortAllocator::release(service_id);
-            crate::network::release_subnet(service_id);
-        } else {
-            tracing::warn!(
-                service_id,
-                stop_ok,
-                tap_ok,
-                "destroy: retaining port/subnet leases after incomplete stop/TAP cleanup"
-            );
-        }
+        // Always free network inventory (idempotent). Control-plane ownership
+        // ends with destroy even if process/TAP cleanup was incomplete — the
+        // operator retries destroy for residual runtime state without needing
+        // the port/subnet leases held indefinitely.
+        crate::network::PortAllocator::release(service_id);
+        crate::network::release_subnet(service_id);
 
         for dir in &[
             format!("/var/lib/microvms/{service_id}"),

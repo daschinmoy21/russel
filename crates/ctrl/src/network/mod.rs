@@ -23,7 +23,7 @@ pub use tap::TapForwarder;
 
 #[cfg(test)]
 #[allow(unused_imports)]
-pub use subnet::{subnet_test_lock, test_with_empty_registry};
+pub use subnet::{subnet_test_lock, test_clear_subnet_registry, test_with_empty_registry};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

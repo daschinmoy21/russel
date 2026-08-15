@@ -766,6 +766,16 @@ async fn vm_destroy(
 
     let label = runtime_label(runtime);
 
+    // Control-plane inventory ownership: always release port/subnet after a
+    // destroy attempt (idempotent), including partial-failure / TAP teardown
+    // error paths. Runner also releases for in-process callers; the API path
+    // covers agent mode and ensures inventory is never permanently held when
+    // destroy returns an error. Failed status is preserved below for retry.
+    PortAllocator::release(&service_id);
+    if runtime == RuntimeKind::Microvm {
+        release_subnet(&service_id);
+    }
+
     match result {
         Ok(_) => {
             // Reap child handles after successful destroy.
@@ -773,13 +783,6 @@ async fn vm_destroy(
                 && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
             {
                 reap_children(vm, aux).await;
-            }
-            // Runner already released port/subnet after confirmed stop+TAP
-            // cleanup; release again here for agent mode / idempotent safety
-            // only on the full-success path.
-            PortAllocator::release(&service_id);
-            if runtime == RuntimeKind::Microvm {
-                release_subnet(&service_id);
             }
             if handle.runtime == RuntimeKind::Container {
                 let base = crate::container::default_base_dir(&service_id);
@@ -798,10 +801,10 @@ async fn vm_destroy(
         }
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
-            // Partial destroy may have already killed processes. Do not release
-            // port/subnet here — runner retains leases when stop/TAP cleanup
-            // failed so live resources are not reassigned. Reap remaining
-            // handles; leave failed so the operator can retry destroy.
+            // Inventory already released above. Partial destroy may have
+            // already killed processes — reap remaining handles; do not
+            // restore deployed. Leave failed so the operator can retry
+            // residual runtime/TAP cleanup.
             if handle.runtime == RuntimeKind::Microvm
                 && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
             {
