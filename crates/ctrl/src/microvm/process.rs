@@ -82,12 +82,15 @@ pub(super) fn network_alloc_for_service(
     if let Some(meta) = read_metadata(service_id)
         && let (Some(tap_id), Some(host_ip), Some(vm_ip)) = (meta.tap_id, meta.host_ip, meta.vm_ip)
     {
-        // MAC from host_ip key when possible; else registered lease; else preferred
-        // string only (not used as TAP identity).
-        let mac = crate::network::network_key_from_host_ip(&host_ip)
+        // MAC only from host_ip key or this service's registry lease — never
+        // invent preferred_subnet MAC (collision-sensitive, not authoritative).
+        // Metadata TAP/IP alone without an authoritative MAC is not safe for teardown.
+        let Some(mac) = crate::network::network_key_from_host_ip(&host_ip)
             .map(|k| crate::network::allocation_from_network_key(k).mac)
             .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.mac))
-            .unwrap_or_else(|| crate::network::preferred_subnet(service_id).mac);
+        else {
+            return None;
+        };
         return Some(crate::network::SubnetAllocation {
             host_ip,
             vm_ip,

@@ -346,23 +346,23 @@ fn network_alloc_ignores_preferred_key_owned_by_other_service() {
 #[tokio::test]
 async fn destroy_releases_port_and_subnet_with_partial_state() {
     let svc = "destroy-partial-lease-svc";
-    // Fixed port outside typical bind(0) ephemeral range; serialized via
-    // port_test_lock around setup/assert (not across .await — clippy).
-    const PORT: u16 = 4197;
-    {
+    // Unique free port under locks (not across .await — clippy await_holding_lock).
+    // Avoids racing a fixed port with parallel tests after destroy.
+    let port = {
         let _subnet = crate::network::subnet_test_lock();
         let _port = crate::network::port_test_lock();
         crate::network::test_clear_subnet_registry();
         PortAllocator::release(svc);
         let _ = subnet_for(svc).unwrap();
-        PortAllocator::reserve(svc, PORT).expect("reserve port");
+        let port = PortAllocator.next(svc).expect("allocate free port");
         assert!(lookup_subnet(svc).is_some(), "precondition: subnet leased");
-        assert_eq!(PortAllocator::allocated_port(svc), Some(PORT));
+        assert_eq!(PortAllocator::allocated_port(svc), Some(port));
         assert!(
             PortAllocator::has_hold(svc),
-            "precondition: reserve must open a hold listener"
+            "precondition: next must open a hold listener"
         );
-    }
+        port
+    };
 
     // No metadata under /var/lib/russel — stop is a no-op; TAP teardown targets
     // the registry lease and treats a missing device as success (or records a
@@ -394,7 +394,7 @@ async fn destroy_releases_port_and_subnet_with_partial_state() {
             "port hold TcpListener must be dropped after destroy so the OS port is free"
         );
         // Re-claim proves registry + OS bind are free for a later deploy.
-        PortAllocator::reserve(svc, PORT)
+        PortAllocator::reserve(svc, port)
             .expect("port must be free after destroy so a later deploy can claim it");
         PortAllocator::release(svc);
         release_subnet(svc);
