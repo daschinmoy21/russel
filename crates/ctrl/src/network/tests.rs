@@ -10,7 +10,66 @@ fn subnet_for_is_deterministic() {
         assert_eq!(a1.host_ip, a2.host_ip);
         assert_eq!(a1.vm_ip, a2.vm_ip);
         assert_eq!(a1.mac, a2.mac);
+        assert_eq!(a1.tap_id, a2.tap_id);
         release_subnet("my-service");
+    });
+}
+
+#[test]
+fn subnet_for_preserves_claimed_non_preferred_key() {
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("claimed-svc");
+        let preferred_key = network_key_from_host_ip(&preferred.host_ip).unwrap();
+        let claimed_key = preferred_key.wrapping_add(1);
+        claim_subnet_key("claimed-svc", claimed_key).unwrap();
+        let allocated = subnet_for("claimed-svc").unwrap();
+        assert_eq!(
+            allocated.tap_id,
+            allocation_from_network_key(claimed_key).tap_id
+        );
+        assert_ne!(allocated.tap_id, preferred.tap_id);
+        release_subnet("claimed-svc");
+    });
+}
+
+#[test]
+fn subnet_for_preserves_same_service_key_without_by_service() {
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("same-owner-svc");
+        let key = network_key_from_host_ip(&preferred.host_ip).unwrap();
+        super::subnet::test_insert_key_owner(key, "same-owner-svc");
+        assert!(
+            lookup_subnet("same-owner-svc").is_none(),
+            "precondition: by_service must be empty so the collision path runs"
+        );
+        let allocated = subnet_for("same-owner-svc").unwrap();
+        assert_eq!(allocated.tap_id, preferred.tap_id);
+        assert_eq!(allocated.host_ip, preferred.host_ip);
+        assert_eq!(
+            lookup_subnet("same-owner-svc").map(|a| a.tap_id),
+            Some(allocated.tap_id)
+        );
+        release_subnet("same-owner-svc");
+    });
+}
+
+#[test]
+fn subnet_for_rehashes_when_preferred_key_owned_by_other() {
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("collide-svc");
+        let key = network_key_from_host_ip(&preferred.host_ip).unwrap();
+        super::subnet::test_insert_key_owner(key, "other-svc");
+        let allocated = subnet_for("collide-svc").unwrap();
+        assert_ne!(allocated.tap_id, preferred.tap_id);
+        assert!(
+            lookup_subnet("other-svc").is_none(),
+            "rehash must not steal the other service's by_key slot"
+        );
+        assert_eq!(
+            lookup_subnet("collide-svc").map(|a| a.tap_id),
+            Some(allocated.tap_id.clone())
+        );
+        release_subnet("collide-svc");
     });
 }
 
