@@ -1,10 +1,9 @@
 ---
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
-import ServicesTable from '../components/ServicesTable.astro';
-import { api, isServiceRunning } from '../lib/api';
 
-const { services, connection } = await api.getServices();
+// Static shell only — no build-time control-plane fetch (#306).
+// Client hydrate() fills the table from the browser.
 ---
 
 <Layout title="Services" activePath="/services">
@@ -12,7 +11,7 @@ const { services, connection } = await api.getServices();
     <Header
       title="Services"
       subtitle="Manage your microVM and container deployments."
-      connection={connection}
+      connection="loading"
     />
     <div class="header-buttons">
       <button id="btnRefresh" class="btn btn-secondary" title="Refresh service list">
@@ -39,30 +38,19 @@ const { services, connection } = await api.getServices();
     </div>
 
     <div class="filter-pills" id="filterPills">
-      <button class="pill-btn active" data-filter="all">All (<span id="countAll">{services.length}</span>)</button>
-      <button class="pill-btn" data-filter="microvm">MicroVMs (<span id="countMicrovm">{services.filter(s => s.runtime === 'microvm').length}</span>)</button>
-      <button class="pill-btn" data-filter="container">Containers (<span id="countContainer">{services.filter(s => s.runtime === 'container').length}</span>)</button>
-      <button class="pill-btn" data-filter="running">Running (<span id="countRunning">{services.filter(s => isServiceRunning(s)).length}</span>)</button>
+      <button class="pill-btn active" data-filter="all">All (<span id="countAll">—</span>)</button>
+      <button class="pill-btn" data-filter="microvm">MicroVMs (<span id="countMicrovm">—</span>)</button>
+      <button class="pill-btn" data-filter="container">Containers (<span id="countContainer">—</span>)</button>
+      <button class="pill-btn" data-filter="running">Running (<span id="countRunning">—</span>)</button>
     </div>
   </div>
 
   <div id="actionFeedback" class="action-feedback"></div>
 
   <section class="services-list-area" id="servicesTableWrapper">
-    {services.length > 0 ? (
-      <ServicesTable services={services} />
-    ) : connection === 'offline' ? (
-      <div class="card-panel empty-state">
-        <p>Control plane offline.</p>
-        <p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p>
-        <a href="/settings" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem">Open Settings</a>
-      </div>
-    ) : (
-      <div class="card-panel empty-state">
-        <p>No services configured.</p>
-        <a href="/deploy" class="btn btn-primary" style="margin-top: 0.75rem">Deploy your first service</a>
-      </div>
-    )}
+    <div class="card-panel empty-state">
+      <p>Loading…</p>
+    </div>
   </section>
 </Layout>
 
@@ -212,7 +200,7 @@ const { services, connection } = await api.getServices();
     });
   });
 
-  // Hydrate: re-fetch on load to pick up demo mode from localStorage
+  // Hydrate: fetch live data (or demo) from the browser
   (async () => {
     const { services, connection } = await api.getServices();
     renderTable(services, connection);

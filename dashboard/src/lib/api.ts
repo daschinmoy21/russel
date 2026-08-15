@@ -146,6 +146,9 @@ export function isServiceFailed(svc: {
 
 export type ConnectionState = "live" | "demo" | "offline";
 
+/** Header may also show pre-probe state for static shells (#316). */
+export type HeaderConnectionState = ConnectionState | "loading";
+
 export function getConnectionLabel(c: ConnectionState): string {
 	switch (c) {
 		case "live":
@@ -155,6 +158,171 @@ export function getConnectionLabel(c: ConnectionState): string {
 		case "offline":
 			return "Offline";
 	}
+}
+
+/**
+ * Resolve the connection badge for static shells.
+ * Omitted connection defaults to `loading` (not LIVE) so prerender never claims
+ * a verified control-plane link before the browser probe completes.
+ */
+export function resolveHeaderConnection(
+	connection?: HeaderConnectionState,
+	isDemo = false,
+): HeaderConnectionState {
+	if (connection) return connection;
+	if (isDemo) return "demo";
+	return "loading";
+}
+
+export function headerBadgeMeta(state: HeaderConnectionState): {
+	label: string;
+	className: string;
+	title: string;
+} {
+	switch (state) {
+		case "live":
+			return {
+				label: "LIVE",
+				className: "badge-online",
+				title: "Connected to russel-ctrl",
+			};
+		case "demo":
+			return {
+				label: "DEMO",
+				className: "badge-demo",
+				title: "Demo mode — mock data (Settings)",
+			};
+		case "offline":
+			return {
+				label: "OFFLINE",
+				className: "badge-offline",
+				title:
+					"Control plane unreachable — start russel-ctrl or enable Demo mode",
+			};
+		case "loading":
+			return {
+				label: "…",
+				className: "badge-muted",
+				title: "Checking control-plane connection…",
+			};
+	}
+}
+
+/** Zeroed fleet snapshot used by prerendered overview shell (no build-time fetch). */
+export const STATIC_FLEET_STATUS: FleetStatus = {
+	online: false,
+	total_vms: 0,
+	running_vms: 0,
+	stopped_vms: 0,
+	failed_vms: 0,
+	api_latency_ms: 0,
+	max_uptime_seconds: 0,
+};
+
+export type OverviewMetricsCard = {
+	title: string;
+	value: string;
+	subtext: string;
+};
+
+/**
+ * Pure metrics for overview hydrate states (live/demo/offline/loading shell).
+ * Used by client hydrate and unit tests so shell contracts stay locked.
+ */
+export function overviewMetricsForConnection(
+	connection: ConnectionState | "loading",
+	status: FleetStatus,
+	services: ServiceVM[],
+): OverviewMetricsCard[] | null {
+	if (connection === "loading") {
+		return [
+			{
+				title: "Fleet Health",
+				value: "—",
+				subtext: "Loading…",
+			},
+			{
+				title: "Longest Uptime",
+				value: "—",
+				subtext: "Across all services",
+			},
+			{
+				title: "API Latency",
+				value: "—",
+				subtext: "Loading…",
+			},
+			{
+				title: "Services",
+				value: "—",
+				subtext: "Loading…",
+			},
+		];
+	}
+	if (connection === "offline") {
+		return [
+			{
+				title: "Fleet Health",
+				value: "0 / 0",
+				subtext: "Control plane offline",
+			},
+			{
+				title: "Longest Uptime",
+				value: "—",
+				subtext: "Across all services",
+			},
+			{
+				title: "API Latency",
+				value: "Offline",
+				subtext: "Unreachable",
+			},
+			{
+				title: "Services",
+				value: "0",
+				subtext: "0 running",
+			},
+		];
+	}
+	// live | demo
+	const active = services.filter((s) => isServiceRunning(s)).length;
+	const uptime =
+		status.max_uptime_seconds > 0
+			? formatUptime(status.max_uptime_seconds)
+			: "—";
+	const latency = status.online ? `${status.api_latency_ms} ms` : "Offline";
+	return [
+		{
+			title: "Fleet Health",
+			value: `${status.running_vms} / ${status.total_vms}`,
+			subtext: status.online
+				? "All systems operational"
+				: "API unreachable",
+		},
+		{
+			title: "Longest Uptime",
+			value: uptime,
+			subtext: "Across all services",
+		},
+		{
+			title: "API Latency",
+			value: latency,
+			subtext: status.online ? "Control plane reachable" : "Unreachable",
+		},
+		{
+			title: "Services",
+			value: String(services.length),
+			subtext: `${active} running`,
+		},
+	];
+}
+
+/** Empty-state copy under Active Fleet Status after hydrate. */
+export function overviewServicesEmptyCopy(
+	connection: ConnectionState,
+): { primary: string; kind: "offline" | "empty" } {
+	if (connection === "offline") {
+		return { primary: "Control plane offline.", kind: "offline" };
+	}
+	return { primary: "No services configured.", kind: "empty" };
 }
 
 // ---- Demo mode / settings ----

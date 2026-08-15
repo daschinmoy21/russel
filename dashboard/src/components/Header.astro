@@ -1,23 +1,22 @@
 ---
-import type { ConnectionState } from '../lib/api';
+import {
+  headerBadgeMeta,
+  resolveHeaderConnection,
+  type HeaderConnectionState,
+} from '../lib/api';
 
 interface Props {
   title: string;
   subtitle?: string;
-  connection?: ConnectionState;
+  /** Omit or pass `loading` for static shells — never defaults to LIVE before probe. */
+  connection?: HeaderConnectionState;
   isDemo?: boolean;
 }
 
 const { title, subtitle, connection, isDemo = false } = Astro.props;
-const effective = connection ?? (isDemo ? 'demo' as const : 'live' as const);
-
-const badgeLabel = { live: 'LIVE', demo: 'DEMO', offline: 'OFFLINE' }[effective];
-const badgeClass = { live: 'badge-online', demo: 'badge-demo', offline: 'badge-offline' }[effective];
-const badgeTitle = {
-  live: 'Connected to russel-ctrl',
-  demo: 'Demo mode — mock data (Settings)',
-  offline: 'Control plane unreachable — start russel-ctrl or enable Demo mode',
-}[effective];
+const effective = resolveHeaderConnection(connection, isDemo);
+const { label: badgeLabel, className: badgeClass, title: badgeTitle } =
+  headerBadgeMeta(effective);
 ---
 
 <header class="top-header">
