@@ -557,8 +557,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // ── resolve_rollback_app_paths (pure) ─────────────────────────────────
-
     #[test]
     fn resolve_app_paths_both_present_with_bin_suffix() {
         let (app, store) =
@@ -604,8 +602,6 @@ mod tests {
         assert!(resolve_rollback_app_paths(None, None, "app").is_err());
     }
 
-    // ── desired_state_env (pure) ──────────────────────────────────────────
-
     #[test]
     fn desired_state_env_extracts_string_values_only() {
         let meta = serde_json::json!({
@@ -633,8 +629,6 @@ mod tests {
         // env present but not an object → empty.
         assert!(desired_state_env(&serde_json::json!({"desired_state": {"env": "x"}})).is_empty());
     }
-
-    // ── attempt_* early-validation failures (no booting) ──────────────────
 
     struct Fixture {
         _tmp: TempDir,

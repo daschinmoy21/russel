@@ -332,7 +332,7 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "k8s-file".to_string(),
         "--log-opt".to_string(),
         format!("path={log_path}"),
-        // ── Hardening: drop all capabilities, prevent privilege escalation,
+        // Drop all capabilities, prevent privilege escalation,
         //     mount rootfs read-only with writable tmpfs for /tmp and /run.
         //     These are re-asserted after passthrough extras so last-wins
         //     cannot weaken isolation (Issue #191).

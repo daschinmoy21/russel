@@ -1,5 +1,3 @@
-// ── Subnet allocation (deterministic per service_id + collision registry) ────
-
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex},
@@ -97,10 +95,7 @@ pub fn subnet_for(service_id: &str) -> anyhow::Result<SubnetAllocation> {
 
     let mut key = network_key(fnv1a(service_id.as_bytes()));
     for attempt in 0u32..1024 {
-        if let Some(owner) = reg.by_key.get(&key) {
-            if owner == service_id {
-                break;
-            }
+        if reg.by_key.contains_key(&key) {
             // Collision on the 16-bit network identity — rehash with salt.
             key = network_key(fnv1a(format!("{service_id}\0salt{attempt}").as_bytes()));
             continue;

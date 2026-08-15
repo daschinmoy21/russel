@@ -366,22 +366,18 @@ pub fn resolve_lifecycle_runtime(
     if let Some(rt) = state_runtime {
         return rt;
     }
-    // Check if metadata file exists at all.
-    let path = metadata_path(service_id);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return RuntimeKind::Microvm, // no metadata → first deploy
+    let Some(content) = std::fs::read_to_string(metadata_path(service_id)).ok() else {
+        return RuntimeKind::Microvm;
     };
-    match prior_runtime_from_metadata(&content) {
-        Some(rt) => rt,
-        None => {
-            tracing::warn!(
-                service_id,
-                "valid metadata.json missing 'runtime' key — defaulting to microvm"
-            );
-            RuntimeKind::Microvm
-        }
+    if let Some(runtime) = prior_runtime_from_metadata(&content) {
+        return runtime;
     }
+
+    tracing::warn!(
+        service_id,
+        "valid metadata.json missing 'runtime' key — defaulting to microvm"
+    );
+    RuntimeKind::Microvm
 }
 
 /// Build versioned metadata JSON for a microVM deployment.
@@ -822,8 +818,6 @@ mod tests {
         assert_eq!(value["container_id"], "abc");
     }
 
-    // ── ServiceDiskRecord tests ──────────────────────────────────────────────
-
     #[test]
     fn service_disk_record_parses_microvm_fields() {
         let meta = build_microvm_metadata(
@@ -898,8 +892,6 @@ mod tests {
         assert!(rec.runtime.is_none());
     }
 
-    // ── Catalog write / read tests ───────────────────────────────────────────
-
     #[test]
     fn catalog_write_and_read_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -924,8 +916,6 @@ mod tests {
         assert_eq!(read["services"]["api"]["status"], "deployed");
         assert_eq!(read["services"]["api"]["host_port"], 3100);
     }
-
-    // ── Atomic write tests (C-3) ────────────────────────────────────────────
 
     fn dir_entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)

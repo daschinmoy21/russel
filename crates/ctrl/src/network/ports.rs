@@ -7,8 +7,6 @@ use std::{
 #[cfg(test)]
 use std::sync::OnceLock;
 
-// ── Port allocator ────────────────────────────────────────────────────────────
-
 struct PortRegistry {
     allocations: HashMap<String, u16>,
     busy_ports: HashSet<u16>,
@@ -62,9 +60,6 @@ fn port_registry() -> std::sync::MutexGuard<'static, PortRegistry> {
 
 /// Bind `port` on the publish address and return the listener, or `None` if busy/invalid.
 fn try_bind(port: u16) -> Option<TcpListener> {
-    if port == 0 {
-        return None;
-    }
     let bind = publish_bind_addr();
     TcpListener::bind((bind.as_str(), port)).ok()
 }

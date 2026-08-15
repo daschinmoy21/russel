@@ -417,7 +417,6 @@ async fn dns_check_skips_literal_ips() {
     assert!(validate_remote_host_dns("10.0.0.1").await.is_ok());
 }
 
-// ── RUSSEL_ALLOW_LOCAL_PATH_DEPLOY gate (#196) ─────────────────────────
 // Serialize env mutations: cargo runs tests in parallel by default.
 // Sync + Drop restore (no await across MutexGuard — clippy await_holding_lock).
 

@@ -4,16 +4,12 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-// ── BootOutput ───────────────────────────────────────────────────────────────
-
 /// Output of `MicrovmRunner::boot()` / `boot_vm()`.
 pub struct BootOutput {
     pub vm_child: tokio::process::Child,
     /// All virtiofsd children (one for nixstore, optionally one for config).
     pub virtiofsd_children: Vec<tokio::process::Child>,
 }
-
-// ── Process metadata (reused by stop/destroy) ───────────────────────────────
 
 #[derive(Debug, Default)]
 pub(super) struct ProcessMetadata {

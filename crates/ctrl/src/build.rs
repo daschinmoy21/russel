@@ -60,12 +60,7 @@ pub async fn init_current_system() -> Result<()> {
 pub fn current_system() -> &'static str {
     CURRENT_SYSTEM
         .get()
-        .unwrap_or_else(|| {
-            panic!(
-                "current_system() called before init_current_system() — \
-                 call init_current_system() at startup"
-            )
-        })
+        .unwrap_or_else(|| panic!("current_system() called before init_current_system()"))
         .as_str()
 }
 
@@ -123,7 +118,7 @@ impl NixBuilder {
         // unrestricted builder network). Require a committed regular flake.nix —
         // reject missing, symlink/non-file, and leftover auto-generated markers.
         if nix_restricted_enabled() {
-            return self.validate_restricted_flake(&flake_path);
+            return Self::validate_restricted_flake(&flake_path);
         }
 
         // Use create_new for atomic check-and-create (fail if exists, no TOCTOU).
@@ -213,7 +208,7 @@ impl NixBuilder {
 
     /// Restricted-mode gate: `flake.nix` must exist as a regular file and must
     /// not be a Russel auto-generated leftover (`GENERATED_MARKER`).
-    fn validate_restricted_flake(&self, flake_path: &Path) -> Result<bool> {
+    fn validate_restricted_flake(flake_path: &Path) -> Result<bool> {
         match std::fs::symlink_metadata(flake_path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() || !meta.file_type().is_file() {

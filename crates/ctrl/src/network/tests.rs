@@ -417,8 +417,6 @@ fn port_allocator_claim_existing_registers_port() {
     PortAllocator::release("other-svc");
 }
 
-// ── #187 guest FORWARD isolation helpers ─────────────────────────────
-
 #[test]
 fn forward_filter_enabled_by_default() {
     assert!(!forward_filter_disabled_from_env(None, None));

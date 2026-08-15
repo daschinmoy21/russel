@@ -46,8 +46,6 @@ fn http_client(control_plane: &str) -> Result<reqwest::Client> {
         .map_err(|e| anyhow!("failed to build HTTP client: {e}"))
 }
 
-// ── F-05 / #189: cleartext Bearer policy ───────────────────────────────────
-
 static CLEARTEXT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// CLI `--insecure` latch (set once from `main` before any subcommand runs).
@@ -347,7 +345,6 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         })?,
     };
 
-    // ── Pre-flight banner ──────────────────────────────────────────────────
     println!();
     println!("  \x1b[1;36mrussel deploy\x1b[0m");
     println!("  \x1b[2m{}\x1b[0m", repo_url);
@@ -372,7 +369,6 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     }
     println!();
 
-    // ── Build env map from CLI args ───────────────────────────────────────
     let mut cli_env: HashMap<String, String> = HashMap::new();
     if let Some(ref env_file_path) = args.env_file {
         let file_env = parse_env_file(env_file_path)?;
@@ -444,8 +440,6 @@ fn ms(v: u128) -> String {
     }
 }
 
-// ── Security: truncate raw NDJSON in error contexts (F-50) ──────────────
-
 /// Truncate an embedded NDJSON line to 256 chars + length suffix for error
 /// messages, so a hostile or buggy control plane cannot flood the terminal.
 fn truncate_for_error(s: &str) -> String {
@@ -470,8 +464,6 @@ fn truncate_for_error(s: &str) -> String {
     out.push_str(&format!("…[{} bytes total]", s.len()));
     out
 }
-
-// ── Security: strip terminal control sequences (F-51) ───────────────────
 
 /// Strip C0 and C1 control characters (except `\t`, `\n`, `\r`) from
 /// server-supplied strings before printing.  This prevents terminal escape
@@ -521,7 +513,6 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     step("vm-id", &sanitize_terminal(&r.vm_id), "");
     step("status", &r.status, "");
 
-    // ── Traefik route (primary ingress) ──────────────────────────────────
     if let Some(route_host) = &r.route_host {
         println!(
             "  \x1b[2m{:>10}\x1b[0m  \x1b[1mhttp://{}\x1b[0m  \x1b[2m(Traefik Host rule)\x1b[0m",
@@ -583,7 +574,6 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         );
     }
 
-    // ── Timing breakdown ───────────────────────────────────────────────────
     if let Some(t) = &r.timing {
         println!();
         println!("  \x1b[1;2mPhase timing:\x1b[0m");
@@ -1468,8 +1458,6 @@ mod tests {
         assert_eq!(map.len(), 2);
     }
 
-    // ── F-49: parse_env_file with BOM, quotes, inline comments, CRLF ──────
-
     #[test]
     fn parse_env_file_bom() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1535,8 +1523,6 @@ mod tests {
         assert_eq!(map.get("KEY"), Some(&"val=ue".to_string()));
     }
 
-    // ── F-51: sanitize_terminal ───────────────────────────────────────────
-
     #[test]
     fn sanitize_terminal_strips_c0_controls() {
         assert_eq!(sanitize_terminal("hello\x00world"), "helloworld");
@@ -1557,8 +1543,6 @@ mod tests {
         let normal = "Hello, world! 123 / path/to/file";
         assert_eq!(sanitize_terminal(normal), normal);
     }
-
-    // ── F-50: truncate_for_error ──────────────────────────────────────────
 
     #[test]
     fn truncate_for_error_short() {
@@ -1612,8 +1596,6 @@ mod tests {
         let kept = truncated.split('…').next().unwrap();
         assert!(kept.is_char_boundary(kept.len()));
     }
-
-    // ── F-05 / #189: loopback detection + cleartext policy ────────────────
 
     /// Serialize mutations of `RUSSEL_INSECURE_CLEARTEXT` and `CLI_INSECURE`.
     /// Restores both on drop (panic-safe). Fixes #302 parallel test races.
@@ -1798,8 +1780,6 @@ mod tests {
             _ => panic!("expected deploy subcommand"),
         }
     }
-
-    // ── stream_deploy_events NDJSON buffering (pure) ────────────────────────
 
     fn collect_lines(chunks: &[&[u8]], trailing: bool) -> Vec<String> {
         let mut buffer = Vec::new();

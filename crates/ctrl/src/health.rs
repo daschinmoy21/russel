@@ -11,29 +11,17 @@ use crate::metadata::load_metadata_from_disk;
 use crate::network::publish_bind_addr;
 use crate::state::AppState;
 
-/// Health checker — TCP reachability probe + background loop.
-#[derive(Debug, Default)]
-pub struct HealthChecker;
-
-impl HealthChecker {
-    /// Check if a service is reachable via TCP at the given socket address.
-    /// Accepts a raw `host:port` string (e.g. `"10.0.5.2:3000"`) or a full
-    /// HTTP URL — the scheme and path are stripped automatically.
-    /// Returns true if the connection succeeds within a short timeout.
-    pub async fn check(&self, addr: &str) -> bool {
-        // Strip scheme and path so callers can pass http://... URLs directly
-        let addr = addr
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .split('/')
-            .next()
-            .unwrap_or(addr);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::net::TcpStream::connect(addr).await.is_ok()
-        })
+/// Check whether a service is reachable at a socket address or HTTP URL.
+pub async fn check(addr: &str) -> bool {
+    let addr = addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(addr);
+    tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
         .await
-        .unwrap_or(false)
-    }
+        .is_ok_and(|result| result.is_ok())
 }
 
 /// Whether auto-restart is enabled (`RUSSEL_HEALTH_RESTART=1`).
@@ -46,7 +34,7 @@ fn probe_interval() -> Duration {
     let secs = std::env::var("RUSSEL_HEALTH_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30u64)
+        .unwrap_or(30)
         .max(5);
     Duration::from_secs(secs)
 }
@@ -107,13 +95,11 @@ enum RestartApply {
     FailedMark,
 }
 
-fn apply_restart_response(status: &str, _message: &str) -> RestartApply {
-    if status == "deployed" {
-        RestartApply::Succeeded
-    } else if status == "rolled_back" {
-        RestartApply::FailedKeepPrior
-    } else {
-        RestartApply::FailedMark
+fn apply_restart_response(status: &str) -> RestartApply {
+    match status {
+        "deployed" => RestartApply::Succeeded,
+        "rolled_back" => RestartApply::FailedKeepPrior,
+        _ => RestartApply::FailedMark,
     }
 }
 
@@ -172,7 +158,7 @@ pub fn spawn_health_loop(state: AppState) {
                 // publish bind is wildcard / loopback; otherwise probe the bind IP.
                 // Bracket IPv6 literals so `TcpStream::connect` parses correctly.
                 checks.spawn(async move {
-                    let reachable = HealthChecker.check(&addr).await;
+                    let reachable = check(&addr).await;
                     (id, addr, reachable)
                 });
             }
@@ -250,15 +236,12 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
 
     // F-07: acquire the deploy semaphore so a health-driven restart does not
     // overwhelm the control plane when many services fail at once.
-    let _permit = match deploy_semaphore().try_acquire() {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::warn!(
-                service_id,
-                "health restart skipped — deploy semaphore exhausted"
-            );
-            return RestartOutcome::SkippedSemaphore;
-        }
+    let Ok(_permit) = deploy_semaphore().try_acquire() else {
+        tracing::warn!(
+            service_id,
+            "health restart skipped — deploy semaphore exhausted"
+        );
+        return RestartOutcome::SkippedSemaphore;
     };
 
     let _guard = state.begin_deploy();
@@ -283,7 +266,7 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let response = pipeline.deploy(request, tx).await;
 
-    match apply_restart_response(&response.status, &response.message) {
+    match apply_restart_response(&response.status) {
         RestartApply::Succeeded => {
             tracing::info!(
                 service_id,
@@ -388,9 +371,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_rejects_closed_port() {
-        let h = HealthChecker;
         // Port 1 is typically closed / privileged.
-        assert!(!h.check("127.0.0.1:1").await);
+        assert!(!check("127.0.0.1:1").await);
     }
 
     #[test]
@@ -428,28 +410,13 @@ mod tests {
 
     #[test]
     fn apply_restart_response_succeeded() {
-        assert_eq!(
-            apply_restart_response("deployed", "ok"),
-            RestartApply::Succeeded
-        );
-        assert_eq!(
-            apply_restart_response("deployed", ""),
-            RestartApply::Succeeded
-        );
-        assert_eq!(
-            apply_restart_response("deployed", "any message is fine"),
-            RestartApply::Succeeded
-        );
+        assert_eq!(apply_restart_response("deployed"), RestartApply::Succeeded);
     }
 
     #[test]
     fn apply_restart_response_rolled_back_keeps_prior() {
         assert_eq!(
-            apply_restart_response("rolled_back", "restored prior"),
-            RestartApply::FailedKeepPrior
-        );
-        assert_eq!(
-            apply_restart_response("rolled_back", ""),
+            apply_restart_response("rolled_back"),
             RestartApply::FailedKeepPrior
         );
     }
@@ -468,7 +435,7 @@ mod tests {
             " rolled_back",
         ] {
             assert_eq!(
-                apply_restart_response(status, "boom"),
+                apply_restart_response(status),
                 RestartApply::FailedMark,
                 "status={status:?} should mark failed"
             );
