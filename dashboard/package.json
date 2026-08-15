@@ -10,7 +10,8 @@
     "preview": "astro preview --host 127.0.0.1",
     "dev:lan": "astro dev --host",
     "preview:lan": "astro preview --host",
-    "astro": "astro"
+    "astro": "astro",
+    "test": "bun test"
   },
   "dependencies": {
     "astro": "^5.1.0"

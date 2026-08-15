@@ -3,19 +3,11 @@ import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import MetricCard from '../components/MetricCard.astro';
 import ActivityChart from '../components/ActivityChart.astro';
-import type { FleetStatus, ServiceVM } from '../lib/api';
+import { STATIC_FLEET_STATUS, type ServiceVM } from '../lib/api';
 
 // Static shell only — no build-time control-plane fetch (#306).
 // Client hydrate() fills live metrics from the browser.
-const status: FleetStatus = {
-  online: false,
-  total_vms: 0,
-  running_vms: 0,
-  stopped_vms: 0,
-  failed_vms: 0,
-  api_latency_ms: 0,
-  max_uptime_seconds: 0,
-};
+const status = STATIC_FLEET_STATUS;
 const services: ServiceVM[] = [];
 ---
 
@@ -23,6 +15,7 @@ const services: ServiceVM[] = [];
   <Header
     title="Overview"
     subtitle="Self-hosted control plane for microVMs and container workloads."
+    connection="loading"
   />
 
   <div class="metrics-grid" id="metricsGrid">
@@ -69,7 +62,15 @@ const services: ServiceVM[] = [];
 </Layout>
 
 <script>
-  import { api, escapeHtml, formatUptime, isServiceRunning, probeEndpointPort } from '../lib/api';
+  import {
+    api,
+    escapeHtml,
+    formatUptime,
+    isServiceRunning,
+    overviewMetricsForConnection,
+    overviewServicesEmptyCopy,
+    probeEndpointPort,
+  } from '../lib/api';
 
   const SAMPLE_KEY = 'RUSSEL_FLEET_SAMPLES';
   const MAX_SAMPLES = 48;
@@ -488,58 +489,28 @@ const services: ServiceVM[] = [];
       updateComposition(status, services);
     }
 
-    // Update metrics
+    // Update metrics via pure shell helpers (unit-tested; keeps Loading… contract locked)
     const grid = document.getElementById('metricsGrid');
-    if (grid && (connection === 'demo' || connection === 'live')) {
-      const active = services.filter((s: any) => isServiceRunning(s)).length;
-      const uptime = status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '\u2014';
-      const latency = status.online ? `${status.api_latency_ms} ms` : 'Offline';
-      const healthPct = status.total_vms > 0 ? Math.round((status.running_vms / status.total_vms) * 100) : 0;
-
-      grid.innerHTML = `
-        <div class="metric-card card-panel">
-          <span class="metric-title">Fleet Health</span>
-          <div class="metric-value-row"><span class="metric-value">${status.running_vms} / ${status.total_vms}</span></div>
-          <span class="metric-subtext">${status.online ? 'All systems operational' : 'API unreachable'}</span>
-          ${healthPct > 0 ? `<div class="metric-progress-track"><div class="metric-progress-fill" style="width:${healthPct}%;background-color:var(--accent-green)"></div></div>` : ''}
-        </div>
-        <div class="metric-card card-panel">
-          <span class="metric-title">Longest Uptime</span>
-          <div class="metric-value-row"><span class="metric-value">${uptime}</span></div>
-          <span class="metric-subtext">Across all services</span>
-        </div>
-        <div class="metric-card card-panel">
-          <span class="metric-title">API Latency</span>
-          <div class="metric-value-row"><span class="metric-value">${latency}</span></div>
-          <span class="metric-subtext">${status.online ? 'Control plane reachable' : 'Unreachable'}</span>
-        </div>
-        <div class="metric-card card-panel">
-          <span class="metric-title">Services</span>
-          <div class="metric-value-row"><span class="metric-value">${services.length}</span></div>
-          <span class="metric-subtext">${active} running</span>
+    if (grid && (connection === 'demo' || connection === 'live' || connection === 'offline')) {
+      const cards = overviewMetricsForConnection(connection, status, services)!;
+      const healthPct =
+        connection !== 'offline' && status.total_vms > 0
+          ? Math.round((status.running_vms / status.total_vms) * 100)
+          : 0;
+      grid.innerHTML = cards
+        .map((card, i) => {
+          const progress =
+            i === 0 && healthPct > 0
+              ? `<div class="metric-progress-track"><div class="metric-progress-fill" style="width:${healthPct}%;background-color:var(--accent-green)"></div></div>`
+              : '';
+          return `<div class="metric-card card-panel">
+          <span class="metric-title">${escapeHtml(card.title)}</span>
+          <div class="metric-value-row"><span class="metric-value">${escapeHtml(card.value)}</span></div>
+          <span class="metric-subtext">${escapeHtml(card.subtext)}</span>
+          ${progress}
         </div>`;
-    } else if (grid && connection === 'offline') {
-      grid.innerHTML = `
-        <div class="metric-card card-panel">
-          <span class="metric-title">Fleet Health</span>
-          <div class="metric-value-row"><span class="metric-value">0 / 0</span></div>
-          <span class="metric-subtext">Control plane offline</span>
-        </div>
-        <div class="metric-card card-panel">
-          <span class="metric-title">Longest Uptime</span>
-          <div class="metric-value-row"><span class="metric-value">\u2014</span></div>
-          <span class="metric-subtext">Across all services</span>
-        </div>
-        <div class="metric-card card-panel">
-          <span class="metric-title">API Latency</span>
-          <div class="metric-value-row"><span class="metric-value">Offline</span></div>
-          <span class="metric-subtext">Unreachable</span>
-        </div>
-        <div class="metric-card card-panel">
-          <span class="metric-title">Services</span>
-          <div class="metric-value-row"><span class="metric-value">0</span></div>
-          <span class="metric-subtext">0 running</span>
-        </div>`;
+        })
+        .join('');
     }
 
     // Update services table
@@ -565,17 +536,16 @@ const services: ServiceVM[] = [];
         const afterHeader = section.querySelector('.data-table-container, .empty-state');
         if (afterHeader) afterHeader.remove();
         if (headerRow) headerRow.insertAdjacentHTML('afterend', tableHtml);
-      } else if (connection === 'offline') {
-        const afterHeader = section.querySelector('.data-table-container, .empty-state');
-        if (afterHeader) afterHeader.remove();
-        if (headerRow) {
-          headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>Control plane offline.</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`);
-        }
       } else {
+        const empty = overviewServicesEmptyCopy(connection === 'demo' ? 'demo' : connection === 'offline' ? 'offline' : 'live');
         const afterHeader = section.querySelector('.data-table-container, .empty-state');
         if (afterHeader) afterHeader.remove();
         if (headerRow) {
-          headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>No services configured.</p><a href="/deploy" class="btn btn-primary" style="margin-top:0.75rem">Deploy your first service</a></div>`);
+          if (empty.kind === 'offline') {
+            headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>${escapeHtml(empty.primary)}</p><p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.3rem">Start <code>russel-ctrl</code> (default :7878) or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`);
+          } else {
+            headerRow.insertAdjacentHTML('afterend', `<div class="card-panel empty-state"><p>${escapeHtml(empty.primary)}</p><a href="/deploy" class="btn btn-primary" style="margin-top:0.75rem">Deploy your first service</a></div>`);
+          }
         }
       }
     }
