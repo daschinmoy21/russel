@@ -162,36 +162,30 @@ fn constant_time_eq_zeroed_suffix_matches() {
 
 // ── POST /deploy vm_id contract (#300) ─────────────────────────────
 
+/// POST /deploy helper that does **not** mutate process environment.
+///
+/// When `RUSSEL_API_TOKEN` is set (common in CI shells), attach a matching
+/// Bearer header so auth middleware passes. Clearing/restoring env across an
+/// `await` races concurrent tests that also touch process-wide environment.
 async fn post_deploy(body: &str) -> (StatusCode, String) {
-    // Ensure auth middleware does not reject (env may be set in some CI shells).
-    // Safety: only cleared for this process during the request; restore after.
-    let prev = std::env::var("RUSSEL_API_TOKEN").ok();
-    // SAFETY: single-threaded test request; restore below.
-    unsafe {
-        std::env::remove_var("RUSSEL_API_TOKEN");
-    }
-
     let app = router(AppState::default());
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/deploy")
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+
+    // Present the configured token when set — no env clear/restore.
+    if let Some(token) = normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref()) {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let req = builder
         .body(Body::from(body.to_string()))
         .expect("build request");
     let res = app.oneshot(req).await.expect("oneshot");
     let status = res.status();
     let bytes = res.into_body().collect().await.expect("body").to_bytes();
     let text = String::from_utf8_lossy(&bytes).into_owned();
-
-    match prev {
-        Some(v) => unsafe {
-            std::env::set_var("RUSSEL_API_TOKEN", v);
-        },
-        None => unsafe {
-            std::env::remove_var("RUSSEL_API_TOKEN");
-        },
-    }
-
     (status, text)
 }
 
