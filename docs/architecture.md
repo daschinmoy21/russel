@@ -376,7 +376,7 @@ flowchart TB
 | Host integrity | Orphan-only TAP cleanup; no iptables mutation; CH API socket + service dirs `0700`; PID ownership verified via `/proc` before signals |
 | Process hygiene | kill+wait with timeout on redeploy; supervisor generations; deploy semaphore; panic isolation per deploy task |
 
-Residual risks documented in `AUDIT-2026-07-23.md`: DNS-rebinding around the
+Residual risks documented in `docs/audits/AUDIT-2026-07-23.md`: DNS-rebinding around the
 SSRF guard (no DNS resolution), metadata-IP redirects during clone, and
 `podman inspect` env visibility on the container runtime.
 
@@ -430,11 +430,11 @@ Things that exist but no longer pull their weight. Recommendation in **bold**.
 | Legacy `/var/lib/microvms` marker dirs + gcroots cleanup | Migration shim for pre-ctrl-state installs | **Remove after one release** with a note; destroy already handles absence |
 | Legacy dead initramfs stack (`build_initramfs`, `generate_init_script`, `boot()`) | `#[allow(dead_code)]` cold-boot fallback superseded by the agent initramfs | **Remove** (in progress in the audit-fix PRs) |
 | Flat `/status` + `/logs` endpoints | CLI-compat shims that 400 when >1 service exists (#54) | **Remove** once CLI drops usage, or make them aggregate all services |
-| `nix/modules/russel-host.nix`, `nix/microvm/README.md` | Host NixOS module docs | **Keep** if anyone installs the host via NixOS; otherwise move to docs/ |
+| `nix/modules/russel-host.nix`, `nix/microvm/` | Host NixOS module stub + legacy microVM reference | **Removed** (2026-08-15): empty stub and legacy reference; runtime boots Cloud Hypervisor directly |
 | `bench.sh` (38 KB) + `docs/plans/` | Dev scaffolding | **Move** to `scripts/` + `docs/archive/`; not part of the product surface |
 | `container debug = true` | Adds bash/curl/env wrapper to rootfs | **Keep** — genuinely useful, one config flag |
 | `Memory` enum (single variant), unit structs (`GitClient`, `NixBuilder`, `PortAllocator`) | Over-abstraction (#50, #53) | **Simplify** opportunistically; low value churn |
-| `SPEC.md` / `FINAL.md` / `AUDIT.md` at repo root | Historical artifacts | **Move** to `docs/archive/` |
+| `docs/SPEC.md` / `docs/vision.md` / `docs/audits/` | Historical artifacts (ex-`SPEC.md` / `FINAL.md` / `AUDIT.md` at repo root) | **Moved** out of repo root (2026-08-15) |
 
 The one-line answer on **database**: yes, remove it — it is schema without a
 feature. If managed DBs ever return, they belong in a separate orchestrator

@@ -12,7 +12,7 @@ use axum::{
 };
 
 /// Minimum accepted length for agent / API tokens after trim.
-pub const MIN_TOKEN_LEN: usize = 32;
+pub const MIN_TOKEN_LEN: usize = russel_core::tokens::MIN_TOKEN_LEN;
 
 /// Env name for the agent node token.
 pub const AGENT_TOKEN_ENV: &str = "RUSSEL_AGENT_TOKEN";
@@ -22,33 +22,14 @@ pub const API_TOKEN_ENV: &str = "RUSSEL_API_TOKEN";
 
 /// Normalize: unset/blank → None.
 pub fn normalize_token(raw: Option<&str>) -> Option<String> {
-    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-fn token_is_http_header_safe(token: &str) -> bool {
-    token
-        .bytes()
-        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+    russel_core::tokens::normalize_token(raw)
 }
 
 /// Reject tokens that are too short or cannot be sent as Bearer.
+///
+/// Shares one implementation with the control plane (`russel_core::tokens`).
 pub fn check_token_min_length(token: &str) -> Result<(), String> {
-    if !token_is_http_header_safe(token) {
-        return Err(
-            "agent token must be printable ASCII only so it can be sent in an \
-             HTTP Authorization header. Generate with: openssl rand -hex 32"
-                .to_string(),
-        );
-    }
-    if token.len() < MIN_TOKEN_LEN {
-        Err(format!(
-            "agent token must be at least {MIN_TOKEN_LEN} characters after trim (got {}). \
-             Generate with: openssl rand -hex 32",
-            token.len()
-        ))
-    } else {
-        Ok(())
-    }
+    russel_core::tokens::check_token_min_length(token)
 }
 
 /// Resolve configured token: `RUSSEL_AGENT_TOKEN` then `RUSSEL_API_TOKEN`.
@@ -64,26 +45,16 @@ pub fn resolve_token(agent: Option<&str>, api_fallback: Option<&str>) -> Option<
     normalize_token(agent).or_else(|| normalize_token(api_fallback))
 }
 
-/// Constant-time-ish equality for Bearer secrets (length leak is acceptable).
+/// Constant-time token equality (shared `russel_core::tokens` implementation).
 fn tokens_equal(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    russel_core::tokens::constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
-/// Extract Bearer token from Authorization header.
+/// Extract Bearer token from Authorization header (case-insensitive scheme).
 pub fn bearer_from_request(req: &Request) -> Option<&str> {
     let val = req.headers().get(axum::http::header::AUTHORIZATION)?;
     let s = val.to_str().ok()?;
-    let rest = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    let t = rest.trim();
-    if t.is_empty() { None } else { Some(t) }
+    russel_core::tokens::bearer_token_from_header(s)
 }
 
 /// Axum middleware state: expected token when auth is enabled.
@@ -148,5 +119,22 @@ mod tests {
         assert!(tokens_equal("abc", "abc"));
         assert!(!tokens_equal("abc", "abd"));
         assert!(!tokens_equal("abc", "ab"));
+    }
+
+    #[test]
+    fn bearer_from_request_is_case_insensitive() {
+        use axum::http::header;
+        let make = |value: &str| {
+            Request::builder()
+                .header(header::AUTHORIZATION, value)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert_eq!(bearer_from_request(&make("Bearer tok")), Some("tok"));
+        assert_eq!(bearer_from_request(&make("bearer tok")), Some("tok"));
+        assert_eq!(bearer_from_request(&make("BEARER tok")), Some("tok"));
+        assert_eq!(bearer_from_request(&make("bEaReR   tok  ")), Some("tok"));
+        assert_eq!(bearer_from_request(&make("Basic tok")), None);
+        assert_eq!(bearer_from_request(&make("Bearer ")), None);
     }
 }

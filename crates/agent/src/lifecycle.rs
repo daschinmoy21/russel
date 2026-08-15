@@ -11,6 +11,8 @@
 //! `RUSSEL_AGENT_URL` cannot recurse back into itself over HTTP.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use russel_core::api::{AgentLifecycleResponse, AgentStatusResponse};
@@ -99,20 +101,7 @@ pub async fn stop(
     data_root: &Path,
     service_id: &str,
 ) -> Result<AgentLifecycleResponse, LifecycleError> {
-    MicrovmRunner::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
-    let resolved = resolve_service(data_root, service_id)?;
-    let runtime = resolved.runtime;
-    in_process_lifecycle(runtime)
-        .stop(service_id)
-        .await
-        .map_err(|e| LifecycleError::internal(format!("failed to stop {service_id}: {e}")))?;
-    Ok(AgentLifecycleResponse {
-        service_id: service_id.to_string(),
-        operation: "stop".into(),
-        status: "stopped".into(),
-        message: format!("stopped {runtime} {service_id}"),
-        runtime: Some(runtime),
-    })
+    run_lifecycle_op(data_root, service_id, "stop", "stopped").await
 }
 
 /// `POST /agent/v1/destroy/{service_id}` — stop + remove all workload state.
@@ -120,18 +109,38 @@ pub async fn destroy(
     data_root: &Path,
     service_id: &str,
 ) -> Result<AgentLifecycleResponse, LifecycleError> {
+    run_lifecycle_op(data_root, service_id, "destroy", "destroyed").await
+}
+
+/// Shared stop/destroy scaffolding: validate, resolve runtime, run the
+/// in-process lifecycle op, and shape the response. `operation` is the RPC
+/// verb/route segment; `status` is the response status and message verb.
+async fn run_lifecycle_op(
+    data_root: &Path,
+    service_id: &str,
+    operation: &str,
+    status: &str,
+) -> Result<AgentLifecycleResponse, LifecycleError> {
     MicrovmRunner::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
     let resolved = resolve_service(data_root, service_id)?;
     let runtime = resolved.runtime;
-    in_process_lifecycle(runtime)
-        .destroy(service_id)
-        .await
-        .map_err(|e| LifecycleError::internal(format!("failed to destroy {service_id}: {e}")))?;
+    let result = match operation {
+        "stop" => in_process_lifecycle(runtime).stop(service_id).await,
+        "destroy" => in_process_lifecycle(runtime).destroy(service_id).await,
+        other => {
+            return Err(LifecycleError::internal(format!(
+                "unknown lifecycle operation {other}"
+            )));
+        }
+    };
+    result.map_err(|e| {
+        LifecycleError::internal(format!("failed to {operation} {service_id}: {e}"))
+    })?;
     Ok(AgentLifecycleResponse {
         service_id: service_id.to_string(),
-        operation: "destroy".into(),
-        status: "destroyed".into(),
-        message: format!("destroyed {runtime} {service_id}"),
+        operation: operation.to_string(),
+        status: status.to_string(),
+        message: format!("{status} {runtime} {service_id}"),
         runtime: Some(runtime),
     })
 }
@@ -290,6 +299,41 @@ fn boot_time_epoch_secs() -> Option<u64> {
         .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
 }
 
+/// Bound for each `podman` subprocess in lifecycle status probes.
+///
+/// Mirrors the timeout+`kill_on_drop` pattern in [`crate::capacity`]: a wedged
+/// `podman` must not hang `/agent/v1/status/{id}` indefinitely.
+const PODMAN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a single `podman` invocation bounded by [`PODMAN_TIMEOUT`].
+///
+/// `what` names the operation for diagnostics. Errors and timeouts return
+/// `None`; the caller reports the workload as `stopped` (best-effort probe).
+async fn podman_output(what: &str, args: &[&str]) -> Option<std::process::Output> {
+    let child = tokio::process::Command::new("podman")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    match tokio::time::timeout(PODMAN_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, what, "podman subprocess wait error");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                what,
+                timeout_secs = PODMAN_TIMEOUT.as_secs(),
+                "podman subprocess timed out"
+            );
+            None
+        }
+    }
+}
+
 /// Podman container state for an exact name **or** container id.
 ///
 /// When `target` looks like a name (contains no `/` and is not a long hex id),
@@ -298,11 +342,11 @@ fn boot_time_epoch_secs() -> Option<u64> {
 /// via `podman inspect` (exact key).
 async fn container_state(target: &str) -> Option<String> {
     // Prefer inspect: works for id *and* exact name including gen-scoped.
-    let output = tokio::process::Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Status}}", target])
-        .output()
-        .await
-        .ok()?;
+    let output = podman_output(
+        "inspect",
+        &["inspect", "--format", "{{.State.Status}}", target],
+    )
+    .await?;
     if output.status.success() {
         let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !state.is_empty() {
@@ -310,18 +354,19 @@ async fn container_state(target: &str) -> Option<String> {
         }
     }
     // Fallback: anchored name filter (canonical names only).
-    let output = tokio::process::Command::new("podman")
-        .args([
+    let filter = format!("name=^{target}$");
+    let output = podman_output(
+        "ps -a",
+        &[
             "ps",
             "-a",
             "--filter",
-            &format!("name=^{target}$"),
+            filter.as_str(),
             "--format",
             "{{.State}}",
-        ])
-        .output()
-        .await
-        .ok()?;
+        ],
+    )
+    .await?;
     if !output.status.success() {
         return None;
     }
@@ -335,11 +380,11 @@ async fn container_state(target: &str) -> Option<String> {
 
 /// Uptime of the podman container's main process (`{{.State.Pid}}`).
 async fn container_pid_uptime(target: &str) -> Option<u64> {
-    let output = tokio::process::Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Pid}}", target])
-        .output()
-        .await
-        .ok()?;
+    let output = podman_output(
+        "inspect pid",
+        &["inspect", "--format", "{{.State.Pid}}", target],
+    )
+    .await?;
     if !output.status.success() {
         return None;
     }

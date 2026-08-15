@@ -5,10 +5,11 @@
 use std::path::Path;
 
 use russel_core::config::RuntimeKind;
+use russel_core::reserved::is_reserved_service_dir;
 
 use crate::metadata::{self, ServiceDiskRecord};
 use crate::network::PortAllocator;
-use crate::state::AppState;
+use crate::state::{AppState, check_container_running};
 
 /// Outcome of reconciling a single service directory.
 #[derive(Debug)]
@@ -55,7 +56,7 @@ pub async fn reconcile_startup_in(state: &AppState, base: &Path) -> ReconcileRep
         };
 
         // Skip backups and well-known non-service directories.
-        if crate::metadata::is_reserved_service_dir(&name) {
+        if is_reserved_service_dir(&name) {
             report.skipped += 1;
             continue;
         }
@@ -104,14 +105,10 @@ async fn reconcile_service(
         None => return Ok(ReconcileOutcome::Skipped),
     };
 
-    // Parse extra fields (tap_id, deployed_at) that ServiceDiskRecord
-    // does not expose (issue #137 uptime back-dating, F-06 identity).
-    let (tap_id, deployed_at) = parse_extra_metadata_fields(metadata_path);
-
     let runtime = record.runtime.unwrap_or(RuntimeKind::Microvm);
 
     let alive = match runtime {
-        RuntimeKind::Microvm => probe_microvm_alive(&record, tap_id.as_deref()),
+        RuntimeKind::Microvm => probe_microvm_alive(&record, record.tap_id.as_deref()),
         RuntimeKind::Container => probe_container_alive(&record).await,
     };
 
@@ -138,7 +135,7 @@ async fn reconcile_service(
                     host_port,
                     guest_port,
                     record.vm_pid,
-                    deployed_at.as_deref(),
+                    record.deployed_at.as_deref(),
                 );
             }
             RuntimeKind::Container => {
@@ -148,7 +145,7 @@ async fn reconcile_service(
                         container_id,
                         host_port,
                         guest_port,
-                        deployed_at.as_deref(),
+                        record.deployed_at.as_deref(),
                     );
                 } else {
                     // Container metadata without a container_id — treat as stopped.
@@ -172,28 +169,6 @@ async fn reconcile_service(
     }
 }
 
-/// Read `tap_id` and `deployed_at` from the metadata JSON directly, since
-/// `ServiceDiskRecord` does not expose them.
-fn parse_extra_metadata_fields(path: &Path) -> (Option<String>, Option<String>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return (None, None),
-    };
-    let value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return (None, None),
-    };
-    let tap_id = value
-        .get("tap_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let deployed_at = value
-        .get("deployed_at")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    (tap_id, deployed_at)
-}
-
 // ── Liveness probes ───────────────────────────────────────────────────────────
 
 /// Check whether a microVM's cloud-hypervisor process is alive *and* matches
@@ -203,12 +178,6 @@ fn parse_extra_metadata_fields(path: &Path) -> (Option<String>, Option<String>) 
 /// liveness yields `false` (they are aux processes that outlive VMs).
 fn probe_microvm_alive(record: &ServiceDiskRecord, tap_id: Option<&str>) -> bool {
     let service_id = record.service_id.as_deref().unwrap_or("");
-
-    // F-06: these fields exist on the disk record (deserialized by serde)
-    // but are not used for liveness — only cloud-hypervisor counts.
-    // Touch them here to suppress dead_code warnings; they are meaningful
-    // for debugging / future use but not for identity checks.
-    let _ = (&record.socat_pid, &record.virtiofsd_pids);
 
     if let Some(pid) = record.vm_pid
         && ch_pid_matches(pid, service_id, tap_id)
@@ -255,7 +224,7 @@ fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
 /// Check whether a container is still running via `podman inspect`.
 async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
     if let Some(container_id) = &record.container_id {
-        if container_running(container_id).await {
+        if check_container_running(container_id).await {
             return true;
         }
         // Fallback: try the Russel naming convention `russel-{service_id}`.
@@ -263,68 +232,52 @@ async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
             "russel-{}",
             record.service_id.as_deref().unwrap_or("unknown")
         );
-        if container_running(&name).await {
+        if check_container_running(&name).await {
             return true;
         }
     }
     false
 }
 
-/// Returns true if the PID exists *and* its cmdline matches expected identity.
-///
-/// `kill(pid, 0)` alone is subject to PID reuse; we also require that
-/// `/proc/<pid>/cmdline` contains one of `needles` (and, when non-empty,
-/// the service id) before treating the process as our workload.
-#[allow(dead_code)] // used by tests in #[cfg(test)] module
-fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs existence check without delivering a signal.
-    if unsafe { libc::kill(pid as i32, 0) } != 0 {
-        return false;
-    }
-    let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
-        Err(_) => return false,
-    };
-    let has_needle = needles.iter().any(|n| cmdline.contains(n));
-    if !has_needle {
-        return false;
-    }
-    // When we know the service id, require it appear (path, arg0, or similar)
-    // so a recycled PID running the same binary for another service is rejected.
-    // Cloud-hypervisor identity is handled separately by `ch_pid_matches`.
-    if !service_id.is_empty() && !cmdline.contains(service_id) {
-        return false;
-    }
-    true
-}
-
-async fn container_running(container_id: &str) -> bool {
-    let output = match crate::container::podman_command()
-        .await
-        .args(["inspect", container_id, "--format", "{{.State.Running}}"])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    String::from_utf8_lossy(&output.stdout).trim() == "true"
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::state::AppState;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    use russel_core::api::{ServiceStatus, VmState};
+
+    /// Returns true if the PID exists *and* its cmdline matches expected identity.
+    ///
+    /// `kill(pid, 0)` alone is subject to PID reuse; we also require that
+    /// `/proc/<pid>/cmdline` contains one of `needles` (and, when non-empty,
+    /// the service id) before treating the process as our workload.
+    fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: signal 0 performs existence check without delivering a signal.
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return false;
+        }
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
+            Err(_) => return false,
+        };
+        let has_needle = needles.iter().any(|n| cmdline.contains(n));
+        if !has_needle {
+            return false;
+        }
+        // When we know the service id, require it appear (path, arg0, or similar)
+        // so a recycled PID running the same binary for another service is rejected.
+        // Cloud-hypervisor identity is handled separately by `ch_pid_matches`.
+        if !service_id.is_empty() && !cmdline.contains(service_id) {
+            return false;
+        }
+        true
+    }
 
     /// Write minimal microVM metadata into `{base}/{service_id}/metadata.json`.
     fn write_microvm_metadata(
@@ -345,29 +298,6 @@ mod tests {
             "vm_pid": vm_pid,
             "socat_pid": socat_pid,
             "virtiofsd_pids": []
-        });
-        let path = dir.join("metadata.json");
-        std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-        path
-    }
-
-    /// Write minimal container metadata.
-    #[allow(dead_code)] // used by future container reconcile tests
-    fn write_container_metadata(
-        base: &Path,
-        service_id: &str,
-        container_id: &str,
-        host_port: u16,
-    ) -> PathBuf {
-        let dir = base.join(service_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let meta = serde_json::json!({
-            "schema_version": 1,
-            "service_id": service_id,
-            "runtime": "container",
-            "host_port": host_port,
-            "guest_port": 3000,
-            "container_id": container_id
         });
         let path = dir.join("metadata.json");
         std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
@@ -613,8 +543,8 @@ mod tests {
         let inner = state.lock_inner();
         let svc = inner.services.get("live-svc").unwrap();
         assert!(svc.vm_process.is_some(), "live Child handle preserved");
-        assert_eq!(svc.status, "deployed");
-        assert_eq!(svc.vm_state, "running");
+        assert_eq!(svc.status, ServiceStatus::Deployed);
+        assert_eq!(svc.vm_state, VmState::Running);
         drop(inner);
         let _ = fake.kill();
         let _ = fake.wait();

@@ -26,8 +26,6 @@ use std::{
     time::Duration,
 };
 
-use tokio::{process::Command, sync::Notify};
-
 use crate::{
     ch_api,
     microvm::{self, BootOutput, FsMount, MicrovmRunner, VmSpec},
@@ -45,12 +43,26 @@ const POOL_TEMPLATE_ID: &str = "pooltpl";
 /// Timeout for the agent to write `.agent_ready` inside the template VM.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// `RUSSEL_CPU_MAX` (default 8) — upper bound for CPU hotplug topology.
+fn env_cpu_max() -> u8 {
+    std::env::var("RUSSEL_CPU_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
+/// `RUSSEL_MEM_HOTPLUG_MB` (default 2048) — memory hotplug headroom.
+fn env_mem_hotplug_mb() -> u16 {
+    std::env::var("RUSSEL_MEM_HOTPLUG_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048)
+}
+
 #[derive(Debug)]
 pub struct WarmPool {
     runner: MicrovmRunner,
     ready: AtomicBool,
-    /// Notified when prepare finishes (success or failure).
-    prepare_done: Notify,
     /// Guards concurrent access to golden snapshot files during restore.
     restore_mutex: tokio::sync::Mutex<()>,
 }
@@ -60,7 +72,6 @@ impl WarmPool {
         Self {
             runner,
             ready: AtomicBool::new(false),
-            prepare_done: Notify::new(),
             restore_mutex: tokio::sync::Mutex::new(()),
         }
     }
@@ -68,15 +79,6 @@ impl WarmPool {
     /// True once prepare has finished successfully.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
-    }
-
-    /// Block until prepare finishes (or immediately if already done).
-    #[allow(dead_code)] // for deploy/API callers that gate on warm-pool readiness
-    pub async fn wait_until_prepare_done(&self) {
-        if self.is_ready() {
-            return;
-        }
-        self.prepare_done.notified().await;
     }
 
     // ── Prepare ──────────────────────────────────────────────────────────
@@ -95,25 +97,18 @@ impl WarmPool {
             tracing::info!(
                 "warm pool disabled (set RUSSEL_WARM_POOL=1 for experimental snapshot restore)"
             );
-            self.prepare_done.notify_waiters();
             return Ok(());
         }
 
-        // ponytail: mutex ensures a single prepare attempt even if main
-        // somehow spawns two tasks.  In practice only one spawn exists.
-        {
-            let _lock = self.restore_mutex.lock().await;
-            if self.is_ready() {
-                return Ok(());
-            }
+        // Hold the restore mutex across the entire prepare so a concurrent
+        // restore cannot race the golden snapshot being written, and a second
+        // prepare task cannot run prepare_inner concurrently.
+        let _lock = self.restore_mutex.lock().await;
+        if self.is_ready() {
+            return Ok(());
         }
 
-        // Inner result — on any error, notify waiters so they never hang.
-        let result = self.prepare_inner().await;
-        if result.is_err() {
-            self.prepare_done.notify_waiters();
-        }
-        result
+        self.prepare_inner().await
     }
 
     async fn prepare_inner(&self) -> anyhow::Result<()> {
@@ -153,15 +148,9 @@ impl WarmPool {
             initramfs: agent_initramfs,
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
-            cpus_max: std::env::var("RUSSEL_CPU_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
-            memory_mb: 256, // ponytail: minimum viable; hotplug adds headroom
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            cpus_max: env_cpu_max(),
+            memory_mb: 256, // minimum viable; hotplug adds headroom
+            memory_hotplug_mb: env_mem_hotplug_mb(),
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket: api_socket.clone(),
@@ -225,7 +214,6 @@ impl WarmPool {
 
         // 9. Mark ready.
         self.ready.store(true, Ordering::Release);
-        self.prepare_done.notify_waiters();
 
         tracing::info!("warm pool ready");
         Ok(())
@@ -235,10 +223,10 @@ impl WarmPool {
         let tap = &alloc.tap_id;
         let host_ip = &alloc.host_ip;
         tracing::info!(tap, "creating template TAP");
-        let _ = Self::run_ip(&["link", "del", tap]).await;
-        Self::run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await?;
-        Self::run_ip(&["link", "set", tap, "up"]).await?;
-        Self::run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
+        let _ = network::run_ip(&["link", "del", tap]).await;
+        network::run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await?;
+        network::run_ip(&["link", "set", tap, "up"]).await?;
+        network::run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
         Ok(())
     }
 
@@ -264,23 +252,6 @@ impl WarmPool {
         }
         let _ = TapForwarder::teardown(alloc).await;
         let _ = tokio::fs::remove_dir_all(sock_dir).await;
-    }
-
-    async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
-        let out = Command::new("ip")
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
-            .args(args)
-            .output()
-            .await?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "ip {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
     }
 
     // ── Restore or boot ──────────────────────────────────────────────────
@@ -375,11 +346,7 @@ impl WarmPool {
         let cfg_sock = PathBuf::from(format!("{sock_dir}/virtiofs-cfg.sock"));
         let api_socket = PathBuf::from(format!("{sock_dir}/cloud-hypervisor.sock"));
 
-        let cpus_max: u8 = std::env::var("RUSSEL_CPU_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
-            .max(cpus_boot);
+        let cpus_max: u8 = env_cpu_max().max(cpus_boot);
 
         let spec = VmSpec {
             kernel: kernel_path.to_path_buf(),
@@ -388,10 +355,7 @@ impl WarmPool {
             cpus_boot,
             cpus_max,
             memory_mb,
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            memory_hotplug_mb: env_mem_hotplug_mb(),
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket,
@@ -421,10 +385,11 @@ impl WarmPool {
         &self,
         service_id: &str,
         alloc: &SubnetAllocation,
-        _memory_mb: u16,
+        memory_mb: u16,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
-        // ponytail: scope the lock so it's dropped before any await.
+        // Hold the restore mutex for the whole restore so a concurrent prepare
+        // (or another restore) cannot race the golden snapshot being read.
         let _lock = self.restore_mutex.lock().await;
 
         let sock_dir = format!("/var/lib/russel/{service_id}");
@@ -479,15 +444,9 @@ impl WarmPool {
             initramfs: PathBuf::from("/dev/null"),
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
-            cpus_max: std::env::var("RUSSEL_CPU_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
-            memory_mb: _memory_mb.max(256),
-            memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            cpus_max: env_cpu_max(),
+            memory_mb: memory_mb.max(256),
+            memory_hotplug_mb: env_mem_hotplug_mb(),
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket: PathBuf::from(&api_socket_path),
@@ -584,4 +543,144 @@ static WARM_POOL: LazyLock<WarmPool> = LazyLock::new(|| WarmPool::new(microvm::s
 /// Shared warm pool singleton (like `shared_runner()` for deploy.rs).
 pub fn shared_warm_pool() -> &'static WarmPool {
     &WARM_POOL
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn pool() -> WarmPool {
+        WarmPool::new(MicrovmRunner::new())
+    }
+
+    /// Representative Cloud Hypervisor `config.json` (golden snapshot).
+    const GOLDEN_CONFIG: &str = r#"{
+        "cpus": {"boot_vcpus": 1, "max_vcpus": 8},
+        "memory": {"size": 268435456},
+        "net": [
+            {"id": "net0", "tap": "pooltpl-tap0", "mac": "aa:bb:cc:dd:ee:ff"}
+        ],
+        "fs": [
+            {"tag": "nixstore", "socket": "/var/lib/russel/_pool/template/virtiofs-nixstore.sock"},
+            {"tag": "russelcfg", "socket": "/var/lib/russel/_pool/template/virtiofs-cfg.sock"},
+            {"tag": "other", "socket": "/keep/me.sock"}
+        ],
+        "api_socket": "/var/lib/russel/_pool/template/cloud-hypervisor.sock",
+        "console": {"mode": "tty"}
+    }"#;
+
+    #[test]
+    fn patch_config_json_rewrites_service_resources() {
+        let patched = pool()
+            .patch_config_json(
+                GOLDEN_CONFIG,
+                "svc-1",
+                "svc-1-tap0",
+                "02:00:00:00:00:01",
+                "/var/lib/russel/svc-1/virtiofs-nixstore.sock",
+                "/var/lib/russel/svc-1/virtiofs-cfg.sock",
+                "/var/lib/russel/svc-1/cloud-hypervisor.sock",
+            )
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
+
+        assert_eq!(config["net"][0]["tap"], "svc-1-tap0");
+        assert_eq!(config["net"][0]["mac"], "02:00:00:00:00:01");
+        assert_eq!(
+            config["fs"][0]["socket"],
+            "/var/lib/russel/svc-1/virtiofs-nixstore.sock"
+        );
+        assert_eq!(
+            config["fs"][1]["socket"],
+            "/var/lib/russel/svc-1/virtiofs-cfg.sock"
+        );
+        // Unrelated fs tags are left untouched.
+        assert_eq!(config["fs"][2]["socket"], "/keep/me.sock");
+        assert_eq!(
+            config["api_socket"],
+            "/var/lib/russel/svc-1/cloud-hypervisor.sock"
+        );
+        assert_eq!(config["console"]["mode"], "null");
+    }
+
+    #[test]
+    fn patch_config_json_preserves_cpu_and_memory() {
+        // CPU/memory are configured on VmSpec (cpus_boot / memory_mb), not in
+        // the snapshot config.json; the patch must not corrupt either field.
+        let patched = pool()
+            .patch_config_json(
+                GOLDEN_CONFIG,
+                "svc-1",
+                "tap",
+                "02:00:00:00:00:01",
+                "/nix.sock",
+                "/cfg.sock",
+                "/ch.sock",
+            )
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(config["cpus"]["boot_vcpus"], 1);
+        assert_eq!(config["cpus"]["max_vcpus"], 8);
+        assert_eq!(config["memory"]["size"], 268435456);
+    }
+
+    #[test]
+    fn patch_config_json_is_idempotent() {
+        let once = pool()
+            .patch_config_json(
+                GOLDEN_CONFIG,
+                "svc-1",
+                "svc-1-tap0",
+                "02:00:00:00:00:01",
+                "/nix.sock",
+                "/cfg.sock",
+                "/ch.sock",
+            )
+            .unwrap();
+        let twice = pool()
+            .patch_config_json(
+                &once,
+                "svc-1",
+                "svc-1-tap0",
+                "02:00:00:00:00:01",
+                "/nix.sock",
+                "/cfg.sock",
+                "/ch.sock",
+            )
+            .unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn patch_config_json_tolerates_missing_fields() {
+        let minimal = r#"{"net": [{"tap": "a", "mac": "b"}]}"#;
+        let patched = pool()
+            .patch_config_json(minimal, "svc-1", "tap", "mac", "/n", "/c", "/ch")
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(config["net"][0]["tap"], "tap");
+        assert_eq!(config["net"][0]["mac"], "mac");
+        // No fs / api_socket / console keys present — nothing to patch, no panic.
+        assert!(config.get("fs").is_none());
+        assert!(config.get("api_socket").is_none());
+    }
+
+    #[test]
+    fn patch_config_json_rejects_invalid_json() {
+        assert!(
+            pool()
+                .patch_config_json("not json", "svc-1", "t", "m", "/n", "/c", "/ch")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn golden_dir_layout_is_stable() {
+        // The pool + golden snapshot live under a reserved `_pool` service dir;
+        // a template id must pass `validate_service_id`.
+        assert_eq!(POOL_BASE, "/var/lib/russel/_pool");
+        assert_eq!(GOLDEN_DIR, "/var/lib/russel/_pool/golden");
+        assert_eq!(POOL_TEMPLATE_ID, "pooltpl");
+    }
 }

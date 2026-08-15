@@ -4,13 +4,14 @@ A self-hosted platform for deploying Nix-built services as **microVMs** ([Cloud 
 
 ## Architecture
 
-Russel is split into three crates:
+Russel is split into four crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `russel-core` | Shared types: `Russelfile` config, API request/response types |
 | `russel-cli` | CLI client that talks to the control plane over HTTP |
 | `russel-ctrl` | Control plane (Axum HTTP API) that orchestrates builds, **microVMs** and **Russel containers**, and networking. MicroVMs use Cloud Hypervisor; containers use rootless Podman `--rootfs`. |
+| `russel-agent` | Node-local agent for multi-host lifecycle RPC (heartbeat + stop/destroy/status proxies) |
 
 ### Deployment Flow
 
@@ -361,6 +362,7 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 ```
 .
 ├── crates/
+│   ├── agent/        # russel-agent (node-local lifecycle RPC)
 │   ├── cli/          # russel-cli
 │   ├── core/         # shared types & config
 │   └── ctrl/         # control plane (main logic)
@@ -373,8 +375,7 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 │   ├── filebrowser/  # nixpkgs filebrowser wrapper
 │   └── static-test/  # Python static site
 ├── nix/
-│   ├── microvm/      # legacy/reference configs; runtime boots Cloud Hypervisor directly
-│   └── modules/      # host NixOS modules
+│   └── microvm-kernel.nix  # compiled kernel (virtio drivers built-in)
 ├── docs/
 │   ├── architecture.md    # Control plane internals
 │   ├── auto-generation.md # Flake auto-detection

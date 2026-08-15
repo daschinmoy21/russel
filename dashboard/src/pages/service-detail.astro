@@ -1,6 +1,7 @@
 ---
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
+import OfflineState from '../components/OfflineState.astro';
 
 // Static shell only — no build-time control-plane fetch (#306).
 // Query ?id= is client-only on static builds; loadDetail() hydrates live data.
@@ -89,6 +90,8 @@ import Header from '../components/Header.astro';
         <div class="log-console" id="logConsole">Loading…</div>
       </div>
     </div>
+
+    <noscript><OfflineState message="Service unavailable" /></noscript>
   </div>
 
   <!-- Deployment History Card -->
@@ -135,6 +138,7 @@ import Header from '../components/Header.astro';
 
 <script>
   import { api, escapeHtml, formatUptime, isServiceRunning } from '../lib/api';
+  import { renderOfflineState } from '../lib/offline_state';
 
   const params = new URLSearchParams(window.location.search);
   const serviceId = params.get('id');
@@ -165,7 +169,7 @@ import Header from '../components/Header.astro';
   async function loadDetail(id: string) {
     const { service, connection } = await api.getServiceDetail(id);
     if (!service) {
-      document.getElementById('detailRoot')!.innerHTML = `<div class="card-panel empty-state" style="text-align:center;padding:2rem"><p style="font-weight:600;font-size:1.1rem;margin-bottom:0.5rem">Service unavailable</p><p style="color:var(--text-muted)">Control plane offline. Start <code>russel-ctrl</code> or enable Demo mode in Settings.</p><a href="/settings" class="btn btn-secondary btn-sm" style="margin-top:0.75rem">Open Settings</a></div>`;
+      document.getElementById('detailRoot')!.innerHTML = renderOfflineState("Service unavailable");
       return;
     }
     document.title = `Service: ${service.name || service.id} — Russel Control Plane`;

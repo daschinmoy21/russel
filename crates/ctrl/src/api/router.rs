@@ -1,6 +1,5 @@
 //! HTTP router and service lifecycle handlers.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,10 +11,11 @@ use axum::{
     routing::{delete, get, post},
 };
 use russel_core::api::{
-    DeployEvent, DeployRequest, DeploymentsResponse, LogsResponse, RollbackRequest, ServiceSummary,
-    StatusResponse, VmsResponse,
+    DeployEvent, DeployRequest, DeploymentsResponse, LogsResponse, RollbackRequest, ServiceStatus,
+    ServiceSummary, StatusResponse, VmState, VmsResponse,
 };
 use russel_core::config::RuntimeKind;
+use russel_core::reserved::is_reserved_service_dir;
 use tokio::process::Child;
 use tokio_stream::StreamExt;
 
@@ -26,10 +26,7 @@ use crate::{
     deploy::DeployPipeline,
     deployments,
     ingress::default_ingress,
-    metadata::{
-        is_reserved_service_dir, load_metadata_from_disk, prior_runtime_from_disk,
-        resolve_lifecycle_runtime,
-    },
+    metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
     microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     runtime::{self, RuntimeLifecycle},
@@ -221,8 +218,8 @@ async fn vm_status(
             .map_err(|e| (e.status, e.message))?;
         return Ok(Json(StatusResponse {
             service_id,
-            status: if agent_status.status == "running" {
-                "deployed".to_string()
+            status: if agent_status.status == ServiceStatus::Running.as_str() {
+                ServiceStatus::Deployed.as_str().to_string()
             } else {
                 agent_status.status
             },
@@ -469,7 +466,8 @@ async fn vm_stop(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
-    let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "stopping")?;
+    let (runtime, handle) =
+        claim_lifecycle_operation(&state, &service_id, ServiceStatus::Stopping)?;
     let result = handle.lifecycle.stop(&service_id).await;
 
     let label = runtime_label(runtime);
@@ -488,7 +486,7 @@ async fn vm_stop(
                 tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during stop");
             }
             tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
-            state.set_status(&service_id, "stopped", "none");
+            state.set_status(&service_id, ServiceStatus::Stopped, VmState::None);
             Ok(Json(format!("stopped {label} {service_id}")))
         }
         Err(e) => {
@@ -498,9 +496,9 @@ async fn vm_stop(
             state.abort_lifecycle_operation(
                 &service_id,
                 handle.claim_generation,
-                &handle.expected_status,
-                &handle.prior_status,
-                &handle.prior_vm_state,
+                handle.expected_status,
+                handle.prior_status,
+                handle.prior_vm_state,
             );
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
@@ -691,59 +689,16 @@ async fn vm_update(
 
     // ── desired_state block (SHARED CONTRACT with deploy-desired-state agent)
     //
-    // All fields are optional; when absent we fall back to the legacy
-    // top-level metadata. The writer persists the user's original (pre-secret
-    // resolution) env plus the podman_args / runtime / port that the deploy
-    // ran with, so a later update can reproduce the request verbatim.
-    let desired = meta.get("desired_state").and_then(|v| v.as_object());
-    let ds_repo_url = desired
-        .and_then(|d| d.get("repo_url"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ds_config_path = desired
-        .and_then(|d| d.get("config_path"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ds_runtime: Option<RuntimeKind> = desired
-        .and_then(|d| d.get("runtime"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
-    let ds_env: HashMap<String, String> = desired
-        .and_then(|d| d.get("env"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let ds_podman_args: Vec<String> = desired
-        .and_then(|d| d.get("podman_args"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let ds_port = desired.and_then(|d| d.get("port").and_then(|p| p.as_object()));
-    let ds_host_port: Option<u16> = ds_port
-        .and_then(|p| p.get("host"))
-        .and_then(|v| v.as_u64())
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid desired_state.port.host: {e}"),
-            )
-        })?;
-    let ds_guest_port: Option<u16> = ds_port
-        .and_then(|p| p.get("guest"))
-        .and_then(|v| v.as_u64())
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid desired_state.port.guest: {e}"),
-            )
-        })?;
+    // Typed via DesiredStateSnapshot (serde(default)); when absent/malformed we
+    // fall back to the legacy top-level metadata. The writer persists the user's
+    // original (pre-secret resolution) env plus podman_args / runtime / port that
+    // the deploy ran with, so a later update can reproduce the request verbatim.
+    let ds = deployments::DesiredStateSnapshot::from_metadata_desired_state(&meta);
 
     // Precedence: request body > desired_state > legacy top-level.
     let repo_url = body
         .repo_url
-        .or(ds_repo_url)
+        .or(ds.repo_url.clone())
         .or(top_repo_url)
         .ok_or_else(|| {
             (
@@ -753,13 +708,13 @@ async fn vm_update(
         })?;
     let config_path = body
         .config_path
-        .or(ds_config_path)
+        .or(ds.config_path.clone())
         .or(top_config_path)
         .unwrap_or_else(|| "Russelfile.toml".into());
 
-    let host_port = ds_host_port.or(top_host_port);
-    let guest_port = ds_guest_port.or(top_guest_port).unwrap_or(3000);
-    let runtime = ds_runtime.or(top_runtime);
+    let host_port = ds.host_port.or(top_host_port);
+    let guest_port = ds.guest_port.or(top_guest_port).unwrap_or(3000);
+    let runtime = ds.runtime.or(top_runtime);
 
     let request = DeployRequest {
         repo_url,
@@ -770,8 +725,8 @@ async fn vm_update(
             guest: guest_port,
         }),
         runtime,
-        env: ds_env,
-        podman_args: ds_podman_args,
+        env: ds.env,
+        podman_args: ds.podman_args,
     };
 
     tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);
@@ -787,7 +742,8 @@ async fn vm_destroy(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
-    let (runtime, handle) = claim_lifecycle_operation(&state, &service_id, "destroying")?;
+    let (runtime, handle) =
+        claim_lifecycle_operation(&state, &service_id, ServiceStatus::Destroying)?;
     let result = handle.lifecycle.destroy(&service_id).await;
 
     let label = runtime_label(runtime);
@@ -836,7 +792,7 @@ async fn vm_destroy(
             {
                 reap_children(vm, aux).await;
             }
-            state.set_status(&service_id, "failed", "failed");
+            state.set_status(&service_id, ServiceStatus::Failed, VmState::Failed);
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
@@ -850,9 +806,9 @@ struct LifecycleClaimHandle {
     /// Process generation at claim time; abort must match to restore.
     claim_generation: u64,
     /// In-progress status this claim set (`stopping` / `destroying`).
-    expected_status: String,
-    prior_status: String,
-    prior_vm_state: String,
+    expected_status: ServiceStatus,
+    prior_status: ServiceStatus,
+    prior_vm_state: VmState,
 }
 
 pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
@@ -865,12 +821,12 @@ pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
 fn claim_lifecycle_operation(
     state: &AppState,
     service_id: &str,
-    target_status: &str,
+    target_status: ServiceStatus,
 ) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
     let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
 
     let (prior_status, prior_vm_state, claim_generation) =
-        match state.begin_lifecycle_operation(service_id, target_status, "pending") {
+        match state.begin_lifecycle_operation(service_id, target_status, VmState::Pending) {
             LifecycleClaim::Claimed {
                 prior_status,
                 prior_vm_state,
@@ -894,7 +850,7 @@ fn claim_lifecycle_operation(
         runtime,
         lifecycle: runtime::lifecycle_for(runtime),
         claim_generation,
-        expected_status: target_status.to_string(),
+        expected_status: target_status,
         prior_status,
         prior_vm_state,
     };

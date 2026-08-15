@@ -324,8 +324,8 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
         .args(["-m", &format!("u:{user}:rx"), &base_s])
         .output()
         .await;
-    match acl {
-        Ok(out) if out.status.success() => {}
+    let acl_failed = match &acl {
+        Ok(out) if out.status.success() => false,
         Ok(out) => {
             tracing::debug!(
                 path = %base_s,
@@ -334,16 +334,7 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
                 err = %String::from_utf8_lossy(&out.stderr).trim(),
                 "setfacl on service dir failed; falling back to root:gid 0750"
             );
-            let output = tokio::process::Command::new("chown")
-                .args([&format!("root:{gid}"), &base_s])
-                .output()
-                .await?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "chown service dir root:{gid} fallback failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
+            true
         }
         Err(e) => {
             tracing::debug!(
@@ -353,16 +344,19 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
                 error = %e,
                 "setfacl unavailable; falling back to root:gid 0750"
             );
-            let output = tokio::process::Command::new("chown")
-                .args([&format!("root:{gid}"), &base_s])
-                .output()
-                .await?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "chown service dir root:{gid} fallback failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
+            true
+        }
+    };
+    if acl_failed {
+        let output = tokio::process::Command::new("chown")
+            .args([&format!("root:{gid}"), &base_s])
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "chown service dir root:{gid} fallback failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
     }
 

@@ -2,19 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// When `RUSSEL_ALLOW_PODMAN_ARGS=0` (or `false`/`no`/`off`), all passthrough
-/// extras are rejected. Unset or any other value leaves the allowlist in effect.
+/// When `RUSSEL_ALLOW_PODMAN_ARGS=0` (or `false`/`no`/`off`/`disabled`), all
+/// passthrough extras are rejected. Unset or any other value leaves the
+/// allowlist in effect.
 fn podman_passthrough_disabled() -> bool {
-    match std::env::var("RUSSEL_ALLOW_PODMAN_ARGS") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off")
-        }
-        Err(_) => false,
-    }
+    russel_core::env_util::env_bool(std::env::var("RUSSEL_ALLOW_PODMAN_ARGS").ok().as_deref())
+        .map(|b| !b)
+        .unwrap_or(false)
 }
 
 /// Require a following value token for a space-separated flag form.

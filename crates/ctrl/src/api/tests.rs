@@ -4,11 +4,11 @@ use http_body_util::BodyExt;
 use russel_core::config::RuntimeKind;
 use tower::ServiceExt;
 
-use super::auth::constant_time_eq;
 use super::router::runtime_label;
 use super::*;
 use crate::metadata::resolve_lifecycle_runtime;
 use crate::state::AppState;
+use russel_core::tokens::constant_time_eq;
 
 // ── auth / concurrency helpers ─────────────────────────────────────
 
@@ -87,10 +87,14 @@ fn require_auth_from_env_truthy() {
     assert!(!require_auth_from_env(Some("0")));
     assert!(!require_auth_from_env(Some("false")));
     assert!(!require_auth_from_env(Some("no")));
+    assert!(!require_auth_from_env(Some("off")));
+    assert!(!require_auth_from_env(Some("disabled")));
     assert!(require_auth_from_env(Some("1")));
     assert!(require_auth_from_env(Some("true")));
     assert!(require_auth_from_env(Some("YES")));
     assert!(require_auth_from_env(Some(" True ")));
+    assert!(require_auth_from_env(Some("on")));
+    assert!(require_auth_from_env(Some("ON")));
 }
 
 #[test]

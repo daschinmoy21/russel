@@ -13,13 +13,8 @@ set -euo pipefail
 # All paths pinned: configurable VCPUs (default 1), 256 MiB memory.
 # ──────────────────────────────────────────────────────────────────────────────
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# shellcheck source=bench-common.sh disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/bench-common.sh"
 
 # ── Defaults (overridable via env) ───────────────────────────────────────────
 : "${LOAD_DURATION:=30s}"
@@ -80,12 +75,6 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-header() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
-pass() { echo -e "  ${GREEN}✓${NC} $1"; }
-info() { echo -e "  ${DIM}→${NC} $1"; }
-warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
-fail() { echo -e "  ${RED}✗${NC} $1"; }
-
 # ── Duration normalisation (hey accepts original via -z, sampler needs int secs) ─
 duration_to_seconds() {
 	local d="$1" secs=0
@@ -96,13 +85,13 @@ duration_to_seconds() {
 			if [ "$ms" -gt 0 ] 2>/dev/null; then
 				secs=$((secs + (ms + 999) / 1000))
 			fi
-			rest="${rest#${BASH_REMATCH[0]}}"
+			rest="${rest#"${BASH_REMATCH[0]}"}"
 		elif [[ "$rest" =~ ^([0-9]+)s ]]; then
-			secs=$((secs + ${BASH_REMATCH[1]}))
-			rest="${rest#${BASH_REMATCH[0]}}"
+			secs=$((secs + BASH_REMATCH[1]))
+			rest="${rest#"${BASH_REMATCH[0]}"}"
 		elif [[ "$rest" =~ ^([0-9]+)m ]]; then
-			secs=$((secs + ${BASH_REMATCH[1]} * 60))
-			rest="${rest#${BASH_REMATCH[0]}}"
+			secs=$((secs + BASH_REMATCH[1] * 60))
+			rest="${rest#"${BASH_REMATCH[0]}"}"
 		elif [[ "$rest" =~ ^[0-9]+$ ]]; then
 			secs=$((secs + rest))
 			rest=""
@@ -116,6 +105,9 @@ LOAD_DURATION_SECS=$(duration_to_seconds "$LOAD_DURATION") || {
 	fail "Invalid LOAD_DURATION: '$LOAD_DURATION' (expected e.g. 30, 30s, 3m, 500ms, 1m30s)"
 	exit 1
 }
+
+# One bench run at a time: they swap the host's /var/lib state.
+bench_run_lock
 
 echo -e "${BOLD}
   ┌──────────────────────────────────────────────┐
@@ -167,34 +159,13 @@ cleanup() {
 	fi
 
 	# Restore /var/lib
-	if [ "$VAR_LIB_REDIRECTED" -eq 1 ]; then
-		rm -f /var/lib/russel /var/lib/microvms
-		[ -n "$RUSSEL_STATE_BAK" ] && [ -e "$RUSSEL_STATE_BAK" ] && mv "$RUSSEL_STATE_BAK" /var/lib/russel || true
-		[ -n "$MICROVMS_STATE_BAK" ] && [ -e "$MICROVMS_STATE_BAK" ] && mv "$MICROVMS_STATE_BAK" /var/lib/microvms || true
-	fi
+	bench_restore_var_lib
 
-	[ -n "$RUSSEL_STATE_DIR" ] && [ -d "$RUSSEL_STATE_DIR" ] && rm -rf "$RUSSEL_STATE_DIR" || true
-	[ -n "$BENCH_CARGO_TARGET" ] && [ -d "$BENCH_CARGO_TARGET" ] && rm -rf "$BENCH_CARGO_TARGET" || true
-	[ -n "${RUSSEL_LOG:-}" ] && [ -f "$RUSSEL_LOG" ] && rm -f "$RUSSEL_LOG" || true
+	bench_cleanup_tmp_paths
 }
 trap cleanup EXIT
 
-# ── podman identity helper ───────────────────────────────────────────────────
-podman_as_deploy_user() {
-	if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-		local uid home
-		uid=$(id -u "$SUDO_USER" 2>/dev/null) || return 1
-		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-		[ -n "$home" ] || home="/home/$SUDO_USER"
-		sudo -u "$SUDO_USER" -H env \
-			"HOME=$home" \
-			"XDG_RUNTIME_DIR=/run/user/$uid" \
-			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-			podman "$@"
-	else
-		podman "$@"
-	fi
-}
+# (podman_as_deploy_user lives in bench-common.sh)
 
 # ── Result accumulators ──────────────────────────────────────────────────────
 declare -A PATH_RPS PATH_P50 PATH_P95 PATH_P99 PATH_MEAN PATH_MAX_LAT PATH_ERR_PCT
@@ -277,8 +248,12 @@ command -v nix &>/dev/null && has_nix=1
 
 # Inject flake devShell PATH for cloud-hypervisor/virtiofsd/socat
 if [ "$has_nix" -eq 1 ] && ! command -v cloud-hypervisor >/dev/null 2>&1; then
+	# PATH must expand inside the nix develop shell, not here.
+	# shellcheck disable=SC2016
 	FLAKE_PATH=$(nix develop -c sh -c 'printf %s "$PATH"' 2>/dev/null || echo "")
-	[ -n "$FLAKE_PATH" ] && export PATH="$FLAKE_PATH:$PATH"
+	if [ -n "$FLAKE_PATH" ]; then
+		export PATH="$FLAKE_PATH:$PATH"
+	fi
 fi
 
 command -v cloud-hypervisor &>/dev/null && has_ch=1
@@ -294,7 +269,11 @@ if [ "$has_kvm" -eq 1 ] && [ "$HAS_ROOT" -eq 1 ] && [ "$has_nix" -eq 1 ] &&
 	HAS_MICROVM=1
 fi
 
-[ "$HAS_MICROVM" -eq 1 ] && pass "microVM prereqs: ok" || warn "microVM prereqs missing (need KVM+root+nix+cloud-hypervisor+socat+ip)"
+if [ "$HAS_MICROVM" -eq 1 ]; then
+	pass "microVM prereqs: ok"
+else
+	warn "microVM prereqs missing (need KVM+root+nix+cloud-hypervisor+socat+ip)"
+fi
 
 # ── 1. Hey available? ────────────────────────────────────────────────────────
 if [ "$HAS_HEY" -eq 0 ]; then
@@ -358,6 +337,8 @@ if [ "$NEED_CTRL" -eq 1 ]; then
 		chmod 755 "$RUSSEL_STATE_DIR" "$RUSSEL_STATE_DIR/lib" \
 			"$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
 
+		# Consumed by bench_restore_var_lib in the EXIT trap (bench-common.sh).
+		# shellcheck disable=SC2034
 		VAR_LIB_REDIRECTED=1
 		if [ -e /var/lib/russel ] || [ -L /var/lib/russel ]; then
 			RUSSEL_STATE_BAK=$(mktemp /tmp/russel-var-lib-bak-XXXXXX)
@@ -485,6 +466,8 @@ run_load_cycle() {
 					stat_line=$(cat "/proc/$ch_pid/stat" 2>/dev/null || echo "")
 					if [ -n "$stat_line" ]; then
 						after_comm="${stat_line##*)}"
+						# Intentional word-split of /proc/<pid>/stat fields after comm.
+						# shellcheck disable=SC2086
 						set -- $after_comm
 						utime=${12:-0}
 						stime=${13:-0}

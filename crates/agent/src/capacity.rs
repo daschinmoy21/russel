@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use russel_core::api::NodeCapacity;
+use russel_core::reserved::is_reserved_service_dir;
 use tokio::process::Command;
 
 /// Default Russel data root (service dirs live under here).
@@ -39,11 +40,6 @@ fn probe_cache() -> &'static Mutex<ProbeCache> {
             last_nix: None,
         })
     })
-}
-
-/// Directories that are not user services (keep in sync with ctrl metadata).
-fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
 }
 
 /// Collect a capacity snapshot.
@@ -196,34 +192,45 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Cached rootless-podman probe (TTL); on miss runs timeout-bounded subprocess.
 async fn probe_rootless_podman_cached() -> bool {
+    cached_probe(
+        |cache| cache.last_podman,
+        |cache, at, val| cache.last_podman = Some((at, val)),
+        probe_rootless_podman(),
+    )
+    .await
+}
+
+/// Cached nix-system probe (TTL); on miss runs timeout-bounded subprocess.
+async fn detect_nix_system_cached() -> Option<String> {
+    cached_probe(
+        |cache| cache.last_nix.clone(),
+        |cache, at, val| cache.last_nix = Some((at, val)),
+        detect_nix_system(),
+    )
+    .await
+}
+
+/// Generic TTL cache wrapper: return the cached value when fresh, otherwise
+/// run `probe`, store the result, and return it.
+async fn cached_probe<T>(
+    get: impl Fn(&ProbeCache) -> Option<(Instant, T)>,
+    set: impl Fn(&mut ProbeCache, Instant, T),
+    probe: impl std::future::Future<Output = T>,
+) -> T
+where
+    T: Clone,
+{
     {
         let cache = probe_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, val)) = cache.last_podman
+        if let Some((at, val)) = get(&cache)
             && at.elapsed() < PROBE_CACHE_TTL
         {
             return val;
         }
     }
-    let val = probe_rootless_podman().await;
+    let val = probe.await;
     if let Ok(mut cache) = probe_cache().lock() {
-        cache.last_podman = Some((Instant::now(), val));
-    }
-    val
-}
-
-/// Cached nix-system probe (TTL); on miss runs timeout-bounded subprocess.
-async fn detect_nix_system_cached() -> Option<String> {
-    {
-        let cache = probe_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, ref val)) = cache.last_nix
-            && at.elapsed() < PROBE_CACHE_TTL
-        {
-            return val.clone();
-        }
-    }
-    let val = detect_nix_system().await;
-    if let Ok(mut cache) = probe_cache().lock() {
-        cache.last_nix = Some((Instant::now(), val.clone()));
+        set(&mut cache, Instant::now(), val.clone());
     }
     val
 }

@@ -34,7 +34,7 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
                 .collect()
         })
         .or_else(|| {
@@ -42,19 +42,20 @@ pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
             value
                 .get("virtiofsd_pid")
                 .and_then(|pid| pid.as_u64())
-                .map(|pid| vec![pid as u32])
+                .and_then(|pid| u32::try_from(pid).ok())
+                .map(|pid| vec![pid])
         })
         .unwrap_or_default();
     Some(ProcessMetadata {
         vm_pid: value
             .get("vm_pid")
             .and_then(|pid| pid.as_u64())
-            .map(|pid| pid as u32),
+            .and_then(|pid| u32::try_from(pid).ok()),
         virtiofsd_pids,
         socat_pid: value
             .get("socat_pid")
             .and_then(|pid| pid.as_u64())
-            .map(|pid| pid as u32),
+            .and_then(|pid| u32::try_from(pid).ok()),
         tap_id: value
             .get("tap_id")
             .and_then(|v| v.as_str())

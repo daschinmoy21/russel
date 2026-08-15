@@ -109,13 +109,7 @@ pub fn forward_filter_disabled_from_env(
 }
 
 fn env_value_truthy(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        Some(v) => {
-            let v = v.to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        }
-        None => false,
-    }
+    russel_core::env_util::env_bool(value).unwrap_or(false)
 }
 
 /// Spec of one iptables filter rule Russel manages (for tests + docs).

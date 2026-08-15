@@ -30,7 +30,6 @@ export interface DeployResponse {
 	status: string;
 	store_path?: string;
 	microvm_config_path?: string;
-	runner_path?: string;
 	port?: PortMapping;
 	elapsed_ms: number;
 	message: string;
@@ -1072,15 +1071,6 @@ export class RusselClient {
 				isDemo: false,
 			};
 		}
-	}
-
-	// Legacy alias for pages that call getStatus()
-	async getStatus(): Promise<{
-		status: FleetStatus;
-		connection: ConnectionState;
-		isDemo: boolean;
-	}> {
-		return this.getFleetStatus();
 	}
 
 	async getServiceDetail(id: string): Promise<{

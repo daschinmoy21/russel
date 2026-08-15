@@ -410,7 +410,7 @@ impl MicrovmRunner {
         let initramfs_file = pool_dir.join(AGENT_INITRAMFS_BASENAME);
 
         // Copy kernel modules when using stock kernel (drivers not built-in).
-        // ponytail: same virtio/fuse list as legacy per-service initramfs.
+        // Same virtio/fuse list as the legacy per-service initramfs.
         if let Some(ref mod_path) = kernel_modules_path {
             let mods: &[&str] = &[
                 "drivers/virtio/virtio_ring.ko.xz",
@@ -655,12 +655,6 @@ impl MicrovmRunner {
         let mut virtiofsd_children: Vec<tokio::process::Child> = Vec::new();
         match spec.fs.as_slice() {
             [] => {}
-            [a] => {
-                let child = self
-                    .spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly)
-                    .await?;
-                virtiofsd_children.push(child);
-            }
             [a, b] => {
                 let (ra, rb) = tokio::join!(
                     self.spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly),
@@ -1056,29 +1050,10 @@ impl MicrovmRunner {
         }
         // Reject host state trees (secrets/traefik/_pool/*.bak) so deploy/destroy
         // cannot wipe /var/lib/russel/{secrets,traefik,_pool} or backup dirs.
-        if crate::metadata::is_reserved_service_dir(service_id) {
+        if russel_core::reserved::is_reserved_service_dir(service_id) {
             anyhow::bail!("service_id is reserved: {service_id}");
         }
         Ok(())
-    }
-
-    /// List registered microVMs (from /var/lib/microvms).
-    #[allow(dead_code)] // admin/status helper; not yet exposed via API
-    pub async fn list(&self) -> anyhow::Result<Vec<String>> {
-        let mut vms = Vec::new();
-        let state_dir = Path::new("/var/lib/microvms");
-        if state_dir.exists()
-            && let Ok(mut entries) = tokio::fs::read_dir(state_dir).await
-        {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry.file_type().await?.is_dir()
-                    && let Some(name) = entry.file_name().to_str()
-                {
-                    vms.push(name.to_string());
-                }
-            }
-        }
-        Ok(vms)
     }
 }
 /// Select the greatest kernel version from a list of version strings.

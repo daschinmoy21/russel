@@ -13,25 +13,14 @@ use axum::{
 ///
 /// Length is measured in bytes/`str::len`, which matches character count only
 /// because non-ASCII tokens are rejected (see [`check_api_token_min_length`]).
-pub const MIN_API_TOKEN_LEN: usize = 32;
+pub const MIN_API_TOKEN_LEN: usize = russel_core::tokens::MIN_TOKEN_LEN;
 
 /// Pure token normalize: unset/blank/whitespace → None.
 ///
 /// Does **not** enforce min length / charset — call [`check_api_token_min_length`]
 /// at startup when a token is present so short or non-header-safe secrets fail closed.
 pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
-    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-/// Whether `token` can appear in an HTTP `Authorization` header value.
-///
-/// Matches what the CLI needs: `HeaderValue` accepts visible ASCII (0x20..=0x7E)
-/// and HTAB. Multibyte Unicode and control bytes are rejected so ctrl never
-/// starts with a token clients cannot send.
-fn token_is_http_header_safe(token: &str) -> bool {
-    token
-        .bytes()
-        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+    russel_core::tokens::normalize_token(raw)
 }
 
 /// Reject tokens that are too short or cannot be sent as a Bearer header value.
@@ -43,38 +32,17 @@ fn token_is_http_header_safe(token: &str) -> bool {
 /// 1. HTTP header-safe charset (ASCII visible / HTAB) — same constraint as the CLI
 /// 2. Length ≥ [`MIN_API_TOKEN_LEN`] (byte length; equivalent to char count after 1)
 pub fn check_api_token_min_length(token: &str) -> Result<(), String> {
-    if !token_is_http_header_safe(token) {
-        return Err(
-            "RUSSEL_API_TOKEN must be printable ASCII only so it can be sent in an \
-             HTTP Authorization header (the CLI rejects non-header-safe tokens). \
-             Generate a strong token with: openssl rand -hex 32"
-                .to_string(),
-        );
-    }
-    if token.len() < MIN_API_TOKEN_LEN {
-        Err(format!(
-            "RUSSEL_API_TOKEN must be at least {MIN_API_TOKEN_LEN} characters after trim \
-             (got {}). Generate a strong token with: openssl rand -hex 32",
-            token.len()
-        ))
-    } else {
-        Ok(())
-    }
+    russel_core::tokens::check_token_min_length(token)
 }
 
-/// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, or `yes` (case-insensitive).
+/// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, `yes`, or `on`
+/// (case-insensitive).
 ///
 /// When enabled, the control plane refuses to start without a valid token even
 /// on loopback — use for production packaging that would otherwise default to
 /// loopback bind.
 pub fn require_auth_from_env(raw: Option<&str>) -> bool {
-    raw.map(|s| {
-        let s = s.trim();
-        s.eq_ignore_ascii_case("1")
-            || s.eq_ignore_ascii_case("true")
-            || s.eq_ignore_ascii_case("yes")
-    })
-    .unwrap_or(false)
+    russel_core::env_util::env_bool(raw).unwrap_or(false)
 }
 
 /// Non-empty RUSSEL_API_TOKEN after trim; None if unset/blank.
@@ -111,24 +79,6 @@ pub(crate) fn deploy_semaphore() -> &'static tokio::sync::Semaphore {
     &SEM
 }
 
-/// Constant-time token comparison to avoid timing side-channels.
-///
-/// Always walks `max(a.len(), b.len())` bytes so the result does not leak the
-/// input lengths. A length mismatch is folded into the accumulator as a
-/// non-zero delta rather than returned early.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let max_len = a.len().max(b.len());
-    // Length mismatch must always contribute a nonzero delta. Narrowing
-    // `(a.len() ^ b.len()) as u8` drops high bits (e.g. len 1 vs 257 → 0).
-    let mut diff: u8 = u8::from(a.len() != b.len());
-    for i in 0..max_len {
-        let x = *a.get(i).unwrap_or(&0);
-        let y = *b.get(i).unwrap_or(&0);
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Bearer auth middleware: if RUSSEL_API_TOKEN is set (non-empty, trimmed),
 /// require it on every request.
 ///
@@ -148,9 +98,9 @@ pub(super) async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let provided = header.strip_prefix("Bearer ").unwrap_or("");
+    let provided = russel_core::tokens::bearer_token_from_header(header).unwrap_or("");
 
-    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+    if !russel_core::tokens::constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

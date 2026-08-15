@@ -27,6 +27,10 @@ use russel_core::config::RuntimeKind;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+/// Process-local counter for unique temp file names, avoiding collisions
+/// between concurrent atomic writes and stale temp files from a crashed writer.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Env override for stable node identity (horizontal scaling Phase 0 / #212).
@@ -92,19 +96,6 @@ fn hostname_for_node_id() -> Option<String> {
     }
 }
 
-/// Directories under `/var/lib/russel` (and peers) that are **not** user services.
-///
-/// Used by list/reconcile/cleanup discovery so internal layout never appears as
-/// deployable services (e.g. dashboard `GET /vms`).
-///
-/// - `*.bak` — dual-live / destroy backups
-/// - `traefik` — ingress dynamic config root
-/// - `secrets` — host secrets store
-/// - `_pool` — warm-pool snapshot state
-pub fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
-}
-
 /// Fields commonly loaded from on-disk metadata for API rehydration.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedMetadata {
@@ -130,14 +121,20 @@ pub struct ServiceDiskRecord {
     pub vm_pid: Option<u32>,
     pub socat_pid: Option<u32>,
     pub virtiofsd_pids: Vec<u32>,
+    /// TAP interface name (`rsl-<hex>`) recorded at deploy time.
+    pub tap_id: Option<String>,
+    /// Host-side TAP address.
+    pub host_ip: Option<String>,
+    /// RFC3339 deploy timestamp (used for uptime back-dating).
+    pub deployed_at: Option<String>,
 }
 
 /// Parse `runtime` from on-disk metadata JSON.
 ///
-/// Returns the parsed runtime if the `runtime` key is present and valid.
-/// Returns `None` when the `runtime` key is absent from valid JSON
-/// (callers should warn about legacy metadata missing the runtime field).
-/// Returns `None` only for unreadable or invalid JSON.
+/// Returns the parsed runtime when the `runtime` key is present and valid.
+/// Returns `None` for unreadable or invalid JSON, or when the `runtime` key is
+/// absent from valid JSON (callers should warn about legacy metadata missing
+/// the runtime field).
 pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
     let value: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
@@ -183,13 +180,6 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     })
-}
-
-/// Load full service metadata from disk for reconcile.
-/// Parses defensively: missing fields are left as None / empty.
-#[allow(dead_code)] // public API — callers outside this crate may use it
-pub fn load_service_disk_record(service_id: &str) -> Option<ServiceDiskRecord> {
-    load_service_disk_record_from(&metadata_path(service_id))
 }
 
 /// Load service metadata from an arbitrary path (for tests / custom base dirs).
@@ -249,6 +239,18 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
             .and_then(|v| v.as_u64())
             .and_then(|p| u32::try_from(p).ok()),
         virtiofsd_pids,
+        tap_id: value
+            .get("tap_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        host_ip: value
+            .get("host_ip")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        deployed_at: value
+            .get("deployed_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -259,52 +261,95 @@ pub fn write_ctrl_catalog(catalog: &serde_json::Value) -> anyhow::Result<()> {
 
 /// Atomic write of the control plane catalog JSON to an arbitrary path.
 pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create catalog parent {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-
     let content = serde_json::to_string_pretty(catalog)
         .map_err(|e| anyhow::anyhow!("failed to serialize catalog: {}", e))?;
+    atomic_write(path, content.as_bytes())
+}
 
-    // Write to temp file with mode 0600
-    #[cfg(unix)]
-    {
+/// Shared nonce for sibling temp-file names across atomic writers (metadata,
+/// secrets, traefik): wall-clock nanos XOR a process-local counter so
+/// concurrent writers and stale temp files from a crashed writer cannot
+/// collide.
+pub(crate) fn write_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Sibling temp path for `path`, in the same directory so the final rename
+/// stays atomic on the same filesystem.
+///
+/// Unlike `Path::with_extension("json.tmp")`, this appends `.tmp.<nonce>` to
+/// the **full** file name, so non-`.json`-named destinations keep their name
+/// and two sibling paths that differ only by extension cannot collide.
+fn temp_sibling_path(path: &Path) -> PathBuf {
+    let nonce = write_nonce();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    path.with_file_name(format!(".{file_name}.tmp.{nonce:x}"))
+}
+
+/// Atomically write `content` to `path` (temp file + rename), modeled on the
+/// `secrets::secure_write` semantics:
+///
+/// - temp file in the same directory (`create_new`) so the rename is atomic,
+/// - `O_NOFOLLOW` + `O_CLOEXEC` + mode `0600` applied at `open(2)` time,
+/// - `write` + `sync_all` before `fs::rename` over the destination,
+/// - best-effort `sync_all` of the parent directory so the rename is durable.
+///
+/// A failed write is cleaned up (temp file removed) and never clobbers the
+/// destination.
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create metadata parent {}: {}",
+            parent.display(),
+            e
+        )
+    })?;
+
+    let tmp = temp_sibling_path(path);
+    let write_result = (|| -> anyhow::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| anyhow::anyhow!("failed to open catalog tmp: {}", e))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
-        file.flush()
-            .map_err(|e| anyhow::anyhow!("failed to flush catalog tmp: {}", e))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            // Apply at open(2) time — not after write — so there is no umask
+            // window (0o600), no fd inheritance to children (O_CLOEXEC), and
+            // no symlink-replace race on the tmp path (O_NOFOLLOW).
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("failed to open tmp {}: {}", tmp.display(), e))?;
+        file.write_all(content)
+            .map_err(|e| anyhow::anyhow!("failed to write tmp {}: {}", tmp.display(), e))?;
         file.sync_all()
-            .map_err(|e| anyhow::anyhow!("failed to fsync catalog tmp: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("failed to fsync tmp {}: {}", tmp.display(), e))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| anyhow::anyhow!("failed to write catalog tmp: {}", e))?;
-    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("failed to rename tmp into place {}: {}", path.display(), e)
+    })?;
 
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| anyhow::anyhow!("failed to rename catalog tmp: {}", e))?;
-
-    // fsync parent directory so the rename is durable
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
+    // fsync parent directory so the rename is durable.
+    if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
 
@@ -341,7 +386,6 @@ pub fn resolve_lifecycle_runtime(
 
 /// Build versioned metadata JSON for a microVM deployment.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // unit-tested; deploy path still builds metadata inline
 pub fn build_microvm_metadata(
     service_id: &str,
     host_port: u16,
@@ -524,49 +568,12 @@ pub fn rewrite_metadata_service_id(path: impl AsRef<Path>, service_id: &str) -> 
 }
 
 pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> anyhow::Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create metadata parent {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
     let content = serde_json::to_string_pretty(metadata)
         .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
-
-    // Mode 0600 so non-root (e.g. podman user) cannot read/rewrite control
-    // plane metadata even if they can traverse the service dir (Issue #193).
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| anyhow::anyhow!("failed to open metadata {}: {}", path.display(), e))?;
-        file.write_all(content.as_bytes()).map_err(|e| {
-            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
-        })?;
-        file.sync_all()
-            .map_err(|e| anyhow::anyhow!("failed to fsync metadata {}: {}", path.display(), e))?;
-        // Re-assert mode if the file already existed with looser permissions.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!("failed to chmod 0600 metadata {}: {}", path.display(), e)
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, content).map_err(|e| {
-            anyhow::anyhow!("failed to write metadata to {}: {}", path.display(), e)
-        })?;
-    }
-    Ok(())
+    // Atomic temp-file + rename write; mode 0600 is applied at open(2) time so
+    // non-root (e.g. podman user) cannot read/rewrite control plane metadata
+    // even if they can traverse the service dir (Issue #193).
+    atomic_write(path.as_ref(), content.as_bytes())
 }
 
 /// Current UTC time as RFC3339 (second precision).
@@ -575,30 +582,7 @@ pub fn deployed_at_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    rfc3339_from_unix(secs)
-}
-
-fn rfc3339_from_unix(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let (y, m, d) = civil_from_days(days);
-    let h = (secs / 3_600) % 24;
-    let min = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
+    russel_core::timeutil::rfc3339_from_unix(secs)
 }
 
 #[cfg(test)]
@@ -917,18 +901,6 @@ mod tests {
     // ── Catalog write / read tests ───────────────────────────────────────────
 
     #[test]
-    fn reserved_service_dirs_are_recognized() {
-        assert!(is_reserved_service_dir("traefik"));
-        assert!(is_reserved_service_dir("secrets"));
-        assert!(is_reserved_service_dir("_pool"));
-        assert!(is_reserved_service_dir("api.bak"));
-        assert!(is_reserved_service_dir("svc.bak"));
-        assert!(!is_reserved_service_dir("basic-http-tester-another"));
-        assert!(!is_reserved_service_dir("api"));
-        assert!(!is_reserved_service_dir("pooltpl"));
-    }
-
-    #[test]
     fn catalog_write_and_read_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_path = tmp.path().join("ctrl-catalog.json");
@@ -951,5 +923,73 @@ mod tests {
         assert_eq!(read["schema_version"], 1);
         assert_eq!(read["services"]["api"]["status"], "deployed");
         assert_eq!(read["services"]["api"]["host_port"], 3100);
+    }
+
+    // ── Atomic write tests (C-3) ────────────────────────────────────────────
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn atomic_write_produces_correct_final_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("metadata.json");
+        let meta = serde_json::json!({"service_id": "api", "host_port": 3100});
+        write_metadata(&dest, &meta).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(read, meta);
+        // The temp file is renamed into place — no `.tmp` siblings remain.
+        assert_eq!(dir_entries(tmp.path()), vec!["metadata.json".to_string()]);
+    }
+
+    #[test]
+    fn atomic_write_keeps_non_json_filename() {
+        // Regression for `with_extension("json.tmp")`: a non-`.json` name must
+        // keep its full filename (and must not lose its real extension).
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("catalog.data");
+        let catalog = serde_json::json!({"schema_version": 1});
+        write_ctrl_catalog_to(&dest, &catalog).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(read, catalog);
+        assert_eq!(dir_entries(tmp.path()), vec!["catalog.data".to_string()]);
+    }
+
+    #[test]
+    fn atomic_write_failure_does_not_clobber_destination() {
+        // Simulate failure: an ancestor is a regular file, so `create_dir_all`
+        // fails before any write — the destination must remain untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "i am a file").unwrap();
+        let dest = blocker.join("sub").join("metadata.json");
+
+        let res = write_metadata(&dest, &serde_json::json!({"x": 1}));
+        assert!(res.is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("metadata.json");
+        write_metadata(&dest, &serde_json::json!({"n": 1})).unwrap();
+        write_metadata(&dest, &serde_json::json!({"n": 2})).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(read, serde_json::json!({"n": 2}));
+        // Only the destination remains — no stale temp files.
+        assert_eq!(dir_entries(tmp.path()), vec!["metadata.json".to_string()]);
     }
 }

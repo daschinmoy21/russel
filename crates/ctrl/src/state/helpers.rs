@@ -23,21 +23,7 @@ pub(super) fn push_capped(buf: &mut String, s: &str) {
 /// Parse RFC3339 timestamp (second precision UTC) to Instant for uptime back-dating.
 /// Returns None if parsing fails or the timestamp is in the future.
 pub(super) fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
-    // Format: YYYY-MM-DDTHH:MM:SSZ
-    let bytes = rfc3339.as_bytes();
-    if bytes.len() < 20 || bytes[19] != b'Z' {
-        return None;
-    }
-
-    let year: i64 = rfc3339[0..4].parse().ok()?;
-    let month: u32 = rfc3339[5..7].parse().ok()?;
-    let day: u32 = rfc3339[8..10].parse().ok()?;
-    let hour: u32 = rfc3339[11..13].parse().ok()?;
-    let minute: u32 = rfc3339[14..16].parse().ok()?;
-    let second: u32 = rfc3339[17..19].parse().ok()?;
-
-    let days = days_from_civil(year, month, day)?;
-    let unix_secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    let unix_secs = russel_core::timeutil::rfc3339_to_unix_secs(rfc3339)?;
 
     let now_sys = std::time::SystemTime::now();
     let now_secs = now_sys
@@ -53,22 +39,8 @@ pub(super) fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
     Some(Instant::now() - Duration::from_secs(elapsed_secs))
 }
 
-pub(super) fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let y = if month <= 2 { year - 1 } else { year };
-    let m = if month <= 2 { month + 9 } else { month - 3 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    Some(days)
-}
-
 /// Check if a container is still running via `podman inspect`.
-pub(super) async fn check_container_running(container_id: &str) -> bool {
+pub(crate) async fn check_container_running(container_id: &str) -> bool {
     let output = match crate::container::podman_command()
         .await
         .args(["inspect", container_id, "--format", "{{.State.Running}}"])

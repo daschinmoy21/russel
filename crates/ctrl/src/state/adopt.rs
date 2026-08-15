@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use russel_core::api::{ServiceStatus, VmState};
 use russel_core::config::RuntimeKind;
 
 use super::app::AppState;
@@ -34,8 +35,8 @@ impl AppState {
                 );
                 return;
             }
-            s.status = "deployed".to_string();
-            s.vm_state = "running".to_string();
+            s.status = ServiceStatus::Deployed;
+            s.vm_state = VmState::Running;
             s.runtime = Some(RuntimeKind::Microvm);
             s.vm_pid = vm_pid;
             s.host_port = Some(host_port);
@@ -85,8 +86,8 @@ impl AppState {
                 );
                 return;
             }
-            s.status = "deployed".to_string();
-            s.vm_state = "running".to_string();
+            s.status = ServiceStatus::Deployed;
+            s.vm_state = VmState::Running;
             s.started_at = deployed_at
                 .and_then(parse_rfc3339_to_instant)
                 .unwrap_or_else(Instant::now);
@@ -127,12 +128,16 @@ impl AppState {
         {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-            // Do not clobber an in-memory live deployment.
-            if s.vm_process.is_some() || s.container_id.is_some() && s.vm_state == "running" {
+            // Do not clobber an in-memory live deployment. A live Child handle
+            // is always authoritative; a container is only authoritative while
+            // its vm_state is "running".
+            if s.vm_process.is_some()
+                || (s.container_id.is_some() && s.vm_state == VmState::Running)
+            {
                 return;
             }
-            s.status = "stopped".to_string();
-            s.vm_state = "none".to_string();
+            s.status = ServiceStatus::Stopped;
+            s.vm_state = VmState::None;
             s.runtime = Some(runtime);
             s.host_port = host_port;
             s.guest_port = guest_port;

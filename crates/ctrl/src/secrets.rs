@@ -4,14 +4,9 @@
 //! This is intentionally a simple single-node store — not a KMS. Values are
 //! never written into Russelfile; deploy resolves `secret://name` env refs.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::{Path, PathBuf};
 
 const DEFAULT_SECRETS_DIR: &str = "/var/lib/russel/secrets";
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Validate a secret name: alphanumeric, `_`, `-`, length 1..=64.
 pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
@@ -30,6 +25,17 @@ pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a secret value: non-empty and at most 64 KiB.
+pub fn validate_secret_value(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("secret value must not be empty");
+    }
+    if value.len() > 64 * 1024 {
+        anyhow::bail!("secret value too large (max 64 KiB)");
+    }
+    Ok(())
+}
+
 fn secrets_dir() -> PathBuf {
     std::env::var("RUSSEL_SECRETS_DIR")
         .map(PathBuf::from)
@@ -43,12 +49,7 @@ fn secret_path(name: &str) -> anyhow::Result<PathBuf> {
 
 /// Persist a secret value (mode 0600). Overwrites if present via atomic rename.
 pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
-    if value.is_empty() {
-        anyhow::bail!("secret value must not be empty");
-    }
-    if value.len() > 64 * 1024 {
-        anyhow::bail!("secret value too large (max 64 KiB)");
-    }
+    validate_secret_value(value)?;
     let path = secret_path(name)?;
     let parent = path
         .parent()
@@ -61,61 +62,18 @@ pub fn set_secret(name: &str, value: &str) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("chmod secrets dir: {e}"))?;
     }
 
-    secure_write(&path, value.as_bytes(), "secret")?;
+    secure_write(&path, value.as_bytes())?;
     Ok(())
 }
 
 /// Write a sensitive file atomically with restrictive permissions.
 ///
-/// The parent directory must already exist. The temporary file is created in
-/// that directory so the final rename remains atomic on the same filesystem.
-pub(crate) fn secure_write(path: &Path, content: &[u8], kind: &str) -> anyhow::Result<()> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        ^ u128::from(TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{kind} path has no parent"))?;
-    let tmp = parent.join(format!(
-        ".{}.tmp.{nonce:x}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-    ));
-    let write_result = (|| -> anyhow::Result<()> {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Apply at open(2) time — not after write — so there is no umask
-            // window (0o600), no fd inheritance to children (O_CLOEXEC), and
-            // no symlink-replace race on the tmp path (O_NOFOLLOW).
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
-        let mut f = options
-            .open(&tmp)
-            .map_err(|e| anyhow::anyhow!("create {kind} tmp: {e}"))?;
-        f.write_all(content)
-            .map_err(|e| anyhow::anyhow!("write {kind} tmp: {e}"))?;
-        f.sync_all()
-            .map_err(|e| anyhow::anyhow!("fsync {kind} tmp: {e}"))?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::anyhow!("rename {kind} into place: {e}")
-    })?;
-    Ok(())
+/// Delegates to [`crate::metadata::atomic_write`]: temp file in the same
+/// directory (`create_new` + `O_NOFOLLOW` + `O_CLOEXEC` + mode `0600`),
+/// fsync, then rename into place. A failed write is cleaned up and never
+/// clobbers the destination.
+pub(crate) fn secure_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    crate::metadata::atomic_write(path, content)
 }
 
 /// Read a secret value.

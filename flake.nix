@@ -1,5 +1,5 @@
 {
-  description = "A simple Rust development environment";
+  description = "Russel — microvm-based deployment platform control plane";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

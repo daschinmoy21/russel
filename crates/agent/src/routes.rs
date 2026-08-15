@@ -30,11 +30,13 @@ use crate::lifecycle;
 pub struct AgentState {
     pub node_id: String,
     pub data_root: PathBuf,
-    /// Skip `podman info` in unit tests.
+    /// Skip `podman info` in unit tests. Production always probes — no prod
+    /// code path sets this (test-only flag, not yet wired to an env/config).
     pub probe_podman: bool,
     pub labels: HashMap<String, String>,
     pub agent_version: String,
-    /// When true, report NotReady (drain / maintenance).
+    /// When true, report NotReady (drain / maintenance). Reserved for the
+    /// drain-mode design — no production code path sets it yet.
     pub not_ready: bool,
 }
 
@@ -103,44 +105,11 @@ pub fn build_heartbeat(
 }
 
 fn now_rfc3339() -> String {
-    // Avoid chrono dependency: format UNIX seconds as approximate UTC.
-    // Good enough for ops visibility; Phase 3 can switch to a time crate.
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Manual RFC3339 without chrono: use a minimal formatter via humantime-free path.
-    // We only need a stable sortable timestamp for heartbeat freshness.
-    format_unix_secs_rfc3339(secs)
-}
-
-/// Format UNIX seconds as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
-pub fn format_unix_secs_rfc3339(secs: u64) -> String {
-    // Civil date from days since epoch (Howard Hinnant algorithm, public domain).
-    let days = (secs / 86_400) as i64;
-    let tod = secs % 86_400;
-    let hour = tod / 3600;
-    let min = (tod % 3600) / 60;
-    let sec = tod % 60;
-
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
-}
-
-/// Days since Unix epoch → (year, month, day) UTC.
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
+    russel_core::timeutil::rfc3339_from_unix(secs)
 }
 
 async fn deploy_not_implemented() -> impl IntoResponse {
@@ -448,17 +417,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn format_unix_epoch() {
-        // 0 → 1970-01-01T00:00:00Z
-        assert_eq!(format_unix_secs_rfc3339(0), "1970-01-01T00:00:00Z");
-        // 1_700_000_000 → 2023-11-14T22:13:20Z
-        assert_eq!(
-            format_unix_secs_rfc3339(1_700_000_000),
-            "2023-11-14T22:13:20Z"
-        );
     }
 
     #[test]

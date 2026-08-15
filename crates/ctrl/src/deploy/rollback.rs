@@ -21,7 +21,27 @@ use crate::{
     warm_pool::shared_warm_pool,
 };
 
-use super::env::shell_quote;
+/// Extract `desired_state.env` from rollback metadata into a plain map
+/// (string values only). Shared by the microVM and container rollback paths.
+fn desired_state_env(old_meta: &serde_json::Value) -> HashMap<String, String> {
+    old_meta
+        .get("desired_state")
+        .and_then(|ds| ds.get("env"))
+        .and_then(|env_obj| {
+            if let serde_json::Value::Object(map) = env_obj {
+                let mut out = HashMap::new();
+                for (k, v) in map {
+                    if let Some(val) = v.as_str() {
+                        out.insert(k.clone(), val.to_string());
+                    }
+                }
+                Some(out)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
 
 /// Resolve the prior runtime for a service before redeploy.
 ///
@@ -207,23 +227,7 @@ pub(crate) async fn attempt_microvm_rollback(
         }
     };
     // Extract desired_state user env for deploy.env restoration (F-04).
-    let user_env: HashMap<String, String> = old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("env"))
-        .and_then(|env_obj| {
-            if let serde_json::Value::Object(map) = env_obj {
-                let mut out = HashMap::new();
-                for (k, v) in map {
-                    if let Some(val) = v.as_str() {
-                        out.insert(k.clone(), val.to_string());
-                    }
-                }
-                Some(out)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let user_env: HashMap<String, String> = desired_state_env(&old_meta);
     // Resolve secret:// refs in restored env
     let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 
@@ -240,25 +244,14 @@ pub(crate) async fn attempt_microvm_rollback(
     // may collide with another service after probe exhaustion.
     let alloc = subnet_for(service_id)?;
     let cfg_dir = format!("{}/cfg", russel_dir);
-    std::fs::create_dir_all(&cfg_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let mut deploy_env = format!(
-        "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
-        alloc.vm_ip,
-        alloc.host_ip,
+    super::write_deploy_env(
+        &cfg_dir,
+        &alloc.vm_ip,
+        &alloc.host_ip,
         guest_port,
-        shell_quote(&app_path)
-    );
-    // Append user env vars from desired_state, shell-quoted (secrets resolved above).
-    for (key, value) in &user_env {
-        deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
-    }
-    let deploy_env_path = PathBuf::from(format!("{cfg_dir}/deploy.env"));
-    crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes(), "deploy.env")?;
+        &app_path,
+        &user_env,
+    )?;
 
     // 4. Reserve port
     PortAllocator::reserve(service_id, host_port)?;
@@ -478,23 +471,7 @@ pub(crate) async fn attempt_container_rollback(
     }
 
     // F-04: restore user env from desired_state (resolved secrets).
-    let user_env: HashMap<String, String> = old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("env"))
-        .and_then(|env_obj| {
-            if let serde_json::Value::Object(map) = env_obj {
-                let mut out = HashMap::new();
-                for (k, v) in map {
-                    if let Some(val) = v.as_str() {
-                        out.insert(k.clone(), val.to_string());
-                    }
-                }
-                Some(out)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let user_env: HashMap<String, String> = desired_state_env(&old_meta);
     // Resolve secret:// refs
     let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 
@@ -572,4 +549,259 @@ pub(crate) async fn attempt_container_rollback(
     }
     write_metadata(format!("{}/metadata.json", russel_dir), &new_metadata)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── resolve_rollback_app_paths (pure) ─────────────────────────────────
+
+    #[test]
+    fn resolve_app_paths_both_present_with_bin_suffix() {
+        let (app, store) =
+            resolve_rollback_app_paths(Some("/nix/store/x/bin/app"), Some("/nix/store/x"), "app")
+                .unwrap();
+        assert_eq!(app, "/nix/store/x/bin/app");
+        assert_eq!(store, "/nix/store/x");
+    }
+
+    #[test]
+    fn resolve_app_paths_reconstructs_from_store_when_app_is_bare() {
+        // Legacy writer stored the bare store dir in app_path.
+        let (app, store) =
+            resolve_rollback_app_paths(Some("/nix/store/x"), Some("/nix/store/x"), "app").unwrap();
+        assert_eq!(app, "/nix/store/x/bin/app");
+        assert_eq!(store, "/nix/store/x");
+    }
+
+    #[test]
+    fn resolve_app_paths_legacy_app_only_with_bin() {
+        let (app, store) =
+            resolve_rollback_app_paths(Some("/nix/store/x/bin/app"), None, "app").unwrap();
+        assert_eq!(app, "/nix/store/x/bin/app");
+        assert_eq!(store, "/nix/store/x");
+    }
+
+    #[test]
+    fn resolve_app_paths_legacy_app_only_bare_store() {
+        let (app, store) = resolve_rollback_app_paths(Some("/nix/store/x"), None, "app").unwrap();
+        assert_eq!(app, "/nix/store/x/bin/app");
+        assert_eq!(store, "/nix/store/x");
+    }
+
+    #[test]
+    fn resolve_app_paths_store_only() {
+        let (app, store) = resolve_rollback_app_paths(None, Some("/nix/store/x"), "app").unwrap();
+        assert_eq!(app, "/nix/store/x/bin/app");
+        assert_eq!(store, "/nix/store/x");
+    }
+
+    #[test]
+    fn resolve_app_paths_neither_is_error() {
+        assert!(resolve_rollback_app_paths(None, None, "app").is_err());
+    }
+
+    // ── desired_state_env (pure) ──────────────────────────────────────────
+
+    #[test]
+    fn desired_state_env_extracts_string_values_only() {
+        let meta = serde_json::json!({
+            "desired_state": {
+                "env": {
+                    "FOO": "bar",
+                    "NUMBER": 42,
+                    "NULL": null,
+                    "PORT": "3000"
+                }
+            }
+        });
+        let env = desired_state_env(&meta);
+        assert_eq!(env.len(), 2);
+        assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(env.get("PORT"), Some(&"3000".to_string()));
+        assert!(!env.contains_key("NUMBER"));
+        assert!(!env.contains_key("NULL"));
+    }
+
+    #[test]
+    fn desired_state_env_empty_when_absent_or_malformed() {
+        assert!(desired_state_env(&serde_json::json!({})).is_empty());
+        assert!(desired_state_env(&serde_json::json!({"desired_state": {}})).is_empty());
+        // env present but not an object → empty.
+        assert!(desired_state_env(&serde_json::json!({"desired_state": {"env": "x"}})).is_empty());
+    }
+
+    // ── attempt_* early-validation failures (no booting) ──────────────────
+
+    struct Fixture {
+        _tmp: TempDir,
+        russel_dir: String,
+        microvms_dir: String,
+        russel_bak: String,
+        microvms_bak: String,
+    }
+
+    fn fixture_with_metadata(metadata: Option<&str>) -> Fixture {
+        let tmp = TempDir::new().unwrap();
+        let russel_dir = format!("{}/russel", tmp.path().display());
+        let microvms_dir = format!("{}/microvms", tmp.path().display());
+        let russel_bak = format!("{}/russel.bak", tmp.path().display());
+        let microvms_bak = format!("{}/microvms.bak", tmp.path().display());
+        std::fs::create_dir_all(&russel_bak).unwrap();
+        if let Some(content) = metadata {
+            std::fs::write(format!("{russel_bak}/metadata.json"), content).unwrap();
+        }
+        Fixture {
+            _tmp: tmp,
+            russel_dir,
+            microvms_dir,
+            russel_bak,
+            microvms_bak,
+        }
+    }
+
+    #[tokio::test]
+    async fn microvm_rollback_missing_metadata_fails_closed() {
+        let fx = fixture_with_metadata(None);
+        let err = attempt_microvm_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.microvms_dir,
+            &fx.russel_bak,
+            &fx.microvms_bak,
+            false,
+            &MicrovmRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("metadata.json") || err.to_string().contains("No such file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn microvm_rollback_malformed_metadata_fails_closed() {
+        let fx = fixture_with_metadata(Some("not-json"));
+        let err = attempt_microvm_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.microvms_dir,
+            &fx.russel_bak,
+            &fx.microvms_bak,
+            false,
+            &MicrovmRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        // serde_json parse failure surfaces directly (no field was missing).
+        assert!(
+            !err.to_string().contains("host_port") && !err.to_string().contains("kernel_path"),
+            "expected a JSON parse error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn microvm_rollback_missing_host_port_fails_closed() {
+        let fx = fixture_with_metadata(Some(r#"{}"#));
+        let err = attempt_microvm_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.microvms_dir,
+            &fx.russel_bak,
+            &fx.microvms_bak,
+            false,
+            &MicrovmRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("host_port"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn microvm_rollback_missing_guest_port_fails_closed() {
+        let fx = fixture_with_metadata(Some(r#"{"host_port": 8080}"#));
+        let err = attempt_microvm_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.microvms_dir,
+            &fx.russel_bak,
+            &fx.microvms_bak,
+            false,
+            &MicrovmRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("guest_port"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn microvm_rollback_missing_kernel_path_fails_closed() {
+        let fx = fixture_with_metadata(Some(r#"{"host_port": 8080, "guest_port": 3000}"#));
+        let err = attempt_microvm_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.microvms_dir,
+            &fx.russel_bak,
+            &fx.microvms_bak,
+            false,
+            &MicrovmRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("kernel_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_rollback_missing_metadata_fails_closed() {
+        let fx = fixture_with_metadata(None);
+        let err = attempt_container_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.russel_bak,
+            &ContainerRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("metadata.json") || err.to_string().contains("No such file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_rollback_missing_rootfs_path_fails_closed() {
+        let fx = fixture_with_metadata(Some(r#"{"host_port": 8080, "guest_port": 3000}"#));
+        let err = attempt_container_rollback(
+            "svc",
+            &fx.russel_dir,
+            &fx.russel_bak,
+            &ContainerRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("rootfs_path"),
+            "unexpected error: {err}"
+        );
+    }
 }

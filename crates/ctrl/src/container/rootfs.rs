@@ -47,13 +47,6 @@ impl DebugToolsCache {
         Self::default()
     }
 
-    #[allow(dead_code)] // optional debug helper for container shells; not on deploy path
-    pub async fn ensure_debug_tools(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
-        let bash = self.ensure_bash(None).await?;
-        let curl = self.ensure_curl(None).await?;
-        Ok((bash, curl))
-    }
-
     async fn ensure_bash(&self, override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
         if let Some(path) = override_path {
             return Ok(path.to_path_buf());

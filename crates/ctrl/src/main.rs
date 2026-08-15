@@ -311,25 +311,16 @@ fn live_service_tap_ids() -> std::collections::HashSet<String> {
                 && ft.is_dir()
                 && let Some(name) = entry.file_name().to_str()
             {
-                if russel_ctrl::metadata::is_reserved_service_dir(name) {
+                if russel_core::reserved::is_reserved_service_dir(name) {
                     continue;
                 }
                 let meta_path = entry.path().join("metadata.json");
                 if !meta_path.exists() {
                     continue;
                 }
-                let (tap, host_ip) = match std::fs::read_to_string(&meta_path)
-                    .ok()
-                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                {
-                    Some(v) => (
-                        v.get("tap_id").and_then(|t| t.as_str()).map(str::to_string),
-                        v.get("host_ip")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string),
-                    ),
-                    None => (None, None),
-                };
+                let record = russel_ctrl::metadata::load_service_disk_record_from(&meta_path);
+                let tap = record.as_ref().and_then(|r| r.tap_id.clone());
+                let host_ip = record.as_ref().and_then(|r| r.host_ip.clone());
                 services.push((
                     name.to_string(),
                     tap,

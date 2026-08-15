@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::process::Command;
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
@@ -156,13 +155,6 @@ impl DeployPipeline {
         }
     }
 
-    /// Replace the build backend (useful for tests).
-    #[allow(dead_code)]
-    pub fn with_builder(mut self, b: Arc<dyn BuildBackend>) -> Self {
-        self.builder = b;
-        self
-    }
-
     pub async fn deploy(
         &self,
         request: DeployRequest,
@@ -185,7 +177,6 @@ impl DeployPipeline {
                     status: "failed".to_string(),
                     store_path: None,
                     microvm_config_path: None,
-                    runner_path: None,
                     port: None,
                     elapsed_ms: started.elapsed().as_millis(),
                     timing: None,
@@ -210,7 +201,6 @@ impl DeployPipeline {
                 status: "failed".to_string(),
                 store_path: None,
                 microvm_config_path: None,
-                runner_path: None,
                 port: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
@@ -233,7 +223,6 @@ impl DeployPipeline {
                 status: "failed".to_string(),
                 store_path: None,
                 microvm_config_path: None,
-                runner_path: None,
                 port: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
@@ -253,7 +242,6 @@ impl DeployPipeline {
                 status: "failed".to_string(),
                 store_path: None,
                 microvm_config_path: None,
-                runner_path: None,
                 port: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
@@ -336,7 +324,6 @@ impl DeployPipeline {
                     status: "deployed".to_string(),
                     store_path: Some(output.store_path.display().to_string()),
                     microvm_config_path,
-                    runner_path: None,
                     port: Some(output.port),
                     elapsed_ms: elapsed,
                     timing: Some(output.timing),
@@ -366,7 +353,6 @@ impl DeployPipeline {
                     status: "rolled_back".to_string(),
                     store_path: None,
                     microvm_config_path: None,
-                    runner_path: None,
                     port: None,
                     elapsed_ms: elapsed,
                     timing: None,
@@ -395,7 +381,6 @@ impl DeployPipeline {
                     status: "failed".to_string(),
                     store_path: None,
                     microvm_config_path: None,
-                    runner_path: None,
                     port: None,
                     elapsed_ms: elapsed,
                     timing: None,
@@ -938,15 +923,27 @@ impl DeployPipeline {
             }
         } else {
             if has_backup {
-                let _ = Command::new("rm")
-                    .args(["-rf", &format!("{}.bak", russel_dir)])
-                    .output()
-                    .await;
-                if has_microvms_dir {
-                    let _ = Command::new("rm")
-                        .args(["-rf", &format!("{}.bak", microvms_dir)])
-                        .output()
-                        .await;
+                // Best-effort cleanup of the pre-deploy backup dirs. Use
+                // std::fs::remove_dir_all rather than shelling out to `rm -rf`
+                // (F-46). A missing dir (already cleaned) is not an error.
+                if let Err(e) = std::fs::remove_dir_all(&russel_bak)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        path = %russel_bak,
+                        error = %e,
+                        "failed to remove russel backup dir after deploy"
+                    );
+                }
+                if has_microvms_dir
+                    && let Err(e) = std::fs::remove_dir_all(&microvms_bak)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        path = %microvms_bak,
+                        error = %e,
+                        "failed to remove microvms backup dir after deploy"
+                    );
                 }
             }
             self.state.attach_flake_path(service_id, repo_path.clone());

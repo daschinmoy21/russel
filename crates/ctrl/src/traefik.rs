@@ -1,10 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ingress::{Backend, HostRule, Ingress};
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_DOMAIN: &str = "russel.local";
 
@@ -116,11 +112,7 @@ async fn atomic_write_dynamic_config(
     content: &[u8],
     service_id: &str,
 ) -> anyhow::Result<()> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        ^ u128::from(TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let nonce = crate::metadata::write_nonce();
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("traefik config path has no parent directory"))?;
@@ -185,8 +177,8 @@ impl Ingress for TraefikFileIngress {
             self.public_host(service_id)
         };
 
-        let router_name = router_name(service_id);
-        let service_name = svc_name(service_id);
+        let router_key = router_name(service_id);
+        let service_name = router_name(service_id);
 
         tokio::fs::create_dir_all(&self.dynamic_dir)
             .await
@@ -215,7 +207,7 @@ impl Ingress for TraefikFileIngress {
         let config = serde_json::json!({
             "http": {
                 "routers": {
-                    &router_name: router
+                    &router_key: router
                 },
                 "services": {
                     &service_name: {
@@ -292,11 +284,6 @@ fn router_name(service_id: &str) -> String {
     format!("russel-{service_id}")
 }
 
-/// Traefik service name for a service: `russel-{service_id}`.
-fn svc_name(service_id: &str) -> String {
-    router_name(service_id)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -320,7 +307,6 @@ mod tests {
     #[test]
     fn router_service_naming() {
         assert_eq!(router_name("api"), "russel-api");
-        assert_eq!(svc_name("api"), "russel-api");
         assert_eq!(router_name("my-service"), "russel-my-service");
     }
 
