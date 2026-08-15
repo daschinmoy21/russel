@@ -739,14 +739,12 @@ impl AppState {
         Some(LogsResponse { output })
     }
 
-    /// Write the durable service catalog to `/var/lib/russel/ctrl-catalog.json`.
+    /// Build the durable service catalog JSON (no disk write).
     ///
-    /// Atomic write: temp file + rename. The catalog is informational;
-    /// `metadata.json` remains the source of truth for runtime details.
-    ///
-    /// Snapshot under the mutex, then do all disk I/O outside the critical
-    /// section so state transitions are not serialized behind filesystem reads.
-    pub fn write_catalog(&self) -> anyhow::Result<()> {
+    /// Snapshot under the mutex, then do disk I/O for per-service metadata
+    /// outside the critical section so state transitions are not serialized
+    /// behind filesystem reads.
+    pub fn build_catalog(&self) -> serde_json::Value {
         let snapshot: Vec<(String, String, Option<RuntimeKind>, Option<u16>)> = {
             let inner = self.lock_inner();
             inner
@@ -776,12 +774,18 @@ impl AppState {
             services_map.insert(id, entry);
         }
 
-        let catalog = serde_json::json!({
+        serde_json::json!({
             "schema_version": 1,
             "updated_at": crate::metadata::deployed_at_now(),
             "services": services_map,
-        });
+        })
+    }
 
-        crate::metadata::write_ctrl_catalog(&catalog)
+    /// Write the durable service catalog to `/var/lib/russel/ctrl-catalog.json`.
+    ///
+    /// Atomic write: temp file + rename. The catalog is informational;
+    /// `metadata.json` remains the source of truth for runtime details.
+    pub fn write_catalog(&self) -> anyhow::Result<()> {
+        crate::metadata::write_ctrl_catalog(&self.build_catalog())
     }
 }

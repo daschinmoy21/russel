@@ -413,9 +413,29 @@ mod tests {
 
     #[test]
     fn default_builder_is_nix_builder() {
-        // default_builder() must return an Arc that can be used as a trait object.
-        let b = default_builder();
-        let _: &dyn BuildBackend = b.as_ref();
+        // default_builder() must return a usable Arc<dyn BuildBackend> whose
+        // concrete backend is NixBuilder: under restricted mode, a missing
+        // flake fails with the restricted-mode message (no auto-gen).
+        with_nix_restricted_env(Some("1"), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let b = default_builder();
+                assert_eq!(Arc::strong_count(&b), 1);
+                let err = b
+                    .build(dir.path())
+                    .await
+                    .expect_err("missing flake must fail under restricted mode");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("RUSSEL_NIX_RESTRICTED"),
+                    "default_builder must use NixBuilder restricted gate, got: {msg}"
+                );
+            });
+        });
     }
 
     /// Serialize mutations of `RUSSEL_NIX_RESTRICTED` and restore even on panic.

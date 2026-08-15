@@ -1360,6 +1360,56 @@ mod tests {
 
     // ── F-05 / #189: loopback detection + cleartext policy ────────────────
 
+    /// Serialize mutations of `RUSSEL_INSECURE_CLEARTEXT` and `CLI_INSECURE`.
+    /// Restores both on drop (panic-safe).
+    fn with_cleartext_env<T>(
+        env_value: Option<&str>,
+        cli_insecure: bool,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: exclusive LOCK held; only test code mutates this var.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v),
+                        None => std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT"),
+                    }
+                }
+            }
+        }
+
+        struct InsecureRestore(bool);
+        impl Drop for InsecureRestore {
+            fn drop(&mut self) {
+                set_cli_insecure(self.0);
+            }
+        }
+
+        let prev_env = std::env::var_os("RUSSEL_INSECURE_CLEARTEXT");
+        let prev_flag = CLI_INSECURE.load(std::sync::atomic::Ordering::Relaxed);
+        let _restore_env = EnvRestore(prev_env);
+        let _restore_flag = InsecureRestore(prev_flag);
+
+        set_cli_insecure(cli_insecure);
+        // SAFETY: exclusive lock held for the duration of the mutation + body.
+        unsafe {
+            match env_value {
+                Some(v) => std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v),
+                None => std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT"),
+            }
+        }
+        f()
+    }
+
     #[test]
     fn loopback_detection() {
         assert!(is_loopback_host("127.0.0.1"));
@@ -1385,62 +1435,51 @@ mod tests {
     #[test]
     fn cleartext_policy_https_ok() {
         // No panic / no error for https regardless of host.
-        ensure_cleartext_token_ok("https://example.com:7878").unwrap();
-        ensure_cleartext_token_ok("https://192.168.1.1").unwrap();
+        with_cleartext_env(None, false, || {
+            ensure_cleartext_token_ok("https://example.com:7878").unwrap();
+            ensure_cleartext_token_ok("https://192.168.1.1").unwrap();
+        });
     }
 
     #[test]
     fn cleartext_policy_loopback_http_ok() {
         // Loopback is warn-only (should not error).
-        ensure_cleartext_token_ok("http://127.0.0.1:7878").unwrap();
-        ensure_cleartext_token_ok("http://localhost:7878").unwrap();
-        ensure_cleartext_token_ok("http://[::1]:7878").unwrap();
+        with_cleartext_env(None, false, || {
+            ensure_cleartext_token_ok("http://127.0.0.1:7878").unwrap();
+            ensure_cleartext_token_ok("http://localhost:7878").unwrap();
+            ensure_cleartext_token_ok("http://[::1]:7878").unwrap();
+        });
     }
 
     #[test]
     fn cleartext_policy_non_loopback_http_refuses() {
-        // Reset escape hatch for isolation.
-        set_cli_insecure(false);
-        // Ensure env is not set for this test.
-        // SAFETY: test process; we restore below.
-        let prev = std::env::var("RUSSEL_INSECURE_CLEARTEXT").ok();
-        unsafe { std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT") };
+        with_cleartext_env(None, false, || {
+            let err = ensure_cleartext_token_ok("http://192.168.1.10:7878").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("refusing to send RUSSEL_API_TOKEN"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("192.168.1.10"), "got: {msg}");
+            assert!(msg.contains("--insecure"), "got: {msg}");
 
-        let err = ensure_cleartext_token_ok("http://192.168.1.10:7878").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("refusing to send RUSSEL_API_TOKEN"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("192.168.1.10"), "got: {msg}");
-        assert!(msg.contains("--insecure"), "got: {msg}");
-
-        let err = ensure_cleartext_token_ok("http://example.com/api").unwrap_err();
-        assert!(err.to_string().contains("example.com"), "got: {}", err);
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v) },
-            None => unsafe { std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT") },
-        }
+            let err = ensure_cleartext_token_ok("http://example.com/api").unwrap_err();
+            assert!(err.to_string().contains("example.com"), "got: {}", err);
+        });
     }
 
     #[test]
     fn cleartext_policy_insecure_flag_allows_non_loopback() {
-        set_cli_insecure(true);
-        ensure_cleartext_token_ok("http://10.0.0.5:7878").unwrap();
-        set_cli_insecure(false);
+        with_cleartext_env(None, true, || {
+            ensure_cleartext_token_ok("http://10.0.0.5:7878").unwrap();
+        });
     }
 
     #[test]
     fn cleartext_policy_env_escape_allows_non_loopback() {
-        set_cli_insecure(false);
-        let prev = std::env::var("RUSSEL_INSECURE_CLEARTEXT").ok();
-        unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", "1") };
-        ensure_cleartext_token_ok("http://10.0.0.5:7878").unwrap();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("RUSSEL_INSECURE_CLEARTEXT", v) },
-            None => unsafe { std::env::remove_var("RUSSEL_INSECURE_CLEARTEXT") },
-        }
+        with_cleartext_env(Some("1"), false, || {
+            ensure_cleartext_token_ok("http://10.0.0.5:7878").unwrap();
+        });
     }
 
     #[test]
