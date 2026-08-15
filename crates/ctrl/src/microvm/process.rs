@@ -200,6 +200,41 @@ pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
     false
 }
 
+pub(super) async fn terminate_owned_process(pid: u32, service_id: &str) -> anyhow::Result<bool> {
+    if !verify_process_ownership(pid, service_id) {
+        return Ok(false);
+    }
+    let output = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .await?;
+    if !output.status.success() && process_is_alive(pid) {
+        anyhow::bail!(
+            "failed to terminate process {pid}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(wait_for_process_exit(pid, Duration::from_secs(2)).await)
+}
+
+pub(super) fn process_is_alive(pid: u32) -> bool {
+    let path = format!("/proc/{pid}/stat");
+    let Ok(stat) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+        .is_some_and(|state| state != 'Z')
+}
+
+pub(super) async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while process_is_alive(pid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !process_is_alive(pid)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod ownership_tests {
@@ -251,39 +286,4 @@ mod ownership_tests {
         let _ = child.kill();
         let _ = child.wait();
     }
-}
-
-pub(super) async fn terminate_owned_process(pid: u32, service_id: &str) -> anyhow::Result<bool> {
-    if !verify_process_ownership(pid, service_id) {
-        return Ok(false);
-    }
-    let output = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .output()
-        .await?;
-    if !output.status.success() && process_is_alive(pid) {
-        anyhow::bail!(
-            "failed to terminate process {pid}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(wait_for_process_exit(pid, Duration::from_secs(2)).await)
-}
-
-pub(super) fn process_is_alive(pid: u32) -> bool {
-    let path = format!("/proc/{pid}/stat");
-    let Ok(stat) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    stat.rsplit_once(") ")
-        .and_then(|(_, rest)| rest.chars().next())
-        .is_some_and(|state| state != 'Z')
-}
-
-pub(super) async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while process_is_alive(pid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    !process_is_alive(pid)
 }
