@@ -1,9 +1,14 @@
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use russel_core::config::RuntimeKind;
+use tower::ServiceExt;
 
 use super::auth::constant_time_eq;
 use super::router::runtime_label;
 use super::*;
 use crate::metadata::resolve_lifecycle_runtime;
+use crate::state::AppState;
 
 // ── auth / concurrency helpers ─────────────────────────────────────
 
@@ -153,4 +158,74 @@ fn constant_time_eq_zeroed_suffix_matches() {
     let short = [0u8; 1];
     let long = [0u8; 257];
     assert!(!constant_time_eq(&short, &long));
+}
+
+// ── POST /deploy vm_id contract (#300) ─────────────────────────────
+
+/// POST /deploy helper that does **not** mutate process environment.
+///
+/// When `RUSSEL_API_TOKEN` is set (common in CI shells), attach a matching
+/// Bearer header so auth middleware passes. Clearing/restoring env across an
+/// `await` races concurrent tests that also touch process-wide environment.
+async fn post_deploy(body: &str) -> (StatusCode, String) {
+    let app = router(AppState::default());
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/deploy")
+        .header("content-type", "application/json");
+
+    // Present the configured token when set — no env clear/restore.
+    if let Some(token) = normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref()) {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let req = builder
+        .body(Body::from(body.to_string()))
+        .expect("build request");
+    let res = app.oneshot(req).await.expect("oneshot");
+    let status = res.status();
+    let bytes = res.into_body().collect().await.expect("body").to_bytes();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    (status, text)
+}
+
+#[tokio::test]
+async fn deploy_missing_vm_id_returns_400() {
+    let (status, body) = post_deploy(
+        r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body.contains("vm_id is required"),
+        "expected vm_id contract message, got: {body}"
+    );
+    // Must not start an NDJSON deploy stream.
+    assert!(
+        !body.contains("application/x-ndjson") && !body.starts_with('{'),
+        "must not invoke deploy pipeline; body={body}"
+    );
+}
+
+#[tokio::test]
+async fn deploy_whitespace_only_vm_id_returns_400() {
+    let (status, body) = post_deploy(
+        r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml","vm_id":"   "}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body.contains("vm_id is required"),
+        "expected vm_id contract message, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn deploy_null_vm_id_returns_400() {
+    let (status, body) = post_deploy(
+        r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml","vm_id":null}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(body.contains("vm_id is required"), "body={body}");
 }

@@ -165,12 +165,12 @@ When `RUSSEL_API_TOKEN` is set on the control plane, **every** API route require
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/deploy` | Deploy or re-deploy a service (returns NDJSON stream) |
+| `POST` | `/deploy` | Deploy or re-deploy a service (`vm_id` **required**; returns NDJSON stream) |
 | `GET` | `/secrets` | List secret names (values never returned) |
 | `POST` | `/secrets/{name}` | Set secret (`{"value":"..."}`); store mode `0600` |
 | `DELETE` | `/secrets/{name}` | Delete a secret |
-| `GET`  | `/status` | Get deployment status for all services (when `service_id` omitted) |
-| `GET`  | `/logs`   | Get logs for all services (when `service_id` omitted) |
+| `GET`  | `/status` | Status of the single registered service; **400** if multiple services exist (pass `/vm/{id}/status`) |
+| `GET`  | `/logs`   | Logs of the single registered service; **400** if multiple services exist (pass `/vm/{id}/logs`) |
 | `GET`  | `/vm/{service_id}/status` | Get deployment status for a service |
 | `GET`  | `/vm/{service_id}/logs`   | Get logs for a service |
 | `GET`  | `/vm/{service_id}/deployments` | List deployment history (newest first; journal under `/var/lib/russel/<id>/deployments.json`) |

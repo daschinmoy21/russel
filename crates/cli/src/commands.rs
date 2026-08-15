@@ -348,15 +348,25 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     }
     let port = args.port.as_deref().map(parse_port_mapping).transpose()?;
 
+    // #300: control plane requires explicit vm_id. Derive a stable id from the
+    // repo path/URL when the operator omits `--vm-id` (never the old shared "api").
+    let vm_id = match args.vm_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => id.trim().to_string(),
+        None => default_service_id_from_repo(&repo_url).ok_or_else(|| {
+            anyhow!(
+                "could not derive a service id from repo; pass --vm-id explicitly \
+                 (control plane no longer defaults to \"api\")"
+            )
+        })?,
+    };
+
     // ── Pre-flight banner ──────────────────────────────────────────────────
     println!();
     println!("  \x1b[1;36mrussel deploy\x1b[0m");
     println!("  \x1b[2m{}\x1b[0m", repo_url);
     println!();
 
-    if let Some(vm_id) = &args.vm_id {
-        step("vm-id", &format!("\x1b[1m{vm_id}\x1b[0m"), "");
-    }
+    step("vm-id", &format!("\x1b[1m{vm_id}\x1b[0m"), "");
     if let Some(p) = &port {
         step(
             "publish",
@@ -394,7 +404,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         .json(&DeployRequest {
             repo_url,
             config_path: args.config,
-            vm_id: args.vm_id,
+            vm_id: Some(vm_id),
             port,
             runtime,
             podman_args: args.podman_args,
@@ -789,6 +799,136 @@ fn parse_port_mapping(value: &str) -> Result<PortMapping> {
     Ok(PortMapping { host, guest })
 }
 
+/// Derive a stable service id from a repo path or URL when `--vm-id` is omitted.
+///
+/// Joins the full repository namespace path (all segments after a remote host,
+/// or all local path segments) so nested groups cannot collapse — e.g.
+/// `gitlab.example/a/team/app` → `a-team-app` vs `gitlab.example/b/team/app` →
+/// `b-team-app`. Sanitizes to the control-plane `validate_service_id` charset,
+/// truncates to 128 chars, and avoids reserved names (`secrets`, `traefik`,
+/// `_pool`, `*.bak`).
+fn default_service_id_from_repo(repo: &str) -> Option<String> {
+    const MAX_SERVICE_ID_LEN: usize = 128;
+
+    let trimmed = repo.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+
+    // Normalize common remote forms to path-like segments:
+    //   https://github.com/org/myapp.git  → github.com/org/myapp
+    //   git@github.com:org/myapp.git      → github.com/org/myapp
+    //   ./examples/basic-http             → examples/basic-http
+    let without_git = trimmed
+        .strip_suffix(".git")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+
+    let is_remote = without_git.starts_with("git@")
+        || without_git.starts_with("https://")
+        || without_git.starts_with("http://")
+        || without_git.starts_with("ssh://");
+
+    let path_like = if let Some(rest) = without_git.strip_prefix("git@") {
+        // scp-like: git@host:owner/repo
+        rest.replacen(':', "/", 1)
+    } else {
+        let rest = without_git
+            .strip_prefix("https://")
+            .or_else(|| without_git.strip_prefix("http://"))
+            .or_else(|| without_git.strip_prefix("ssh://"))
+            .unwrap_or(without_git);
+        // ssh://git@host/owner/repo → drop optional git@ user
+        rest.strip_prefix("git@").unwrap_or(rest).to_string()
+    };
+
+    let segments: Vec<&str> = path_like
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Remotes: drop the host segment and join the full owner/group/repo path so
+    // nested namespaces stay distinct. Local paths: join every segment.
+    // Host-only remote (no path) falls back to sanitized host basename.
+    let id_segments: &[&str] = if is_remote {
+        if segments.len() >= 2 {
+            &segments[1..]
+        } else {
+            // rare: host only — use host basename (strip domain noise later)
+            &segments[..]
+        }
+    } else if segments.len() >= 2 && segments[0].contains('.') {
+        // path-like host/repo without a scheme
+        &segments[1..]
+    } else {
+        &segments[..]
+    };
+
+    if id_segments.is_empty() {
+        return None;
+    }
+    let raw_id = id_segments.join("-");
+
+    let mut out = String::with_capacity(raw_id.len());
+    for c in raw_id.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if c == '.' {
+            out.push('-');
+        }
+    }
+    // Collapse runs of separators introduced by sanitization.
+    let collapsed: String = {
+        let mut s = String::with_capacity(out.len());
+        let mut prev_sep = false;
+        for c in out.chars() {
+            let sep = c == '-' || c == '_';
+            if sep && prev_sep {
+                continue;
+            }
+            s.push(c);
+            prev_sep = sep;
+        }
+        s
+    };
+    let mut out = collapsed.trim_matches('-').trim_matches('_').to_string();
+    if out.is_empty() {
+        return None;
+    }
+
+    // Mirror control-plane reserved service dirs (metadata::is_reserved_service_dir).
+    // After sanitization dots become dashes, so `*.bak` cannot appear; still
+    // guard exact reserved names.
+    let is_reserved =
+        out == "traefik" || out == "secrets" || out == "_pool" || out.ends_with(".bak");
+    if is_reserved {
+        out.push_str("-svc");
+    }
+
+    // Enforce validate_service_id max length (128).
+    if out.len() > MAX_SERVICE_ID_LEN {
+        out.truncate(MAX_SERVICE_ID_LEN);
+        out = out.trim_end_matches('-').trim_end_matches('_').to_string();
+        if out.is_empty() {
+            return None;
+        }
+        // Truncation could theoretically land on a reserved exact name.
+        if out == "traefik" || out == "secrets" || out == "_pool" {
+            let suffix = "-svc";
+            let keep = MAX_SERVICE_ID_LEN.saturating_sub(suffix.len());
+            out.truncate(keep);
+            out = out.trim_end_matches('-').trim_end_matches('_').to_string();
+            out.push_str(suffix);
+        }
+    }
+
+    Some(out)
+}
+
 // ponytail: only status/logs/vms/stop/destroy use HTTP — tested via unit tests
 // on pure functions below.
 
@@ -1120,7 +1260,59 @@ mod tests {
     #[test]
     fn parse_port_mapping_guest_zero_rejected() {
         let err = parse_port_mapping("8080:0").unwrap_err();
-        assert!(err.to_string().contains("must not be 0"));
+        assert!(
+            err.to_string().contains("guest port must not be 0"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn default_service_id_from_repo_path_and_url() {
+        assert_eq!(
+            default_service_id_from_repo("./examples/basic-http"),
+            Some("examples-basic-http".into())
+        );
+        assert_eq!(
+            default_service_id_from_repo("https://github.com/org/myapp.git"),
+            Some("org-myapp".into())
+        );
+        assert_eq!(
+            default_service_id_from_repo("git@github.com:org/my.app.git"),
+            Some("org-my-app".into())
+        );
+        // Different owners sharing basename must not collide.
+        assert_eq!(
+            default_service_id_from_repo("https://github.com/alice/app.git"),
+            Some("alice-app".into())
+        );
+        assert_eq!(
+            default_service_id_from_repo("https://github.com/bob/app.git"),
+            Some("bob-app".into())
+        );
+        // Nested namespaces: same final two segments under different groups.
+        assert_eq!(
+            default_service_id_from_repo("https://gitlab.example/a/team/app.git"),
+            Some("a-team-app".into())
+        );
+        assert_eq!(
+            default_service_id_from_repo("https://gitlab.example/b/team/app.git"),
+            Some("b-team-app".into())
+        );
+        assert_ne!(
+            default_service_id_from_repo("https://gitlab.example/a/team/app.git"),
+            default_service_id_from_repo("https://gitlab.example/b/team/app.git"),
+        );
+        // Reserved basenames get a safe suffix so validate_service_id accepts them.
+        assert_eq!(
+            default_service_id_from_repo("https://github.com/org/secrets.git"),
+            Some("org-secrets".into())
+        );
+        assert_eq!(
+            default_service_id_from_repo("secrets"),
+            Some("secrets-svc".into())
+        );
+        assert_eq!(default_service_id_from_repo("."), None);
+        assert_eq!(default_service_id_from_repo(""), None);
     }
 
     #[test]
@@ -1370,7 +1562,7 @@ mod tests {
     // ── F-05 / #189: loopback detection + cleartext policy ────────────────
 
     /// Serialize mutations of `RUSSEL_INSECURE_CLEARTEXT` and `CLI_INSECURE`.
-    /// Restores both on drop (panic-safe).
+    /// Restores both on drop (panic-safe). Fixes #302 parallel test races.
     fn with_cleartext_env<T>(
         env_value: Option<&str>,
         cli_insecure: bool,

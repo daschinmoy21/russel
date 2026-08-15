@@ -41,6 +41,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Match CONTRIBUTING.md: lint tests too (`--all-targets`).
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:

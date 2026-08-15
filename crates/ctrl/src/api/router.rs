@@ -164,7 +164,26 @@ async fn deploy(
             });
     }
 
-    let service_id = request.vm_id.clone().unwrap_or_else(|| "api".to_string());
+    // #300: never default to shared "api" — concurrent deploys would collide.
+    let service_id = match request
+        .vm_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => {
+            return axum::response::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "text/plain")
+                .body(axum::body::Body::from(
+                    "vm_id is required (e.g. \"my-service\"); shared default \"api\" was removed",
+                ))
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new(axum::body::Body::from("internal server error"))
+                });
+        }
+    };
 
     tracing::info!(
         repo = %request.repo_url,
@@ -244,8 +263,15 @@ async fn vm_logs(
 async fn append_podman_logs(service_id: &str, output: &mut String) {
     let name = ContainerRunner::container_name(service_id);
     let log_path = container_log_path(service_id);
+    // #298: only skip podman logs when the on-disk file has usable content.
+    // Empty/stale zero-byte files used to short-circuit and hide container output.
     if log_path.exists() {
-        return;
+        match tokio::fs::metadata(&log_path).await {
+            Ok(meta) if meta.len() > 0 => return,
+            _ => {
+                // Missing stats or empty file — fall through to `podman logs`.
+            }
+        }
     }
 
     let result = crate::container::podman_command()

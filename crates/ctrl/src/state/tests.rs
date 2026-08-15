@@ -1,3 +1,5 @@
+// unwrap/expect allowed via parent `#[allow(...)]` on `mod tests` in state/mod.rs.
+
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 

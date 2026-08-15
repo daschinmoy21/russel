@@ -1,6 +1,7 @@
 /target
 target/
 crates/*/target/
+crates/*/Cargo.lock
 result
 result-*
 microvm.nix/
