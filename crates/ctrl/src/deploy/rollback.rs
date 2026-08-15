@@ -21,7 +21,27 @@ use crate::{
     warm_pool::shared_warm_pool,
 };
 
-use super::env::shell_quote;
+/// Extract `desired_state.env` from rollback metadata into a plain map
+/// (string values only). Shared by the microVM and container rollback paths.
+fn desired_state_env(old_meta: &serde_json::Value) -> HashMap<String, String> {
+    old_meta
+        .get("desired_state")
+        .and_then(|ds| ds.get("env"))
+        .and_then(|env_obj| {
+            if let serde_json::Value::Object(map) = env_obj {
+                let mut out = HashMap::new();
+                for (k, v) in map {
+                    if let Some(val) = v.as_str() {
+                        out.insert(k.clone(), val.to_string());
+                    }
+                }
+                Some(out)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
 
 /// Resolve the prior runtime for a service before redeploy.
 ///
@@ -207,23 +227,7 @@ pub(crate) async fn attempt_microvm_rollback(
         }
     };
     // Extract desired_state user env for deploy.env restoration (F-04).
-    let user_env: HashMap<String, String> = old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("env"))
-        .and_then(|env_obj| {
-            if let serde_json::Value::Object(map) = env_obj {
-                let mut out = HashMap::new();
-                for (k, v) in map {
-                    if let Some(val) = v.as_str() {
-                        out.insert(k.clone(), val.to_string());
-                    }
-                }
-                Some(out)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let user_env: HashMap<String, String> = desired_state_env(&old_meta);
     // Resolve secret:// refs in restored env
     let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 
@@ -240,25 +244,14 @@ pub(crate) async fn attempt_microvm_rollback(
     // may collide with another service after probe exhaustion.
     let alloc = subnet_for(service_id)?;
     let cfg_dir = format!("{}/cfg", russel_dir);
-    std::fs::create_dir_all(&cfg_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let mut deploy_env = format!(
-        "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
-        alloc.vm_ip,
-        alloc.host_ip,
+    super::write_deploy_env(
+        &cfg_dir,
+        &alloc.vm_ip,
+        &alloc.host_ip,
         guest_port,
-        shell_quote(&app_path)
-    );
-    // Append user env vars from desired_state, shell-quoted (secrets resolved above).
-    for (key, value) in &user_env {
-        deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
-    }
-    let deploy_env_path = PathBuf::from(format!("{cfg_dir}/deploy.env"));
-    crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes(), "deploy.env")?;
+        &app_path,
+        &user_env,
+    )?;
 
     // 4. Reserve port
     PortAllocator::reserve(service_id, host_port)?;
@@ -478,23 +471,7 @@ pub(crate) async fn attempt_container_rollback(
     }
 
     // F-04: restore user env from desired_state (resolved secrets).
-    let user_env: HashMap<String, String> = old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("env"))
-        .and_then(|env_obj| {
-            if let serde_json::Value::Object(map) = env_obj {
-                let mut out = HashMap::new();
-                for (k, v) in map {
-                    if let Some(val) = v.as_str() {
-                        out.insert(k.clone(), val.to_string());
-                    }
-                }
-                Some(out)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let user_env: HashMap<String, String> = desired_state_env(&old_meta);
     // Resolve secret:// refs
     let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 

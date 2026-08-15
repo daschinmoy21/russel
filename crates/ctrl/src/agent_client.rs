@@ -117,13 +117,14 @@ impl AgentClient {
         &self.base_url
     }
 
-    async fn post(
+    async fn request_json<T: serde::de::DeserializeOwned>(
         &self,
-        service_id: &str,
+        method: reqwest::Method,
+        url: &str,
         operation: &str,
-    ) -> Result<AgentLifecycleResponse, AgentRpcError> {
-        let url = format!("{}/agent/v1/{}/{}", self.base_url, operation, service_id);
-        let mut req = self.http.post(&url);
+        service_id: &str,
+    ) -> Result<T, AgentRpcError> {
+        let mut req = self.http.request(method, url);
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
         }
@@ -142,6 +143,16 @@ impl AgentClient {
         })
     }
 
+    async fn post(
+        &self,
+        service_id: &str,
+        operation: &str,
+    ) -> Result<AgentLifecycleResponse, AgentRpcError> {
+        let url = format!("{}/agent/v1/{}/{}", self.base_url, operation, service_id);
+        self.request_json(reqwest::Method::POST, &url, operation, service_id)
+            .await
+    }
+
     /// `POST /agent/v1/stop/{service_id}`.
     pub async fn stop(&self, service_id: &str) -> Result<AgentLifecycleResponse, AgentRpcError> {
         self.post(service_id, "stop").await
@@ -155,23 +166,8 @@ impl AgentClient {
     /// `GET /agent/v1/status/{service_id}`.
     pub async fn status(&self, service_id: &str) -> Result<AgentStatusResponse, AgentRpcError> {
         let url = format!("{}/agent/v1/status/{}", self.base_url, service_id);
-        let mut req = self.http.get(&url);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await.map_err(|e| AgentRpcError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("agent RPC failed (status {service_id}): {e}"),
-        })?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(AgentRpcError::from_response(status, &body));
-        }
-        serde_json::from_str(&body).map_err(|e| AgentRpcError {
-            status,
-            message: format!("invalid agent response for status {service_id}: {e}"),
-        })
+        self.request_json(reqwest::Method::GET, &url, "status", service_id)
+            .await
     }
 }
 

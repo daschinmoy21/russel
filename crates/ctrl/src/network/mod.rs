@@ -18,6 +18,7 @@ pub use subnet::{
     network_key_from_host_ip, preferred_subnet, release_subnet, subnet_for,
 };
 pub use tap::TapForwarder;
+pub(crate) use tap::run_ip;
 
 #[cfg(test)]
 pub use ports::port_test_lock;

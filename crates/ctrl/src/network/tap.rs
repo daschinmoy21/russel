@@ -147,7 +147,7 @@ async fn wait_for_tcp_addr(addr: &str, timeout: Duration) -> bool {
     false
 }
 
-async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
     let out = Command::new("ip")
         .env("LC_ALL", "C")
         .env("LANG", "C")

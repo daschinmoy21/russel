@@ -21,7 +21,7 @@ use crate::{
     warm_pool::shared_warm_pool,
 };
 
-use super::env::{build_container_env, shell_quote, validate_bin_name};
+use super::env::{build_container_env, validate_bin_name};
 use super::pipeline::{DeployPipeline, DeployWorkload};
 
 impl DeployPipeline {
@@ -61,28 +61,14 @@ impl DeployPipeline {
             .await;
 
         let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
-        std::fs::create_dir_all(&cfg_dir)
-            .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {}", cfg_dir, e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| anyhow::anyhow!("chmod config dir: {e}"))?;
-        }
-        // Shell-quote APP path to prevent injection through deploy.env
-        let mut deploy_env = format!(
-            "VM_IP={}\nHOST_IP={}\nPORT={}\nAPP={}\n",
-            alloc.vm_ip,
-            alloc.host_ip,
+        super::write_deploy_env(
+            &cfg_dir,
+            &alloc.vm_ip,
+            &alloc.host_ip,
             port.guest,
-            shell_quote(&app_path)
-        );
-        // Append user env vars, shell-quoted (may include expanded secrets).
-        for (key, value) in env {
-            deploy_env.push_str(&format!("{}={}\n", key, shell_quote(value)));
-        }
-        let deploy_env_path = PathBuf::from(format!("{cfg_dir}/deploy.env"));
-        crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes(), "deploy.env")?;
+            &app_path,
+            env,
+        )?;
 
         // Agent initramfs is cached after first use — no app baked in.
         let initramfs_path = self.runner.build_agent_initramfs().await?;

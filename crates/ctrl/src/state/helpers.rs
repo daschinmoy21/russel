@@ -40,7 +40,7 @@ pub(super) fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
 }
 
 /// Check if a container is still running via `podman inspect`.
-pub(super) async fn check_container_running(container_id: &str) -> bool {
+pub(crate) async fn check_container_running(container_id: &str) -> bool {
     let output = match crate::container::podman_command()
         .await
         .args(["inspect", container_id, "--format", "{{.State.Running}}"])

@@ -9,7 +9,7 @@ use russel_core::reserved::is_reserved_service_dir;
 
 use crate::metadata::{self, ServiceDiskRecord};
 use crate::network::PortAllocator;
-use crate::state::AppState;
+use crate::state::{AppState, check_container_running};
 
 /// Outcome of reconciling a single service directory.
 #[derive(Debug)]
@@ -224,7 +224,7 @@ fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
 /// Check whether a container is still running via `podman inspect`.
 async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
     if let Some(container_id) = &record.container_id {
-        if container_running(container_id).await {
+        if check_container_running(container_id).await {
             return true;
         }
         // Fallback: try the Russel naming convention `russel-{service_id}`.
@@ -232,34 +232,17 @@ async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
             "russel-{}",
             record.service_id.as_deref().unwrap_or("unknown")
         );
-        if container_running(&name).await {
+        if check_container_running(&name).await {
             return true;
         }
     }
     false
 }
 
-async fn container_running(container_id: &str) -> bool {
-    let output = match crate::container::podman_command()
-        .await
-        .args(["inspect", container_id, "--format", "{{.State.Running}}"])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    String::from_utf8_lossy(&output.stdout).trim() == "true"
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::state::AppState;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;

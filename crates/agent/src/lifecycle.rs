@@ -101,20 +101,7 @@ pub async fn stop(
     data_root: &Path,
     service_id: &str,
 ) -> Result<AgentLifecycleResponse, LifecycleError> {
-    MicrovmRunner::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
-    let resolved = resolve_service(data_root, service_id)?;
-    let runtime = resolved.runtime;
-    in_process_lifecycle(runtime)
-        .stop(service_id)
-        .await
-        .map_err(|e| LifecycleError::internal(format!("failed to stop {service_id}: {e}")))?;
-    Ok(AgentLifecycleResponse {
-        service_id: service_id.to_string(),
-        operation: "stop".into(),
-        status: "stopped".into(),
-        message: format!("stopped {runtime} {service_id}"),
-        runtime: Some(runtime),
-    })
+    run_lifecycle_op(data_root, service_id, "stop", "stopped").await
 }
 
 /// `POST /agent/v1/destroy/{service_id}` — stop + remove all workload state.
@@ -122,18 +109,38 @@ pub async fn destroy(
     data_root: &Path,
     service_id: &str,
 ) -> Result<AgentLifecycleResponse, LifecycleError> {
+    run_lifecycle_op(data_root, service_id, "destroy", "destroyed").await
+}
+
+/// Shared stop/destroy scaffolding: validate, resolve runtime, run the
+/// in-process lifecycle op, and shape the response. `operation` is the RPC
+/// verb/route segment; `status` is the response status and message verb.
+async fn run_lifecycle_op(
+    data_root: &Path,
+    service_id: &str,
+    operation: &str,
+    status: &str,
+) -> Result<AgentLifecycleResponse, LifecycleError> {
     MicrovmRunner::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
     let resolved = resolve_service(data_root, service_id)?;
     let runtime = resolved.runtime;
-    in_process_lifecycle(runtime)
-        .destroy(service_id)
-        .await
-        .map_err(|e| LifecycleError::internal(format!("failed to destroy {service_id}: {e}")))?;
+    let result = match operation {
+        "stop" => in_process_lifecycle(runtime).stop(service_id).await,
+        "destroy" => in_process_lifecycle(runtime).destroy(service_id).await,
+        other => {
+            return Err(LifecycleError::internal(format!(
+                "unknown lifecycle operation {other}"
+            )));
+        }
+    };
+    result.map_err(|e| {
+        LifecycleError::internal(format!("failed to {operation} {service_id}: {e}"))
+    })?;
     Ok(AgentLifecycleResponse {
         service_id: service_id.to_string(),
-        operation: "destroy".into(),
-        status: "destroyed".into(),
-        message: format!("destroyed {runtime} {service_id}"),
+        operation: operation.to_string(),
+        status: status.to_string(),
+        message: format!("{status} {runtime} {service_id}"),
         runtime: Some(runtime),
     })
 }

@@ -26,8 +26,6 @@ use std::{
     time::Duration,
 };
 
-use tokio::process::Command;
-
 use crate::{
     ch_api,
     microvm::{self, BootOutput, FsMount, MicrovmRunner, VmSpec},
@@ -225,10 +223,10 @@ impl WarmPool {
         let tap = &alloc.tap_id;
         let host_ip = &alloc.host_ip;
         tracing::info!(tap, "creating template TAP");
-        let _ = Self::run_ip(&["link", "del", tap]).await;
-        Self::run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await?;
-        Self::run_ip(&["link", "set", tap, "up"]).await?;
-        Self::run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
+        let _ = network::run_ip(&["link", "del", tap]).await;
+        network::run_ip(&["tuntap", "add", "dev", tap, "mode", "tap"]).await?;
+        network::run_ip(&["link", "set", tap, "up"]).await?;
+        network::run_ip(&["addr", "replace", &format!("{host_ip}/30"), "dev", tap]).await?;
         Ok(())
     }
 
@@ -254,23 +252,6 @@ impl WarmPool {
         }
         let _ = TapForwarder::teardown(alloc).await;
         let _ = tokio::fs::remove_dir_all(sock_dir).await;
-    }
-
-    async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
-        let out = Command::new("ip")
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
-            .args(args)
-            .output()
-            .await?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "ip {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
     }
 
     // ── Restore or boot ──────────────────────────────────────────────────

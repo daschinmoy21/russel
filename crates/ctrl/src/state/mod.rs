@@ -7,6 +7,7 @@ mod lifecycle;
 
 // Stable crate::state::* surface (pre-split public API).
 pub use app::{AppState, DeployGuard, LifecycleClaim};
+pub(crate) use helpers::check_container_running;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

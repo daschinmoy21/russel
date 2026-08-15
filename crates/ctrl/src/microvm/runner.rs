@@ -655,12 +655,6 @@ impl MicrovmRunner {
         let mut virtiofsd_children: Vec<tokio::process::Child> = Vec::new();
         match spec.fs.as_slice() {
             [] => {}
-            [a] => {
-                let child = self
-                    .spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly)
-                    .await?;
-                virtiofsd_children.push(child);
-            }
             [a, b] => {
                 let (ra, rb) = tokio::join!(
                     self.spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly),

@@ -266,6 +266,18 @@ pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow
     atomic_write(path, content.as_bytes())
 }
 
+/// Shared nonce for sibling temp-file names across atomic writers (metadata,
+/// secrets, traefik): wall-clock nanos XOR a process-local counter so
+/// concurrent writers and stale temp files from a crashed writer cannot
+/// collide.
+pub(crate) fn write_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Sibling temp path for `path`, in the same directory so the final rename
 /// stays atomic on the same filesystem.
 ///
@@ -273,11 +285,7 @@ pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow
 /// the **full** file name, so non-`.json`-named destinations keep their name
 /// and two sibling paths that differ only by extension cannot collide.
 fn temp_sibling_path(path: &Path) -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64
-        ^ TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = write_nonce();
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -295,7 +303,7 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 ///
 /// A failed write is cleaned up (temp file removed) and never clobbers the
 /// destination.
-fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),

@@ -81,7 +81,7 @@ fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
         Some(r) => r,
         None => return Ok(()), // https:// or other schemes
     };
-    let host = extract_http_host(rest);
+    let host = control_plane_host(rest);
     if is_loopback_host(host) {
         // Warn-only on loopback (local dev still cleartext, but not on-path WAN risk).
         if !CLEARTEXT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -109,19 +109,6 @@ fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
          or target a loopback URL (e.g. http://127.0.0.1:7878),\n\
          or override with --insecure / RUSSEL_INSECURE_CLEARTEXT=1 (not recommended)."
     ))
-}
-
-/// Extract host from the authority part of an `http://` URL (no scheme prefix).
-///
-/// Handles `host:port/path`, bare `host`, and bracketed IPv6 (`[::1]:7878/...`).
-fn extract_http_host(rest: &str) -> &str {
-    let authority = rest.split('/').next().unwrap_or("");
-    if let Some(inner) = authority.strip_prefix('[')
-        && let Some(end) = inner.find(']')
-    {
-        return &inner[..end];
-    }
-    authority.split(':').next().unwrap_or("")
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1661,12 +1648,20 @@ mod tests {
     }
 
     #[test]
-    fn extract_http_host_ipv4_and_ipv6() {
-        assert_eq!(extract_http_host("127.0.0.1:7878/vms"), "127.0.0.1");
-        assert_eq!(extract_http_host("example.com/foo"), "example.com");
-        assert_eq!(extract_http_host("[::1]:7878"), "::1");
-        assert_eq!(extract_http_host("[2001:db8::1]:443/x"), "2001:db8::1");
-        assert_eq!(extract_http_host("192.168.1.1"), "192.168.1.1");
+    fn control_plane_host_strips_scheme_userinfo_and_port() {
+        assert_eq!(control_plane_host("127.0.0.1:7878/vms"), "127.0.0.1");
+        assert_eq!(control_plane_host("example.com/foo"), "example.com");
+        assert_eq!(control_plane_host("[::1]:7878"), "::1");
+        assert_eq!(control_plane_host("[2001:db8::1]:443/x"), "2001:db8::1");
+        assert_eq!(control_plane_host("192.168.1.1"), "192.168.1.1");
+        assert_eq!(
+            control_plane_host("http://user:pass@127.0.0.1:7878"),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            control_plane_host("https://user:pass@ctrl.example.com/v1"),
+            "ctrl.example.com"
+        );
     }
 
     #[test]
