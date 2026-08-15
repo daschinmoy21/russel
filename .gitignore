@@ -8,3 +8,6 @@ microvm.nix/
 .commandcode/
 .kiro/
 .pi-subagents/
+.direnv/
+.opencode/
+dashboard/package-lock.json
