@@ -2,10 +2,12 @@
  * Unit tests for API base validation and URL joining.
  * Run: bun test (from dashboard/)
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	apiBaseValidationError,
+	getApiBase,
 	joinApiUrl,
+	setApiBase,
 	validateApiBase,
 } from "./api";
 
@@ -118,5 +120,77 @@ describe("apiBaseValidationError", () => {
 
 	test("mentions scheme", () => {
 		expect(apiBaseValidationError("javascript:void(0)")).toMatch(/scheme/i);
+	});
+});
+
+describe("getApiBase / setApiBase", () => {
+	const store = new Map<string, string>();
+	const memoryStorage = {
+		getItem(key: string) {
+			return store.has(key) ? store.get(key)! : null;
+		},
+		setItem(key: string, value: string) {
+			store.set(key, String(value));
+		},
+		removeItem(key: string) {
+			store.delete(key);
+		},
+		clear() {
+			store.clear();
+		},
+		key(i: number) {
+			return [...store.keys()][i] ?? null;
+		},
+		get length() {
+			return store.size;
+		},
+	};
+
+	beforeEach(() => {
+		store.clear();
+		// get/setApiBase gate on `window`; bun test has no DOM by default.
+		(globalThis as any).window = globalThis;
+		(globalThis as any).localStorage = memoryStorage;
+	});
+	afterEach(() => {
+		store.clear();
+		delete (globalThis as any).localStorage;
+		// leave window alone if other suites need it; only remove our stub if we set it
+		if ((globalThis as any).window === globalThis) {
+			delete (globalThis as any).window;
+		}
+	});
+
+	test("default when unset is /api", () => {
+		expect(getApiBase()).toBe("/api");
+	});
+
+	test("set/get relative and absolute bases", () => {
+		setApiBase("/v1/russel");
+		expect(getApiBase()).toBe("/v1/russel");
+		expect(memoryStorage.getItem("RUSSEL_API_URL")).toBe("/v1/russel");
+
+		setApiBase("https://ctrl.example.com/api/");
+		expect(getApiBase()).toBe("https://ctrl.example.com/api");
+	});
+
+	test("set root normalizes to empty string and get returns it", () => {
+		setApiBase("/");
+		expect(memoryStorage.getItem("RUSSEL_API_URL")).toBe("");
+		expect(getApiBase()).toBe("");
+		expect(joinApiUrl(getApiBase(), "/vms")).toBe("/vms");
+	});
+
+	test("set rejects query/fragment/credentials and leaves storage unchanged", () => {
+		setApiBase("/api");
+		expect(() => setApiBase("/api?x=1")).toThrow(/query|fragment/i);
+		expect(() => setApiBase("https://ex.com#frag")).toThrow(/query|fragment/i);
+		expect(() => setApiBase("https://u:p@ex.com")).toThrow(/credentials/i);
+		expect(getApiBase()).toBe("/api");
+	});
+
+	test("invalid stored value falls back to /api", () => {
+		memoryStorage.setItem("RUSSEL_API_URL", "javascript:alert(1)");
+		expect(getApiBase()).toBe("/api");
 	});
 });
