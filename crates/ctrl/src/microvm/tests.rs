@@ -6,8 +6,6 @@ use super::runner::{MicrovmRunner, select_kernel_version};
 use crate::network::{PortAllocator, lookup_subnet, release_subnet, subnet_for};
 use std::path::PathBuf;
 
-// ── Stop process-selection fallback (metadata / registry / service-path) ────
-
 #[test]
 fn stop_tap_prefers_metadata_over_registry() {
     crate::network::test_with_empty_registry(|| {
@@ -277,8 +275,6 @@ fn which_busybox() -> Option<PathBuf> {
         PathBuf::from("/nix/store/4s514kmhnmncvcsvjh3d17y7y0psbyc1-busybox-1.37.0/bin/busybox");
     store.is_file().then_some(store)
 }
-
-// ── network_alloc_for_service ownership contract ────────────────────────────
 
 #[test]
 fn network_alloc_none_without_metadata_or_lease() {

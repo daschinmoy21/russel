@@ -4,9 +4,6 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-// ── RUSSEL_PODMAN_USER env support (Issue #278598) ───────────────────────────
-
-// ── Rootless podman user (Issue #278598) ─────────────────────────────────────
 // microVMs need a privileged ctrl (TAP/KVM). Containers must stay rootless.
 // When ctrl is root, run podman as RUSSEL_PODMAN_USER or SUDO_USER.
 

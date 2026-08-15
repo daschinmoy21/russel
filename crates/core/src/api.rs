@@ -320,10 +320,6 @@ pub struct RollbackRequest {
     pub version: Option<u32>,
 }
 
-// ---------------------------------------------------------------------------
-// Agent API (horizontal scaling Phase 1 / #213)
-// ---------------------------------------------------------------------------
-
 /// Worker readiness reported on heartbeat.
 ///
 /// `Ready` can receive new work; `NotReady` is draining or unhealthy.

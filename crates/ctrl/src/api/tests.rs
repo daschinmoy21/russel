@@ -10,8 +10,6 @@ use crate::metadata::resolve_lifecycle_runtime;
 use crate::state::AppState;
 use russel_core::tokens::constant_time_eq;
 
-// ── auth / concurrency helpers ─────────────────────────────────────
-
 #[test]
 fn token_normalize_empty() {
     assert_eq!(normalize_api_token(None), None);
@@ -107,8 +105,6 @@ fn parse_max_concurrent_deploys_clamps() {
     assert_eq!(parse_max_concurrent_deploys(Some("nope")), 4);
 }
 
-// ── existing tests ─────────────────────────────────────────────────
-
 #[test]
 fn resolve_lifecycle_runtime_uses_state_over_disk_default() {
     assert_eq!(
@@ -126,8 +122,6 @@ fn runtime_label_matches_kind() {
     assert_eq!(runtime_label(RuntimeKind::Microvm), "microvm");
     assert_eq!(runtime_label(RuntimeKind::Container), "container");
 }
-
-// ── constant_time_eq ───────────────────────────────────────────────
 
 #[test]
 fn constant_time_eq_identical() {
@@ -163,8 +157,6 @@ fn constant_time_eq_zeroed_suffix_matches() {
     let long = [0u8; 257];
     assert!(!constant_time_eq(&short, &long));
 }
-
-// ── POST /deploy vm_id contract (#300) ─────────────────────────────
 
 /// POST /deploy helper that does **not** mutate process environment.
 ///

@@ -51,7 +51,6 @@ impl DeployPipeline {
         let mem_mb = config.service.memory.as_mebibytes();
         let app_path = format!("{}/bin/{bin_name}", store_path.display());
 
-        // ── Write deploy.env for the agent init ─────────────────────────
         let t = Instant::now();
         let _ = tx
             .send(DeployEvent::Progress {
@@ -80,7 +79,6 @@ impl DeployPipeline {
             "deploy.env written, agent initramfs ready"
         );
 
-        // ── TAP + socat + boot/restore VM ──────────────────────────────
         let _ = tx
             .send(DeployEvent::Progress {
                 phase: "start".into(),
@@ -111,7 +109,6 @@ impl DeployPipeline {
             )
             .await?;
 
-        // ── Write metadata via build_microvm_metadata ────────────────
         let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
         let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
         let mut meta = build_microvm_metadata_with_gen(
@@ -156,7 +153,6 @@ impl DeployPipeline {
             "network + VM booted/restored"
         );
 
-        // ── Wait for VM service to be reachable ────────────────────────
         let t = Instant::now();
         let _ = tx
             .send(DeployEvent::Progress {

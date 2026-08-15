@@ -100,9 +100,8 @@ async fn reconcile_service(
     service_id: &str,
     metadata_path: &Path,
 ) -> anyhow::Result<ReconcileOutcome> {
-    let record = match metadata::load_service_disk_record_from(metadata_path) {
-        Some(r) => r,
-        None => return Ok(ReconcileOutcome::Skipped),
+    let Some(record) = metadata::load_service_disk_record_from(metadata_path) else {
+        return Ok(ReconcileOutcome::Skipped);
     };
 
     let runtime = record.runtime.unwrap_or(RuntimeKind::Microvm);
@@ -169,8 +168,6 @@ async fn reconcile_service(
     }
 }
 
-// ── Liveness probes ───────────────────────────────────────────────────────────
-
 /// Check whether a microVM's cloud-hypervisor process is alive *and* matches
 /// the expected identity (guards against PID reuse after ctrl restart).
 ///
@@ -179,13 +176,9 @@ async fn reconcile_service(
 fn probe_microvm_alive(record: &ServiceDiskRecord, tap_id: Option<&str>) -> bool {
     let service_id = record.service_id.as_deref().unwrap_or("");
 
-    if let Some(pid) = record.vm_pid
-        && ch_pid_matches(pid, service_id, tap_id)
-    {
-        return true;
-    }
-
-    false
+    record
+        .vm_pid
+        .is_some_and(|pid| ch_pid_matches(pid, service_id, tap_id))
 }
 
 /// Identity check for cloud-hypervisor PIDs.

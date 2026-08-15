@@ -69,7 +69,6 @@ fn validate_passthrough_env_assignment(flag: &str, val: &str) -> anyhow::Result<
 /// Returns `Ok(())` when `arg` is not a special-cased deny (caller continues
 /// allowlist matching). Bails when `arg` is reserved or always-denied.
 fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
-    // ── Reserved by Russel (owned flags) ──────────────────────────────────
     if arg == "--rootfs" || arg.starts_with("--rootfs=") {
         anyhow::bail!("podman passthrough arg reserved by Russel: --rootfs");
     }
@@ -94,7 +93,6 @@ fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
         anyhow::bail!("podman passthrough arg denied for security: port publish ({arg})");
     }
 
-    // ── Always-denied isolation / escape flags (explicit messages) ────────
     // All --privileged variants (including =false) — deny for simplicity.
     if arg == "--privileged" || arg.starts_with("--privileged=") {
         anyhow::bail!("podman passthrough arg denied for security: --privileged");
@@ -183,7 +181,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
         // Stable denials for reserved / known-unsafe flags (before allowlist match).
         deny_known_unsafe_passthrough(arg)?;
 
-        // ── Allowlist: network ────────────────────────────────────────────
         if arg == "--network" || arg == "--net" || arg == "-net" {
             let val = require_passthrough_value(arg, next)?;
             validate_passthrough_network_mode(arg, val)?;
@@ -201,7 +198,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: userns (keep-id only) ──────────────────────────────
         if arg == "--userns" {
             let val = require_passthrough_value(arg, next)?;
             validate_passthrough_userns(val)?;
@@ -220,7 +216,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: cap-drop (further drops only; re-asserted after extras) ─
         if arg == "--cap-drop" {
             let _ = require_passthrough_value(arg, next)?;
             i += 2;
@@ -231,7 +226,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: secret ─────────────────────────────────────────────
         if arg == "--secret" {
             let _ = require_passthrough_value(arg, next)?;
             i += 2;
@@ -242,7 +236,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: env (-e / --env), non-PORT ─────────────────────────
         // Long forms before compact `-e…` so `--env` is not misparsed.
         if arg == "--env" || arg == "-e" {
             let val = require_passthrough_value(arg, next)?;
@@ -268,7 +261,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: label / annotation ─────────────────────────────────
         if arg == "--label" || arg == "-l" {
             let _ = require_passthrough_value(arg, next)?;
             i += 2;
@@ -295,7 +287,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: resource limits ────────────────────────────────────
         const RESOURCE_FLAGS: &[&str] = &[
             "--memory",
             "--memory-swap",
@@ -320,7 +311,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: tmpfs (in-container only; path:options) ────────────
         if arg == "--tmpfs" {
             let val = require_passthrough_value(arg, next)?;
             validate_passthrough_tmpfs(val)?;
@@ -333,7 +323,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Allowlist: volume / mount (nix-store RO only) ─────────────────
         // Long forms before compact `-v…`.
         if arg == "--volume" || arg == "-v" {
             let val = require_passthrough_value(arg, next)?;
@@ -366,7 +355,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Default deny: unknown flag ────────────────────────────────────
         // Prefer a short flag name in the message for operators.
         let flag_name = arg.split('=').next().unwrap_or(arg);
         anyhow::bail!(

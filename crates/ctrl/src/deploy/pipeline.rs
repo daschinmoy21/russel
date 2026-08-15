@@ -400,7 +400,6 @@ impl DeployPipeline {
         request: DeployRequest,
         tx: tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<DeployInnerResult> {
-        // ── 1. Resolve repo ──────────────────────────────────────────────────
         let t = Instant::now();
         let _ = tx
             .send(DeployEvent::Progress {
@@ -474,7 +473,6 @@ impl DeployPipeline {
             "repo resolved"
         );
 
-        // ── 2. Build (+ kernel stack only for microVM) ───────────────────
         let t = Instant::now();
         let build_description = if runtime == RuntimeKind::Microvm {
             "Building package + ensuring kernel/busybox/modules"

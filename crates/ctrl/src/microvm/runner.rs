@@ -95,7 +95,7 @@ impl MicrovmRunner {
             tracing::warn!("RUSSEL_KERNEL_PATH={env_path} does not exist, continuing");
         }
 
-        if let Some(repo_root) = self.find_repo_root()
+        if let Some(repo_root) = Self::find_repo_root()
             && repo_root.join("flake.nix").exists()
         {
             match self.build_flake_kernel(&repo_root).await {
@@ -154,7 +154,7 @@ impl MicrovmRunner {
 
     /// Find the repo root by looking for flake.nix upward from
     /// CARGO_MANIFEST_DIR (compile-time) or cwd (runtime).
-    fn find_repo_root(&self) -> Option<PathBuf> {
+    fn find_repo_root() -> Option<PathBuf> {
         // Compile-time: CARGO_MANIFEST_DIR is crates/ctrl → ../../ is repo root
         let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         if compile_time.join("flake.nix").exists() {
@@ -1037,9 +1037,6 @@ impl MicrovmRunner {
         if service_id.contains('/') || service_id.contains('\\') {
             anyhow::bail!("service_id cannot contain path separators");
         }
-        if service_id.contains("..") || service_id == "." {
-            anyhow::bail!("service_id cannot contain path traversal components");
-        }
         if !service_id
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
@@ -1063,11 +1060,7 @@ pub(super) fn select_kernel_version(versions: &mut [String]) -> anyhow::Result<S
         anyhow::bail!("no kernel versions provided");
     }
     versions.sort();
-    // Safe: we bail above if versions is empty.
-    versions
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("unreachable: versions is empty"))
+    Ok(versions[versions.len() - 1].clone())
 }
 
 #[async_trait::async_trait]

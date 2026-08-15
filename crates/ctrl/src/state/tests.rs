@@ -465,8 +465,6 @@ fn test_list_services() {
     assert_eq!(ids, vec!["a", "m", "z"]);
 }
 
-// ── mark_building vm_state transition tests ──────────────────────────────
-
 #[test]
 fn test_mark_building_resets_failed_vm_state() {
     // Verify that redeploying a failed service resets vm_state to pending,
@@ -498,8 +496,6 @@ fn test_mark_building_preserves_running_vm_state() {
     assert_eq!(status.status, "building");
     assert_eq!(status.vm_state, "pending");
 }
-
-// ── mark_failed prior-state preservation tests ───────────────────────────
 
 #[test]
 fn test_mark_failed_preserves_prior_running_state() {
@@ -553,8 +549,6 @@ fn test_mark_failed_after_take_processes_sets_failed() {
     assert_eq!(status.vm_state, "failed");
 }
 
-// ── ensure_service tests ─────────────────────────────────────────────────
-
 #[test]
 fn test_ensure_service_creates_minimal_entry() {
     let state = AppState::default();
@@ -597,8 +591,6 @@ fn test_ensure_service_does_not_overwrite_existing() {
     assert_eq!(status.status, "deployed");
     assert_eq!(status.vm_state, "running");
 }
-
-// ── process supervisor (issue #32) ───────────────────────────────────────
 
 #[tokio::test]
 async fn supervisor_marks_failed_when_child_exits() {
@@ -653,8 +645,6 @@ async fn supervisor_ignores_intentional_take_processes() {
         let _ = child.wait().await;
     }
 }
-
-// ── deploy tracking tests ─────────────────────────────────────────────
 
 #[test]
 fn test_begin_deploy_increments_counter() {
@@ -761,8 +751,6 @@ async fn test_wait_for_deploys_no_lost_notification_race() {
         assert_eq!(state.deploy_count.load(Ordering::SeqCst), 0);
     }
 }
-
-// ── adopt / reconcile APIs ────────────────────────────────────────────────
 
 #[test]
 fn test_adopt_running_microvm_sets_deployed() {

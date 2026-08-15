@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-// ── VmSpec: centralized, hotplug-ready Cloud Hypervisor spawn config ────────
-
 /// Filesystem mount for Cloud Hypervisor `--fs` arguments.
 #[derive(Debug, Clone)]
 pub struct FsMount {
@@ -44,8 +42,6 @@ pub struct VmSpec {
     /// If true, use `--restore source_url=…` instead of `--kernel`.
     pub restore_url: Option<String>,
 }
-
-// ── Kernel info ──────────────────────────────────────────────────────────────
 
 /// Result of kernel resolution.
 #[derive(Debug, Clone)]

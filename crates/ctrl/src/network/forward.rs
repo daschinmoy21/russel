@@ -1,5 +1,3 @@
-// ── IP forwarding tracking (#39) ─────────────────────────────────────────────
-
 use std::sync::LazyLock;
 
 use tokio::process::Command;
@@ -51,7 +49,6 @@ async fn count_rsl_taps() -> usize {
     }
 }
 
-// ── Guest FORWARD isolation (#187) ───────────────────────────────────────────
 //
 // Architecture: host→guest publish uses userspace `socat` (OUTPUT path), not
 // kernel FORWARD. Guests only need L2 on their TAP + host→guest L3 for socat.

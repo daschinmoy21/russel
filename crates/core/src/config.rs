@@ -463,8 +463,6 @@ type = "kubernetes"
         assert_eq!(resolved, RuntimeKind::Container);
     }
 
-    // ── env var tests ──────────────────────────────────────────────────
-
     #[test]
     fn service_env_defaults_to_empty() {
         let toml = r#"
@@ -604,8 +602,6 @@ FEATURE_X = "1"
         assert_eq!(merged.get("C"), Some(&"overlay_c".to_string()));
     }
 
-    // ── F-34 / #134: port 0 + memory minimum ─────────────────────────
-
     #[test]
     fn reject_port_zero() {
         let toml = r#"
@@ -655,8 +651,6 @@ memory = "16mb"
         assert_eq!(config.service.memory.as_mebibytes(), 16);
     }
 
-    // ── #135: source validation ──────────────────────────────────────
-
     #[test]
     fn validate_source_accepts_dot() {
         validate_source_path(".").unwrap();
@@ -687,8 +681,6 @@ memory = "16mb"
         let err = validate_source_path("sub/../../escape").unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
     }
-
-    // ── cpus ────────────────────────────────────────────────────────
 
     #[test]
     fn cpus_defaults_to_1() {

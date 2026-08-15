@@ -2,8 +2,6 @@
 
 use std::path::Path;
 
-// ── Agent init script (config-driven guest, no app baked in) ────────────────
-
 /// Basename for the agent initramfs CPIO file. Bump when `AGENT_INIT_SCRIPT` changes
 /// so stale disk caches cannot serve an old init.
 pub(super) const AGENT_INITRAMFS_BASENAME: &str = "agent-initramfs-v3.cpio";

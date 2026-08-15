@@ -180,9 +180,8 @@ impl DesiredStateSnapshot {
 
     pub fn is_rollback_ready(&self) -> bool {
         self.repo_url
-            .as_ref()
-            .map(|u| !u.trim().is_empty())
-            .unwrap_or(false)
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
     }
 }
 
@@ -335,14 +334,11 @@ fn recompute_rollback_ready(entry: &mut JournalEntry) {
     let ready = entry
         .desired_state
         .as_ref()
-        .map(DesiredStateSnapshot::is_rollback_ready)
-        .unwrap_or(false)
+        .is_some_and(DesiredStateSnapshot::is_rollback_ready)
         || entry
             .repo_url
-            .as_ref()
-            .map(|u| !u.trim().is_empty())
-            .unwrap_or(false);
-    // Active is never a rollback target of itself.
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
     entry.rollback_ready = ready && entry.status != STATUS_ACTIVE;
 }
 
@@ -542,22 +538,15 @@ pub fn select_rollback_target_at(
 }
 
 fn entry_is_rollbackable(entry: &JournalEntry) -> bool {
-    if entry.rollback_ready {
-        return true;
-    }
-    if entry
-        .desired_state
-        .as_ref()
-        .map(DesiredStateSnapshot::is_rollback_ready)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    entry
-        .repo_url
-        .as_ref()
-        .map(|u| !u.trim().is_empty())
-        .unwrap_or(false)
+    entry.rollback_ready
+        || entry
+            .desired_state
+            .as_ref()
+            .is_some_and(DesiredStateSnapshot::is_rollback_ready)
+        || entry
+            .repo_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
 }
 
 #[cfg(test)]

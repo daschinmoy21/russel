@@ -81,8 +81,6 @@ impl WarmPool {
         self.ready.load(Ordering::Acquire)
     }
 
-    // ── Prepare ──────────────────────────────────────────────────────────
-
     /// Build the warm pool snapshot in the background.
     ///
     /// Idempotent: if the pool is already ready, returns immediately.
@@ -253,8 +251,6 @@ impl WarmPool {
         let _ = TapForwarder::teardown(alloc).await;
         let _ = tokio::fs::remove_dir_all(sock_dir).await;
     }
-
-    // ── Restore or boot ──────────────────────────────────────────────────
 
     /// Acquire a VM: restore from warm pool snapshot if ready, else cold boot.
     ///
@@ -533,8 +529,6 @@ impl WarmPool {
         Ok(patched)
     }
 }
-
-// ── Public accessor ─────────────────────────────────────────────────────────
 
 use std::sync::LazyLock;
 

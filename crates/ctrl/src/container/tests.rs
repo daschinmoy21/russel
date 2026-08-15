@@ -284,7 +284,6 @@ fn build_run_args_includes_rootfs_mount_ports_memory_and_labels() {
     assert!(args.contains(&"RUSSEL=1".to_string()));
     assert_eq!(args.last().unwrap(), "/bin/api");
 
-    // ── Hardening flags: verify flag/value adjacency, not just presence ──
     let has_adjacent =
         |flag: &str, val: &str| -> bool { args.windows(2).any(|w| w[0] == flag && w[1] == val) };
     assert!(
@@ -383,8 +382,6 @@ fn validate_podman_passthrough_accepts_common_flags() {
     validate_podman_passthrough_args(&args).unwrap();
 }
 
-// ── Issue #2: PORT override rejection ───────────────────────────────────
-
 #[test]
 fn reject_port_override_via_e_flag() {
     for (arg, next) in [("-e", Some("PORT=3000")), ("--env", Some("PORT=3000"))] {
@@ -432,8 +429,6 @@ fn managed_port_appears_after_passthrough_env() {
         "passthrough -e FOO=bar should appear before managed PORT"
     );
 }
-
-// ── Issue #3: isolation-weakening rejection ─────────────────────────────
 
 #[test]
 fn reject_privileged() {
@@ -521,8 +516,6 @@ fn reject_port_publish() {
         );
     }
 }
-
-// ── Volume / mount denials ────────────────────────────────────────────
 
 #[test]
 fn reject_volume_non_nix_store_source() {
@@ -680,8 +673,6 @@ fn reject_mount_missing_source() {
     assert!(err.to_string().contains("missing source"), "{err}");
 }
 
-// ── Path-traversal / allowlist hardening (#192) ───────────────────────
-
 #[test]
 fn reject_volume_path_traversal_past_nix_store() {
     for val in [
@@ -806,8 +797,6 @@ fn validate_nix_store_source_direct() {
     assert!(validate_nix_store_source("/nix/store/foo/../../../etc/passwd").is_err());
 }
 
-// ── --env-file denial ─────────────────────────────────────────────────
-
 #[test]
 fn reject_env_file() {
     for arg in ["--env-file", "--env-file=/etc/host-env"] {
@@ -819,8 +808,6 @@ fn reject_env_file() {
     }
 }
 
-// ── --entrypoint denial ───────────────────────────────────────────────
-
 #[test]
 fn reject_entrypoint() {
     for arg in ["--entrypoint", "--entrypoint=/bin/sh"] {
@@ -831,8 +818,6 @@ fn reject_entrypoint() {
         );
     }
 }
-
-// ── --user / -u denial ────────────────────────────────────────────────
 
 #[test]
 fn reject_user() {
@@ -853,8 +838,6 @@ fn reject_user() {
         );
     }
 }
-
-// ── --network allowlist ───────────────────────────────────────────────
 
 #[test]
 fn reject_network_disallowed() {
@@ -884,8 +867,6 @@ fn accept_network_allowed_modes() {
         validate_podman_passthrough_args(&[format!("--network={mode}")]).unwrap();
     }
 }
-
-// ── --userns allowlist ────────────────────────────────────────────────
 
 #[test]
 fn reject_userns_disallowed() {
@@ -918,45 +899,43 @@ fn reject_userns_no_value() {
     assert!(err.to_string().contains("requires a value"), "{err}");
 }
 
-// ── --secret is allowed ───────────────────────────────────────────────
-
 #[test]
 fn accept_secret() {
     validate_podman_passthrough_args(&["--secret".into(), "mysecret".into()]).unwrap();
     validate_podman_passthrough_args(&["--secret=mysecret".into()]).unwrap();
 }
 
-// ── Issue #191: allowlist default-deny + hardening re-assert ──────────
-
 #[test]
 fn reject_unknown_passthrough_flags() {
-    for arg in [
-        "--hooks-dir=/tmp/hooks",
-        "--runtime=runc",
-        "--sysctl=net.ipv4.ip_forward=1",
-        "--pid=host",
-        "--ipc=host",
-        "--uts=host",
-        "--cgroupns=host",
-        "--systemd=always",
-        "--pull=always",
-        "--gidmap=0:0:1",
-        "--uidmap=0:0:1",
-        "--executable=/bin/sh",
-        "--conmon-pidfile=/tmp/x",
-        "--cidfile=/tmp/x",
-    ] {
-        let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not on the allowlist")
-                || msg.contains("denied for security")
-                || msg.contains("hooks-dir")
-                || msg.contains("runtime")
-                || msg.contains("pid"),
-            "expected allowlist denial for {arg}: {err}"
-        );
-    }
+    with_allow_podman_args_env(None, || {
+        for arg in [
+            "--hooks-dir=/tmp/hooks",
+            "--runtime=runc",
+            "--sysctl=net.ipv4.ip_forward=1",
+            "--pid=host",
+            "--ipc=host",
+            "--uts=host",
+            "--cgroupns=host",
+            "--systemd=always",
+            "--pull=always",
+            "--gidmap=0:0:1",
+            "--uidmap=0:0:1",
+            "--executable=/bin/sh",
+            "--conmon-pidfile=/tmp/x",
+            "--cidfile=/tmp/x",
+        ] {
+            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not on the allowlist")
+                    || msg.contains("denied for security")
+                    || msg.contains("hooks-dir")
+                    || msg.contains("runtime")
+                    || msg.contains("pid"),
+                "expected allowlist denial for {arg}: {err}"
+            );
+        }
+    });
 }
 
 #[test]
@@ -1189,8 +1168,6 @@ fn build_run_args_reasserts_hardening_after_passthrough() {
         "hardening must still appear before --rootfs; args={args:?}"
     );
 }
-
-// ── Issue #4: env wrapper in rootfs ─────────────────────────────────────
 
 #[tokio::test]
 async fn prepare_rootfs_creates_env_wrapper() {
@@ -1435,7 +1412,6 @@ async fn e2e_podman_container_lifecycle() {
     assert!(runner.inspect(service_id).await.unwrap().is_none());
 }
 
-// ── RUSSEL_PODMAN_USER tests (Issue #278598) ────────────────────────
 // Serialize env mutations: cargo runs tests in parallel by default.
 
 static PODMAN_USER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1532,8 +1508,6 @@ fn resolve_podman_user_rejects_root_and_empty() {
     assert_eq!(resolve_podman_user(Some(""), None, 0), None);
     assert_eq!(resolve_podman_user(Some("  "), None, 0), None);
 }
-
-// ── container_name trust / resolve (Issue #193) ─────────────────────
 
 #[test]
 fn trusted_container_name_accepts_canonical() {

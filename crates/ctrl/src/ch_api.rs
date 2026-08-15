@@ -35,8 +35,6 @@ impl ChClient {
     }
 }
 
-// ── Empty-body PUT ───────────────────────────────────────────────────────────
-
 /// Send an empty-body PUT to a Cloud Hypervisor API endpoint.
 ///
 /// Used for: `vm.pause`, `vm.resume`, `vm.shutdown`, `vmm.shutdown`, etc.
@@ -49,8 +47,6 @@ impl ChClient {
         put_request(&self.api_socket, endpoint, None).await
     }
 }
-
-// ── JSON-body PUT ────────────────────────────────────────────────────────────
 
 /// Send a JSON-body PUT to a Cloud Hypervisor API endpoint.
 ///
@@ -69,8 +65,6 @@ impl ChClient {
         put_request(&self.api_socket, endpoint, Some(body)).await
     }
 }
-
-// ── VM lifecycle helpers ─────────────────────────────────────────────────────
 
 /// Pause a running VM (prep for snapshot).
 pub async fn vm_pause(api_socket: &Path) -> anyhow::Result<()> {
@@ -92,8 +86,6 @@ pub async fn vm_snapshot(api_socket: &Path, destination_url: &str) -> anyhow::Re
     let body = serde_json::json!({"destination_url": destination_url});
     json_put(api_socket, "vm.snapshot", &body).await
 }
-
-// ── Internal HTTP PUT ────────────────────────────────────────────────────────
 
 /// Build the raw HTTP PUT request bytes (headers only) for a CH endpoint.
 ///

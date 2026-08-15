@@ -29,8 +29,6 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-// ── helpers ───────────────────────────────────────────────────────────
-
 fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -222,8 +220,6 @@ fn seed_service(state: &AppState, id: &str) {
 
 const STRONG_TOKEN: &str = "integration-test-token-32chars!!"; // 32 chars
 
-// ── inventory ────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn vms_list_empty_when_no_services() {
     let _env = EnvGuard::open_auth();
@@ -303,8 +299,6 @@ async fn logs_all_rejects_multiple_services() {
     assert!(text.contains("multiple services"), "body={text}");
 }
 
-// ── per-service routes ───────────────────────────────────────────────
-
 #[tokio::test]
 async fn vm_status_not_found() {
     let _env = EnvGuard::open_auth();
@@ -381,8 +375,6 @@ async fn destroy_unknown_service_is_not_found() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
-// ── auth ─────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn auth_required_when_token_configured() {
     let _env = EnvGuard::with_token(STRONG_TOKEN);
@@ -439,8 +431,6 @@ async fn auth_accepts_case_insensitive_bearer_scheme() {
     assert!(vms.iter().any(|v| v.as_str() == Some("authed")));
 }
 
-// ── secrets ──────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn secrets_list_set_delete_roundtrip() {
     let tmp = TempDir::new().unwrap();
@@ -496,8 +486,6 @@ async fn secrets_reject_invalid_name() {
         "body={text}"
     );
 }
-
-// ── deploy request shape ─────────────────────────────────────────────
 
 #[tokio::test]
 async fn deploy_rejects_malformed_json() {

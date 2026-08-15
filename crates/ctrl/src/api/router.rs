@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     middleware,
     routing::{delete, get, post},
 };
@@ -60,18 +60,24 @@ fn ndjson_response(rx: tokio::sync::mpsc::Receiver<DeployEvent>) -> axum::respon
         let json = serde_json::to_string(&msg).map_err(std::io::Error::other)?;
         Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{}\n", json)))
     });
-    axum::response::Response::builder()
-        .header("Content-Type", "application/x-ndjson")
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to build NDJSON stream response");
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from(e.to_string()))
-                .unwrap_or_else(|_| {
-                    axum::response::Response::new(axum::body::Body::from("internal server error"))
-                })
-        })
+    let mut response = axum::response::Response::new(axum::body::Body::from_stream(stream));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response
+}
+
+fn text_response(
+    status: StatusCode,
+    body: impl Into<axum::body::Body>,
+) -> axum::response::Response {
+    let mut response = axum::response::Response::new(body.into());
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    response
 }
 
 /// Spawn an NDJSON-streamed deploy/update task, enforcing the deploy semaphore
@@ -84,23 +90,20 @@ fn spawn_deploy_stream(
     service_id: String,
     task_label: &'static str,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let permit = match deploy_semaphore().try_acquire() {
-        Ok(p) => p,
-        Err(_) => {
-            let max = max_concurrent_deploys();
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("too many concurrent deploys (max {max}); retry later"),
-            ));
-        }
-    };
+    let permit = deploy_semaphore().try_acquire().map_err(|_| {
+        let max = max_concurrent_deploys();
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("too many concurrent deploys (max {max}); retry later"),
+        )
+    })?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let deploy_tx = tx.clone();
     let monitor_state = state.clone();
     let deploy_guard = state.begin_deploy();
-    let sid = service_id.clone();
-    let sid2 = service_id.clone();
+    let sid = service_id;
+    let sid2 = sid.clone();
 
     let deploy_handle = tokio::spawn(async move {
         let _permit = permit;
@@ -127,7 +130,7 @@ fn spawn_deploy_stream(
             let panic = e.into_panic();
             let detail = panic
                 .downcast_ref::<&'static str>()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| format!("{task_label} deploy task panicked"));
             tracing::error!(
@@ -152,13 +155,7 @@ async fn deploy(
     Json(request): Json<DeployRequest>,
 ) -> axum::response::Response {
     if let Some(err) = request.port.as_ref().and_then(|p| p.validate().err()) {
-        return axum::response::Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "text/plain")
-            .body(axum::body::Body::from(err))
-            .unwrap_or_else(|_| {
-                axum::response::Response::new(axum::body::Body::from("internal server error"))
-            });
+        return text_response(StatusCode::BAD_REQUEST, err);
     }
 
     // #300: never default to shared "api" — concurrent deploys would collide.
@@ -170,15 +167,10 @@ async fn deploy(
     {
         Some(id) => id.to_string(),
         None => {
-            return axum::response::Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "text/plain")
-                .body(axum::body::Body::from(
-                    "vm_id is required (e.g. \"my-service\"); shared default \"api\" was removed",
-                ))
-                .unwrap_or_else(|_| {
-                    axum::response::Response::new(axum::body::Body::from("internal server error"))
-                });
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "vm_id is required (e.g. \"my-service\"); shared default \"api\" was removed",
+            );
         }
     };
 
@@ -191,13 +183,7 @@ async fn deploy(
 
     match spawn_deploy_stream(state, request, service_id, "deploy") {
         Ok(response) => response,
-        Err((status, message)) => axum::response::Response::builder()
-            .status(status)
-            .header("Content-Type", "text/plain")
-            .body(axum::body::Body::from(message))
-            .unwrap_or_else(|_| {
-                axum::response::Response::new(axum::body::Body::from("internal server error"))
-            }),
+        Err((status, message)) => text_response(status, message),
     }
 }
 
@@ -262,13 +248,11 @@ async fn append_podman_logs(service_id: &str, output: &mut String) {
     let log_path = container_log_path(service_id);
     // #298: only skip podman logs when the on-disk file has usable content.
     // Empty/stale zero-byte files used to short-circuit and hide container output.
-    if log_path.exists() {
-        match tokio::fs::metadata(&log_path).await {
-            Ok(meta) if meta.len() > 0 => return,
-            _ => {
-                // Missing stats or empty file — fall through to `podman logs`.
-            }
-        }
+    if log_path.exists()
+        && let Ok(meta) = tokio::fs::metadata(&log_path).await
+        && meta.len() > 0
+    {
+        return;
     }
 
     let result = crate::container::podman_command()
@@ -339,9 +323,8 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
     let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
     for base in &["/var/lib/russel", "/var/lib/microvms"] {
-        let mut entries = match tokio::fs::read_dir(base).await {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(mut entries) = tokio::fs::read_dir(base).await else {
+            continue;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let Ok(file_type) = entry.file_type().await else {
@@ -651,7 +634,6 @@ async fn vm_update(
         }
     };
 
-    // ── Legacy top-level metadata fields (fallback) ────────────────────────
     let top_repo_url = meta
         .get("repo_url")
         .and_then(|v| v.as_str())
@@ -687,7 +669,6 @@ async fn vm_update(
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok());
 
-    // ── desired_state block (SHARED CONTRACT with deploy-desired-state agent)
     //
     // Typed via DesiredStateSnapshot (serde(default)); when absent/malformed we
     // fall back to the legacy top-level metadata. The writer persists the user's

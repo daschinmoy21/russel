@@ -1,5 +1,3 @@
-// ── Subnet allocation (deterministic per service_id + collision registry) ────
-
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex},
@@ -97,14 +95,15 @@ pub fn subnet_for(service_id: &str) -> anyhow::Result<SubnetAllocation> {
 
     let mut key = network_key(fnv1a(service_id.as_bytes()));
     for attempt in 0u32..1024 {
-        if let Some(owner) = reg.by_key.get(&key) {
-            if owner == service_id {
-                break;
-            }
+        if let Some(owner) = reg.by_key.get(&key)
+            && owner != service_id
+        {
             // Collision on the 16-bit network identity — rehash with salt.
             key = network_key(fnv1a(format!("{service_id}\0salt{attempt}").as_bytes()));
             continue;
         }
+        // Free, or already owned by this service (by_key without by_service).
+        // Inserting both indexes is idempotent in the same-owner case.
         reg.by_key.insert(key, service_id.to_string());
         reg.by_service.insert(service_id.to_string(), key);
         return Ok(allocation_from_network_key(key));
@@ -133,6 +132,16 @@ pub fn test_fill_all_subnet_keys() {
     for k in 0u16..=u16::MAX {
         reg.by_key.insert(k, format!("filler-{k}"));
     }
+}
+
+/// Insert a `by_key` owner without touching `by_service`.
+///
+/// Used to prove `subnet_for` preserves a same-service key instead of
+/// treating it as a collision and rehashing.
+#[cfg(test)]
+pub fn test_insert_key_owner(key: u16, service_id: &str) {
+    let mut reg = subnet_registry();
+    reg.by_key.insert(key, service_id.to_string());
 }
 
 #[cfg(test)]
