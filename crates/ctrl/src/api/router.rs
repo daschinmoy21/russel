@@ -468,9 +468,10 @@ async fn vm_stop(
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to stop service");
             // Keep process ownership; restore prior status and re-supervise
-            // only if this claim's in-progress status is still current.
+            // only if this claim still owns the lifecycle generation.
             state.abort_lifecycle_operation(
                 &service_id,
+                handle.claim_generation,
                 &handle.expected_status,
                 &handle.prior_status,
                 &handle.prior_vm_state,
@@ -796,9 +797,10 @@ async fn vm_destroy(
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
             // Keep process ownership; restore prior status and re-supervise
-            // only if this claim's in-progress status is still current.
+            // only if this claim still owns the lifecycle generation.
             state.abort_lifecycle_operation(
                 &service_id,
+                handle.claim_generation,
                 &handle.expected_status,
                 &handle.prior_status,
                 &handle.prior_vm_state,
@@ -813,6 +815,8 @@ async fn vm_destroy(
 struct LifecycleClaimHandle {
     runtime: RuntimeKind,
     lifecycle: Arc<dyn RuntimeLifecycle>,
+    /// Process generation at claim time; abort must match to restore.
+    claim_generation: u64,
     /// In-progress status this claim set (`stopping` / `destroying`).
     expected_status: String,
     prior_status: String,
@@ -833,12 +837,13 @@ fn claim_lifecycle_operation(
 ) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
     let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
 
-    let (prior_status, prior_vm_state) =
+    let (prior_status, prior_vm_state, claim_generation) =
         match state.begin_lifecycle_operation(service_id, target_status, "pending") {
             LifecycleClaim::Claimed {
                 prior_status,
                 prior_vm_state,
-            } => (prior_status, prior_vm_state),
+                claim_generation,
+            } => (prior_status, prior_vm_state, claim_generation),
             LifecycleClaim::NotFound => {
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -856,6 +861,7 @@ fn claim_lifecycle_operation(
     let handle = LifecycleClaimHandle {
         runtime,
         lifecycle: runtime::lifecycle_for(runtime),
+        claim_generation,
         expected_status: target_status.to_string(),
         prior_status,
         prior_vm_state,

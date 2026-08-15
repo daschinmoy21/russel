@@ -18,9 +18,13 @@ use tokio::sync::Notify;
 pub enum LifecycleClaim {
     /// Service was claimed. Process handles remain in `AppState` until the
     /// success path takes them for reaping; `prior_*` restore status on abort.
+    ///
+    /// `claim_generation` is the process generation after this claim; abort
+    /// must supply the same value so a superseded claim cannot restore.
     Claimed {
         prior_status: String,
         prior_vm_state: String,
+        claim_generation: u64,
     },
     /// No such service in state.
     NotFound,

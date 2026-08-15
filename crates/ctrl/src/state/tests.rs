@@ -219,7 +219,7 @@ async fn begin_lifecycle_keeps_processes_until_take() {
         .spawn()
         .expect("spawn sleep");
     let expected_pid = child.id();
-    state.mark_deployed_with_aux("svc-keep", child, vec![]);
+    state.mark_deployed_with_aux("svc-keep", child, vec![], None, None);
 
     let gen_before = {
         let inner = state.lock_inner();
@@ -231,9 +231,11 @@ async fn begin_lifecycle_keeps_processes_until_take() {
         LifecycleClaim::Claimed {
             prior_status,
             prior_vm_state,
+            claim_generation,
         } => {
             assert_eq!(prior_status, "deployed");
             assert_eq!(prior_vm_state, "running");
+            assert_ne!(claim_generation, gen_before);
         }
         other => panic!("expected Claimed, got non-Claimed: {other:?}"),
     }
@@ -276,12 +278,13 @@ async fn abort_lifecycle_restores_status_and_keeps_processes() {
         .arg("30")
         .spawn()
         .expect("spawn sleep");
-    state.mark_deployed_with_aux("svc-abort", child, vec![]);
+    state.mark_deployed_with_aux("svc-abort", child, vec![], None, None);
 
     let claim = state.begin_lifecycle_operation("svc-abort", "stopping", "pending");
     let LifecycleClaim::Claimed {
         prior_status,
         prior_vm_state,
+        claim_generation,
     } = claim
     else {
         panic!("expected Claimed");
@@ -291,8 +294,15 @@ async fn abort_lifecycle_restores_status_and_keeps_processes() {
         let inner = state.lock_inner();
         inner.services.get("svc-abort").unwrap().process_generation
     };
+    assert_eq!(claim_generation, gen_after_claim);
 
-    state.abort_lifecycle_operation("svc-abort", "stopping", &prior_status, &prior_vm_state);
+    state.abort_lifecycle_operation(
+        "svc-abort",
+        claim_generation,
+        "stopping",
+        &prior_status,
+        &prior_vm_state,
+    );
 
     let status = state.status("svc-abort").unwrap();
     assert_eq!(status.status, "deployed");
@@ -329,13 +339,14 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
         .arg("30")
         .spawn()
         .expect("spawn sleep");
-    state.mark_deployed_with_aux("svc-race", child, vec![]);
+    state.mark_deployed_with_aux("svc-race", child, vec![], None, None);
 
     // First stop claim — snapshots deployed/running.
     let first = state.begin_lifecycle_operation("svc-race", "stopping", "pending");
     let LifecycleClaim::Claimed {
         prior_status: first_prior_status,
         prior_vm_state: first_prior_vm_state,
+        claim_generation: first_gen,
     } = first
     else {
         panic!("expected Claimed for first stop");
@@ -343,9 +354,16 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
     assert_eq!(first_prior_status, "deployed");
     assert_eq!(first_prior_vm_state, "running");
 
-    // Second stop re-enters while first is still in-flight.
+    // Second stop re-enters while first is still in-flight (bumps generation).
     let second = state.begin_lifecycle_operation("svc-race", "stopping", "pending");
-    assert!(matches!(second, LifecycleClaim::Claimed { .. }));
+    let LifecycleClaim::Claimed {
+        claim_generation: second_gen,
+        ..
+    } = second
+    else {
+        panic!("expected Claimed for second stop");
+    };
+    assert_ne!(first_gen, second_gen);
 
     // Later stop succeeds: reap children and commit terminal status.
     let (vm, aux) = state
@@ -362,6 +380,7 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
     // Earlier abort must not overwrite stopped/none with deployed/running.
     state.abort_lifecycle_operation(
         "svc-race",
+        first_gen,
         "stopping",
         &first_prior_status,
         &first_prior_vm_state,
@@ -377,6 +396,67 @@ async fn abort_lifecycle_skips_stale_restore_after_later_success() {
             s.vm_process.is_none(),
             "children stay reaped after stale abort"
         );
+    }
+}
+
+/// Older same-status claim aborts while a newer re-entry is still active:
+/// must not restore the older prior over the newer claim.
+#[tokio::test]
+async fn abort_lifecycle_older_claim_skipped_while_newer_active() {
+    let state = AppState::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    state.mark_deployed_with_aux("svc-overlap", child, vec![], None, None);
+
+    let older = state.begin_lifecycle_operation("svc-overlap", "stopping", "pending");
+    let LifecycleClaim::Claimed {
+        prior_status: older_prior_status,
+        prior_vm_state: older_prior_vm_state,
+        claim_generation: older_gen,
+    } = older
+    else {
+        panic!("expected Claimed for older stop");
+    };
+    assert_eq!(older_prior_status, "deployed");
+
+    let newer = state.begin_lifecycle_operation("svc-overlap", "stopping", "pending");
+    let LifecycleClaim::Claimed {
+        claim_generation: newer_gen,
+        ..
+    } = newer
+    else {
+        panic!("expected Claimed for newer stop");
+    };
+    assert_ne!(older_gen, newer_gen);
+
+    // Older abort while newer still owns the generation — no restore.
+    state.abort_lifecycle_operation(
+        "svc-overlap",
+        older_gen,
+        "stopping",
+        &older_prior_status,
+        &older_prior_vm_state,
+    );
+
+    {
+        let inner = state.lock_inner();
+        let s = inner.services.get("svc-overlap").unwrap();
+        assert_eq!(s.status, "stopping");
+        assert_eq!(s.process_generation, newer_gen);
+        assert!(
+            s.vm_process.is_some(),
+            "children remain for the active claim"
+        );
+    }
+
+    // Clean up.
+    if let Some((vm, _)) = state.take_processes_for_reap("svc-overlap")
+        && let Some(mut child) = vm
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }
 

@@ -525,6 +525,8 @@ impl AppState {
     /// [`abort_lifecycle_operation`] to restore prior status and re-supervise.
     ///
     /// Distinguishes NotFound (no such service) from Busy (conflicting op).
+    /// Same-op re-entry is allowed (hung stop retry); destroy may supersede stop.
+    /// Each claim returns a `claim_generation` that abort must present.
     pub fn begin_lifecycle_operation(
         &self,
         service_id: &str,
@@ -554,12 +556,14 @@ impl AppState {
         s.vm_state = vm_state.to_string();
         // Invalidate supervisor so intentional stop/destroy is not reported as crash.
         // Children remain owned by this ServiceState until take_processes_for_reap.
+        // claim_generation identity is this bumped process_generation.
         s.process_generation = s.process_generation.wrapping_add(1);
         s.prebuild_status = None;
         s.prebuild_vm_state = None;
         LifecycleClaim::Claimed {
             prior_status,
             prior_vm_state,
+            claim_generation: s.process_generation,
         }
     }
 
@@ -579,15 +583,16 @@ impl AppState {
     /// Abort a failed lifecycle op: restore prior status/vm_state, re-bump
     /// generation, and re-spawn a process supervisor if children remain.
     ///
-    /// `expected_status` is the in-progress status this claim set (e.g.
-    /// `"stopping"` / `"destroying"`). Restore is skipped when current status
-    /// no longer matches — a later overlapping stop/destroy may already have
-    /// committed `stopped`/`none` or removed the service, and a stale abort
-    /// must not resurrect a phantom `deployed`/`running` snapshot without
-    /// process handles.
+    /// Restore runs only when `claim_generation` still matches the service's
+    /// current `process_generation` **and** `expected_status` still matches.
+    /// A newer same-status re-entry bumps generation so an older abort cannot
+    /// restore `deployed` over the active claim; a completed stop/destroy
+    /// advances status so a late abort cannot resurrect a phantom running
+    /// snapshot without process handles.
     pub fn abort_lifecycle_operation(
         &self,
         service_id: &str,
+        claim_generation: u64,
         expected_status: &str,
         prior_status: &str,
         prior_vm_state: &str,
@@ -597,8 +602,15 @@ impl AppState {
             let Some(s) = inner.services.get_mut(service_id) else {
                 return;
             };
-            // Stale abort: a newer op completed, superseding claim advanced
-            // status, or remove_service already ran.
+            if s.process_generation != claim_generation {
+                tracing::debug!(
+                    service_id = %service_id,
+                    claim_generation,
+                    current_generation = s.process_generation,
+                    "skipping abort restore; claim superseded by newer lifecycle op"
+                );
+                return;
+            }
             if s.status != expected_status {
                 tracing::debug!(
                     service_id = %service_id,
