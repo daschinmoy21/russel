@@ -517,14 +517,15 @@ async fn deploy_requires_auth_when_token_set() {
 #[tokio::test]
 async fn deploy_with_auth_accepts_request_and_streams_ndjson() {
     // Does not require a successful deploy — only that the control plane
-    // accepts the request and opens an NDJSON stream (pipeline will fail
-    // on clone/build against a nonexistent host, which still yields events).
+    // accepts the request and opens an NDJSON stream. Use a loopback git URL
+    // so SSRF validation fails immediately (no DNS / outbound network).
+    // Pipeline still emits Progress + Complete NDJSON events.
     let _env = EnvGuard::with_token(STRONG_TOKEN);
     let res = post_json_auth(
         app(AppState::default()),
         "/deploy",
         &json!({
-            "repo_url": "https://example.invalid/does-not-exist.git",
+            "repo_url": "https://127.0.0.1/does-not-exist.git",
             "config_path": "Russelfile.toml",
             "vm_id": "integ-deploy",
             "runtime": "container"
@@ -544,7 +545,9 @@ async fn deploy_with_auth_accepts_request_and_streams_ndjson() {
         "content-type={ct}"
     );
 
-    let text = body_text(res).await;
+    let text = tokio::time::timeout(std::time::Duration::from_secs(5), body_text(res))
+        .await
+        .expect("deploy stream body should finish quickly without network I/O");
     assert!(
         !text.trim().is_empty(),
         "expected NDJSON events, got empty body"
