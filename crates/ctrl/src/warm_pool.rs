@@ -26,7 +26,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{process::Command, sync::Notify};
+use tokio::process::Command;
 
 use crate::{
     ch_api,
@@ -49,8 +49,6 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct WarmPool {
     runner: MicrovmRunner,
     ready: AtomicBool,
-    /// Notified when prepare finishes (success or failure).
-    prepare_done: Notify,
     /// Guards concurrent access to golden snapshot files during restore.
     restore_mutex: tokio::sync::Mutex<()>,
 }
@@ -60,7 +58,6 @@ impl WarmPool {
         Self {
             runner,
             ready: AtomicBool::new(false),
-            prepare_done: Notify::new(),
             restore_mutex: tokio::sync::Mutex::new(()),
         }
     }
@@ -68,15 +65,6 @@ impl WarmPool {
     /// True once prepare has finished successfully.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
-    }
-
-    /// Block until prepare finishes (or immediately if already done).
-    #[allow(dead_code)] // for deploy/API callers that gate on warm-pool readiness
-    pub async fn wait_until_prepare_done(&self) {
-        if self.is_ready() {
-            return;
-        }
-        self.prepare_done.notified().await;
     }
 
     // ── Prepare ──────────────────────────────────────────────────────────
@@ -95,7 +83,6 @@ impl WarmPool {
             tracing::info!(
                 "warm pool disabled (set RUSSEL_WARM_POOL=1 for experimental snapshot restore)"
             );
-            self.prepare_done.notify_waiters();
             return Ok(());
         }
 
@@ -107,12 +94,7 @@ impl WarmPool {
             return Ok(());
         }
 
-        // Inner result — on any error, notify waiters so they never hang.
-        let result = self.prepare_inner().await;
-        if result.is_err() {
-            self.prepare_done.notify_waiters();
-        }
-        result
+        self.prepare_inner().await
     }
 
     async fn prepare_inner(&self) -> anyhow::Result<()> {
@@ -156,7 +138,7 @@ impl WarmPool {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
-            memory_mb: 256, // ponytail: minimum viable; hotplug adds headroom
+            memory_mb: 256, // minimum viable; hotplug adds headroom
             memory_hotplug_mb: std::env::var("RUSSEL_MEM_HOTPLUG_MB")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -224,7 +206,6 @@ impl WarmPool {
 
         // 9. Mark ready.
         self.ready.store(true, Ordering::Release);
-        self.prepare_done.notify_waiters();
 
         tracing::info!("warm pool ready");
         Ok(())
@@ -423,7 +404,8 @@ impl WarmPool {
         memory_mb: u16,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
-        // ponytail: scope the lock so it's dropped before any await.
+        // Hold the restore mutex for the whole restore so a concurrent prepare
+        // (or another restore) cannot race the golden snapshot being read.
         let _lock = self.restore_mutex.lock().await;
 
         let sock_dir = format!("/var/lib/russel/{service_id}");

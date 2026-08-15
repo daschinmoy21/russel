@@ -20,7 +20,7 @@ pub(super) const AGENT_INIT_SCRIPT: &str = r#"#!/bin/sh
 /bin/mount -t devtmpfs devtmpfs /dev
 
 # Load virtio/fuse modules if present (stock kernel fallback).
-# ponytail: ordered list matches legacy per-service init, xzcat+insmod.
+# Ordered list matches legacy per-service init, xzcat+insmod.
 if [ -d /modules ] && ls /modules/*.ko.xz >/dev/null 2>&1; then
   echo "Loading kernel modules from /modules..."
   for mod in /modules/virtio_ring.ko.xz /modules/virtio.ko.xz \

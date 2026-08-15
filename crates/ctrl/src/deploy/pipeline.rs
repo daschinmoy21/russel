@@ -155,13 +155,6 @@ impl DeployPipeline {
         }
     }
 
-    /// Replace the build backend (useful for tests).
-    #[allow(dead_code)]
-    pub fn with_builder(mut self, b: Arc<dyn BuildBackend>) -> Self {
-        self.builder = b;
-        self
-    }
-
     pub async fn deploy(
         &self,
         request: DeployRequest,
@@ -184,7 +177,6 @@ impl DeployPipeline {
                     status: "failed".to_string(),
                     store_path: None,
                     microvm_config_path: None,
-                    runner_path: None,
                     port: None,
                     elapsed_ms: started.elapsed().as_millis(),
                     timing: None,
@@ -209,7 +201,6 @@ impl DeployPipeline {
                 status: "failed".to_string(),
                 store_path: None,
                 microvm_config_path: None,
-                runner_path: None,
                 port: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
@@ -232,7 +223,6 @@ impl DeployPipeline {
                 status: "failed".to_string(),
                 store_path: None,
                 microvm_config_path: None,
-                runner_path: None,
                 port: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
@@ -252,7 +242,6 @@ impl DeployPipeline {
                 status: "failed".to_string(),
                 store_path: None,
                 microvm_config_path: None,
-                runner_path: None,
                 port: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 timing: None,
@@ -335,7 +324,6 @@ impl DeployPipeline {
                     status: "deployed".to_string(),
                     store_path: Some(output.store_path.display().to_string()),
                     microvm_config_path,
-                    runner_path: None,
                     port: Some(output.port),
                     elapsed_ms: elapsed,
                     timing: Some(output.timing),
@@ -365,7 +353,6 @@ impl DeployPipeline {
                     status: "rolled_back".to_string(),
                     store_path: None,
                     microvm_config_path: None,
-                    runner_path: None,
                     port: None,
                     elapsed_ms: elapsed,
                     timing: None,
@@ -394,7 +381,6 @@ impl DeployPipeline {
                     status: "failed".to_string(),
                     store_path: None,
                     microvm_config_path: None,
-                    runner_path: None,
                     port: None,
                     elapsed_ms: elapsed,
                     timing: None,

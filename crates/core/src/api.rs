@@ -27,7 +27,6 @@ pub struct DeployResponse {
     pub status: String,
     pub store_path: Option<String>,
     pub microvm_config_path: Option<String>,
-    pub runner_path: Option<String>,
     pub port: Option<PortMapping>,
     pub elapsed_ms: u128,
     pub message: String,
@@ -214,6 +213,9 @@ pub struct NodeCapacity {
 ///
 /// Phase 1 skeleton: the agent *serves* this for ctrl (or ops) to poll.
 /// Phase 3 may invert to agent→ctrl push; the JSON shape stays the contract.
+///
+/// Note: not yet consumed by ctrl — the agent exposes the wire endpoint but
+/// nothing polls it today (write-only API; see audit P1).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AgentHeartbeat {
     /// Stable node identity (`RUSSEL_NODE_ID` → hostname → `local`).
@@ -346,7 +348,6 @@ mod tests {
                 status: "deployed".into(),
                 store_path: Some("/nix/store/abc".into()),
                 microvm_config_path: None,
-                runner_path: None,
                 port: Some(PortMapping {
                     host: 8080,
                     guest: 3000,

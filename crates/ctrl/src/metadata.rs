@@ -138,10 +138,10 @@ pub struct ServiceDiskRecord {
 
 /// Parse `runtime` from on-disk metadata JSON.
 ///
-/// Returns the parsed runtime if the `runtime` key is present and valid.
-/// Returns `None` when the `runtime` key is absent from valid JSON
-/// (callers should warn about legacy metadata missing the runtime field).
-/// Returns `None` only for unreadable or invalid JSON.
+/// Returns the parsed runtime when the `runtime` key is present and valid.
+/// Returns `None` for unreadable or invalid JSON, or when the `runtime` key is
+/// absent from valid JSON (callers should warn about legacy metadata missing
+/// the runtime field).
 pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
     let value: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
@@ -187,13 +187,6 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     })
-}
-
-/// Load full service metadata from disk for reconcile.
-/// Parses defensively: missing fields are left as None / empty.
-#[allow(dead_code)] // public API — callers outside this crate may use it
-pub fn load_service_disk_record(service_id: &str) -> Option<ServiceDiskRecord> {
-    load_service_disk_record_from(&metadata_path(service_id))
 }
 
 /// Load service metadata from an arbitrary path (for tests / custom base dirs).
@@ -380,7 +373,6 @@ pub fn resolve_lifecycle_runtime(
 
 /// Build versioned metadata JSON for a microVM deployment.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // unit-tested; deploy path still builds metadata inline
 pub fn build_microvm_metadata(
     service_id: &str,
     host_port: u16,

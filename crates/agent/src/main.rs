@@ -4,8 +4,6 @@
 //! (501 until #214 wires ctrl → agent RPC). Default single-node installs keep
 //! using monolithic `russel-ctrl`; this binary is opt-in.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
 #[cfg(not(target_os = "linux"))]
 compile_error!("russel-agent requires Linux (same host constraints as russel-ctrl)");
 

@@ -7,8 +7,6 @@ use crate::commands::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
     // Latch --insecure for cleartext Bearer policy (also RUSSEL_INSECURE_CLEARTEXT).
     commands::set_cli_insecure(cli.insecure);

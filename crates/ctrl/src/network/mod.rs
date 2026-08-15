@@ -7,8 +7,6 @@ mod subnet;
 mod tap;
 
 // Re-export the pre-split public surface so callers keep `crate::network::…`.
-// Some items are only used inside this module tree today; keep them public for API stability.
-#[allow(unused_imports)]
 pub use forward::{
     FORWARD_FILTER_ALLOW_RISK, RSL_IFACE_MATCH, RUSSEL_FORWARD_CHAIN, ensure_forward_filter,
     ensure_forward_filter_if_taps_present, forward_filter_disabled,
@@ -22,10 +20,8 @@ pub use subnet::{
 pub use tap::TapForwarder;
 
 #[cfg(test)]
-#[allow(unused_imports)]
 pub use ports::port_test_lock;
 #[cfg(test)]
-#[allow(unused_imports)]
 pub use subnet::{subnet_test_lock, test_clear_subnet_registry, test_with_empty_registry};
 
 #[cfg(test)]

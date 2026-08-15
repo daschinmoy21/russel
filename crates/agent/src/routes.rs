@@ -30,11 +30,13 @@ use crate::lifecycle;
 pub struct AgentState {
     pub node_id: String,
     pub data_root: PathBuf,
-    /// Skip `podman info` in unit tests.
+    /// Skip `podman info` in unit tests. Production always probes — no prod
+    /// code path sets this (test-only flag, not yet wired to an env/config).
     pub probe_podman: bool,
     pub labels: HashMap<String, String>,
     pub agent_version: String,
-    /// When true, report NotReady (drain / maintenance).
+    /// When true, report NotReady (drain / maintenance). Reserved for the
+    /// drain-mode design — no production code path sets it yet.
     pub not_ready: bool,
 }
 

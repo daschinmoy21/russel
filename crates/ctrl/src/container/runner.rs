@@ -213,7 +213,6 @@ impl ContainerRunner {
     }
 
     /// Inspect a running Russel container (used by e2e tests and future status API).
-    #[allow(dead_code)]
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
         crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);

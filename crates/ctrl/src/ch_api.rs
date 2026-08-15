@@ -30,12 +30,6 @@ impl ChClient {
             api_socket: api_socket.to_path_buf(),
         }
     }
-
-    /// Accessor for callers that need the raw socket path (e.g. logging, handoff).
-    #[allow(dead_code)] // public API surface; not all call sites use it yet
-    pub fn socket(&self) -> &Path {
-        &self.api_socket
-    }
 }
 
 // ── Empty-body PUT ───────────────────────────────────────────────────────────
@@ -78,12 +72,6 @@ impl ChClient {
 /// Pause a running VM (prep for snapshot).
 pub async fn vm_pause(api_socket: &Path) -> anyhow::Result<()> {
     empty_put(api_socket, "vm.pause").await
-}
-
-/// Resume a paused VM (pair of `vm_pause`; used after snapshot restore).
-#[allow(dead_code)] // wired when warm-pool restore path lands
-pub async fn vm_resume(api_socket: &Path) -> anyhow::Result<()> {
-    empty_put(api_socket, "vm.resume").await
 }
 
 /// Ask the guest to shut down gracefully.

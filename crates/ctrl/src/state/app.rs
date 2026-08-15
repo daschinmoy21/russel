@@ -146,12 +146,6 @@ impl AppState {
         ids
     }
 
-    /// Check if the state inner is healthy (not poisoned).
-    #[allow(dead_code)]
-    pub fn is_healthy(&self) -> bool {
-        self.inner.try_lock().is_ok()
-    }
-
     /// Increment the in-flight deploy counter and return a guard.
     ///
     /// The guard must be moved into the spawned deploy task so the counter

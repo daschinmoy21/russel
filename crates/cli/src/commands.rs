@@ -654,8 +654,6 @@ fn timing_row(label: &str, val_ms: u128, desc: &str) {
     );
 }
 
-// ponytail: tests inline, no test framework ceremony for pure functions
-
 fn resolve_deploy_runtime(
     repo: &str,
     config_path: &str,
@@ -774,13 +772,8 @@ fn parse_env_value(raw: &str) -> String {
     if let Some(inner) = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
         return inner.to_string();
     }
-    // Strip inline comment: find first ` #` that is preceded by whitespace
-    // (or at start of value after trimming).
+    // Strip an inline comment: any ` #` sequence (outside quotes) starts a comment.
     if let Some(pos) = raw.find(" #") {
-        // Only strip if the space before # is preceded by a non-hash char
-        // or is at position 0 (for values like `#comment`).
-        // Actually: standard convention is ` # ` at word boundary.
-        // We're already outside quotes, so any ` #` starts a comment.
         return raw[..pos].trim_end().to_string();
     }
     raw.to_string()
@@ -934,9 +927,6 @@ fn default_service_id_from_repo(repo: &str) -> Option<String> {
 
     Some(out)
 }
-
-// ponytail: only status/logs/vms/stop/destroy use HTTP — tested via unit tests
-// on pure functions below.
 
 pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
     let url = match args.service_id {

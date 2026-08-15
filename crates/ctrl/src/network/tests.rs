@@ -165,7 +165,7 @@ fn port_allocator_increments() {
     let p1 = alloc.next("service-1").unwrap();
     let p2 = alloc.next("service-2").unwrap();
     let p3 = alloc.next("service-3").unwrap();
-    // ponytail: do not assert absolute 3100 — host may have that port
+    // Do not assert absolute 3100 — host may have that port
     // bound. Just verify distinct, monotonic, and >= 3100.
     assert!(p1 >= 3100, "p1={p1} must be >= 3100");
     assert!(p1 < p2, "p1={p1} must be < p2={p2}");

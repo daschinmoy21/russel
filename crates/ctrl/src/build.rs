@@ -250,13 +250,6 @@ impl NixBuilder {
         }
     }
 
-    /// Build using `nix build`; the inherent entry point for callers that
-    /// hold a concrete `NixBuilder` (delegates to `build_package`).
-    #[allow(dead_code)]
-    pub async fn build(&self, repo_path: &Path) -> Result<BuildOutput> {
-        self.build_package(repo_path).await
-    }
-
     /// Shared implementation: generates a flake if missing, runs `nix build`,
     /// and cleans up the auto-generated flake on success.
     async fn build_package(&self, repo_path: &Path) -> Result<BuildOutput> {

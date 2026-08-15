@@ -204,12 +204,6 @@ fn parse_extra_metadata_fields(path: &Path) -> (Option<String>, Option<String>) 
 fn probe_microvm_alive(record: &ServiceDiskRecord, tap_id: Option<&str>) -> bool {
     let service_id = record.service_id.as_deref().unwrap_or("");
 
-    // F-06: these fields exist on the disk record (deserialized by serde)
-    // but are not used for liveness — only cloud-hypervisor counts.
-    // Touch them here to suppress dead_code warnings; they are meaningful
-    // for debugging / future use but not for identity checks.
-    let _ = (&record.socat_pid, &record.virtiofsd_pids);
-
     if let Some(pid) = record.vm_pid
         && ch_pid_matches(pid, service_id, tap_id)
     {
@@ -270,37 +264,6 @@ async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
     false
 }
 
-/// Returns true if the PID exists *and* its cmdline matches expected identity.
-///
-/// `kill(pid, 0)` alone is subject to PID reuse; we also require that
-/// `/proc/<pid>/cmdline` contains one of `needles` (and, when non-empty,
-/// the service id) before treating the process as our workload.
-#[allow(dead_code)] // used by tests in #[cfg(test)] module
-fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs existence check without delivering a signal.
-    if unsafe { libc::kill(pid as i32, 0) } != 0 {
-        return false;
-    }
-    let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
-        Err(_) => return false,
-    };
-    let has_needle = needles.iter().any(|n| cmdline.contains(n));
-    if !has_needle {
-        return false;
-    }
-    // When we know the service id, require it appear (path, arg0, or similar)
-    // so a recycled PID running the same binary for another service is rejected.
-    // Cloud-hypervisor identity is handled separately by `ch_pid_matches`.
-    if !service_id.is_empty() && !cmdline.contains(service_id) {
-        return false;
-    }
-    true
-}
-
 async fn container_running(container_id: &str) -> bool {
     let output = match crate::container::podman_command()
         .await
@@ -326,6 +289,36 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    /// Returns true if the PID exists *and* its cmdline matches expected identity.
+    ///
+    /// `kill(pid, 0)` alone is subject to PID reuse; we also require that
+    /// `/proc/<pid>/cmdline` contains one of `needles` (and, when non-empty,
+    /// the service id) before treating the process as our workload.
+    fn pid_matches(pid: u32, needles: &[&str], service_id: &str) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: signal 0 performs existence check without delivering a signal.
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return false;
+        }
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
+            Err(_) => return false,
+        };
+        let has_needle = needles.iter().any(|n| cmdline.contains(n));
+        if !has_needle {
+            return false;
+        }
+        // When we know the service id, require it appear (path, arg0, or similar)
+        // so a recycled PID running the same binary for another service is rejected.
+        // Cloud-hypervisor identity is handled separately by `ch_pid_matches`.
+        if !service_id.is_empty() && !cmdline.contains(service_id) {
+            return false;
+        }
+        true
+    }
+
     /// Write minimal microVM metadata into `{base}/{service_id}/metadata.json`.
     fn write_microvm_metadata(
         base: &Path,
@@ -345,29 +338,6 @@ mod tests {
             "vm_pid": vm_pid,
             "socat_pid": socat_pid,
             "virtiofsd_pids": []
-        });
-        let path = dir.join("metadata.json");
-        std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-        path
-    }
-
-    /// Write minimal container metadata.
-    #[allow(dead_code)] // used by future container reconcile tests
-    fn write_container_metadata(
-        base: &Path,
-        service_id: &str,
-        container_id: &str,
-        host_port: u16,
-    ) -> PathBuf {
-        let dir = base.join(service_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let meta = serde_json::json!({
-            "schema_version": 1,
-            "service_id": service_id,
-            "runtime": "container",
-            "host_port": host_port,
-            "guest_port": 3000,
-            "container_id": container_id
         });
         let path = dir.join("metadata.json");
         std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();

@@ -30,7 +30,6 @@ export interface DeployResponse {
 	status: string;
 	store_path?: string;
 	microvm_config_path?: string;
-	runner_path?: string;
 	port?: PortMapping;
 	elapsed_ms: number;
 	message: string;

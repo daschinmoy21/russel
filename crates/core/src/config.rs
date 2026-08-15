@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Russelfile {
     pub service: ServiceConfig,
-    /// ponytail: database provisioning is not yet implemented.
+    /// Database provisioning is not yet implemented.
     /// When enabled = true, `load` returns an error telling the user
     /// databases are not supported yet, rather than silently ignoring
     /// their config.

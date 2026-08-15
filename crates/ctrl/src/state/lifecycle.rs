@@ -89,8 +89,8 @@ impl AppState {
     }
 
     fn spawn_process_supervisor(&self, service_id: String, generation: u64) {
-        // ponytail: skip supervisor when no tokio runtime is active (e.g.
-        // sync unit tests). The test process is the only observer.
+        // Skip supervisor when no tokio runtime is active (e.g. sync unit
+        // tests); the test process is the only observer.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
