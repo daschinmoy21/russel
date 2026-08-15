@@ -112,11 +112,18 @@ fn owned_tap_ids(service_id: &str) -> Vec<String> {
     tap_ids
 }
 
-fn exe_basename(arg0: &str) -> &str {
-    std::path::Path::new(arg0)
+/// Trusted executable basename from `/proc/{pid}/exe` (not user-controlled argv0).
+///
+/// Linux may report `"path (deleted)"` when the binary was unlinked; strip that
+/// suffix before taking the basename.
+fn proc_exe_basename(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let s = link.to_string_lossy();
+    let s = s.strip_suffix(" (deleted)").unwrap_or(&s);
+    std::path::Path::new(s)
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(arg0)
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_string())
 }
 
 /// True when `arg` is exactly `tap={id}` or `tap={id},...` (CH multi-device form).
@@ -125,22 +132,30 @@ fn arg_matches_tap(arg: &str, tap_id: &str) -> bool {
     arg == tap_arg || arg.starts_with(&format!("{tap_arg},"))
 }
 
-/// Socat process title / argv token bound to this service (space or end after id).
+/// Socat process title / argv token bound to this service.
+///
+/// Accept only the exact title (or a trailing space boundary). Do **not** treat
+/// `-` as a boundary: service IDs contain hyphens, so `socat-russel-foo-bar`
+/// must not match service `foo`.
 fn arg_matches_socat_title(arg: &str, service_id: &str) -> bool {
     let needle = format!("socat-russel-{service_id}");
     if arg == needle {
         return true;
     }
     arg.strip_prefix(&needle)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('-'))
+        .is_some_and(|rest| rest.starts_with(' '))
 }
 
-/// Verify PID ownership via /proc/<pid>/cmdline.
+/// Verify PID ownership via trusted `/proc/<pid>/exe` + cmdline markers.
 ///
-/// Requires a corroborating executable identity before trusting service-scoped
-/// path or name markers. TAP matches only use owned (metadata/lease) identities.
-/// Never registers a lease and never invents preferred_subnet.
+/// Executable identity comes only from `/proc/{pid}/exe` (kernel-resolved), never
+/// from cmdline argv0. Cmdline is used only for owned TAP, path, and socat title
+/// markers. Never registers a lease and never invents preferred_subnet.
 pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
+    let Some(base) = proc_exe_basename(pid) else {
+        return false;
+    };
+
     let cmdline_path = format!("/proc/{pid}/cmdline");
     let Ok(raw) = std::fs::read(cmdline_path) else {
         return false;
@@ -154,38 +169,88 @@ pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
         return false;
     }
 
-    let exe = args[0].as_str();
-    let base = exe_basename(exe);
     let tap_ids = owned_tap_ids(service_id);
     let trusted_path = format!("/var/lib/russel/{service_id}/");
     let path_marker = format!("russel/{service_id}/");
 
-    // cloud-hypervisor: executable + owned TAP device argument.
+    // cloud-hypervisor: real executable + owned TAP device argument.
     if base == "cloud-hypervisor" {
         return args
             .iter()
             .any(|arg| tap_ids.iter().any(|tap| arg_matches_tap(arg, tap)));
     }
 
-    // virtiofsd: executable + trusted socket/path under this service tree.
+    // virtiofsd: real executable + trusted socket/path under this service tree.
     if base == "virtiofsd" {
         return args
             .iter()
             .any(|arg| arg.contains(&trusted_path) || arg.contains(&path_marker));
     }
 
-    // socat: executable (or retitled argv0) + service-bound title/token.
-    // Retitled processes may present argv0 as `socat-russel-{id}`.
-    if base == "socat" || arg_matches_socat_title(base, service_id) {
+    // socat: real executable must be socat; retitled argv0 is only a title marker
+    // (spawned with `.arg0("socat-russel-{id}")` while the binary remains socat).
+    if base == "socat" {
         return args
             .iter()
-            .any(|arg| arg_matches_socat_title(arg, service_id))
-            || (base != "socat" && arg_matches_socat_title(base, service_id));
+            .any(|arg| arg_matches_socat_title(arg, service_id));
     }
 
     // No unscoped substring match: unrelated processes that merely mention the
-    // service id in an argument must not pass ownership checks.
+    // service id in an argument (or spoof argv0) must not pass ownership checks.
     false
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn socat_title_exact_match_only() {
+        assert!(arg_matches_socat_title("socat-russel-foo", "foo"));
+        assert!(arg_matches_socat_title(
+            "socat-russel-foo TCP-LISTEN",
+            "foo"
+        ));
+        // Hyphen is part of another service id — must not prefix-match.
+        assert!(!arg_matches_socat_title("socat-russel-foo-bar", "foo"));
+        assert!(!arg_matches_socat_title("socat-russel-foobar", "foo"));
+        assert!(arg_matches_socat_title("socat-russel-foo-bar", "foo-bar"));
+    }
+
+    #[test]
+    fn spoofed_argv0_without_real_exe_is_rejected() {
+        // Current process can set nothing about /proc/self/exe — it is not socat/
+        // cloud-hypervisor/virtiofsd, so even a crafted service id must fail.
+        let me = std::process::id();
+        assert!(!verify_process_ownership(me, "api"));
+        assert!(!verify_process_ownership(me, "any-service"));
+    }
+
+    #[test]
+    fn retitled_shell_is_not_owned_socat() {
+        // Mimic a malicious/stale process: argv0 = socat-russel-{id} but real
+        // executable is /bin/sh (as spawn does with CommandExt::arg0).
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0("socat-russel-api");
+        }
+        let mut child = command
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("spawn retitled shell");
+        let pid = child.id();
+        // Give the kernel a moment to publish /proc entries.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !verify_process_ownership(pid, "api"),
+            "retitled non-socat binary must not be treated as owned socat"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 pub(super) async fn terminate_owned_process(pid: u32, service_id: &str) -> anyhow::Result<bool> {
