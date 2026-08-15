@@ -12,8 +12,8 @@ use crate::ch_api;
 
 use super::agent::{AGENT_BUSYBOX_APPLETS, AGENT_INIT_SCRIPT, AGENT_INITRAMFS_BASENAME};
 use super::process::{
-    BootOutput, network_alloc_for_service, read_metadata, terminate_owned_process,
-    wait_for_process_exit,
+    BootOutput, cloud_hypervisor_stop_pattern, network_alloc_for_service, read_metadata,
+    stop_tap_identity, terminate_owned_process, wait_for_process_exit,
 };
 use super::spec::{KernelInfo, VmSpec};
 
@@ -882,28 +882,15 @@ impl MicrovmRunner {
         };
 
         if !vm_stopped {
-            // Prefer metadata TAP, then registry lease — never preferred_subnet
-            // alone (collision can match another service's CH process).
-            let tap = metadata
-                .as_ref()
-                .and_then(|m| m.tap_id.clone())
-                .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.tap_id));
-            if let Some(tap) = tap {
-                self.pkill_service_process(
-                    service_id,
-                    "cloud-hypervisor",
-                    &format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)"),
-                )
+            // Metadata TAP → registry lease → service-path marker. Never
+            // preferred_subnet / subnet_for (wrong TAP or phantom lease).
+            let tap = stop_tap_identity(
+                service_id,
+                metadata.as_ref().and_then(|m| m.tap_id.as_deref()),
+            );
+            let pattern = cloud_hypervisor_stop_pattern(service_id, tap.as_deref());
+            self.pkill_service_process(service_id, "cloud-hypervisor", &pattern)
                 .await?;
-            } else {
-                // No owned TAP: service-scoped path pattern only (no preferred invent).
-                self.pkill_service_process(
-                    service_id,
-                    "cloud-hypervisor",
-                    &format!("russel/{service_id}/"),
-                )
-                .await?;
-            }
             if let Some(pid) = vm_pid {
                 let _ = wait_for_process_exit(pid, Duration::from_secs(2)).await;
             }

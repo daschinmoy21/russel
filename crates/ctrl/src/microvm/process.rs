@@ -82,10 +82,12 @@ pub(super) fn network_alloc_for_service(
     if let Some(meta) = read_metadata(service_id)
         && let (Some(tap_id), Some(host_ip), Some(vm_ip)) = (meta.tap_id, meta.host_ip, meta.vm_ip)
     {
+        // MAC only from host_ip key or this service's registry lease — never
+        // invent preferred_subnet MAC (collision-sensitive, not authoritative).
+        // Metadata TAP/IP alone without an authoritative MAC is not safe for teardown.
         let mac = crate::network::network_key_from_host_ip(&host_ip)
             .map(|k| crate::network::allocation_from_network_key(k).mac)
-            .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.mac))
-            .unwrap_or_default();
+            .or_else(|| crate::network::lookup_subnet(service_id).map(|a| a.mac))?;
         return Some(crate::network::SubnetAllocation {
             host_ip,
             vm_ip,
@@ -94,6 +96,54 @@ pub(super) fn network_alloc_for_service(
         });
     }
     crate::network::lookup_subnet(service_id)
+}
+
+/// Authoritative TAP for stop process-selection: metadata TAP first, then this
+/// service's registry lease. Never invents a preferred hash TAP.
+pub(super) fn stop_tap_identity(service_id: &str, metadata_tap: Option<&str>) -> Option<String> {
+    if let Some(tap) = metadata_tap.filter(|t| !t.is_empty()) {
+        return Some(tap.to_string());
+    }
+    crate::network::lookup_subnet(service_id).map(|a| a.tap_id)
+}
+
+/// Escape a literal for embedding in a `pkill -f` ERE pattern.
+///
+/// Service IDs are normally constrained by `validate_service_id`, but this
+/// helper is independently callable — unescaped metacharacters could broaden
+/// the match and terminate another Cloud Hypervisor process.
+pub(super) fn escape_pkill_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            // POSIX ERE metacharacters (and common GNU extensions).
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `pkill -f` pattern for Cloud Hypervisor stop fallback.
+///
+/// - With a known TAP: match that TAP only (literal-escaped).
+/// - Without: match the service path marker under `russel/{service_id}/` so
+///   cleanup cannot select another service's CH process via preferred hash.
+///   `service_id` is regex-escaped so metacharacters cannot broaden the match.
+pub(super) fn cloud_hypervisor_stop_pattern(service_id: &str, tap: Option<&str>) -> String {
+    match tap {
+        Some(tap) => {
+            let tap = escape_pkill_literal(tap);
+            format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)")
+        }
+        None => {
+            let sid = escape_pkill_literal(service_id);
+            format!("(^|[[:space:]])cloud-hypervisor .*russel/{sid}/")
+        }
+    }
 }
 
 /// Owned TAP ids from metadata and/or registry lease (no preferred invent).
