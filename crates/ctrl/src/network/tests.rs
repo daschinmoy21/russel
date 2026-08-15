@@ -15,6 +15,81 @@ fn subnet_for_is_deterministic() {
 }
 
 #[test]
+fn preferred_subnet_does_not_register_lease() {
+    // preferred_subnet is hash-only: it must not claim a registry slot.
+    // subnet_for("pref-only-svc") alone cannot prove this — it returns the
+    // preferred key both when no lease exists and when preferred_subnet
+    // incorrectly registered one for the same service.
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("pref-only-svc");
+        assert!(
+            lookup_subnet("pref-only-svc").is_none(),
+            "preferred_subnet must leave the registry empty for this service"
+        );
+        // Distinct service claims its own lease; preferred key for pref-only-svc
+        // remains free so subnet_for can still take it without collision on that
+        // service id.
+        let other = subnet_for("pref-other-svc").unwrap();
+        assert!(lookup_subnet("pref-only-svc").is_none());
+        let claimed = subnet_for("pref-only-svc").unwrap();
+        assert_eq!(preferred.tap_id, claimed.tap_id);
+        assert_eq!(preferred.host_ip, claimed.host_ip);
+        assert_eq!(
+            lookup_subnet("pref-only-svc").map(|a| a.tap_id),
+            Some(claimed.tap_id.clone())
+        );
+        assert_ne!(other.tap_id, claimed.tap_id);
+        release_subnet("pref-only-svc");
+        release_subnet("pref-other-svc");
+    });
+}
+
+#[test]
+fn lookup_subnet_is_read_only_and_returns_owned_lease() {
+    super::subnet::test_with_empty_registry(|| {
+        assert!(lookup_subnet("lookup-svc").is_none());
+        let allocated = subnet_for("lookup-svc").unwrap();
+        let looked = lookup_subnet("lookup-svc").expect("lease present");
+        assert_eq!(looked.tap_id, allocated.tap_id);
+        assert_eq!(looked.host_ip, allocated.host_ip);
+        // Second lookup must not mutate / re-register.
+        let again = lookup_subnet("lookup-svc").expect("lease still present");
+        assert_eq!(again.tap_id, allocated.tap_id);
+        release_subnet("lookup-svc");
+        assert!(lookup_subnet("lookup-svc").is_none());
+    });
+}
+
+#[test]
+fn preferred_subnet_matches_subnet_for_when_uncontended() {
+    super::subnet::test_with_empty_registry(|| {
+        let preferred = preferred_subnet("uncontended-svc");
+        let allocated = subnet_for("uncontended-svc").unwrap();
+        assert_eq!(preferred.host_ip, allocated.host_ip);
+        assert_eq!(preferred.vm_ip, allocated.vm_ip);
+        assert_eq!(preferred.mac, allocated.mac);
+        assert_eq!(preferred.tap_id, allocated.tap_id);
+        release_subnet("uncontended-svc");
+    });
+}
+
+#[test]
+fn release_port_and_subnet_are_idempotent() {
+    let _port = super::port_test_lock();
+    super::subnet::test_with_empty_registry(|| {
+        let _ = subnet_for("idem-svc").unwrap();
+        PortAllocator::release("idem-svc");
+        PortAllocator::reserve("idem-svc", 4199).expect("reserve");
+        PortAllocator::release("idem-svc");
+        PortAllocator::release("idem-svc");
+        assert!(!PortAllocator::has_hold("idem-svc"));
+        assert!(PortAllocator::allocated_port("idem-svc").is_none());
+        release_subnet("idem-svc");
+        release_subnet("idem-svc");
+    });
+}
+
+#[test]
 fn subnet_for_different_services_differ() {
     super::subnet::test_with_empty_registry(|| {
         let a = subnet_for("service-a").unwrap();
@@ -82,6 +157,10 @@ fn subnet_index_bounded() {
 
 #[test]
 fn port_allocator_increments() {
+    let _g = super::port_test_lock();
+    PortAllocator::release("service-1");
+    PortAllocator::release("service-2");
+    PortAllocator::release("service-3");
     let alloc = PortAllocator;
     let p1 = alloc.next("service-1").unwrap();
     let p2 = alloc.next("service-2").unwrap();
@@ -98,6 +177,9 @@ fn port_allocator_increments() {
 
 #[test]
 fn port_allocator_reserve_and_release() {
+    let _g = super::port_test_lock();
+    PortAllocator::release("custom-service");
+    PortAllocator::release("another-service");
     PortAllocator::reserve("custom-service", 4000).unwrap();
     assert!(PortAllocator::reserve("another-service", 4000).is_err());
     PortAllocator::release("custom-service");
@@ -113,12 +195,22 @@ fn port_allocator_rejects_port_zero() {
     assert!(err.to_string().contains("port 0"), "unexpected err: {err}");
 }
 
+/// Fixed ports in 40xx — outside the typical ephemeral bind(0) range used by
+/// other unit tests (agent mock servers, etc.), and serialized via port_test_lock.
+const HOLD_TEST_PORT: u16 = 4010;
+const RELEASE_HOLD_TEST_PORT: u16 = 4011;
+const CLAIM_HOLD_TEST_PORT: u16 = 4012;
+
 #[test]
 fn port_allocator_hold_blocks_external_bind() {
+    let _g = super::port_test_lock();
     PortAllocator::release("hold-svc");
-    PortAllocator::reserve("hold-svc", 4010).unwrap();
+    PortAllocator::release("other-hold-svc");
+    let port = HOLD_TEST_PORT;
+    PortAllocator::reserve("hold-svc", port).unwrap();
+    assert!(PortAllocator::has_hold("hold-svc"));
     let bind = publish_bind_addr();
-    let second = std::net::TcpListener::bind((bind.as_str(), 4010u16));
+    let second = std::net::TcpListener::bind((bind.as_str(), port));
     assert!(
         second.is_err(),
         "held port must not be bindable by another listener"
@@ -127,50 +219,79 @@ fn port_allocator_hold_blocks_external_bind() {
     let held = PortAllocator::take_hold("hold-svc");
     assert!(held.is_some());
     drop(held);
-    let after = std::net::TcpListener::bind((bind.as_str(), 4010u16));
+    assert!(!PortAllocator::has_hold("hold-svc"));
+    let after = std::net::TcpListener::bind((bind.as_str(), port));
     assert!(after.is_ok(), "port must be free after take_hold");
     drop(after);
     // Registry still owns the port until release.
-    assert!(PortAllocator::reserve("other-hold-svc", 4010).is_err());
+    assert!(PortAllocator::reserve("other-hold-svc", port).is_err());
     PortAllocator::release("hold-svc");
-    PortAllocator::reserve("other-hold-svc", 4010).unwrap();
+    PortAllocator::reserve("other-hold-svc", port).unwrap();
     PortAllocator::release("other-hold-svc");
 }
 
 #[test]
 fn port_allocator_release_drops_hold() {
+    let _g = super::port_test_lock();
     PortAllocator::release("release-hold-svc");
-    PortAllocator::reserve("release-hold-svc", 4011).unwrap();
+    let port = RELEASE_HOLD_TEST_PORT;
+    PortAllocator::reserve("release-hold-svc", port).unwrap();
+    assert!(PortAllocator::has_hold("release-hold-svc"));
+    assert_eq!(
+        PortAllocator::allocated_port("release-hold-svc"),
+        Some(port)
+    );
     let bind = publish_bind_addr();
-    assert!(std::net::TcpListener::bind((bind.as_str(), 4011u16)).is_err());
+    assert!(
+        std::net::TcpListener::bind((bind.as_str(), port)).is_err(),
+        "hold must block external bind"
+    );
     PortAllocator::release("release-hold-svc");
-    assert!(std::net::TcpListener::bind((bind.as_str(), 4011u16)).is_ok());
+    assert!(
+        !PortAllocator::has_hold("release-hold-svc"),
+        "release must drop hold listener"
+    );
+    assert!(
+        PortAllocator::allocated_port("release-hold-svc").is_none(),
+        "release must clear allocation"
+    );
+    // Same service can re-reserve (registry free + OS bind free).
+    PortAllocator::reserve("release-hold-svc", port)
+        .expect("release must free OS port for re-reserve");
+    PortAllocator::release("release-hold-svc");
 }
 
 #[test]
 fn claim_existing_same_port_drops_residual_hold() {
+    let _g = super::port_test_lock();
     // reserve holds a TcpListener; claim_existing means the live publisher
     // already owns the port, so any residual hold must be released.
     PortAllocator::release("claim-hold-svc");
-    PortAllocator::reserve("claim-hold-svc", 4012).unwrap();
+    let port = CLAIM_HOLD_TEST_PORT;
+    PortAllocator::reserve("claim-hold-svc", port).unwrap();
+    assert!(PortAllocator::has_hold("claim-hold-svc"));
     let bind = publish_bind_addr();
     assert!(
-        std::net::TcpListener::bind((bind.as_str(), 4012u16)).is_err(),
+        std::net::TcpListener::bind((bind.as_str(), port)).is_err(),
         "port must be held after reserve"
     );
-    PortAllocator::claim_existing("claim-hold-svc", 4012).unwrap();
+    PortAllocator::claim_existing("claim-hold-svc", port).unwrap();
     // Hold should be gone so the publisher (or a test bind) can take the port.
     assert!(
         PortAllocator::take_hold("claim-hold-svc").is_none(),
         "claim_existing must clear residual hold for same port"
     );
-    let after = std::net::TcpListener::bind((bind.as_str(), 4012u16));
+    assert!(!PortAllocator::has_hold("claim-hold-svc"));
+    // Registry still owns the port (claim_existing keeps allocation).
+    assert_eq!(PortAllocator::allocated_port("claim-hold-svc"), Some(port));
+    let after = std::net::TcpListener::bind((bind.as_str(), port));
     assert!(
         after.is_ok(),
-        "port must be free for bind after claim_existing same port"
+        "port must be free for OS bind after claim_existing drops residual hold"
     );
     drop(after);
     PortAllocator::release("claim-hold-svc");
+    assert!(PortAllocator::allocated_port("claim-hold-svc").is_none());
 }
 
 #[test]
@@ -279,7 +400,9 @@ fn subnet_for_exhaustion_fails_closed() {
 }
 #[test]
 fn port_allocator_claim_existing_registers_port() {
+    let _g = super::port_test_lock();
     PortAllocator::release("claimed-svc");
+    PortAllocator::release("other-svc");
     PortAllocator::claim_existing("claimed-svc", 9000).unwrap();
     // Same service, same port is idempotent.
     PortAllocator::claim_existing("claimed-svc", 9000).unwrap();

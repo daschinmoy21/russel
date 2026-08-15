@@ -2,6 +2,7 @@ use super::agent::{
     AGENT_BUSYBOX_APPLETS, AGENT_INIT_SCRIPT, AGENT_INITRAMFS_BASENAME, pack_cpio_blocking,
 };
 use super::runner::{MicrovmRunner, select_kernel_version};
+use crate::network::{PortAllocator, lookup_subnet, release_subnet, subnet_for};
 use std::path::PathBuf;
 
 #[test]
@@ -213,4 +214,71 @@ fn network_alloc_ignores_preferred_key_owned_by_other_service() {
         assert_eq!(owner.tap_id, preferred.tap_id);
         crate::network::release_subnet(other);
     });
+}
+
+/// Destroy with inventory but no live TAP/VM must free port + subnet.
+///
+/// Models partial destroy (missing TAP device / stop no-op). Control-plane
+/// inventory ownership ends with destroy even when runtime cleanup is a no-op
+/// or only partially successful — leases must not be retained for retry.
+/// Covers the contract that TAP teardown issues must not permanently hold
+/// inventory (release is unconditional after stop/TAP attempts), including
+/// dropping any net-03 `TcpListener` hold so the OS port is bindable again.
+#[tokio::test]
+async fn destroy_releases_port_and_subnet_with_partial_state() {
+    let svc = "destroy-partial-lease-svc";
+    // Fixed port outside typical bind(0) ephemeral range; serialized via
+    // port_test_lock around setup/assert (not across .await — clippy).
+    const PORT: u16 = 4197;
+    {
+        let _subnet = crate::network::subnet_test_lock();
+        let _port = crate::network::port_test_lock();
+        crate::network::test_clear_subnet_registry();
+        PortAllocator::release(svc);
+        let _ = subnet_for(svc).unwrap();
+        PortAllocator::reserve(svc, PORT).expect("reserve port");
+        assert!(lookup_subnet(svc).is_some(), "precondition: subnet leased");
+        assert_eq!(PortAllocator::allocated_port(svc), Some(PORT));
+        assert!(
+            PortAllocator::has_hold(svc),
+            "precondition: reserve must open a hold listener"
+        );
+    }
+
+    // No metadata under /var/lib/russel — stop is a no-op; TAP teardown targets
+    // the registry lease and treats a missing device as success (or records a
+    // teardown error). Either way, inventory must be free afterward.
+    let result = MicrovmRunner::new().destroy(svc).await;
+    // Prefer Ok when only inventory existed; tolerate partial-failure Err so
+    // the assertion below still checks the inventory contract.
+    if let Err(e) = &result {
+        let msg = e.to_string();
+        assert!(
+            msg.contains("partial") || msg.contains("tap teardown") || msg.contains("stop"),
+            "unexpected destroy error: {msg}"
+        );
+    }
+
+    {
+        let _subnet = crate::network::subnet_test_lock();
+        let _port = crate::network::port_test_lock();
+        assert!(
+            lookup_subnet(svc).is_none(),
+            "subnet must be released after destroy (partial runtime state)"
+        );
+        assert!(
+            PortAllocator::allocated_port(svc).is_none(),
+            "port allocation must be cleared after destroy"
+        );
+        assert!(
+            !PortAllocator::has_hold(svc),
+            "port hold TcpListener must be dropped after destroy so the OS port is free"
+        );
+        // Re-claim proves registry + OS bind are free for a later deploy.
+        PortAllocator::reserve(svc, PORT)
+            .expect("port must be free after destroy so a later deploy can claim it");
+        PortAllocator::release(svc);
+        release_subnet(svc);
+        crate::network::test_clear_subnet_registry();
+    }
 }

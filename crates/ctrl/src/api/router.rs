@@ -792,17 +792,25 @@ async fn vm_destroy(
 
     let label = runtime_label(runtime);
 
+    // Control-plane inventory ownership: always release port/subnet after a
+    // destroy attempt (idempotent), including partial-failure / TAP teardown
+    // error paths. Runner also releases for in-process callers; the API path
+    // covers agent mode and ensures inventory is never permanently held when
+    // destroy returns an error. Failed status is preserved below for retry.
+    PortAllocator::release(&service_id);
+    if runtime == RuntimeKind::Microvm {
+        release_subnet(&service_id);
+    }
+
     match result {
         Ok(_) => {
-            // Reap only after successful destroy — handles stayed in state during the op.
+            // Reap child handles after successful destroy.
             if handle.runtime == RuntimeKind::Microvm
                 && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
             {
                 reap_children(vm, aux).await;
             }
-            // container destroy still does base-dir cleanup on success as today
             if handle.runtime == RuntimeKind::Container {
-                PortAllocator::release(&service_id);
                 let base = crate::container::default_base_dir(&service_id);
                 if base.exists() {
                     let _ = tokio::fs::remove_dir_all(&base).await;
@@ -813,24 +821,22 @@ async fn vm_destroy(
             if let Err(e) = ingress.deregister(&service_id).await {
                 tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during destroy");
             }
-            if runtime == RuntimeKind::Microvm {
-                release_subnet(&service_id);
-            }
             tracing::info!(service_id = %service_id, runtime = %label, "destroyed service");
             state.remove_service(&service_id);
             Ok(Json(format!("destroyed {label} {service_id}")))
         }
         Err(e) => {
             tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
-            // Keep process ownership; restore prior status and re-supervise
-            // only if this claim still owns the lifecycle generation.
-            state.abort_lifecycle_operation(
-                &service_id,
-                handle.claim_generation,
-                &handle.expected_status,
-                &handle.prior_status,
-                &handle.prior_vm_state,
-            );
+            // Inventory already released above. Partial destroy may have
+            // already killed processes — reap remaining handles; do not
+            // restore deployed. Leave failed so the operator can retry
+            // residual runtime/TAP cleanup.
+            if handle.runtime == RuntimeKind::Microvm
+                && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
+            {
+                reap_children(vm, aux).await;
+            }
+            state.set_status(&service_id, "failed", "failed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
     }
