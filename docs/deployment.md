@@ -20,7 +20,16 @@ The `Russelfile.toml` specifies deploy requirements for your service (microVM or
 
 ### Template & Reference
 
-Create a file named `Russelfile.toml` in your project root with the following structure:
+Scaffold a starter manifest (and optionally a flake) from the project directory:
+
+```bash
+russel init
+russel init --type container          # VPS / no KVM
+russel init --with-flake              # also write flake.nix
+russel init --name api --port 3000
+```
+
+Or create `Russelfile.toml` yourself with the following structure:
 
 ```toml
 [service]

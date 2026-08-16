@@ -16,6 +16,8 @@ use russel_core::{
     config::{Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
+use crate::init::InitArgs;
+
 /// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
 ///
 /// Token handling matches ctrl `normalize_api_token`: trim whitespace; blank → no auth.
@@ -206,6 +208,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create a starter Russelfile.toml (and optionally flake.nix).
+    Init(InitArgs),
     Deploy(DeployArgs),
     Status(StatusArgs),
     Logs(LogsArgs),
@@ -1415,6 +1419,30 @@ mod tests {
                 assert_eq!(args.podman_args, vec!["-v", "/a:/b"]);
             }
             _ => panic!("expected deploy subcommand"),
+        }
+    }
+
+    #[test]
+    fn init_is_a_cli_subcommand() {
+        let cli = Cli::try_parse_from([
+            "russel",
+            "init",
+            "./svc",
+            "--name",
+            "svc",
+            "--type",
+            "container",
+            "--with-flake",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Init(args) => {
+                assert_eq!(args.path, PathBuf::from("./svc"));
+                assert_eq!(args.name.as_deref(), Some("svc"));
+                assert_eq!(args.runtime, RuntimeKind::Container);
+                assert!(args.with_flake);
+            }
+            _ => panic!("expected init subcommand"),
         }
     }
 
