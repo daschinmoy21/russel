@@ -1,4 +1,5 @@
 mod commands;
+mod init;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,6 +13,7 @@ async fn main() -> Result<()> {
     commands::set_cli_insecure(cli.insecure);
 
     match cli.command {
+        Command::Init(args) => init::run(args)?,
         Command::Deploy(args) => commands::deploy(args, &cli.control_plane).await?,
         Command::Status(args) => commands::status(args, &cli.control_plane).await?,
         Command::Logs(args) => commands::logs(args, &cli.control_plane).await?,

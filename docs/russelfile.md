@@ -11,7 +11,7 @@ Power users can still provide and customize a `flake.nix` when they need full Ni
 Russel aims to provide a workflow like:
 
 ```bash
-russel init          # planned — not yet implemented
+russel init          # implemented — writes Russelfile.toml (optional --with-flake)
 russel develop       # planned — not yet implemented
 russel build         # planned — not yet implemented
 russel deploy        # implemented — POST /deploy via control plane
@@ -611,12 +611,14 @@ Build secrets require additional care. If private dependencies need credentials 
 
 ## Proposed Commands
 
-### `russel init` [planned]
+### `russel init`
 
 Create a starter manifest:
 
 ```bash
 russel init
+russel init ./my-app
+russel init --type container --name api
 ```
 
 This creates:
@@ -625,11 +627,15 @@ This creates:
 Russelfile.toml
 ```
 
-An optional flag can create both the manifest and a generated flake:
+The command infers `service.name` from `Cargo.toml`, `go.mod`, or the directory name when `--name` is omitted. It refuses to overwrite an existing manifest unless `--force` is passed.
+
+An optional flag also writes a committed starter flake for the detected project type (Rust / Go / static):
 
 ```bash
 russel init --with-flake
 ```
+
+`russel init` currently writes `Russelfile.toml`. YAML remains a planned native format; do not pass a YAML path to deploy until that parser exists.
 
 ### `russel develop` [planned]
 
@@ -753,7 +759,7 @@ A practical implementation sequence is:
 3. Generate `devShells.<system>.default` alongside application packages.
 4. Add `russel develop`.
 5. Extend the `Russelfile` schema with `[dependencies]`.
-6. Add `russel init`.
+6. Add `russel init`. (CLI: `russel init` / `russel init --with-flake`)
 7. Add `russel check`.
 8. Make deployment use the same shared build and project resolver.
 

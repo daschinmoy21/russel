@@ -237,7 +237,15 @@ The control plane probes `127.0.0.1:<host_port>` every `RUSSEL_HEALTH_INTERVAL_S
 
 ## Project Requirements
 
-A repository you want to deploy needs a `Russelfile.toml` in its root. If no `flake.nix` is present, Russel auto-generates one based on project type (Rust → Cargo.toml, Go → go.mod, else → static server). See the [Application Deployment Guide](docs/deployment.md), [Flake Auto-Generation docs](docs/auto-generation.md), and [Examples](docs/examples.md) for details.
+A repository you want to deploy needs a `Russelfile.toml` in its root. Scaffold one with `russel init` (add `--with-flake` to also write a starter `flake.nix`). If no `flake.nix` is present, Russel auto-generates one based on project type (Rust → Cargo.toml, Go → go.mod, else → static server). See the [Application Deployment Guide](docs/deployment.md), [Flake Auto-Generation docs](docs/auto-generation.md), and [Examples](docs/examples.md) for details.
+
+```bash
+cd my-app
+russel init                       # writes Russelfile.toml
+russel init --type container      # no KVM / typical VPS
+russel init --with-flake          # also writes flake.nix
+# then: russel deploy . -p 8080:3000
+```
 
 ```toml
 [service]
