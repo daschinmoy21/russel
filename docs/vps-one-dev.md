@@ -6,9 +6,8 @@
 **Scope:** container runtime on typical no-KVM VPS images. MicroVMs need
 `/dev/kvm` and are optional on bare metal / nested virt only.
 
-**Related:** [mvp-self-hosted plan](plans/mvp-self-hosted.md) ·
-[TLS reverse-proxy runbook](security-tls.md) · [Traefik app ingress](traefik.md) ·
-[app packaging](deployment.md)
+**Related:** [TLS reverse-proxy runbook](security-tls.md) ·
+[Traefik app ingress](traefik.md) · [app packaging](deployment.md)
 
 ---
 

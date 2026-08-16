@@ -51,7 +51,7 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Match CONTRIBUTING.md: lint tests too (`--all-targets`).
+      # Match docs/contributing.md: lint tests too (`--all-targets`).
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:

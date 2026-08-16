@@ -61,11 +61,8 @@ If you serve the static `dist/` behind a reverse proxy, consider a Content-Secur
 
 ## Documentation
 
-See [`docs/`](docs/) for:
-
-- [Architecture](docs/architecture.md)
-- [API Mapping](docs/api-mapping.md)
-- [Realtime Roadmap](docs/realtime-roadmap.md)
+See the repo [README](../README.md) and [docs/](../docs/) — especially
+[architecture](../docs/architecture.md) and [API & CLI](../docs/api.md).
 
 ## Project Structure
 
@@ -76,7 +73,6 @@ dashboard/
 ├── astro.config.mjs
 ├── tsconfig.json
 ├── public/               # favicon
-├── docs/                 # architecture, API mapping, roadmap
 └── src/
     ├── components/       # Header, Sidebar, MetricCard, ServicesTable, ActivityChart
     ├── layouts/          # Layout.astro

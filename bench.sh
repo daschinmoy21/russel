@@ -115,7 +115,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ponytail: results arrays — indexed by example order
 declare -a EXAMPLES=()
 declare -a RUSSEL_MICROVM_DEPLOY_MS=()
 declare -a RUSSEL_MICROVM_CURL_MS=()
@@ -289,7 +288,6 @@ command -v nix &>/dev/null && has_nix=1
 
 # Inject flake devShell PATH so cloud-hypervisor/virtiofsd/socat are found
 # without a global install. Works under sudo when run from the repo root.
-# ponytail: one-shot inject; run `sudo nix develop -c ./bench.sh` alternative.
 if [ "$has_nix" -eq 1 ] && ! command -v cloud-hypervisor >/dev/null 2>&1; then
 	# PATH must expand inside the nix develop shell, not here.
 	# shellcheck disable=SC2016
@@ -548,7 +546,6 @@ else
 		# /var/lib/russel → this tree to faccessat the prepared rootfs.
 		chmod 755 "$RUSSEL_STATE_DIR" "$RUSSEL_STATE_DIR/lib" \
 			"$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
-		# ponytail: redirect /var/lib/{russel,microvms} to temp dir (requires root)
 		# Consumed by bench_restore_var_lib in the EXIT trap (bench-common.sh).
 		# shellcheck disable=SC2034
 		VAR_LIB_REDIRECTED=1

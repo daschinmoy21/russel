@@ -1,6 +1,4 @@
 # syntax=docker/dockerfile:1
-# ponytail: filebrowser binary downloaded from GitHub releases (not in Alpine repos).
-# ponytail: ADD (not RUN curl) so the download layer is cacheable by the container runtime.
 FROM docker.io/library/alpine:3.21 AS build
 RUN apk add --no-cache ca-certificates
 ARG FILEBROWSER_VERSION=v2.31.2
