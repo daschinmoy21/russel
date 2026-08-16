@@ -72,6 +72,18 @@ enum ProjectKind {
     Static,
 }
 
+/// How `buildGoModule` should treat dependencies in a generated flake.
+///
+/// `vendorHash = null` tells nixpkgs to skip the module FOD and use only a
+/// committed `vendor/` directory (or a stdlib-only module). External modules
+/// without `vendor/` need a real hash; `lib.fakeHash` makes the first
+/// `nix build` print it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoVendorMode {
+    Null,
+    FakeHash,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteOutcome {
     Created,
@@ -83,6 +95,7 @@ enum WriteOutcome {
 struct ProjectHints {
     kind: ProjectKind,
     inferred_name: Option<String>,
+    go_vendor: GoVendorMode,
 }
 
 /// Run `russel init`.
@@ -149,7 +162,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         if !args.force && flake_existed {
             flake_outcome = Some(WriteOutcome::LeftInPlace);
         } else {
-            let flake = render_flake(hints.kind, &name, &bin);
+            let flake = render_flake(hints.kind, &name, &bin, hints.go_vendor);
             flake_outcome = Some(write_text_file(
                 &flake_path,
                 &flake,
@@ -171,6 +184,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         flake_outcome,
         args.with_flake,
         hints.kind == ProjectKind::Rust && !root.join("Cargo.lock").exists(),
+        hints.kind == ProjectKind::Go && hints.go_vendor == GoVendorMode::FakeHash,
     );
 
     Ok(())
@@ -221,21 +235,96 @@ fn detect_project(root: &Path) -> ProjectHints {
         return ProjectHints {
             kind: ProjectKind::Rust,
             inferred_name,
+            go_vendor: GoVendorMode::Null,
         };
     }
     if root.join("go.mod").is_file() {
-        let inferred_name = fs::read_to_string(root.join("go.mod"))
-            .ok()
-            .and_then(|c| go_module_basename(&c));
+        let contents = fs::read_to_string(root.join("go.mod")).unwrap_or_default();
+        let inferred_name = go_module_basename(&contents);
         return ProjectHints {
             kind: ProjectKind::Go,
             inferred_name,
+            go_vendor: detect_go_vendor_mode(root, &contents),
         };
     }
     ProjectHints {
         kind: ProjectKind::Static,
         inferred_name: None,
+        go_vendor: GoVendorMode::Null,
     }
+}
+
+fn detect_go_vendor_mode(root: &Path, go_mod: &str) -> GoVendorMode {
+    // A committed vendor tree is what vendorHash = null is for.
+    if root.join("vendor").is_dir() {
+        return GoVendorMode::Null;
+    }
+    if go_mod_has_external_require(go_mod) || go_sum_has_modules(root) {
+        return GoVendorMode::FakeHash;
+    }
+    GoVendorMode::Null
+}
+
+fn strip_go_line_comment(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.starts_with("//") {
+        return "";
+    }
+    match trimmed.find("//") {
+        Some(i) => trimmed[..i].trim(),
+        None => trimmed,
+    }
+}
+
+/// True when `go.mod` lists at least one module `require` (direct or indirect).
+fn go_mod_has_external_require(contents: &str) -> bool {
+    let mut in_require = false;
+    for line in contents.lines() {
+        let t = strip_go_line_comment(line);
+        if t.is_empty() {
+            continue;
+        }
+        if in_require {
+            if t == ")" || t.starts_with(')') {
+                in_require = false;
+                continue;
+            }
+            if t.split_whitespace().next().is_some() {
+                return true;
+            }
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("require") else {
+            continue;
+        };
+        // Word boundary: do not match identifiers like `required`.
+        if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            continue;
+        }
+        let rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix('(') {
+            in_require = true;
+            let after = after.trim();
+            if !after.is_empty() && after != ")" {
+                return true;
+            }
+            continue;
+        }
+        if !rest.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+fn go_sum_has_modules(root: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(root.join("go.sum")) else {
+        return false;
+    };
+    contents.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with("//")
+    })
 }
 
 fn cargo_package_name(contents: &str) -> Option<String> {
@@ -508,7 +597,7 @@ bin = \"{bin}\"
     )
 }
 
-fn render_flake(kind: ProjectKind, name: &str, bin: &str) -> String {
+fn render_flake(kind: ProjectKind, name: &str, bin: &str, go_vendor: GoVendorMode) -> String {
     // Committed starter: no auto-generation marker (restricted Nix mode
     // refuses files that start with that banner). Keep pname/bin interpolated
     // values restricted to the validated charset so Nix strings stay safe.
@@ -549,8 +638,23 @@ fn render_flake(kind: ProjectKind, name: &str, bin: &str) -> String {
 }}
 "
         ),
-        ProjectKind::Go => format!(
-            "\
+        ProjectKind::Go => {
+            let vendor_attr = match go_vendor {
+                GoVendorMode::Null => {
+                    "\
+            # null is correct for stdlib-only modules or a committed vendor/ directory.
+            vendorHash = null;"
+                }
+                GoVendorMode::FakeHash => {
+                    "\
+            # External modules and no vendor/. null skips fetching and the sandbox build fails.
+            # First `nix build` / deploy prints got: sha256-... — paste it here.
+            # Or run `go mod vendor` and set vendorHash = null.
+            vendorHash = pkgs.lib.fakeHash;"
+                }
+            };
+            format!(
+                "\
 # Starter flake written by `russel init --with-flake`.
 # Russel deploys packages.<system>.default. Edit freely.
 {{
@@ -570,7 +674,7 @@ fn render_flake(kind: ProjectKind, name: &str, bin: &str) -> String {
             pname = \"{bin}\";
             version = \"0.1.0\";
             src = ./.;
-            vendorHash = null;
+{vendor_attr}
           }};
         }});
 
@@ -584,7 +688,8 @@ fn render_flake(kind: ProjectKind, name: &str, bin: &str) -> String {
     }};
 }}
 "
-        ),
+            )
+        }
         ProjectKind::Static => format!(
             "\
 # Starter flake written by `russel init --with-flake`.
@@ -682,6 +787,7 @@ fn print_summary(
     flake_outcome: Option<WriteOutcome>,
     with_flake: bool,
     warn_missing_lock: bool,
+    warn_go_vendor_hash: bool,
 ) {
     println!();
     println!("  \x1b[1;36mrussel init\x1b[0m");
@@ -731,6 +837,12 @@ fn print_summary(
             "  \x1b[1;33mwarning:\x1b[0m no Cargo.lock found; `nix build` / deploy will need one"
         );
         println!("    cargo generate-lockfile");
+    }
+    if warn_go_vendor_hash && with_flake {
+        println!();
+        println!("  \x1b[1;33mwarning:\x1b[0m go.mod has external modules and no vendor/");
+        println!("    flake.nix uses lib.fakeHash — first `nix build` / deploy prints vendorHash");
+        println!("    paste that hash, or run `go mod vendor` and set vendorHash = null");
     }
     println!();
 }
@@ -804,6 +916,57 @@ version = "0.1.0"
             Some("foo")
         );
         assert_eq!(go_module_basename("go 1.22\n"), None);
+    }
+
+    #[test]
+    fn go_mod_detects_single_and_block_requires() {
+        assert!(!go_mod_has_external_require(
+            "module example.com/svc\n\ngo 1.22\n"
+        ));
+        assert!(!go_mod_has_external_require(
+            "module example.com/svc\n// require github.com/foo/bar v1.0.0\n"
+        ));
+        assert!(!go_mod_has_external_require(
+            "module example.com/svc\nrequired = true\n"
+        ));
+        assert!(go_mod_has_external_require(
+            "module example.com/svc\nrequire github.com/foo/bar v1.2.3\n"
+        ));
+        assert!(go_mod_has_external_require(
+            "module example.com/svc\nrequire (\n\tgithub.com/foo/bar v1.2.3\n)\n"
+        ));
+        assert!(go_mod_has_external_require(
+            "module example.com/svc\nrequire (\n\tgolang.org/x/sys v0.1.0 // indirect\n)\n"
+        ));
+    }
+
+    #[test]
+    fn go_vendor_mode_prefers_vendor_dir_then_requires() {
+        let dir = tempfile::tempdir().unwrap();
+        let go_mod = "module example.com/svc\nrequire github.com/foo/bar v1.0.0\n";
+        assert_eq!(
+            detect_go_vendor_mode(dir.path(), go_mod),
+            GoVendorMode::FakeHash
+        );
+        fs::create_dir(dir.path().join("vendor")).unwrap();
+        assert_eq!(
+            detect_go_vendor_mode(dir.path(), go_mod),
+            GoVendorMode::Null
+        );
+    }
+
+    #[test]
+    fn go_vendor_mode_treats_go_sum_as_external_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("go.sum"),
+            "github.com/foo/bar v1.0.0 h1:abc=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_go_vendor_mode(dir.path(), "module example.com/svc\ngo 1.22\n"),
+            GoVendorMode::FakeHash
+        );
     }
 
     #[test]
@@ -889,7 +1052,7 @@ version = "0.1.0"
 
     #[test]
     fn rust_flake_mentions_cargo_lock_and_dev_shell() {
-        let flake = render_flake(ProjectKind::Rust, "api", "api");
+        let flake = render_flake(ProjectKind::Rust, "api", "api", GoVendorMode::Null);
         assert!(flake.contains("buildRustPackage"));
         assert!(flake.contains("cargoLock.lockFile"));
         assert!(flake.contains("devShells"));
@@ -899,15 +1062,24 @@ version = "0.1.0"
 
     #[test]
     fn go_flake_uses_build_go_module() {
-        let flake = render_flake(ProjectKind::Go, "api", "basic-http");
+        let flake = render_flake(ProjectKind::Go, "api", "basic-http", GoVendorMode::Null);
         assert!(flake.contains("buildGoModule"));
         assert!(flake.contains("vendorHash = null"));
         assert!(flake.contains("pname = \"basic-http\""));
+        assert!(!flake.contains("fakeHash"));
+    }
+
+    #[test]
+    fn go_flake_uses_fake_hash_when_modules_are_unvendored() {
+        let flake = render_flake(ProjectKind::Go, "api", "api", GoVendorMode::FakeHash);
+        assert!(flake.contains("buildGoModule"));
+        assert!(flake.contains("vendorHash = pkgs.lib.fakeHash"));
+        assert!(!flake.contains("vendorHash = null;"));
     }
 
     #[test]
     fn static_flake_serves_on_port() {
-        let flake = render_flake(ProjectKind::Static, "site", "site");
+        let flake = render_flake(ProjectKind::Static, "site", "site", GoVendorMode::Null);
         assert!(flake.contains("http.server"));
         assert!(flake.contains("$PORT"));
         assert!(flake.contains("${./.}"));
@@ -1066,6 +1238,37 @@ version = "0.1.0"
         let flake = fs::read_to_string(dir.path().join(FLAKE_NAME)).unwrap();
         assert!(flake.contains("buildGoModule"));
         assert!(flake.contains("pname = \"svc\""));
+        assert!(
+            flake.contains("vendorHash = null"),
+            "stdlib-only go.mod should keep vendorHash = null, got:\n{flake}"
+        );
+    }
+
+    #[test]
+    fn init_with_flake_uses_fake_hash_for_unvendored_go_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/svc\n\ngo 1.22\n\nrequire github.com/foo/bar v1.2.3\n",
+        )
+        .unwrap();
+        run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: None,
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: RuntimeKind::Microvm,
+            bin: None,
+            with_flake: true,
+            force: false,
+        })
+        .unwrap();
+        let flake = fs::read_to_string(dir.path().join(FLAKE_NAME)).unwrap();
+        assert!(
+            flake.contains("vendorHash = pkgs.lib.fakeHash"),
+            "unvendored Go modules should use fakeHash, got:\n{flake}"
+        );
+        assert!(!flake.contains("vendorHash = null;"));
     }
 
     #[test]
