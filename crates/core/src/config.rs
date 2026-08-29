@@ -39,6 +39,12 @@ impl Russelfile {
         if config.service.cpus < 1 || config.service.cpus > 32 {
             anyhow::bail!("service.cpus must be 1..=32 (got {})", config.service.cpus);
         }
+        if config.service.guest == GuestKind::Linux {
+            anyhow::bail!(
+                "guest = \"linux\" is not implemented yet (omit guest or set guest = \"busybox\"; \
+                 linux is a host-built NixOS userspace)"
+            );
+        }
         validate_source_path(&config.service.source)?;
         Ok(config)
     }
@@ -103,6 +109,41 @@ impl FromStr for RuntimeKind {
     }
 }
 
+/// Guest userspace. Orthogonal to [`RuntimeKind`] (isolation).
+///
+/// `busybox` is today's service guest: pid 1 mounts the store and execs one
+/// ELF (microVM) or a hardened rootfs with no distro (container).
+/// `linux` is a host-built NixOS userspace. Serde parses the flag;
+/// [`Russelfile::load_from_str`] rejects it until the boot path lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestKind {
+    #[default]
+    Busybox,
+    Linux,
+}
+
+impl fmt::Display for GuestKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busybox => write!(f, "busybox"),
+            Self::Linux => write!(f, "linux"),
+        }
+    }
+}
+
+impl FromStr for GuestKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "busybox" => Ok(Self::Busybox),
+            "linux" => Ok(Self::Linux),
+            other => anyhow::bail!("unknown guest {other:?}, expected \"busybox\" or \"linux\""),
+        }
+    }
+}
+
 /// Resolve effective runtime: Russelfile `service.type` is source of truth.
 /// CLI `--runtime` must match when provided; otherwise the file value is used.
 pub fn resolve_runtime(file: RuntimeKind, cli: Option<RuntimeKind>) -> anyhow::Result<RuntimeKind> {
@@ -125,6 +166,9 @@ pub struct ServiceConfig {
     /// Runtime kind (`microvm` or `container`). TOML field is `type`.
     #[serde(default, rename = "type")]
     pub runtime: RuntimeKind,
+    /// Guest userspace (`busybox` or `linux`). Default busybox.
+    #[serde(default)]
+    pub guest: GuestKind,
     /// Name of the binary produced by the build.
     /// Defaults to `name` if not specified.
     pub bin: Option<String>,
@@ -440,6 +484,68 @@ type = "kubernetes"
 "#;
         let err = toml::from_str::<Russelfile>(toml).unwrap_err();
         assert!(err.to_string().contains("kubernetes"));
+    }
+
+    #[test]
+    fn guest_defaults_to_busybox_when_omitted() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+"#;
+        let config = Russelfile::load_from_str(toml).unwrap();
+        assert_eq!(config.service.guest, GuestKind::Busybox);
+    }
+
+    #[test]
+    fn guest_parses_busybox() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+guest = "busybox"
+"#;
+        let config = Russelfile::load_from_str(toml).unwrap();
+        assert_eq!(config.service.guest, GuestKind::Busybox);
+    }
+
+    #[test]
+    fn guest_linux_rejected_at_load() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+guest = "linux"
+"#;
+        let parsed: Russelfile = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.service.guest, GuestKind::Linux);
+        let err = Russelfile::load_from_str(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("linux"), "expected linux in error: {msg}");
+        assert!(
+            msg.contains("not implemented"),
+            "expected not implemented in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn guest_rejects_unknown_value() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+guest = "ubuntu"
+"#;
+        let err = toml::from_str::<Russelfile>(toml).unwrap_err();
+        assert!(err.to_string().contains("ubuntu"));
     }
 
     #[test]

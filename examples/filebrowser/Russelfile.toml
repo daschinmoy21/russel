@@ -1,6 +1,9 @@
 # filebrowser — nixpkgs filebrowser via writeShellScriptBin.
 # Shell entrypoint uses an absolute /nix/store shebang (works with debug = false).
 # Writes under /tmp (tmpfs is writable even with --read-only rootfs).
+# Auth is on. Demo password below is public; the wrapper warns when it is
+# the effective password. Do not copy --noauth. Do not publish the host port
+# on 0.0.0.0 (Russel default RUSSEL_PUBLISH_BIND=127.0.0.1).
 
 [service]
 name = "filebrowser"
@@ -10,3 +13,8 @@ memory = "256mb"
 type = "container"
 bin = "filebrowser"
 # debug = true
+
+[service.env]
+# Production: printf '%s' 'your-password' | russel-cli secrets set FILEBROWSER_PASSWORD
+# then replace the value with "secret://FILEBROWSER_PASSWORD".
+FILEBROWSER_PASSWORD = "demo-only-not-for-production"

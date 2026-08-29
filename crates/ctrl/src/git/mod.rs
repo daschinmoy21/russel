@@ -4,6 +4,7 @@ mod allowlist;
 mod client;
 mod gc;
 mod lease;
+mod redact;
 
 // Preserve `crate::git::{GitClient, CheckoutLease, gc_old_checkouts}` paths.
 // Some symbols are only named by external callers / type inference; keep re-exports.
@@ -13,6 +14,7 @@ pub use client::GitClient;
 pub use gc::gc_old_checkouts;
 #[allow(unused_imports)]
 pub use lease::CheckoutLease;
+pub use redact::redact_repo_url;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

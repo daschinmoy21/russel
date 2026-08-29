@@ -33,6 +33,28 @@
         );
     in
     {
+      # Linux/NixOS only. Darwin can import the flake; the module is a no-op
+      # until services.russel.enable is set on a NixOS host.
+      nixosModules.default = ./nix/modules/russel-host.nix;
+      nixosModules.russel = ./nix/modules/russel-host.nix;
+
+      checks = forEachSupportedSystem (
+        { pkgs }:
+        pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          russel-host-eval =
+            let
+              results = import ./nix/tests/russel-host-eval.nix {
+                inherit (nixpkgs) lib;
+                nixosSystem = nixpkgs.lib.nixosSystem;
+                module = self.nixosModules.russel;
+                system = pkgs.stdenv.hostPlatform.system;
+              };
+            in
+            assert results.ok;
+            pkgs.runCommand "russel-host-eval" { } "touch $out";
+        }
+      );
+
       packages = forEachSupportedSystem (
         { pkgs }:
         pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {

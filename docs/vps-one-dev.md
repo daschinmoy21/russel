@@ -6,8 +6,8 @@
 **Scope:** container runtime on typical no-KVM VPS images. MicroVMs need
 `/dev/kvm` and are optional on bare metal / nested virt only.
 
-**Related:** [TLS reverse-proxy runbook](security-tls.md) ·
-[Traefik app ingress](traefik.md) · [app packaging](deployment.md)
+**Related:** [TLS reverse-proxy runbook](security-tls.md) · [Traefik app ingress](traefik.md) ·
+[app packaging](deployment.md)
 
 ---
 
@@ -19,7 +19,7 @@
 | Auth on remote bind | **Yes** | `RUSSEL_API_TOKEN` ≥32 ASCII chars; non-loopback refuses without token |
 | TLS in ctrl binary | **No** | Terminate TLS at Caddy/nginx/Traefik ([security-tls.md](security-tls.md)) |
 | Typical cheap VPS (no KVM) | **Containers only** | Set `type = "container"` in every `Russelfile.toml` |
-| Install package / systemd unit | **No** | Build from source; run under your process manager |
+| Install package / systemd unit | **Yes** | NixOS: `nixosModules.russel`. Others: `contrib/russel-ctrl.service` |
 | Multi-tenant / multi-user | **No** | Single trusted operator model |
 | Managed databases | **No** | `[database.*]` is a placeholder |
 | Dashboard | **Yes (DIY)** | Static or dev; set API URL + token; prefer same-origin proxy |
@@ -47,19 +47,24 @@ Copy this into your runbook and tick as you go.
 
 ### B. Build and install ctrl + CLI
 
-- [ ] Clone this repo on the server (or CI artifact of your choosing)
+This is the install story. Pick one host path, then put the CLI on the laptop.
+
+- [ ] Clone this repo on the server (or a CI artifact you trust)
 - [ ] `nix develop` then `cargo build --release` (or equivalent toolchain)
-- [ ] Binaries available: `target/release/russel-ctrl`, `target/release/russel-cli`
+- [ ] `russel-ctrl` and `russel-cli` binaries exist (`target/release/…` or a package)
+- [ ] NixOS. Import `nixosModules.russel` (flake output `nixosModules.default`). Set `services.russel.enable`, `environmentFile` (0600, `RUSSEL_API_TOKEN=`), and `bin` or `package`. Defaults already bind `127.0.0.1:7878`, set `RUSSEL_REQUIRE_AUTH=1`, use `/var/lib/russel` mode 0700, leave the warm pool off, put `/run/wrappers` on PATH, enable `virtualisation.podman`, set linger on the service user, and set `rootlessPodman = true` (`NoNewPrivileges` off for `newuidmap`). For an existing login user set `user`, `group` (or omit `group` to use the primary group), and `createUser = false`. `rootlessPodman = false` only keeps NNP on; it does not configure microVMs. See [nix/modules/russel-host.nix](../nix/modules/russel-host.nix).
+- [ ] Non-NixOS. Install [contrib/russel-ctrl.service](../contrib/russel-ctrl.service) as a systemd user unit (comments in the file). Same env defaults.
+- [ ] Container-only VPS: skip KVM, TAP, and cloud-hypervisor. Use a lingering user with rootless Podman. MicroVMs stay optional on bare metal / nested virt.
 - [ ] (Optional) Install CLI on the laptop the same way or copy the binary
 
 ### C. Secure control plane
 
-- [ ] Generate token: `export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"` and store it offline
-- [ ] Bind loopback: `export RUSSEL_CTRL_ADDR=127.0.0.1:7878`
-- [ ] Fail-closed auth: `export RUSSEL_REQUIRE_AUTH=1`
-- [ ] Reverse proxy TLS → `127.0.0.1:7878` (Caddy/nginx — see [security-tls.md](security-tls.md))
+- [ ] Generate token: `export RUSSEL_API_TOKEN="$(openssl rand -hex 32)"` and store it offline (or write it into the 0600 env file the unit/module loads)
+- [ ] Bind loopback: `127.0.0.1:7878` (module/unit default `RUSSEL_CTRL_ADDR`)
+- [ ] Fail-closed auth: `RUSSEL_REQUIRE_AUTH=1` (module/unit default)
+- [ ] Reverse proxy TLS → `127.0.0.1:7878` (Caddy/nginx — see [security-tls.md](security-tls.md); app HTTP: [traefik.md](traefik.md))
 - [ ] Clients use `https://…` for `RUSSEL_CONTROL_PLANE` (CLI refuses cleartext Bearer to non-loopback unless `--insecure`)
-- [ ] Process supervised (systemd user unit, `tmux`, etc. — not shipped in-tree yet)
+- [ ] Process supervised by the NixOS module or `contrib/russel-ctrl.service`
 
 ### D. App reachability
 
@@ -105,6 +110,8 @@ russel-cli destroy demo
 ---
 
 ## Minimal server commands
+
+Prefer the module or user unit above. Manual equivalent:
 
 ```bash
 # After Nix + rootless Podman + /var/lib/russel are ready:
@@ -157,10 +164,11 @@ What must be true in the tree for the operator path above. Tick when verifying a
 - [x] Secrets API + host store
 - [x] Dashboard does not bake public API token (#198); default bind localhost (#188)
 - [x] Operator docs: this file + README “Remote VPS” section
+- [x] NixOS module + systemd user unit with loopback / token / 0700 defaults (#207)
 
 ### Still DIY / later
 
-- [ ] Packaged install (deb/OCI/NixOS module with systemd) — host module is a stub
+- [ ] deb/OCI packages
 - [ ] `russel login` / config file for URL + token
 - [ ] Native TLS in `russel-ctrl` (proxy is enough for one-dev)
 - [ ] Fresh VPS e2e automated in CI

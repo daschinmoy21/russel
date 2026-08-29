@@ -3,11 +3,13 @@ use super::allowlist::{
     validate_remote_host, validate_remote_host_dns,
 };
 use super::client::{
-    GitClient, checkout_dir_name, clone_security_config_args, fnv1a_u64, local_path_deploy_allowed,
-    reserve_checkout_dir, unique_checkout_dir_name, unique_checkout_dir_name_with,
+    GitClient, checkout_dir_name, clone_failure_message, clone_security_config_args, fnv1a_u64,
+    local_path_deploy_allowed, reserve_checkout_dir, unique_checkout_dir_name,
+    unique_checkout_dir_name_with,
 };
 use super::gc::gc_old_checkouts;
 use super::lease::active_checkouts;
+use super::redact_repo_url;
 use std::{
     collections::HashSet,
     fs,
@@ -37,15 +39,26 @@ fn checkout_dir_name_is_unique_for_distinct_urls() {
 
 #[test]
 fn checkout_dir_name_avoids_sanitize_collision() {
-    // Identical 48-char sanitized prefix; only the hash must distinguish them.
+    // Long shared URL prefix; only the hash of the full URL distinguishes them.
     let base = "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let a = checkout_dir_name(&format!("{base}/one"));
     let b = checkout_dir_name(&format!("{base}/two"));
     assert_ne!(a, b);
-    // Prefixes before the 16-hex hash should match.
     let pa = a.rsplit_once('-').unwrap().0;
     let pb = b.rsplit_once('-').unwrap().0;
     assert_eq!(pa, pb);
+}
+
+#[test]
+fn checkout_dir_name_omits_url_userinfo() {
+    let name = checkout_dir_name("https://user:s3cret@github.com/org/repo.git");
+    assert!(!name.contains("s3cret"), "{name}");
+    assert!(!name.contains("user"), "{name}");
+    assert_ne!(
+        name,
+        checkout_dir_name("https://github.com/org/repo.git"),
+        "hash the original URL so credentialed and plain URLs stay distinct"
+    );
 }
 
 #[test]
@@ -563,4 +576,112 @@ fn local_absolute_path_still_checks_exists_and_dotdot_when_gate_on() {
             );
         });
     });
+}
+
+#[test]
+fn redact_https_userinfo() {
+    assert_eq!(
+        redact_repo_url("https://user:token@github.com/org/repo.git"),
+        "https://github.com/org/repo.git"
+    );
+    assert_eq!(
+        redact_repo_url("https://user:token@github.com:8443/org/repo.git?x=1#f"),
+        "https://github.com:8443/org/repo.git?x=1#f"
+    );
+    assert_eq!(
+        redact_repo_url("http://token@example.com/repo.git"),
+        "http://example.com/repo.git"
+    );
+    assert_eq!(
+        redact_repo_url("HTTPS://User:TOKEN@Example.COM/Org/Repo.git"),
+        "HTTPS://Example.COM/Org/Repo.git"
+    );
+}
+
+#[test]
+fn redact_https_without_userinfo_is_unchanged() {
+    assert_eq!(
+        redact_repo_url("https://github.com/org/repo.git"),
+        "https://github.com/org/repo.git"
+    );
+}
+
+#[test]
+fn redact_https_empty_host_still_strips_userinfo() {
+    assert_eq!(
+        redact_repo_url("https://user:token@/repo.git"),
+        "https:///repo.git"
+    );
+    assert_eq!(redact_repo_url("https://user:token@"), "https://");
+    assert_eq!(redact_repo_url("http://token@/x"), "http:///x");
+    let empty_host = redact_repo_url("https://user:token@/repo.git");
+    assert!(!empty_host.contains("token"), "{empty_host}");
+    assert!(!empty_host.contains("user:"), "{empty_host}");
+}
+
+#[test]
+fn redact_ssh_scp_form_is_unchanged() {
+    assert_eq!(
+        redact_repo_url("git@github.com:org/repo.git"),
+        "git@github.com:org/repo.git"
+    );
+    assert_eq!(
+        redact_repo_url("ssh://git@github.com/org/repo.git"),
+        "ssh://git@github.com/org/repo.git"
+    );
+    assert_eq!(
+        redact_repo_url("ssh://git:hunter2@github.com/org/repo.git"),
+        "ssh://github.com/org/repo.git"
+    );
+}
+
+#[test]
+fn redact_empty_and_relative_path_are_unchanged() {
+    assert_eq!(redact_repo_url(""), "");
+    assert_eq!(redact_repo_url("./src"), "./src");
+    assert_eq!(redact_repo_url("../repo"), "../repo");
+    assert_eq!(redact_repo_url("/var/src/app"), "/var/src/app");
+    assert_eq!(redact_repo_url("not a url @ all"), "not a url @ all");
+}
+
+#[test]
+fn clone_failure_message_redacts_userinfo() {
+    let repo = "https://user:token@github.com/org/repo.git";
+    let msg = clone_failure_message(
+        repo,
+        "fatal: could not read from remote 'https://user:token@github.com/org/repo.git'",
+        None,
+    );
+    assert!(!msg.contains("token"), "{msg}");
+    assert!(!msg.contains("user:"), "{msg}");
+    assert!(msg.contains("https://github.com/org/repo.git"), "{msg}");
+    assert!(msg.contains("git clone failed for"), "{msg}");
+}
+
+#[test]
+fn clone_failure_message_redacts_userinfo_when_host_case_differs() {
+    let repo = "https://user:token@GitHub.com/org/repo.git";
+    let msg = clone_failure_message(
+        repo,
+        "fatal: could not read from remote 'https://user:token@github.com/org/repo.git'",
+        None,
+    );
+    assert!(!msg.contains("token"), "{msg}");
+    assert!(!msg.contains("user:"), "{msg}");
+}
+
+#[test]
+fn clone_failure_cleanup_path_omits_userinfo() {
+    let repo = "https://user:s3cret@github.com/org/repo.git";
+    let checkout = std::path::PathBuf::from("/tmp/russel/checkouts")
+        .join(unique_checkout_dir_name_with(repo, 1, 1));
+    let cleanup_err = std::io::Error::other("permission denied");
+    let msg = clone_failure_message(
+        repo,
+        "fatal: authentication failed",
+        Some((checkout.as_path(), &cleanup_err)),
+    );
+    assert!(!msg.contains("s3cret"), "{msg}");
+    assert!(!msg.contains("user"), "{msg}");
+    assert!(msg.contains("https://github.com/org/repo.git"), "{msg}");
 }

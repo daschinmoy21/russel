@@ -1,6 +1,6 @@
 //! VmSpec and related Cloud Hypervisor spawn configuration types.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Filesystem mount for Cloud Hypervisor `--fs` arguments.
 #[derive(Debug, Clone)]
@@ -13,6 +13,51 @@ pub struct FsMount {
     pub shared_dir: PathBuf,
     /// Whether the mount is read-only (e.g. /nix/store).
     pub readonly: bool,
+}
+
+/// virtiofs shares for a service VM: host store (RO), deploy.env (RO), guest scratch (RW).
+///
+/// Scratch is the only guest-writable host path. There is no quota, so a
+/// guest can fill that directory and the host disk. Bound the risk to this
+/// dir; never share `cfg/`, `metadata.json`, or the service root as RW.
+pub(crate) fn service_fs_mounts(
+    sock_dir: &Path,
+    cfg_dir: &Path,
+    scratch_dir: &Path,
+) -> Vec<FsMount> {
+    vec![
+        FsMount {
+            tag: "nixstore".into(),
+            socket: sock_dir.join("virtiofs-nixstore.sock"),
+            shared_dir: PathBuf::from("/nix/store"),
+            readonly: true,
+        },
+        FsMount {
+            tag: "russelcfg".into(),
+            socket: sock_dir.join("virtiofs-cfg.sock"),
+            shared_dir: cfg_dir.to_path_buf(),
+            readonly: true,
+        },
+        FsMount {
+            tag: "russelscratch".into(),
+            socket: sock_dir.join("virtiofs-scratch.sock"),
+            shared_dir: scratch_dir.to_path_buf(),
+            readonly: false,
+        },
+    ]
+}
+
+/// Create `path` and set mode `0700` so it is not world-accessible on the host.
+pub(crate) fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Centralized Cloud Hypervisor spawn configuration.

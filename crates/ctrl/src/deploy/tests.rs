@@ -1,7 +1,7 @@
 //! Unit tests for deploy helpers (generation ids, config path containment, podman args).
 
 use super::config::{MAX_CONFIG_BYTES, load_russelfile_under_repo};
-use super::pipeline::new_generation_id;
+use super::pipeline::{build_desired_state, new_generation_id};
 use crate::metadata::build_microvm_metadata_with_gen;
 use crate::microvm::MicrovmRunner;
 use std::io::Write;
@@ -230,7 +230,42 @@ fn load_russelfile_rejects_oversized() {
 }
 
 use crate::container::validate_podman_args_for_runtime;
-use russel_core::config::RuntimeKind;
+use russel_core::config::{GuestKind, RuntimeKind};
+
+fn desired_state_for_toml(body: &str) -> serde_json::Value {
+    let repo = TempRepo::new();
+    write_config(repo.path(), "Russelfile.toml", body);
+    let cfg = load_russelfile_under_repo(repo.path(), "Russelfile.toml").unwrap();
+    build_desired_state(
+        "https://example.com/app.git",
+        "Russelfile.toml",
+        RuntimeKind::Microvm,
+        cfg.service.guest,
+        &std::collections::HashMap::new(),
+        &[],
+        None,
+    )
+}
+
+#[test]
+fn desired_state_records_omitted_guest_as_busybox() {
+    let ds = desired_state_for_toml(MINIMAL);
+    assert_eq!(ds["runtime"], "microvm");
+    assert_eq!(ds["guest"], "busybox");
+}
+
+#[test]
+fn desired_state_records_explicit_busybox() {
+    let toml = r#"[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+guest = "busybox"
+"#;
+    let ds = desired_state_for_toml(toml);
+    assert_eq!(ds["guest"], "busybox");
+}
 
 #[test]
 fn podman_args_rejected_for_microvm_runtime() {
@@ -247,4 +282,29 @@ fn podman_args_allowed_for_container_runtime() {
         &["--network".into(), "bridge".into()],
     )
     .unwrap();
+}
+
+#[test]
+fn persist_repo_url_drops_http_userinfo() {
+    let ds = build_desired_state(
+        "https://user:token@github.com/org/app.git",
+        "Russelfile.toml",
+        RuntimeKind::Microvm,
+        GuestKind::Busybox,
+        &std::collections::HashMap::new(),
+        &[],
+        None,
+    );
+    assert_eq!(ds["repo_url"], "https://github.com/org/app.git");
+    assert_eq!(ds["guest"], "busybox");
+    let plain = build_desired_state(
+        "https://github.com/org/app.git",
+        "Russelfile.toml",
+        RuntimeKind::Microvm,
+        GuestKind::Busybox,
+        &std::collections::HashMap::new(),
+        &[],
+        None,
+    );
+    assert_eq!(plain["repo_url"], "https://github.com/org/app.git");
 }

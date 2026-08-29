@@ -1,6 +1,7 @@
 //! DeployPipeline: request entrypoint, dual-live orchestration, and workload types.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -8,14 +9,14 @@ use std::{
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::{RuntimeKind, merge_env_maps, resolve_runtime, validate_env_map},
+    config::{GuestKind, RuntimeKind, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
 use crate::{
     build::{self, BuildBackend},
     container::{ContainerRunner, validate_podman_args_for_runtime},
     deployments::{self, AppendSuccess, DesiredStateSnapshot},
-    git::GitClient,
+    git::{GitClient, redact_repo_url},
     ingress::{self, Backend, Ingress},
     metadata::{rewrite_metadata_service_id, write_metadata},
     microvm::{self, MicrovmRunner},
@@ -102,9 +103,64 @@ pub(crate) fn record_source_in_metadata(
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("failed to create metadata object"))?
     };
-    object.insert("repo_url".into(), serde_json::json!(repo_url));
+    object.insert(
+        "repo_url".into(),
+        serde_json::json!(redact_repo_url(repo_url)),
+    );
     object.insert("config_path".into(), serde_json::json!(config_path));
     write_metadata(&path, &value)
+}
+
+/// JSON object written into metadata `desired_state` (next to `"runtime"`).
+///
+/// Env is the pre-secret-resolution map so rollback and health restart
+/// re-resolve `secret://` refs. `guest` is always present (default busybox).
+pub(crate) fn build_desired_state(
+    repo_url: &str,
+    config_path: &str,
+    runtime: RuntimeKind,
+    guest: GuestKind,
+    env: &HashMap<String, String>,
+    podman_args: &[String],
+    port: Option<&PortMapping>,
+) -> serde_json::Value {
+    let mut ds = serde_json::Map::new();
+    let env_obj: serde_json::Map<String, serde_json::Value> = env
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    ds.insert("env".into(), serde_json::Value::Object(env_obj));
+    if !podman_args.is_empty() {
+        ds.insert(
+            "podman_args".into(),
+            serde_json::Value::Array(
+                podman_args
+                    .iter()
+                    .map(|a| serde_json::Value::String(a.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    ds.insert(
+        "repo_url".into(),
+        serde_json::Value::String(redact_repo_url(repo_url)),
+    );
+    ds.insert(
+        "config_path".into(),
+        serde_json::Value::String(config_path.to_string()),
+    );
+    ds.insert(
+        "runtime".into(),
+        serde_json::Value::String(runtime.to_string()),
+    );
+    ds.insert("guest".into(), serde_json::Value::String(guest.to_string()));
+    if let Some(p) = port {
+        let mut port_obj = serde_json::Map::new();
+        port_obj.insert("host".into(), serde_json::json!(p.host));
+        port_obj.insert("guest".into(), serde_json::json!(p.guest));
+        ds.insert("port".into(), serde_json::Value::Object(port_obj));
+    }
+    serde_json::Value::Object(ds)
 }
 
 /// Typed outcome of `deploy_inner` — success, rollback, or hard failure.
@@ -170,7 +226,7 @@ impl DeployPipeline {
         {
             Some(id) => id.to_string(),
             None => {
-                tracing::error!(repo = %request.repo_url, "deploy rejected: vm_id required");
+                tracing::error!(repo = %redact_repo_url(&request.repo_url), "deploy rejected: vm_id required");
                 return DeployResponse {
                     service_id: String::new(),
                     vm_id: String::new(),
@@ -190,7 +246,7 @@ impl DeployPipeline {
         };
         let vm_id = service_id.clone();
 
-        tracing::info!(service_id = %service_id, repo = %request.repo_url, "deploy started");
+        tracing::info!(service_id = %service_id, repo = %redact_repo_url(&request.repo_url), "deploy started");
 
         // Validate service_id before touching any state (#4).
         if let Err(e) = MicrovmRunner::validate_service_id(&service_id) {
@@ -422,53 +478,22 @@ impl DeployPipeline {
         validate_env_map(&merged_env)?;
 
         // Build desired_state for rollback + health restart + update (F-04/08/09).
-        let desired_state = {
-            let mut ds = serde_json::Map::new();
-            // env PRE secret resolution
-            let env_obj: serde_json::Map<String, serde_json::Value> = merged_env_pre_resolve
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            ds.insert("env".into(), serde_json::Value::Object(env_obj));
-            if !request.podman_args.is_empty() {
-                ds.insert(
-                    "podman_args".into(),
-                    serde_json::Value::Array(
-                        request
-                            .podman_args
-                            .iter()
-                            .map(|a| serde_json::Value::String(a.clone()))
-                            .collect(),
-                    ),
-                );
-            }
-            ds.insert(
-                "repo_url".into(),
-                serde_json::Value::String(request.repo_url.clone()),
-            );
-            ds.insert(
-                "config_path".into(),
-                serde_json::Value::String(request.config_path.clone()),
-            );
-            ds.insert(
-                "runtime".into(),
-                serde_json::Value::String(runtime.to_string()),
-            );
-            // Fixed port only when user passed -p
-            if let Some(ref p) = request.port {
-                let mut port_obj = serde_json::Map::new();
-                port_obj.insert("host".into(), serde_json::json!(p.host));
-                port_obj.insert("guest".into(), serde_json::json!(p.guest));
-                ds.insert("port".into(), serde_json::Value::Object(port_obj));
-            }
-            Some(serde_json::Value::Object(ds))
-        };
+        let desired_state = Some(build_desired_state(
+            &request.repo_url,
+            &request.config_path,
+            runtime,
+            config.service.guest,
+            &merged_env_pre_resolve,
+            &request.podman_args,
+            request.port.as_ref(),
+        ));
 
         let resolve_ms = t.elapsed().as_millis();
         tracing::info!(
             service_id,
             service_name = %config.service.name,
             runtime = %runtime,
+            guest = %config.service.guest,
             resolve_ms,
             "repo resolved"
         );
@@ -948,9 +973,11 @@ impl DeployPipeline {
         }
 
         // Record source so `russel update` / health restart can redeploy.
-        if let Err(e) =
-            record_source_in_metadata(service_id, &request.repo_url, &request.config_path)
-        {
+        if let Err(e) = record_source_in_metadata(
+            service_id,
+            &redact_repo_url(&request.repo_url),
+            &request.config_path,
+        ) {
             tracing::warn!(service_id, error = %e, "failed to record source in metadata");
         }
 
@@ -967,7 +994,7 @@ impl DeployPipeline {
                 generation_id: Some(generation_id.clone()),
                 runtime: Some(runtime),
                 store_path: Some(build.store_path.display().to_string()),
-                repo_url: Some(request.repo_url.clone()),
+                repo_url: Some(redact_repo_url(&request.repo_url)),
                 config_path: Some(request.config_path.clone()),
                 host_port: Some(port.host),
                 guest_port: Some(port.guest),

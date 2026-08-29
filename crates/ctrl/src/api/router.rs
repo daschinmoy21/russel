@@ -175,7 +175,7 @@ async fn deploy(
     };
 
     tracing::info!(
-        repo = %request.repo_url,
+        repo = %crate::git::redact_repo_url(&request.repo_url),
         service_id = %service_id,
         port = ?request.port.as_ref().map(|p| format!("{}:{}", p.host, p.guest)),
         "POST /deploy"

@@ -124,16 +124,28 @@ curl -sI "http://127.0.0.1:8085/<id>"   # 302
 
 ## 6. filebrowser — nixpkgs binary wrapper
 
+**Demo only.** Auth is required. The process binds `0.0.0.0` inside the guest
+so `-p` works. Do not copy `--noauth`. Do not publish the host port on
+`0.0.0.0` (Russel default `RUSSEL_PUBLISH_BIND=127.0.0.1`). Default login is
+`admin` / `demo-only-not-for-production` (public; the wrapper warns whenever
+that password is in effect). Set `FILEBROWSER_PASSWORD` or
+`secret://FILEBROWSER_PASSWORD`. See [examples/filebrowser/README.md](../examples/filebrowser/README.md).
+
 | Field | Value |
 |-------|--------|
 | Port | 8080 |
 | Binary | `filebrowser` (shell wrapper; store shebang) |
+| Auth | on (password from `FILEBROWSER_PASSWORD`) |
+| Bind | `0.0.0.0` in the guest; host publish stays loopback |
 
-Uses `/tmp` for data (writable tmpfs under read-only rootfs).
+Uses `/tmp` for data (writable tmpfs under read-only rootfs). Russel deploy
+builds `flake.nix` (`pkgs.filebrowser`). The Dockerfile is optional (bench /
+legacy) and checksum-pins the v2.31.2 linux-amd64 tarball.
 
 ```bash
 ./target/debug/russel-cli deploy examples/filebrowser -p 8081:8080 --vm-id files
 curl -sI http://127.0.0.1:8081/ | head -5
+# browser: http://127.0.0.1:8081/  login admin / demo-only-not-for-production
 ```
 
 ---

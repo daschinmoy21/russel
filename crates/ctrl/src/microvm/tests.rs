@@ -3,8 +3,9 @@ use super::agent::{
 };
 use super::process::{cloud_hypervisor_stop_pattern, escape_pkill_literal, stop_tap_identity};
 use super::runner::{MicrovmRunner, select_kernel_version};
+use super::spec::service_fs_mounts;
 use crate::network::{PortAllocator, lookup_subnet, release_subnet, subnet_for};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn stop_tap_prefers_metadata_over_registry() {
@@ -221,8 +222,61 @@ fn agent_init_script_uses_short_usleep_retries() {
 }
 
 #[test]
-fn agent_initramfs_cache_version_is_v3() {
-    assert_eq!(AGENT_INITRAMFS_BASENAME, "agent-initramfs-v3.cpio");
+fn agent_initramfs_cache_version_is_v4() {
+    assert_eq!(AGENT_INITRAMFS_BASENAME, "agent-initramfs-v4.cpio");
+}
+
+#[test]
+fn agent_init_script_writes_ready_to_scratch_not_cfg() {
+    assert!(AGENT_INIT_SCRIPT.contains("mount -t virtiofs -o ro russelcfg /config"));
+    assert!(AGENT_INIT_SCRIPT.contains("mount -t virtiofs russelscratch /run/russel"));
+    assert!(AGENT_INIT_SCRIPT.contains("/run/russel/.agent_ready"));
+    assert!(!AGENT_INIT_SCRIPT.contains("/config/.agent_ready"));
+    assert!(AGENT_INIT_SCRIPT.contains(". /config/deploy.env"));
+}
+
+#[test]
+fn service_fs_mounts_cfg_readonly_scratch_separate() {
+    let sock = Path::new("/var/lib/russel/svc-1");
+    let cfg = Path::new("/var/lib/russel/svc-1/cfg");
+    let scratch = Path::new("/var/lib/russel/svc-1/scratch");
+    let mounts = service_fs_mounts(sock, cfg, scratch);
+
+    assert_eq!(mounts.len(), 3);
+    assert_eq!(mounts[0].tag, "nixstore");
+    assert!(mounts[0].readonly);
+    assert_eq!(mounts[0].shared_dir, PathBuf::from("/nix/store"));
+
+    assert_eq!(mounts[1].tag, "russelcfg");
+    assert!(
+        mounts[1].readonly,
+        "cfg share must be read-only so the guest cannot write deploy.env or fill the host cfg dir"
+    );
+    assert_eq!(mounts[1].shared_dir, cfg);
+    assert_eq!(
+        mounts[1].socket,
+        PathBuf::from("/var/lib/russel/svc-1/virtiofs-cfg.sock")
+    );
+
+    assert_eq!(mounts[2].tag, "russelscratch");
+    assert!(
+        !mounts[2].readonly,
+        "scratch is the only guest-writable host share"
+    );
+    assert_eq!(mounts[2].shared_dir, scratch);
+    assert_ne!(
+        mounts[2].shared_dir, mounts[1].shared_dir,
+        "scratch must not be the cfg directory"
+    );
+    assert_ne!(
+        mounts[2].shared_dir.as_path(),
+        sock,
+        "scratch must not be the service root (metadata.json lives there)"
+    );
+    assert_eq!(
+        mounts[2].socket,
+        PathBuf::from("/var/lib/russel/svc-1/virtiofs-scratch.sock")
+    );
 }
 
 #[test]

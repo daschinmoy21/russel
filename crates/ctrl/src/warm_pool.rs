@@ -4,9 +4,9 @@
 //!   1. ensure kernel + busybox
 //!   2. build agent initramfs once (no app baked in)
 //!   3. create template TAP under reserved id `pooltpl`
-//!   4. start virtiofsd for /nix/store + empty cfg dir
-//!   5. boot CH with VmSpec (hotplug-ready), agent initramfs, dual fs
-//!   6. poll host for cfg/.agent_ready (timeout 15s)
+//!   4. start virtiofsd for /nix/store + RO cfg + RW scratch
+//!   5. boot CH with VmSpec (hotplug-ready), agent initramfs, three fs shares
+//!   6. poll host for scratch/.agent_ready (timeout 15s)
 //!   7. API vm.pause → vm.snapshot to golden/
 //!   8. tear down template VM/TAP/fsd cleanly
 //!   9. mark pool ready
@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     ch_api,
-    microvm::{self, BootOutput, FsMount, MicrovmRunner, VmSpec},
+    microvm::{self, BootOutput, MicrovmRunner, VmSpec, ensure_private_dir, service_fs_mounts},
     network::{self, SubnetAllocation, TapForwarder},
 };
 
@@ -57,6 +57,18 @@ fn env_mem_hotplug_mb() -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048)
+}
+
+/// Drop a leftover `scratch/.agent_ready` from a previous template boot.
+///
+/// Missing file is fine. Any other error is returned so prepare does not
+/// treat a stale marker as a live agent.
+fn clear_agent_ready(scratch_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(scratch_dir.join(".agent_ready")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug)]
@@ -125,14 +137,15 @@ impl WarmPool {
         std::fs::create_dir_all(&sock_dir)?;
 
         let cfg_dir = format!("{sock_dir}/cfg");
-        std::fs::create_dir_all(&cfg_dir)?;
+        let scratch_dir = format!("{sock_dir}/scratch");
+        ensure_private_dir(Path::new(&cfg_dir))?;
+        ensure_private_dir(Path::new(&scratch_dir))?;
+        clear_agent_ready(Path::new(&scratch_dir))?;
 
         // Spin up a short-lived TAP — no socat needed for template.
         Self::create_template_tap(&alloc).await?;
 
         // 4. Boot template CH with hotplug-ready VmSpec (boot_vm spawns virtiofsd).
-        let nixstore_sock = PathBuf::from(format!("{sock_dir}/virtiofs-nixstore.sock"));
-        let cfg_sock = PathBuf::from(format!("{sock_dir}/virtiofs-cfg.sock"));
         let api_socket = PathBuf::from(format!("{sock_dir}/cloud-hypervisor.sock"));
 
         if let Err(e) = std::fs::remove_file(&api_socket)
@@ -152,20 +165,11 @@ impl WarmPool {
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket: api_socket.clone(),
-            fs: vec![
-                FsMount {
-                    tag: "nixstore".into(),
-                    socket: nixstore_sock.clone(),
-                    shared_dir: PathBuf::from("/nix/store"),
-                    readonly: true,
-                },
-                FsMount {
-                    tag: "russelcfg".into(),
-                    socket: cfg_sock.clone(),
-                    shared_dir: PathBuf::from(&cfg_dir),
-                    readonly: false,
-                },
-            ],
+            fs: service_fs_mounts(
+                Path::new(&sock_dir),
+                Path::new(&cfg_dir),
+                Path::new(&scratch_dir),
+            ),
             console: "null".into(),
             restore_url: None,
         };
@@ -174,8 +178,8 @@ impl WarmPool {
         let children: Vec<tokio::process::Child> = boot.virtiofsd_children;
         let vm_child = boot.vm_child;
 
-        // 6. Poll for .agent_ready in cfg dir.
-        let agent_ready = PathBuf::from(format!("{cfg_dir}/.agent_ready"));
+        // 6. Poll for .agent_ready in scratch dir (cfg is read-only).
+        let agent_ready = PathBuf::from(format!("{scratch_dir}/.agent_ready"));
         let deadline = tokio::time::Instant::now() + AGENT_READY_TIMEOUT;
         let mut agent_seen = false;
         while tokio::time::Instant::now() < deadline {
@@ -337,9 +341,9 @@ impl WarmPool {
     ) -> anyhow::Result<BootOutput> {
         let sock_dir = format!("/var/lib/russel/{service_id}");
         std::fs::create_dir_all(&sock_dir)?;
+        let scratch_dir = PathBuf::from(format!("{sock_dir}/scratch"));
+        ensure_private_dir(&scratch_dir)?;
 
-        let nixstore_sock = PathBuf::from(format!("{sock_dir}/virtiofs-nixstore.sock"));
-        let cfg_sock = PathBuf::from(format!("{sock_dir}/virtiofs-cfg.sock"));
         let api_socket = PathBuf::from(format!("{sock_dir}/cloud-hypervisor.sock"));
 
         let cpus_max: u8 = env_cpu_max().max(cpus_boot);
@@ -355,20 +359,7 @@ impl WarmPool {
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket,
-            fs: vec![
-                FsMount {
-                    tag: "nixstore".into(),
-                    socket: nixstore_sock,
-                    shared_dir: PathBuf::from("/nix/store"),
-                    readonly: true,
-                },
-                FsMount {
-                    tag: "russelcfg".into(),
-                    socket: cfg_sock,
-                    shared_dir: config_dir.to_path_buf(),
-                    readonly: false,
-                },
-            ],
+            fs: service_fs_mounts(Path::new(&sock_dir), config_dir, &scratch_dir),
             console: "null".into(),
             restore_url: None,
         };
@@ -420,7 +411,10 @@ impl WarmPool {
 
         let nixstore_sock = format!("{sock_dir}/virtiofs-nixstore.sock");
         let cfg_sock = format!("{sock_dir}/virtiofs-cfg.sock");
+        let scratch_sock = format!("{sock_dir}/virtiofs-scratch.sock");
         let api_socket_path = format!("{sock_dir}/cloud-hypervisor.sock");
+        let scratch_dir = PathBuf::from(format!("{sock_dir}/scratch"));
+        ensure_private_dir(&scratch_dir)?;
 
         let raw = std::fs::read_to_string(&golden_config)?;
         let patched = self.patch_config_json(
@@ -430,6 +424,7 @@ impl WarmPool {
             &alloc.mac,
             &nixstore_sock,
             &cfg_sock,
+            &scratch_sock,
             &api_socket_path,
         )?;
         std::fs::write(&restore_config, patched)?;
@@ -446,20 +441,7 @@ impl WarmPool {
             tap: alloc.tap_id.clone(),
             mac: alloc.mac.clone(),
             api_socket: PathBuf::from(&api_socket_path),
-            fs: vec![
-                FsMount {
-                    tag: "nixstore".into(),
-                    socket: PathBuf::from(&nixstore_sock),
-                    shared_dir: PathBuf::from("/nix/store"),
-                    readonly: true,
-                },
-                FsMount {
-                    tag: "russelcfg".into(),
-                    socket: PathBuf::from(&cfg_sock),
-                    shared_dir: config_dir.to_path_buf(),
-                    readonly: false,
-                },
-            ],
+            fs: service_fs_mounts(Path::new(&sock_dir), config_dir, &scratch_dir),
             console: "null".into(),
             restore_url: Some(format!("file://{restore_dir}")),
         };
@@ -480,6 +462,7 @@ impl WarmPool {
         mac: &str,
         nixstore_sock: &str,
         cfg_sock: &str,
+        scratch_sock: &str,
         api_socket: &str,
     ) -> anyhow::Result<String> {
         let mut config: serde_json::Value = serde_json::from_str(raw)?;
@@ -497,7 +480,7 @@ impl WarmPool {
         }
 
         // Patch virtiofs socket paths in `fs` array.
-        // The golden snapshot has tags ["nixstore", "russelcfg"] in order.
+        // Golden snapshots have tags nixstore, russelcfg, russelscratch.
         if let Some(fs_arr) = config.get_mut("fs").and_then(|f| f.as_array_mut()) {
             for fs_entry in fs_arr.iter_mut() {
                 let tag = fs_entry.get("tag").and_then(|t| t.as_str()).unwrap_or("");
@@ -507,6 +490,9 @@ impl WarmPool {
                     }
                     "russelcfg" => {
                         fs_entry["socket"] = serde_json::Value::String(cfg_sock.to_string());
+                    }
+                    "russelscratch" => {
+                        fs_entry["socket"] = serde_json::Value::String(scratch_sock.to_string());
                     }
                     _ => {}
                 }
@@ -558,6 +544,7 @@ mod tests {
         "fs": [
             {"tag": "nixstore", "socket": "/var/lib/russel/_pool/template/virtiofs-nixstore.sock"},
             {"tag": "russelcfg", "socket": "/var/lib/russel/_pool/template/virtiofs-cfg.sock"},
+            {"tag": "russelscratch", "socket": "/var/lib/russel/_pool/template/virtiofs-scratch.sock"},
             {"tag": "other", "socket": "/keep/me.sock"}
         ],
         "api_socket": "/var/lib/russel/_pool/template/cloud-hypervisor.sock",
@@ -574,6 +561,7 @@ mod tests {
                 "02:00:00:00:00:01",
                 "/var/lib/russel/svc-1/virtiofs-nixstore.sock",
                 "/var/lib/russel/svc-1/virtiofs-cfg.sock",
+                "/var/lib/russel/svc-1/virtiofs-scratch.sock",
                 "/var/lib/russel/svc-1/cloud-hypervisor.sock",
             )
             .unwrap();
@@ -589,8 +577,12 @@ mod tests {
             config["fs"][1]["socket"],
             "/var/lib/russel/svc-1/virtiofs-cfg.sock"
         );
+        assert_eq!(
+            config["fs"][2]["socket"],
+            "/var/lib/russel/svc-1/virtiofs-scratch.sock"
+        );
         // Unrelated fs tags are left untouched.
-        assert_eq!(config["fs"][2]["socket"], "/keep/me.sock");
+        assert_eq!(config["fs"][3]["socket"], "/keep/me.sock");
         assert_eq!(
             config["api_socket"],
             "/var/lib/russel/svc-1/cloud-hypervisor.sock"
@@ -610,6 +602,7 @@ mod tests {
                 "02:00:00:00:00:01",
                 "/nix.sock",
                 "/cfg.sock",
+                "/scratch.sock",
                 "/ch.sock",
             )
             .unwrap();
@@ -629,6 +622,7 @@ mod tests {
                 "02:00:00:00:00:01",
                 "/nix.sock",
                 "/cfg.sock",
+                "/scratch.sock",
                 "/ch.sock",
             )
             .unwrap();
@@ -640,6 +634,7 @@ mod tests {
                 "02:00:00:00:00:01",
                 "/nix.sock",
                 "/cfg.sock",
+                "/scratch.sock",
                 "/ch.sock",
             )
             .unwrap();
@@ -650,7 +645,7 @@ mod tests {
     fn patch_config_json_tolerates_missing_fields() {
         let minimal = r#"{"net": [{"tap": "a", "mac": "b"}]}"#;
         let patched = pool()
-            .patch_config_json(minimal, "svc-1", "tap", "mac", "/n", "/c", "/ch")
+            .patch_config_json(minimal, "svc-1", "tap", "mac", "/n", "/c", "/s", "/ch")
             .unwrap();
         let config: serde_json::Value = serde_json::from_str(&patched).unwrap();
         assert_eq!(config["net"][0]["tap"], "tap");
@@ -664,7 +659,7 @@ mod tests {
     fn patch_config_json_rejects_invalid_json() {
         assert!(
             pool()
-                .patch_config_json("not json", "svc-1", "t", "m", "/n", "/c", "/ch")
+                .patch_config_json("not json", "svc-1", "t", "m", "/n", "/c", "/s", "/ch")
                 .is_err()
         );
     }
@@ -676,5 +671,32 @@ mod tests {
         assert_eq!(POOL_BASE, "/var/lib/russel/_pool");
         assert_eq!(GOLDEN_DIR, "/var/lib/russel/_pool/golden");
         assert_eq!(POOL_TEMPLATE_ID, "pooltpl");
+    }
+
+    #[test]
+    fn clear_agent_ready_ok_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        clear_agent_ready(dir.path()).unwrap();
+        assert!(!dir.path().join(".agent_ready").exists());
+    }
+
+    #[test]
+    fn clear_agent_ready_deletes_stale_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".agent_ready");
+        std::fs::write(&marker, "ready").unwrap();
+        assert!(marker.exists());
+        clear_agent_ready(dir.path()).unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn clear_agent_ready_propagates_non_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".agent_ready");
+        std::fs::create_dir(&marker).unwrap();
+        let err = clear_agent_ready(dir.path()).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(marker.is_dir());
     }
 }

@@ -354,12 +354,13 @@ impl MicrovmRunner {
     ///
     /// The `/init` script:
     ///   1. mounts proc/sys/devtmpfs
-    ///   2. mounts virtiofs `nixstore` → `/nix/store`
-    ///   3. mounts virtiofs `russelcfg` → `/config`
-    ///   4. echoes `ready` into `/config/.agent_ready`
-    ///   5. waits until `/config/deploy.env` exists
-    ///   6. sources `/config/deploy.env` (expects `VM_IP`, `HOST_IP`, `PORT`, `APP`)
-    ///   7. configures eth0 + default route; `exec $APP`
+    ///   2. mounts virtiofs `nixstore` → `/nix/store` (RO)
+    ///   3. mounts virtiofs `russelcfg` → `/config` (RO, host `deploy.env`)
+    ///   4. mounts virtiofs `russelscratch` → `/run/russel` (RW)
+    ///   5. echoes `ready` into `/run/russel/.agent_ready`
+    ///   6. waits until `/config/deploy.env` exists
+    ///   7. sources `/config/deploy.env` (expects `VM_IP`, `HOST_IP`, `PORT`, `APP`)
+    ///   8. configures eth0 + default route; `exec $APP`
     ///
     /// No app binary is baked in — it is resolved at deploy time via `deploy.env`.
     pub async fn build_agent_initramfs(&self) -> anyhow::Result<PathBuf> {
@@ -438,7 +439,7 @@ impl MicrovmRunner {
         self.create_busybox_symlinks(&work, &bb_bin)?;
         self.copy_closure_to(&busybox_path, &work).await?;
         // Build to a temp file, then atomic rename (F-18).
-        let tmp_cpio = pool_dir.join(format!(".agent-initramfs-v3.{pid}.{nanos}.cpio.tmp"));
+        let tmp_cpio = pool_dir.join(format!(".{AGENT_INITRAMFS_BASENAME}.{pid}.{nanos}.tmp"));
         self.pack_cpio(&work, &tmp_cpio, &bb_bin).await?;
         std::fs::rename(&tmp_cpio, &initramfs_file)?;
 
@@ -663,6 +664,16 @@ impl MicrovmRunner {
                 virtiofsd_children.push(ra?);
                 virtiofsd_children.push(rb?);
             }
+            [a, b, c] => {
+                let (ra, rb, rc) = tokio::join!(
+                    self.spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly),
+                    self.spawn_virtiofsd(&b.socket, &b.shared_dir, b.readonly),
+                    self.spawn_virtiofsd(&c.socket, &c.shared_dir, c.readonly),
+                );
+                virtiofsd_children.push(ra?);
+                virtiofsd_children.push(rb?);
+                virtiofsd_children.push(rc?);
+            }
             _ => {
                 for fs in &spec.fs {
                     let child = self
@@ -807,7 +818,8 @@ impl MicrovmRunner {
 
         let mut cmd = Command::new("virtiofsd");
         // virtiofsd --cache accepts: auto | always | never | metadata (not "none").
-        // readonly nixstore: always cache; rw cfg: never cache so guest sees host writes promptly.
+        // readonly (nixstore, cfg): always cache; rw scratch: never cache so
+        // the host sees `.agent_ready` promptly.
         let cache_policy = if readonly { "always" } else { "never" };
         cmd.arg(format!("--socket-path={}", socket.display()))
             .arg(format!("--shared-dir={}", shared_dir.display()))

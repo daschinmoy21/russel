@@ -9,6 +9,7 @@ mod spec;
 pub use process::BootOutput;
 pub use runner::MicrovmRunner;
 pub use spec::{FsMount, KernelInfo, VmSpec};
+pub(crate) use spec::{ensure_private_dir, service_fs_mounts};
 
 /// Shared runner singleton used by deploy and warm_pool.
 pub(crate) use runner::shared_runner;

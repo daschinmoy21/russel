@@ -11,6 +11,7 @@ use tokio::process::Command;
 use super::allowlist::{extract_url_host, validate_remote_host, validate_remote_host_dns};
 use super::gc::gc_old_checkouts;
 use super::lease::CheckoutLease;
+use super::redact::{redact_repo_url, scrub_logged_repo_text};
 
 static CHECKOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -123,16 +124,15 @@ impl GitClient {
                 && cleanup_err.kind() != std::io::ErrorKind::NotFound
             {
                 anyhow::bail!(
-                    "git clone failed for {repo}: {} (also failed to remove partial checkout {}: {})",
-                    stderr.trim(),
-                    checkout.display(),
-                    cleanup_err
+                    "{}",
+                    clone_failure_message(
+                        repo,
+                        stderr.as_ref(),
+                        Some((checkout.as_path(), &cleanup_err)),
+                    )
                 );
             }
-            anyhow::bail!(
-                "git clone failed for {repo}: {}.\nUse an absolute path for local deploys.",
-                stderr.trim()
-            );
+            anyhow::bail!("{}", clone_failure_message(repo, stderr.as_ref(), None));
         }
 
         Ok((checkout.clone(), CheckoutLease::active(checkout)))
@@ -143,6 +143,29 @@ impl GitClient {
     /// concurrent deployments, but must not be removed while this lease lives.
     pub fn hold_checkout(&self, path: &Path) -> CheckoutLease {
         CheckoutLease::active(path.to_path_buf())
+    }
+}
+
+/// Format a clone failure without interpolating HTTP userinfo from `repo`.
+///
+/// `stderr` may itself echo the clone URL (git often does), sometimes with
+/// a different host case than the request string.
+pub(super) fn clone_failure_message(
+    repo: &str,
+    stderr: &str,
+    cleanup: Option<(&Path, &std::io::Error)>,
+) -> String {
+    let safe_repo = redact_repo_url(repo);
+    let stderr = scrub_logged_repo_text(stderr, repo);
+    let stderr = stderr.trim();
+    match cleanup {
+        Some((checkout, cleanup_err)) => format!(
+            "git clone failed for {safe_repo}: {stderr} (also failed to remove partial checkout {}: {cleanup_err})",
+            checkout.display()
+        ),
+        None => format!(
+            "git clone failed for {safe_repo}: {stderr}.\nUse an absolute path for local deploys."
+        ),
     }
 }
 
@@ -186,22 +209,12 @@ fn url_hash_hex(repo: &str) -> String {
     format!("{:016x}", fnv1a_u64(repo.as_bytes()))
 }
 
-/// Stable, unique directory name stem for a remote repo URL.
+/// Stable directory name stem for a remote repo URL.
 ///
-/// Format: `{sanitized_prefix}-{16 hex FNV identity}`.
+/// Hex of FNV-1a over the original URL. Distinct URLs stay unique; userinfo
+/// never appears as a path component.
 pub(super) fn checkout_dir_name(repo: &str) -> String {
-    let hash = url_hash_hex(repo);
-    let prefix: String = repo
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .take(48)
-        .collect();
-    let prefix = prefix.trim_matches('-');
-    if prefix.is_empty() {
-        format!("repo-{hash}")
-    } else {
-        format!("{prefix}-{hash}")
-    }
+    format!("repo-{}", url_hash_hex(repo))
 }
 
 /// Per-deploy immutable directory under the URL stem.

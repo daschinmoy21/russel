@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// Basename for the agent initramfs CPIO file. Bump when `AGENT_INIT_SCRIPT` changes
 /// so stale disk caches cannot serve an old init.
-pub(super) const AGENT_INITRAMFS_BASENAME: &str = "agent-initramfs-v3.cpio";
+pub(super) const AGENT_INITRAMFS_BASENAME: &str = "agent-initramfs-v4.cpio";
 
 /// Busybox applets symlinked into the agent initramfs.
 pub(super) const AGENT_BUSYBOX_APPLETS: &[&str] = &[
@@ -12,7 +12,7 @@ pub(super) const AGENT_BUSYBOX_APPLETS: &[&str] = &[
 ];
 
 pub(super) const AGENT_INIT_SCRIPT: &str = r#"#!/bin/sh
-/bin/mkdir -p /proc /sys /dev /nix/store /config /tmp
+/bin/mkdir -p /proc /sys /dev /nix/store /config /tmp /run/russel
 /bin/mount -t proc proc /proc
 /bin/mount -t sysfs sysfs /sys
 /bin/mount -t devtmpfs devtmpfs /dev
@@ -57,12 +57,12 @@ if [ "$mounted" -ne 1 ]; then
   exec /bin/sh
 fi
 
-# Mount config (read-write) for deploy.env + readiness marker.
+# Mount config (read-only) for host-written deploy.env.
 echo "Mounting /config via virtiofs..."
 i=0
 mounted=0
 while [ $i -lt 30 ]; do
-  if /bin/mount -t virtiofs russelcfg /config; then
+  if /bin/mount -t virtiofs -o ro russelcfg /config; then
     echo "russelcfg mounted"
     mounted=1
     break
@@ -75,8 +75,26 @@ if [ "$mounted" -ne 1 ]; then
   exec /bin/sh
 fi
 
-# Signal readiness to host.
-echo "ready" > /config/.agent_ready
+# Mount scratch (read-write) for the readiness marker only.
+echo "Mounting /run/russel via virtiofs..."
+i=0
+mounted=0
+while [ $i -lt 30 ]; do
+  if /bin/mount -t virtiofs russelscratch /run/russel; then
+    echo "russelscratch mounted"
+    mounted=1
+    break
+  fi
+  i=$((i + 1))
+  /bin/usleep 5000
+done
+if [ "$mounted" -ne 1 ]; then
+  echo "ERROR: Failed to mount /run/russel via virtiofs after retries"
+  exec /bin/sh
+fi
+
+# Signal readiness to host (scratch only — cfg is read-only).
+echo "ready" > /run/russel/.agent_ready
 
 # Wait for deploy.env to be written by the host.
 echo "Waiting for /config/deploy.env..."

@@ -1,0 +1,52 @@
+# systemd --user unit for russel-ctrl (non-NixOS).
+#
+# Same defaults as nix/modules/russel-host.nix:
+#   127.0.0.1:7878, RUSSEL_REQUIRE_AUTH=1, warm pool off, /var/lib/russel 0700.
+#
+# Install:
+#   cargo build --release
+#   sudo install -m 755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
+#   mkdir -p ~/.config/systemd/user ~/.config/russel
+#   cp contrib/russel-ctrl.service ~/.config/systemd/user/
+#   umask 077
+#   printf 'RUSSEL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > ~/.config/russel/env
+#   sudo mkdir -p /var/lib/russel
+#   sudo chown "$USER:" /var/lib/russel
+#   sudo chmod 700 /var/lib/russel
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now russel-ctrl.service
+#
+# TLS: reverse proxy to 127.0.0.1:7878. Do not expose :7878.
+# See docs/security-tls.md and docs/traefik.md.
+# KVM/TAP/cloud-hypervisor are optional. Container-only VPS uses rootless Podman.
+
+[Unit]
+Description=Russel control plane
+Documentation=https://github.com/daschinmoy21/russel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/russel-ctrl
+WorkingDirectory=/var/lib/russel
+Environment=RUSSEL_CTRL_ADDR=127.0.0.1:7878
+Environment=RUSSEL_REQUIRE_AUTH=1
+Environment=RUSSEL_WARM_POOL=0
+Environment=HOME=/var/lib/russel
+EnvironmentFile=%h/.config/russel/env
+Restart=on-failure
+RestartSec=5s
+# Rootless Podman needs newuidmap (file caps). Matches
+# services.russel.rootlessPodman default true. Set yes if this unit
+# never starts containers.
+NoNewPrivileges=no
+ProtectSystem=strict
+# /run/user is the rootless Podman runtime. ProtectSystem=strict
+# would otherwise make it read-only.
+ReadWritePaths=/var/lib/russel /run/user
+PrivateTmp=yes
+Delegate=yes
+
+[Install]
+WantedBy=default.target

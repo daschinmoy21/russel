@@ -9,7 +9,7 @@ Self-contained apps for trying **container** (default) and **microVM** deploys.
 | [hello-rust](hello-rust/) | container | pure-std Rust | 3000 | No crates.io deps; Dockerfile |
 | [env-config](env-config/) | container | Go + `[service.env]` | 3000 | `secret://` demo; Dockerfile |
 | [shortlink](shortlink/) | container | Go in-memory shortener | 3000 | POST / + GET /{id}; Dockerfile |
-| [filebrowser](filebrowser/) | container | nixpkgs filebrowser | 8080 | Shell wrapper; uses `/tmp`; Dockerfile |
+| [filebrowser](filebrowser/) | container | nixpkgs filebrowser | 8080 | Auth on; guest binds `0.0.0.0`; host publish stays loopback; demo password; Dockerfile optional |
 | [static-test](static-test/) | container | Python http.server | 8000 | Static HTML; Dockerfile |
 
 All examples ship a `Dockerfile` so `./bench.sh` can race Russel against raw podman/docker.

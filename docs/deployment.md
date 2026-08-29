@@ -54,6 +54,10 @@ bin = "my-app"
 # This is the source of truth. CLI --runtime must match if provided.
 type = "microvm"
 
+# Optional: guest userspace. "busybox" (default). "linux" is parsed but
+# rejected at load until the boot path exists. Omit or set busybox.
+# guest = "busybox"
+
 # Optional: include bash, curl, and /usr/bin/env in container rootfs for
 # debugging. Default false (hardened: no shell tools, read-only rootfs).
 debug = false

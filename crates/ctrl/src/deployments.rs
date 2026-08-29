@@ -25,6 +25,7 @@ use russel_core::api::{DeploymentRecord, DeploymentsResponse};
 use russel_core::config::RuntimeKind;
 use serde::{Deserialize, Serialize};
 
+use crate::git::redact_repo_url;
 use crate::metadata::{deployed_at_now, write_metadata};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -222,7 +223,7 @@ impl JournalEntry {
             runtime: self.runtime,
             deployed_at: self.deployed_at.clone(),
             store_path: self.store_path.clone(),
-            repo_url: self.repo_url.clone(),
+            repo_url: self.repo_url.as_deref().map(redact_repo_url),
             config_path: self.config_path.clone(),
             host_port: self.host_port,
             guest_port: self.guest_port,
@@ -356,10 +357,14 @@ pub fn append_success_at(path: &Path, info: AppendSuccess) -> anyhow::Result<u32
     let version = journal.next_version;
     journal.next_version = journal.next_version.saturating_add(1);
 
-    let desired = info.desired_state;
+    let mut desired = info.desired_state;
+    if let Some(ds) = desired.as_mut() {
+        ds.repo_url = ds.repo_url.as_deref().map(redact_repo_url);
+    }
     let repo_url = info
         .repo_url
-        .or_else(|| desired.as_ref().and_then(|d| d.repo_url.clone()));
+        .or_else(|| desired.as_ref().and_then(|d| d.repo_url.clone()))
+        .map(|u| redact_repo_url(&u));
     let config_path = info
         .config_path
         .or_else(|| desired.as_ref().and_then(|d| d.config_path.clone()));
@@ -759,6 +764,50 @@ mod tests {
         let snap: DesiredStateSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(snap.host_port, Some(8080));
         assert_eq!(snap.guest_port, Some(3000));
+    }
+
+    #[test]
+    fn append_success_strips_http_userinfo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        append(&path, "https://user:token@example.com/app.git", "aaaa1111");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("token"), "{raw}");
+        assert!(!raw.contains("user:"), "{raw}");
+        assert!(raw.contains("https://example.com/app.git"), "{raw}");
+
+        let list = list_at(&path, "api").unwrap();
+        assert_eq!(
+            list.deployments[0].repo_url.as_deref(),
+            Some("https://example.com/app.git")
+        );
+    }
+
+    #[test]
+    fn list_redacts_legacy_journal_userinfo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+              "schema_version": 1,
+              "next_version": 2,
+              "entries": [{
+                "version": 1,
+                "status": "active",
+                "deployed_at": "2026-01-01T00:00:00Z",
+                "repo_url": "https://user:token@example.com/app.git",
+                "rollback_ready": false
+              }]
+            }"#,
+        )
+        .unwrap();
+        let list = list_at(&path, "api").unwrap();
+        assert_eq!(
+            list.deployments[0].repo_url.as_deref(),
+            Some("https://example.com/app.git")
+        );
     }
 
     #[test]

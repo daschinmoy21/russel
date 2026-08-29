@@ -566,6 +566,10 @@ memory = \"{memory}\"
 #   container  — rootless Podman --rootfs (typical VPS / no KVM)
 type = \"{runtime}\"
 
+# Guest userspace. Orthogonal to type (isolation). Default busybox.
+# linux is parsed but rejected until implemented (host-built NixOS userspace).
+# guest = \"busybox\"
+
 # Binary produced by the Nix build, executed as $out/bin/<bin>.
 # Defaults to `name` when omitted. Allowed: A-Za-z0-9._+- (max 256).
 bin = \"{bin}\"
@@ -865,6 +869,7 @@ fn file_line(name: &str, outcome: WriteOutcome) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use russel_core::GuestKind;
     use russel_core::config::Russelfile;
 
     #[derive(Debug, Parser)]
@@ -991,6 +996,7 @@ version = "0.1.0"
         assert_eq!(cfg.service.port, 3000);
         assert_eq!(cfg.service.bin_name(), "my-app");
         assert_eq!(cfg.service.runtime, RuntimeKind::Container);
+        assert_eq!(cfg.service.guest, GuestKind::Busybox);
         assert_eq!(cfg.service.source, ".");
         assert_eq!(cfg.service.memory.as_mebibytes(), 256);
         assert!(!cfg.service.debug);
@@ -1014,6 +1020,8 @@ version = "0.1.0"
             "port = 8080",
             "memory = \"512mb\"",
             "type = \"container\"",
+            "# guest = \"busybox\"",
+            "linux is parsed but rejected until implemented",
             "bin = \"custom-bin\"",
             "# cpus = 1",
             "# debug = false",

@@ -5,7 +5,7 @@ with Nix, and runs the resulting store path as either a **Cloud Hypervisor micro
 or a **rootless Podman container**, with Traefik as the HTTP ingress gateway.
 
 This document is the canonical architecture reference. For API/CLI details see
-[api.md](api.md); for config schema see [russelfile.md](russelfile.md).
+[README.md](../README.md); for config schema see [russelfile.md](russelfile.md).
 
 ---
 
@@ -138,7 +138,8 @@ Notable hardening on this path:
 flowchart TB
     subgraph Host
         VFD1[virtiofsd<br/>/nix/store ro]
-        VFD2[virtiofsd<br/>cfg dir rw]
+        VFD2[virtiofsd<br/>cfg dir ro]
+        VFD3[virtiofsd<br/>scratch dir rw]
         SOC[socat<br/>127.0.0.1:host_port]
         TAP[TAP rsl-&lt;key&gt;<br/>10.x.y.1/30]
         CH[cloud-hypervisor<br/>--api-socket --kernel --initramfs]
@@ -154,8 +155,10 @@ flowchart TB
     TAP <-->|virtio-net| CH
     VFD1 <-->|virtiofs tag=nixstore| CH
     VFD2 <-->|virtiofs tag=russelcfg| CH
+    VFD3 <-->|virtiofs tag=russelscratch| CH
     CH --> INIT --> MODS --> APP
     INIT -.->|reads /config/deploy.env| VFD2
+    INIT -.->|writes /run/russel/.agent_ready| VFD3
 ```
 
 Design decisions:
@@ -166,8 +169,11 @@ Design decisions:
   in the guest, so the app closure never gets copied into an image.
 - **Generic agent initramfs**: one cached CPIO for all services. Per-service
   config (`VM_IP`, `HOST_IP`, `PORT`, `APP`, user env) is delivered through a
-  second virtiofs share (`russelcfg`) as a shell-quoted `deploy.env` that `/init`
-  sources. Nothing app-specific is baked into the initramfs.
+  read-only virtiofs share (`russelcfg`) as a shell-quoted `deploy.env` that
+  `/init` sources. Guest writes (`.agent_ready`) go to a separate RW scratch
+  share (`russelscratch` → guest `/run/russel`), not the host cfg dir.
+  Scratch has no quota; disk-fill is bounded to that directory. Nothing
+  app-specific is baked into the initramfs.
 - **Kernel strategy**: prefer the repo's `microvm-kernel` flake attr (virtio/fuse
   built-in `=y`); fall back to stock nixpkgs kernel + module loading in init.
 - **Readiness is a TCP poll** of the guest IP across the TAP (10 s), then a
@@ -430,7 +436,7 @@ Things that exist but no longer pull their weight. Recommendation in **bold**.
 | Legacy `/var/lib/microvms` marker dirs + gcroots cleanup | Migration shim for pre-ctrl-state installs | **Remove after one release** with a note; destroy already handles absence |
 | Legacy dead initramfs stack (`build_initramfs`, `generate_init_script`, `boot()`) | `#[allow(dead_code)]` cold-boot fallback superseded by the agent initramfs | **Remove** (in progress in the audit-fix PRs) |
 | Flat `/status` + `/logs` endpoints | CLI-compat shims that 400 when >1 service exists (#54) | **Remove** once CLI drops usage, or make them aggregate all services |
-| `nix/modules/russel-host.nix`, `nix/microvm/` | Host NixOS module stub + legacy microVM reference | **Removed** (2026-08-15): empty stub and legacy reference; runtime boots Cloud Hypervisor directly |
+| `nix/microvm/` legacy reference | Removed 2026-08-15 (runtime boots Cloud Hypervisor directly) | Keep gone. Host install is `nix/modules/russel-host.nix` + `contrib/russel-ctrl.service` (#207) |
 | `bench.sh` | Dev scaffolding | Keep in-repo; not part of the operator surface |
 | `container debug = true` | Adds bash/curl/env wrapper to rootfs | **Keep** — genuinely useful, one config flag |
 | `Memory` enum (single variant), unit structs (`GitClient`, `NixBuilder`, `PortAllocator`) | Over-abstraction (#50, #53) | **Simplify** opportunistically; low value churn |

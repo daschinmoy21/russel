@@ -248,7 +248,7 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
 
     tracing::info!(
         service_id,
-        repo = %meta.repo_url,
+        repo = %crate::git::redact_repo_url(&meta.repo_url),
         "health restart: redeploying from recorded source"
     );
     let pipeline = DeployPipeline::new(state.clone());

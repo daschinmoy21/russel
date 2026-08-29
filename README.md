@@ -31,6 +31,24 @@ Scaffold an app with `russel init` (`--type container` on a typical VPS, `--with
 
 Remote control planes should get a **git URL**, not a laptop path. Bind off-loopback only with a ≥32-character `RUSSEL_API_TOKEN`, and terminate TLS in front of ctrl — see [docs/security-tls.md](docs/security-tls.md).
 
+## Install (one host)
+
+Build from source (`nix develop` then `cargo build --release`). The flake does not yet package `russel-ctrl`.
+
+**NixOS.** Import `nixosModules.russel`. Set `bin` or `package`, and `environmentFile` (mode 0600) with `RUSSEL_API_TOKEN`. Defaults: bind `127.0.0.1:7878`, `RUSSEL_REQUIRE_AUTH=1`, `/var/lib/russel` mode 0700, rootless Podman on.
+
+```nix
+{
+  services.russel.enable = true;
+  services.russel.bin = "/usr/local/bin/russel-ctrl";
+  services.russel.environmentFile = "/etc/russel/env";
+}
+```
+
+**Other Linux.** Copy [contrib/russel-ctrl.service](contrib/russel-ctrl.service) to `~/.config/systemd/user/` and follow the comments in that file.
+
+Typical VPS has no KVM. Set `type = "container"` in every Russelfile. Full checklist: [docs/vps-one-dev.md](docs/vps-one-dev.md).
+
 ## Docs
 
 | Doc | What it covers |
@@ -58,6 +76,8 @@ Remote control planes should get a **git URL**, not a laptop path. Bind off-loop
 | `crates/agent` | `russel-agent` (multi-host lifecycle RPC) |
 | `dashboard/` | Static web UI |
 | `examples/` | Deployable sample apps |
+| `nix/modules/` | NixOS `services.russel` |
+| `contrib/` | systemd user unit |
 | `docs/` | Operator and contributor docs |
 
 ## License
