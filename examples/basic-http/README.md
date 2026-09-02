@@ -17,7 +17,7 @@ microVM deploy paths.
 ./target/debug/russel-ctrl
 
 # terminal 2
-./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id basic
+./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id basic
 
 curl http://127.0.0.1:8080/health   # ok
 # Traefik (optional): http://basic.russel.local  after Host routing is set up
@@ -32,7 +32,7 @@ type = "microvm"
 
 ```bash
 sudo -E ./target/debug/russel-ctrl   # TAP/KVM usually needs privileges
-./target/debug/russel-cli deploy examples/microvm-http -p 8080:3000 --vm-id basic-vm
+./target/debug/russel deploy examples/microvm-http -p 8080:3000 --vm-id basic-vm
 ```
 
 ## Local Nix (no Russel)

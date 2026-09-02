@@ -1,5 +1,5 @@
 # env-config — demonstrates Russelfile [service.env] and secret:// refs.
-# Deploy after: printf '%s' 's3cret' | russel-cli secrets set DEMO_SECRET
+# Deploy after: printf '%s' 's3cret' | russel secrets set DEMO_SECRET
 
 [service]
 name = "env-config"

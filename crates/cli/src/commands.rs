@@ -16,7 +16,9 @@ use russel_core::{
     config::{Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
 };
 
+use crate::config::{self, Resolved};
 use crate::init::InitArgs;
+use crate::ui;
 
 /// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
 ///
@@ -29,23 +31,52 @@ use crate::init::InitArgs;
 ///
 /// Returns an error when the token value cannot be parsed into a valid HTTP
 /// header value (F-47).
+/// Token from `RUSSEL_API_TOKEN` (any origin) or the saved config token when
+/// the request URL matches the origin stored at login.
+fn bearer_token(control_plane: &str) -> Option<String> {
+    config::token_for(control_plane).map(|(token, _source)| token)
+}
+
 fn http_client(control_plane: &str) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
-    if let Ok(raw) = std::env::var("RUSSEL_API_TOKEN") {
-        let token = raw.trim();
-        if !token.is_empty() {
-            let header_value = format!("Bearer {token}").parse().map_err(|_| {
-                anyhow!("RUSSEL_API_TOKEN contains characters invalid in an HTTP header")
-            })?;
-            headers.insert(AUTHORIZATION, header_value);
-            // F-05 / #189: refuse cleartext Bearer to non-loopback; warn on loopback.
-            ensure_cleartext_token_ok(control_plane)?;
-        }
+    if let Some(token) = bearer_token(control_plane) {
+        let header_value = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| anyhow!("API token contains characters invalid in an HTTP header"))?;
+        headers.insert(AUTHORIZATION, header_value);
+        // F-05 / #189: refuse cleartext Bearer to non-loopback; warn on loopback.
+        ensure_cleartext_token_ok(control_plane)?;
     }
     reqwest::Client::builder()
         .default_headers(headers)
         .build()
         .map_err(|e| anyhow!("failed to build HTTP client: {e}"))
+}
+
+fn unauthorized_message(control_plane: &str) -> String {
+    format!(
+        "unauthorized (HTTP 401) at {control_plane}\n\
+         \n\
+         The control plane expects a Bearer token. Run:\n\
+           russel login {control_plane}\n\
+         or set RUSSEL_API_TOKEN.\n\
+         Fish does not load KEY=VALUE files; `russel login` writes\n\
+         ~/.config/russel/config.toml (mode 0600) so later shells work."
+    )
+}
+
+fn ok_status(resp: reqwest::Response, control_plane: &str) -> Result<reqwest::Response> {
+    if resp.status().as_u16() == 401 {
+        anyhow::bail!("{}", unauthorized_message(control_plane));
+    }
+    Ok(resp.error_for_status()?)
+}
+
+fn fail_if_unauthorized(status: reqwest::StatusCode, control_plane: &str) -> Result<()> {
+    if status.as_u16() == 401 {
+        anyhow::bail!("{}", unauthorized_message(control_plane));
+    }
+    Ok(())
 }
 
 static CLEARTEXT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -186,15 +217,12 @@ fn map_control_plane_error(err: reqwest::Error, control_plane: &str) -> anyhow::
 #[derive(Debug, Parser)]
 #[command(
     name = "russel",
-    about = "Deploy Nix-built services into microVMs/containers"
+    about = "Talk to russel-ctrl: deploy, list, logs, secrets"
 )]
 pub struct Cli {
-    #[arg(
-        long,
-        env = "RUSSEL_CONTROL_PLANE",
-        default_value = "http://127.0.0.1:7878"
-    )]
-    pub control_plane: String,
+    /// Control plane URL. Overrides `RUSSEL_CONTROL_PLANE` and `russel login`.
+    #[arg(long, env = "RUSSEL_CONTROL_PLANE")]
+    pub control_plane: Option<String>,
 
     /// Allow sending Bearer token over plain HTTP to non-loopback hosts.
     /// Prefer HTTPS (TLS reverse proxy) — see docs/security-tls.md.
@@ -210,10 +238,18 @@ pub struct Cli {
 pub enum Command {
     /// Create a starter Russelfile.toml (and optionally flake.nix).
     Init(InitArgs),
+    /// Save control-plane URL and API token to ~/.config/russel/config.toml.
+    Login(LoginArgs),
+    /// Remove the saved token from the config file (URL is kept).
+    Logout,
+    /// Show which control plane this CLI will talk to.
+    Origin,
     Deploy(DeployArgs),
     Status(StatusArgs),
     Logs(LogsArgs),
-    Vms,
+    /// List services (`list` is a visible alias; `vms` still works).
+    #[command(visible_alias = "list", alias = "vms")]
+    Ps,
     Stop(StopArgs),
     Destroy(DestroyArgs),
     /// Re-apply desired state from the recorded Russelfile source (or override).
@@ -223,6 +259,17 @@ pub enum Command {
         #[command(subcommand)]
         action: SecretsCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Control plane URL (default: --control-plane, env, saved config, or loopback).
+    #[arg(value_name = "URL")]
+    pub url: Option<String>,
+
+    /// Read the token from a file. Accepts a bare token or `RUSSEL_API_TOKEN=...`.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -399,8 +446,8 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         })
         .send()
         .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?
-        .error_for_status()?;
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?;
 
     let response = stream_deploy_events(&mut response, "deploy").await?;
 
@@ -909,6 +956,189 @@ fn default_service_id_from_repo(repo: &str) -> Option<String> {
     Some(out)
 }
 
+pub async fn login(args: LoginArgs, resolved: &Resolved) -> Result<()> {
+    let url = args
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(resolved.control_plane.as_str())
+        .to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("control plane URL must start with http:// or https:// (got {url})");
+    }
+    let token = read_login_token(&args)?;
+    config::validate_token(&token)?;
+    let mut cfg = config::load().unwrap_or_default();
+    cfg.control_plane = Some(url.clone());
+    cfg.token = Some(token);
+    let path = config::save(&cfg)?;
+    ui::heading("login");
+    ui::kv("saved", &path.display().to_string());
+    ui::kv("origin", &ui::sanitize(&url));
+    ui::kv("auth", "token stored (not printed)");
+    println!();
+    println!(
+        "  {}",
+        ui::dim("Later shells read this file. Fish does not need KEY=VALUE exports.")
+    );
+    println!();
+    Ok(())
+}
+
+pub fn logout() -> Result<()> {
+    let mut cfg = config::load()?;
+    cfg.token = None;
+    let path = config::save(&cfg)?;
+    ui::heading("logout");
+    ui::kv("config", &path.display().to_string());
+    ui::kv("auth", "token removed");
+    println!();
+    Ok(())
+}
+
+pub async fn origin(resolved: &Resolved) -> Result<()> {
+    let host = control_plane_host(&resolved.control_plane);
+    let auth = match (resolved.token.as_ref(), resolved.token_source) {
+        (Some(_), Some(src)) => format!("token ({})", src.as_str()),
+        (Some(_), None) => "token".to_string(),
+        _ => "none".to_string(),
+    };
+    ui::heading("origin");
+    ui::kv("url", &ui::sanitize(&resolved.control_plane));
+    ui::kv("source", resolved.control_plane_source.as_str());
+    ui::kv("host", host);
+    ui::kv("auth", &auth);
+    ui::kv("config", &resolved.config_path.display().to_string());
+    match probe_origin(&resolved.control_plane).await {
+        Ok(n) => {
+            let word = if n == 1 { "service" } else { "services" };
+            ui::kv("reachable", &format!("{}  ({n} {word})", ui::green("yes")));
+        }
+        Err(e) => {
+            ui::kv("reachable", &format!("{}  ({e})", ui::red("no")));
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn probe_origin(control_plane: &str) -> Result<usize> {
+    let r = http_client(control_plane)?
+        .get(format!("{control_plane}/vms"))
+        .send()
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?
+        .json::<VmsResponse>()
+        .await?;
+    Ok(r.vms.len())
+}
+
+#[cfg(unix)]
+struct TtyEchoGuard {
+    fd: i32,
+    orig: libc::termios,
+}
+
+#[cfg(unix)]
+impl Drop for TtyEchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn hide_tty_echo() -> Option<TtyEchoGuard> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    unsafe {
+        let mut term = std::mem::zeroed::<libc::termios>();
+        if libc::tcgetattr(fd, &mut term) != 0 {
+            return None;
+        }
+        let orig = term;
+        term.c_lflag &= !(libc::ECHO as libc::tcflag_t);
+        if libc::tcsetattr(fd, libc::TCSANOW, &term) != 0 {
+            return None;
+        }
+        Some(TtyEchoGuard { fd, orig })
+    }
+}
+
+#[cfg(not(unix))]
+fn hide_tty_echo() -> Option<()> {
+    None
+}
+
+fn read_login_token(args: &LoginArgs) -> Result<String> {
+    if let Some(path) = &args.token_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read token file {}", path.display()))?;
+        return parse_token_input(&raw);
+    }
+    if let Ok(raw) = std::env::var("RUSSEL_API_TOKEN") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return Ok(t.to_string());
+        }
+    }
+    use std::io::{BufRead, IsTerminal, Read, Write, stdin};
+    let stdin = stdin();
+    if stdin.is_terminal() {
+        eprint!("API token: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let read = {
+            let _guard = hide_tty_echo();
+            stdin
+                .lock()
+                .read_line(&mut line)
+                .context("read token from stdin")
+        };
+        eprintln!();
+        read?;
+        return parse_token_input(&line);
+    }
+    let mut value = String::new();
+    stdin
+        .lock()
+        .read_to_string(&mut value)
+        .context("read token from stdin")?;
+    parse_token_input(&value)
+}
+
+fn parse_token_input(raw: &str) -> Result<String> {
+    let mut bare: Option<String> = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("RUSSEL_API_TOKEN=") {
+            let v = v.trim().trim_matches('"').trim().to_string();
+            if !v.is_empty() {
+                return Ok(v);
+            }
+        }
+        if !line.contains('=') && bare.is_none() {
+            bare = Some(line.to_string());
+        }
+    }
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && !trimmed.contains('\n') && !trimmed.contains('=') {
+        return Ok(trimmed.to_string());
+    }
+    bare.ok_or_else(|| {
+        anyhow!(
+            "no token found. Paste the token, or a line `RUSSEL_API_TOKEN=...`, \
+             or pass --token-file"
+        )
+    })
+}
+
 pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
     let url = match args.service_id {
         Some(id) => format!("{control_plane}/vm/{id}/status"),
@@ -918,28 +1148,33 @@ pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
         .get(&url)
         .send()
         .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?
-        .error_for_status()?
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?
         .json::<StatusResponse>()
         .await?;
-    println!("service_id={}", r.service_id);
-    println!("status={}", r.status);
-    println!("vm_state={}", r.vm_state);
-    println!("uptime_seconds={}", r.uptime_seconds);
-    if let Some(runtime) = r.runtime {
-        println!("runtime={runtime}");
-    }
-    if let Some(host_port) = r.host_port {
-        println!("host_port={host_port}");
-    }
-    if let Some(guest_port) = r.guest_port {
-        println!("guest_port={guest_port}");
-    }
+    print_status(&r);
     Ok(())
 }
 
+fn print_status(r: &StatusResponse) {
+    ui::heading(&ui::sanitize(&r.service_id));
+    ui::kv("status", &ui::status_style(&r.status));
+    ui::kv("state", &ui::status_style(&r.vm_state));
+    if let Some(runtime) = r.runtime {
+        ui::kv("runtime", &runtime.to_string());
+    }
+    match (r.host_port, r.guest_port) {
+        (Some(h), Some(g)) => ui::kv("ports", &format!("{h} → {g}")),
+        (Some(h), None) => ui::kv("host port", &h.to_string()),
+        (None, Some(g)) => ui::kv("guest port", &g.to_string()),
+        (None, None) => {}
+    }
+    ui::kv("uptime", &ui::format_uptime(r.uptime_seconds));
+    println!();
+}
+
 pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
-    let url = match args.service_id {
+    let url = match &args.service_id {
         Some(id) => format!("{control_plane}/vm/{id}/logs"),
         None => format!("{control_plane}/logs"),
     };
@@ -947,43 +1182,109 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
         .get(&url)
         .send()
         .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?
-        .error_for_status()?
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?
         .json::<LogsResponse>()
         .await?;
-    print!("{}", r.output);
+    let title = args.service_id.as_deref().unwrap_or("logs");
+    ui::heading(title);
+    ui::kv("origin", control_plane);
+    println!("  {}", ui::dim("─".repeat(40).as_str()));
+    print!("{}", ui::sanitize(&r.output));
+    if !r.output.ends_with('\n') {
+        println!();
+    }
     Ok(())
 }
 
-pub async fn vms(control_plane: &str) -> Result<()> {
+pub async fn ps(control_plane: &str) -> Result<()> {
     let r = http_client(control_plane)?
         .get(format!("{control_plane}/vms"))
         .send()
         .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?
-        .error_for_status()?
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?
         .json::<VmsResponse>()
         .await?;
+    println!();
     if r.vms.is_empty() {
-        println!("no services registered");
+        println!("  {}", ui::dim("no services"));
+        println!();
         return Ok(());
     }
 
-    if !r.services.is_empty() {
-        for svc in &r.services {
-            let runtime = svc
-                .runtime
-                .as_ref()
-                .map(|r| format!("{r}"))
-                .unwrap_or_else(|| "unknown".to_string());
-            println!("{} runtime={runtime} status={}", svc.service_id, svc.status);
-        }
+    let summaries: Vec<(String, String, String)> = if !r.services.is_empty() {
+        r.services
+            .iter()
+            .map(|s| {
+                (
+                    s.service_id.clone(),
+                    s.runtime
+                        .as_ref()
+                        .map(|rt| rt.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                    s.status.clone(),
+                )
+            })
+            .collect()
     } else {
-        for vm in r.vms {
-            println!("{vm}");
-        }
+        r.vms
+            .iter()
+            .map(|id| (id.clone(), "—".into(), "—".into()))
+            .collect()
+    };
+
+    let mut rows = Vec::new();
+    for (id, runtime, list_status) in summaries {
+        let extra = fetch_status_row(control_plane, &id).await;
+        let (state, ports, uptime, status) = match extra {
+            Ok(st) => {
+                let ports = match (st.host_port, st.guest_port) {
+                    (Some(h), Some(g)) => format!("{h}→{g}"),
+                    (Some(h), None) => h.to_string(),
+                    _ => "—".into(),
+                };
+                (
+                    ui::status_style(&st.vm_state),
+                    ports,
+                    ui::format_uptime(st.uptime_seconds),
+                    ui::status_style(&st.status),
+                )
+            }
+            Err(_) => (
+                ui::dim("—"),
+                "—".into(),
+                "—".into(),
+                ui::status_style(&list_status),
+            ),
+        };
+        rows.push(vec![
+            ui::bold(&ui::sanitize(&id)),
+            runtime,
+            status,
+            state,
+            ports,
+            uptime,
+        ]);
     }
+    ui::table(
+        &["ID", "RUNTIME", "STATUS", "STATE", "PORTS", "UPTIME"],
+        &rows,
+    );
+    println!();
     Ok(())
+}
+
+async fn fetch_status_row(control_plane: &str, id: &str) -> Result<StatusResponse> {
+    http_client(control_plane)?
+        .get(format!("{control_plane}/vm/{id}/status"))
+        .send()
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?
+        .json::<StatusResponse>()
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
@@ -991,11 +1292,14 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
         .post(format!("{control_plane}/vm/{id}/stop"))
         .send()
         .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?
-        .error_for_status()?
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?
         .json::<String>()
         .await?;
-    println!("{}", r);
+    ui::heading("stop");
+    ui::kv("id", &ui::sanitize(id));
+    ui::kv("result", &ui::sanitize(&r));
+    println!();
     Ok(())
 }
 
@@ -1021,8 +1325,8 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
         .json(&body)
         .send()
         .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?
-        .error_for_status()?;
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?;
 
     let response = stream_deploy_events(&mut response, "update").await?;
     let status = response.status.clone();
@@ -1150,13 +1454,17 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
     // Do not treat bare 404 as success: unmatched routes and "not in memory"
     // can 404 while runtime resources still exist. Server returns 200 with an
     // "already gone" body when destroy was intentionally idempotent.
+    fail_if_unauthorized(resp.status(), control_plane)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("destroy failed ({status}): {body}");
     }
     let r = resp.json::<String>().await?;
-    println!("{}", r);
+    ui::heading("destroy");
+    ui::kv("id", &ui::sanitize(id));
+    ui::kv("result", &ui::sanitize(&r));
+    println!();
     Ok(())
 }
 
@@ -1184,34 +1492,39 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
                 .send()
                 .await
                 .map_err(|e| map_control_plane_error(e, control_plane))?;
+            fail_if_unauthorized(resp.status(), control_plane)?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 anyhow::bail!("secrets set failed ({status}): {body}");
             }
-            println!("secret {name} stored");
+            ui::heading("secrets");
+            ui::kv("set", &ui::sanitize(&name));
+            println!();
         }
         SecretsCommand::List => {
             let resp = http_client(control_plane)?
                 .get(format!("{control_plane}/secrets"))
                 .send()
                 .await
-                .map_err(|e| map_control_plane_error(e, control_plane))?
-                .error_for_status()?;
+                .map_err(|e| map_control_plane_error(e, control_plane))
+                .and_then(|r| ok_status(r, control_plane))?;
             let body: serde_json::Value = resp.json().await?;
+            ui::heading("secrets");
             if let Some(arr) = body.get("secrets").and_then(|v| v.as_array()) {
                 if arr.is_empty() {
-                    println!("(no secrets)");
+                    println!("  {}", ui::dim("(none)"));
                 } else {
                     for name in arr {
                         if let Some(s) = name.as_str() {
-                            println!("{s}");
+                            println!("  {}", ui::sanitize(s));
                         }
                     }
                 }
             } else {
-                println!("{body}");
+                println!("  {body}");
             }
+            println!();
         }
         SecretsCommand::Delete { name } => {
             let resp = http_client(control_plane)?
@@ -1219,12 +1532,15 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
                 .send()
                 .await
                 .map_err(|e| map_control_plane_error(e, control_plane))?;
+            fail_if_unauthorized(resp.status(), control_plane)?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 anyhow::bail!("secrets delete failed ({status}): {body}");
             }
-            println!("secret {name} deleted");
+            ui::heading("secrets");
+            ui::kv("deleted", &ui::sanitize(&name));
+            println!();
         }
     }
     Ok(())
@@ -1420,6 +1736,54 @@ mod tests {
             }
             _ => panic!("expected deploy subcommand"),
         }
+    }
+
+    #[test]
+    fn ps_list_vms_aliases_parse() {
+        for name in ["ps", "list", "vms"] {
+            let cli = Cli::try_parse_from(["russel", name]).unwrap();
+            assert!(matches!(cli.command, Command::Ps), "expected Ps for {name}");
+        }
+    }
+
+    #[test]
+    fn login_and_origin_parse() {
+        let login = Cli::try_parse_from([
+            "russel",
+            "login",
+            "http://127.0.0.1:7878",
+            "--token-file",
+            "/tmp/t",
+        ])
+        .unwrap();
+        match login.command {
+            Command::Login(args) => {
+                assert_eq!(args.url.as_deref(), Some("http://127.0.0.1:7878"));
+                assert_eq!(
+                    args.token_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/t"))
+                );
+            }
+            _ => panic!("expected login"),
+        }
+        let origin = Cli::try_parse_from(["russel", "origin"]).unwrap();
+        assert!(matches!(origin.command, Command::Origin));
+        let logout = Cli::try_parse_from(["russel", "logout"]).unwrap();
+        assert!(matches!(logout.command, Command::Logout));
+    }
+
+    #[test]
+    fn parse_token_from_env_file_line() {
+        let t = parse_token_input(
+            "RUSSEL_CONTROL_PLANE=http://127.0.0.1:7878\nRUSSEL_API_TOKEN=abc123\n",
+        )
+        .unwrap();
+        assert_eq!(t, "abc123");
+    }
+
+    #[test]
+    fn parse_token_bare_line() {
+        assert_eq!(parse_token_input("  deadbeef  \n").unwrap(), "deadbeef");
     }
 
     #[test]
@@ -1766,7 +2130,8 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.insecure);
-        assert_eq!(cli.control_plane, "http://10.0.0.1:7878");
+        assert_eq!(cli.control_plane.as_deref(), Some("http://10.0.0.1:7878"));
+        assert!(matches!(cli.command, Command::Ps));
     }
 
     #[tokio::test]

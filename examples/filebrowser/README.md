@@ -21,13 +21,13 @@ loopback). Isolation for the demo is host-side. Russel default
 
 ```bash
 ./target/debug/russel-ctrl
-./target/debug/russel-cli deploy examples/filebrowser -p 8081:8080 --vm-id files
+./target/debug/russel deploy examples/filebrowser -p 8081:8080 --vm-id files
 ```
 
 Open `http://127.0.0.1:8081/` and sign in. Then:
 
 ```bash
-./target/debug/russel-cli destroy files
+./target/debug/russel destroy files
 ```
 
 ## Password
@@ -41,7 +41,7 @@ prints a warning.
 For a real secret:
 
 ```bash
-printf '%s' 'your-password' | russel-cli secrets set FILEBROWSER_PASSWORD
+printf '%s' 'your-password' | russel secrets set FILEBROWSER_PASSWORD
 ```
 
 In `Russelfile.toml`:

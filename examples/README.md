@@ -30,9 +30,9 @@ Rootless Podman is required for `type = "container"`. See root [README](../READM
 ## Quick deploy
 
 ```bash
-./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id basic
+./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id basic
 curl http://127.0.0.1:8080/health
-./target/debug/russel-cli destroy basic
+./target/debug/russel destroy basic
 ```
 
 ## Runtime switch (dual-live)

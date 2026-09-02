@@ -1,7 +1,7 @@
 # Single-VPS, one-developer deploy checklist
 
 **Audience:** one trusted operator running `russel-ctrl` on a single Linux VPS
-(or home server), deploying with `russel-cli` from a laptop.
+(or home server), deploying with `russel` from a laptop.
 
 **Scope:** container runtime on typical no-KVM VPS images. MicroVMs need
 `/dev/kvm` and are optional on bare metal / nested virt only.
@@ -51,11 +51,12 @@ This is the install story. Pick one host path, then put the CLI on the laptop.
 
 - [ ] Clone this repo on the server (or a CI artifact you trust)
 - [ ] `nix develop` then `cargo build --release` (or equivalent toolchain)
-- [ ] `russel-ctrl` and `russel-cli` binaries exist (`target/release/…` or a package)
+- [ ] `russel-ctrl` and `russel` binaries exist (`target/release/…` or a package)
 - [ ] NixOS. Import `nixosModules.russel` (flake output `nixosModules.default`). Set `services.russel.enable`, `environmentFile` (0600, `RUSSEL_API_TOKEN=`), and `bin` or `package`. Defaults already bind `127.0.0.1:7878`, set `RUSSEL_REQUIRE_AUTH=1`, use `/var/lib/russel` mode 0700, leave the warm pool off, put `/run/wrappers` on PATH, enable `virtualisation.podman`, set linger on the service user, and set `rootlessPodman = true` (`NoNewPrivileges` off for `newuidmap`). For an existing login user set `user`, `group` (or omit `group` to use the primary group), and `createUser = false`. `rootlessPodman = false` only keeps NNP on; it does not configure microVMs. See [nix/modules/russel-host.nix](../nix/modules/russel-host.nix).
 - [ ] Non-NixOS. Install [contrib/russel-ctrl.service](../contrib/russel-ctrl.service) as a systemd user unit (comments in the file). Same env defaults.
 - [ ] Container-only VPS: skip KVM, TAP, and cloud-hypervisor. Use a lingering user with rootless Podman. MicroVMs stay optional on bare metal / nested virt.
-- [ ] (Optional) Install CLI on the laptop the same way or copy the binary
+- [ ] Laptop: `./contrib/install.sh cli` → `~/.local/bin/russel` ([install.md](install.md))
+- [ ] Server: `./contrib/install.sh ctrl` or NixOS module / systemd unit above
 
 ### C. Secure control plane
 
@@ -83,13 +84,16 @@ Pick one:
 - [ ] Smoke:
 
 ```bash
-russel-cli vms
-russel-cli deploy https://github.com/YOU/APP.git \
+russel login https://russel.example.com   # token from stdin or --token-file
+# Fish: do not source KEY=VALUE files. login writes ~/.config/russel/config.toml.
+russel origin
+russel ps
+russel deploy https://github.com/YOU/APP.git \
   --vm-id demo -p 8080:3000 --runtime container
-russel-cli status demo
-russel-cli logs demo
+russel status demo
+russel logs demo
 # curl health on published port or via Traefik Host rule
-russel-cli destroy demo
+russel destroy demo
 ```
 
 ### F. Dashboard (optional)
@@ -103,7 +107,7 @@ russel-cli destroy demo
 
 - [ ] Local path deploys stay **off** on remote ctrl (`RUSSEL_ALLOW_LOCAL_PATH_DEPLOY` unset)
 - [ ] Prefer git deploys; never put laptop paths in deploy requests to a remote server
-- [ ] Secrets via `russel-cli secrets set` + `secret://NAME` (files under `/var/lib/russel/secrets/` mode `0600`)
+- [ ] Secrets via `russel secrets set` + `secret://NAME` (files under `/var/lib/russel/secrets/` mode `0600`)
 - [ ] Expect slow **first** Nix builds on small VPS; later deploys hit the store cache
 - [ ] Backup `/var/lib/russel` if you care about metadata, secrets, and deployment history
 
@@ -129,11 +133,17 @@ export RUSSEL_REQUIRE_AUTH=1
 ## Minimal laptop commands
 
 ```bash
+# bash/zsh
 export RUSSEL_CONTROL_PLANE=https://russel.example.com
 export RUSSEL_API_TOKEN='…same as server…'
+russel login   # optional: persist to ~/.config/russel/config.toml (0600)
 
-russel-cli vms
-russel-cli deploy https://github.com/you/app.git \
+# fish — KEY=VALUE files are not exported. Persist instead:
+#   russel login http://127.0.0.1:7878 --token-file ~/.config/russel/token.env
+
+russel origin
+russel ps
+russel deploy https://github.com/you/app.git \
   --vm-id app -p 8080:3000 --runtime container
 ```
 
@@ -141,9 +151,9 @@ SSH tunnel alternative (no public TLS yet):
 
 ```bash
 ssh -L 7878:127.0.0.1:7878 user@vps
-export RUSSEL_CONTROL_PLANE=http://127.0.0.1:7878
-export RUSSEL_API_TOKEN='…'
-russel-cli vms
+russel login http://127.0.0.1:7878 --token-file ~/.config/russel/token.env
+russel origin
+russel ps
 ```
 
 ---
@@ -169,7 +179,7 @@ What must be true in the tree for the operator path above. Tick when verifying a
 ### Still DIY / later
 
 - [ ] deb/OCI packages
-- [ ] `russel login` / config file for URL + token
+- [x] `russel login` / config file for URL + token (`~/.config/russel/config.toml`, mode 0600)
 - [ ] Native TLS in `russel-ctrl` (proxy is enough for one-dev)
 - [ ] Fresh VPS e2e automated in CI
 - [ ] Multi-tenant isolation, horizontal scale, managed DBs

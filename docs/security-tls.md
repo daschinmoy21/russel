@@ -29,7 +29,7 @@ export RUSSEL_REQUIRE_AUTH=1                        # optional, fail-closed on l
 # Client
 export RUSSEL_CONTROL_PLANE=https://russel.example.com
 export RUSSEL_API_TOKEN='…same token…'
-russel-cli vms
+russel ps
 ```
 
 ## Caddy

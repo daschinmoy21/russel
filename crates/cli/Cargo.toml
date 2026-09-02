@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+autobins = false
+
+[[bin]]
+name = "russel"
+path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -11,8 +16,11 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 tokio.workspace = true
+toml.workspace = true
 
 russel-core = { path = "../core" }
 serde_json.workspace = true

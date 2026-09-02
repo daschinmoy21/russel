@@ -41,10 +41,10 @@ env/secrets, and a small multi-app tour. Index: [examples/README.md](../examples
 | Config | `examples/basic-http/Russelfile.toml` (`type = "container"`) |
 
 ```bash
-./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id basic
+./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id basic
 curl http://127.0.0.1:8080/health
-./target/debug/russel-cli status basic
-./target/debug/russel-cli destroy basic
+./target/debug/russel status basic
+./target/debug/russel destroy basic
 ```
 
 Hardened containers (`debug = false`): no bash/curl; this app is a static ELF so it is fine.
@@ -60,7 +60,7 @@ Hardened containers (`debug = false`): no bash/curl; this app is a static ELF so
 
 ```bash
 sudo -E ./target/debug/russel-ctrl
-./target/debug/russel-cli deploy examples/microvm-http -p 8080:3000 --vm-id basic-vm
+./target/debug/russel deploy examples/microvm-http -p 8080:3000 --vm-id basic-vm
 curl http://127.0.0.1:8080/health
 ```
 
@@ -70,9 +70,9 @@ Redeploy the **same** service id with the other example (or change `type` and re
 
 ```bash
 # was microVM; switch to container (candidate boots, Traefik swap, old gen drained)
-./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id demo
+./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id demo
 # later:
-./target/debug/russel-cli deploy examples/microvm-http -p 8080:3000 --vm-id demo
+./target/debug/russel deploy examples/microvm-http -p 8080:3000 --vm-id demo
 ```
 
 Prefer Traefik Host names over a fixed `-p` for stable URLs across generations.
@@ -88,7 +88,7 @@ Prefer Traefik Host names over a fixed `-p` for stable URLs across generations.
 | Health | `GET /health` |
 
 ```bash
-./target/debug/russel-cli deploy examples/hello-rust -p 8083:3000 --vm-id hello
+./target/debug/russel deploy examples/hello-rust -p 8083:3000 --vm-id hello
 curl http://127.0.0.1:8083/health
 curl http://127.0.0.1:8083/
 ```
@@ -103,8 +103,8 @@ curl http://127.0.0.1:8083/
 | Env | `GREETING`, `LOG_LEVEL`, `DEMO_SECRET=secret://DEMO_SECRET` |
 
 ```bash
-printf '%s' 's3cret' | ./target/debug/russel-cli secrets set DEMO_SECRET
-./target/debug/russel-cli deploy examples/env-config -p 8084:3000 --vm-id envdemo
+printf '%s' 's3cret' | ./target/debug/russel secrets set DEMO_SECRET
+./target/debug/russel deploy examples/env-config -p 8084:3000 --vm-id envdemo
 curl -s http://127.0.0.1:8084/ | jq .
 # → greeting, log_level, secret_set=true, secret_len=… (value never returned)
 ```
@@ -114,7 +114,7 @@ curl -s http://127.0.0.1:8084/ | jq .
 ## 5. shortlink — URL shortener
 
 ```bash
-./target/debug/russel-cli deploy examples/shortlink -p 8085:3000 --vm-id link
+./target/debug/russel deploy examples/shortlink -p 8085:3000 --vm-id link
 curl -s -X POST --data 'https://example.com' http://127.0.0.1:8085/
 # → {"id":"…","url":"https://example.com"}
 curl -sI "http://127.0.0.1:8085/<id>"   # 302
@@ -143,7 +143,7 @@ builds `flake.nix` (`pkgs.filebrowser`). The Dockerfile is optional (bench /
 legacy) and checksum-pins the v2.31.2 linux-amd64 tarball.
 
 ```bash
-./target/debug/russel-cli deploy examples/filebrowser -p 8081:8080 --vm-id files
+./target/debug/russel deploy examples/filebrowser -p 8081:8080 --vm-id files
 curl -sI http://127.0.0.1:8081/ | head -5
 # browser: http://127.0.0.1:8081/  login admin / demo-only-not-for-production
 ```
@@ -158,7 +158,7 @@ curl -sI http://127.0.0.1:8081/ | head -5
 | Binary | `app` |
 
 ```bash
-./target/debug/russel-cli deploy examples/static-test -p 8082:8000 --vm-id static
+./target/debug/russel deploy examples/static-test -p 8082:8000 --vm-id static
 curl http://127.0.0.1:8082/
 ```
 
@@ -181,5 +181,5 @@ nix build path:examples/env-config && PORT=3000 ./result/bin/env-config
 |--------|----------|
 | `debug = true` | Only if entrypoints need bash/`#!/usr/bin/env` |
 | Publish bind | Default backend bind is often loopback-friendly; Traefik on host is preferred ingress |
-| Secrets | `russel-cli secrets set/list/delete`; never put raw secrets in git |
+| Secrets | `russel secrets set/list/delete`; never put raw secrets in git |
 | Auth | Same `RUSSEL_API_TOKEN` on ctrl and CLI when set |

@@ -1,6 +1,5 @@
 # Untrusted Nix builds — threat model & operator guidance
 
-**Issue:** [#197](https://github.com/daschinmoy21/russel-dev/issues/197) (audit H-09)  
 **Code:** `crates/ctrl/src/build.rs` (`NixBuilder`)  
 **Opt-in gate:** `RUSSEL_NIX_RESTRICTED=1`
 

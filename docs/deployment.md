@@ -309,9 +309,9 @@ Store secret values on the control plane host (not in the Russelfile). Values li
 the control plane resolves them at deploy time.
 
 ```bash
-printf '%s' "$VAL" | russel-cli secrets set NAME
-russel-cli secrets list
-russel-cli secrets delete NAME
+printf '%s' "$VAL" | russel secrets set NAME
+russel secrets list
+russel secrets delete NAME
 ```
 
 ```toml

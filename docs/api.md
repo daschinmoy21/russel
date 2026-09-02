@@ -7,7 +7,8 @@ JSON over HTTP. `POST /deploy` (and update/rollback) return an NDJSON event stre
 
 When `RUSSEL_API_TOKEN` is set on the control plane, **every** route requires
 `Authorization: Bearer <token>`. The token must be **at least 32 characters**
-after trim (`openssl rand -hex 32`). The CLI sends the same env var automatically.
+after trim (`openssl rand -hex 32`). The CLI sends `RUSSEL_API_TOKEN` when set,
+otherwise a token saved by `russel login` for that origin.
 
 - Loopback + no token: dev mode (warning).
 - Non-loopback: token required or ctrl **refuses to start**.
@@ -53,32 +54,38 @@ Statuses: `active`, `previous`, `superseded`, `rolled_back`.
 
 ## CLI
 
-Binaries: `russel-cli`, `russel-ctrl`. Clap program name is `russel`.
+Binaries: `russel` (crate `russel-cli`) and `russel-ctrl`.
 
 **Global options:**
 
-- `--control-plane URL` (`RUSSEL_CONTROL_PLANE`, default `http://127.0.0.1:7878`)
+- `--control-plane URL` (`RUSSEL_CONTROL_PLANE`, then `russel login` config, default `http://127.0.0.1:7878`)
 - `--insecure` — allow Bearer over plain HTTP to non-loopback hosts (`RUSSEL_INSECURE_CLEARTEXT=1`)
 
 ```bash
-russel-cli deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
+russel login [<url>] [--token-file PATH]
+russel logout
+russel origin
+russel deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
   [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] \
   [-- <podman-run-args...>]          # container only, after --
-russel-cli init [--type microvm|container] [--with-flake]
-russel-cli status [<service_id>]
-russel-cli logs [<service_id>]
-russel-cli vms
-russel-cli stop <service_id>
-russel-cli destroy <service_id>
-russel-cli update <service_id> [--repo REPO] [--config PATH]
-russel-cli secrets set <name>        # value from stdin
-russel-cli secrets list
-russel-cli secrets delete <name>
+russel init [--type microvm|container] [--with-flake]
+russel status [<service_id>]
+russel logs [<service_id>]
+russel ps                            # aliases: list, vms
+russel stop <service_id>
+russel destroy <service_id>
+russel update <service_id> [--repo REPO] [--config PATH]
+russel secrets set <name>            # value from stdin
+russel secrets list
+russel secrets delete <name>
 ```
+
+`russel login` writes `~/.config/russel/config.toml` (mode 0600). The saved token
+is sent only to that origin. `RUSSEL_API_TOKEN` still wins and is not origin-bound.
 
 - `--env` / `--env-file` merge over `[service.env]` (later wins). Reserved keys
   (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected.
-- Secrets: `printf '%s' "$VAL" | russel-cli secrets set NAME`. In env maps use
+- Secrets: `printf '%s' "$VAL" | russel secrets set NAME`. In env maps use
   `secret://NAME` — resolved at deploy time from `/var/lib/russel/secrets/` (`0600`).
 - `--runtime` is **not** an override. If set, it must match `service.type` (default `microvm`).
 - `-p HOST:GUEST` publishes a host port. Traefik is the primary HTTP gateway; `-p` is optional for HTTP apps.
@@ -88,7 +95,7 @@ russel-cli secrets delete <name>
 `--config` must be a relative path under the repo root (`openat` + `O_NOFOLLOW`, 1 MiB cap).
 The binary name (`bin` or `name`) must match `[A-Za-z0-9._+-]` (max 256).
 
-`russel-cli update <id>` re-applies the last successful `repo_url` / `config_path`.
+`russel update <id>` re-applies the last successful `repo_url` / `config_path`.
 A failed redeploy after a prior success attempts rollback; CLI exit is non-zero.
 
 Health: TCP probe of `127.0.0.1:<host_port>` every `RUSSEL_HEALTH_INTERVAL_SECS` (default 30).

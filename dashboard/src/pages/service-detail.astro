@@ -349,7 +349,7 @@ import OfflineState from '../components/OfflineState.astro';
         deployBody.innerHTML = '<p style="color: var(--text-muted);">Unavailable while control plane is offline.</p>';
       } else {
         deployBody.innerHTML =
-          '<p style="color: var(--text-muted);">Deployment history requires russel-ctrl with history API (<a href="https://github.com/daschinmoy21/russel-dev/issues/177">issue #177</a>).</p>';
+          '<p style="color: var(--text-muted);">Deployment history requires russel-ctrl with the history API.</p>';
       }
       return;
     }
@@ -380,7 +380,7 @@ import OfflineState from '../components/OfflineState.astro';
       rollbackModal?.classList.add('hidden');
       const res = await api.rollbackService(serviceId, pendingRollbackVersion);
       if (!res.supported) {
-        showFeedback('Rollback not supported by this control plane (issue #177).', true);
+        showFeedback('Rollback not supported by this control plane.', true);
         return;
       }
       showFeedback(res.message, !res.success);

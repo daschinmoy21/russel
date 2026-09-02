@@ -15,6 +15,6 @@ bin = "filebrowser"
 # debug = true
 
 [service.env]
-# Production: printf '%s' 'your-password' | russel-cli secrets set FILEBROWSER_PASSWORD
+# Production: printf '%s' 'your-password' | russel secrets set FILEBROWSER_PASSWORD
 # then replace the value with "secret://FILEBROWSER_PASSWORD".
 FILEBROWSER_PASSWORD = "demo-only-not-for-production"

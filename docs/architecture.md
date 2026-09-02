@@ -14,7 +14,7 @@ This document is the canonical architecture reference. For API/CLI details see
 ```mermaid
 flowchart LR
     subgraph User
-        CLI[russel-cli]
+        CLI[russel]
     end
 
     subgraph Host["Linux host"]
@@ -74,7 +74,7 @@ Key properties:
 | Crate | Role | Notable modules |
 |-------|------|-----------------|
 | `russel-core` | Shared types | `config.rs` (Russelfile schema + validation), `api.rs` (wire types) |
-| `russel-cli` | CLI client | `commands.rs` (deploy/status/logs/vms/stop/destroy/update/secrets) |
+| `russel` | CLI client (crate `russel-cli`) | `commands.rs` (deploy/status/logs/ps/stop/destroy/update/secrets/login/origin) |
 | `russel-ctrl` | Control plane | `api.rs`, `deploy.rs`, `state.rs`, `microvm.rs`, `container.rs`, `network.rs`, `git.rs`, `build.rs`, `metadata.rs`, `reconcile.rs`, `health.rs`, `secrets.rs`, `traefik.rs`, `ingress.rs`, `warm_pool.rs`, `ch_api.rs` |
 
 ---
@@ -83,7 +83,7 @@ Key properties:
 
 ```mermaid
 sequenceDiagram
-    participant U as russel-cli
+    participant U as russel
     participant A as /deploy (axum)
     participant P as DeployPipeline
     participant G as GitClient

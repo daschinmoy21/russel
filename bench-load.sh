@@ -139,9 +139,9 @@ cleanup() {
 	# Destroy any bench VMs
 	for vm in "${BENCH_VMS_CREATED[@]:-}"; do
 		[ -n "$vm" ] || continue
-		if command -v russel-cli &>/dev/null; then
+		if command -v russel &>/dev/null; then
 			info "cleanup: destroy $vm"
-			timeout --signal=TERM --kill-after=2s 15s russel-cli destroy "$vm" &>/dev/null || true
+			timeout --signal=TERM --kill-after=2s 15s russel destroy "$vm" &>/dev/null || true
 		fi
 	done
 
@@ -288,7 +288,7 @@ NEED_CTRL=0
 [ "$HAS_ROOTLESS_PODMAN" -eq 1 ] && [ "$HAS_ROOT" -eq 1 ] && NEED_CTRL=1
 
 if [ "$NEED_CTRL" -eq 1 ]; then
-	if [ ! -f "$RELEASE_DIR/russel-ctrl" ] || [ ! -f "$RELEASE_DIR/russel-cli" ]; then
+	if [ ! -f "$RELEASE_DIR/russel-ctrl" ] || [ ! -f "$RELEASE_DIR/russel" ]; then
 		info "building russel (release)..."
 		cargo build --release -q 2>&1
 	fi
@@ -650,7 +650,7 @@ russel_deploy_and_wait() {
 russel_destroy() {
 	local vm_id="$1"
 	info "destroying $vm_id..."
-	russel-cli destroy "$vm_id" &>/dev/null || true
+	russel destroy "$vm_id" &>/dev/null || true
 	# Remove from cleanup list
 	local _kept=()
 	for _v in "${BENCH_VMS_CREATED[@]:-}"; do

@@ -7,7 +7,7 @@ How to develop, test, and open pull requests.
 | Path | Role |
 |------|------|
 | `crates/core` | Shared types (`Russelfile`, API) |
-| `crates/cli` | `russel-cli` |
+| `crates/cli` | `russel` CLI (crate name `russel-cli`) |
 | `crates/ctrl` | `russel-ctrl` control plane |
 | `crates/agent` | `russel-agent` node-local lifecycle RPC |
 | `docs/` | Operator and contributor docs |
@@ -65,9 +65,9 @@ Do not force-push `main`. If CI conflicts with this guide, **CI wins**.
 ```bash
 cargo build
 ./target/debug/russel-ctrl &
-./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id contrib-smoke
+./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id contrib-smoke
 curl -sf http://127.0.0.1:8080/health
-./target/debug/russel-cli destroy contrib-smoke
+./target/debug/russel destroy contrib-smoke
 ```
 
 See [examples.md](examples.md) and the root [README](../README.md).

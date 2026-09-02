@@ -89,12 +89,12 @@ cleanup() {
 	for vm in "${RUSSEL_VMS_CREATED[@]:-}"; do
 		# Skip empty slots left when the array is cleared with "${arr[@]:-}"
 		[ -n "$vm" ] || continue
-		if command -v russel-cli &>/dev/null; then
+		if command -v russel &>/dev/null; then
 			info "cleaning up VM: $vm"
 			if command -v timeout &>/dev/null; then
-				timeout --signal=TERM --kill-after=2s 15s russel-cli destroy "$vm" &>/dev/null || warn "cleanup timed out or failed for $vm"
+				timeout --signal=TERM --kill-after=2s 15s russel destroy "$vm" &>/dev/null || warn "cleanup timed out or failed for $vm"
 			else
-				russel-cli destroy "$vm" &>/dev/null || warn "cleanup failed for $vm"
+				russel destroy "$vm" &>/dev/null || warn "cleanup failed for $vm"
 			fi
 		fi
 	done
@@ -109,8 +109,8 @@ cleanup() {
 	# Remove temp files
 	bench_cleanup_tmp_paths
 	# Remove the bench secret if this run set it (best effort)
-	if [ "${BENCH_SECRET_SET:-0}" -eq 1 ] && command -v russel-cli &>/dev/null; then
-		russel-cli secrets delete DEMO_SECRET &>/dev/null || warn "failed to delete DEMO_SECRET"
+	if [ "${BENCH_SECRET_SET:-0}" -eq 1 ] && command -v russel &>/dev/null; then
+		russel secrets delete DEMO_SECRET &>/dev/null || warn "failed to delete DEMO_SECRET"
 	fi
 }
 trap cleanup EXIT
@@ -223,7 +223,7 @@ pass "release build: ${rel_ms}ms"
 # ── 6. Binary sizes ──────────────────────────────────────────────────────────
 header "Binary Sizes"
 
-for bin in russel-cli russel-ctrl; do
+for bin in russel russel-ctrl; do
 	path="${RELEASE_DIR}/${bin}"
 	if [ -f "$path" ]; then
 		size=$(stat --printf="%s" "$path")
@@ -347,11 +347,11 @@ else
 		if [ "$example" != "env-config" ]; then
 			return 0
 		fi
-		if ! command -v russel-cli &>/dev/null; then
-			warn "env-config: russel-cli missing; DEMO_SECRET not set"
+		if ! command -v russel &>/dev/null; then
+			warn "env-config: russel missing; DEMO_SECRET not set"
 			return 0
 		fi
-		if printf '%s' 'bench-secret' | russel-cli secrets set DEMO_SECRET &>/dev/null; then
+		if printf '%s' 'bench-secret' | russel secrets set DEMO_SECRET &>/dev/null; then
 			BENCH_SECRET_SET=1
 			info "env-config: set DEMO_SECRET for secret:// resolution"
 		else
@@ -375,7 +375,7 @@ else
 		out_spawn_ms=0
 		out_status="failed"
 
-		russel-cli destroy "$vm_id" &>/dev/null || true
+		russel destroy "$vm_id" &>/dev/null || true
 		ensure_bench_secrets "$example"
 
 		if [ "$COLD" -eq 1 ]; then
@@ -528,7 +528,7 @@ else
 		fi
 
 		# Build release binaries if missing
-		if [ ! -f "$RELEASE_DIR/russel-ctrl" ] || [ ! -f "$RELEASE_DIR/russel-cli" ]; then
+		if [ ! -f "$RELEASE_DIR/russel-ctrl" ] || [ ! -f "$RELEASE_DIR/russel" ]; then
 			info "building russel (release) for deploy comparison..."
 			cargo build --release -q 2>&1
 		fi
@@ -710,7 +710,7 @@ else
 				fail "russel microVM: ${out_status#failed:}"
 				;;
 			esac
-			russel-cli destroy "$vm_id" &>/dev/null || true
+			russel destroy "$vm_id" &>/dev/null || true
 			# Already destroyed; drop from EXIT cleanup list so trap does not re-destroy.
 			_kept=()
 			for _v in "${RUSSEL_VMS_CREATED[@]:-}"; do
@@ -753,7 +753,7 @@ else
 				fail "russel container: ${out_status#failed:}"
 				;;
 			esac
-			russel-cli destroy "$vm_id" &>/dev/null || true
+			russel destroy "$vm_id" &>/dev/null || true
 			_kept=()
 			for _v in "${RUSSEL_VMS_CREATED[@]:-}"; do
 				[ -n "$_v" ] && [ "$_v" != "$vm_id" ] && _kept+=("$_v")

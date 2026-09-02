@@ -5,7 +5,7 @@ Self-hosted platform for deploying Nix-built services as
 **rootless Podman** containers.
 
 ```
-russel-cli  ──HTTP──►  russel-ctrl  ──►  nix build  ──►  microVM | container
+russel  ──HTTP──►  russel-ctrl  ──►  nix build  ──►  microVM | container
 ```
 
 ## Quick start
@@ -22,12 +22,12 @@ export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1   # local examples only
 ./target/debug/russel-ctrl                # http://127.0.0.1:7878
 
 # other terminal — same token
-./target/debug/russel-cli deploy examples/basic-http -p 8080:3000 --vm-id test-api
+./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id test-api
 curl http://127.0.0.1:8080/health
-./target/debug/russel-cli destroy test-api
+./target/debug/russel destroy test-api
 ```
 
-Scaffold an app with `russel init` (`--type container` on a typical VPS, `--with-flake` to write `flake.nix`).
+Scaffold an app with `russel init` (`--type container` on a typical VPS, `--with-flake` to write `flake.nix`). Persist a control-plane URL and token with `russel login` (`~/.config/russel/config.toml`, mode 0600). `russel origin` shows which ctrl this CLI will hit. `ps` / `list` list services (`vms` still works).
 
 Remote control planes should get a **git URL**, not a laptop path. Bind off-loopback only with a ≥32-character `RUSSEL_API_TOKEN`, and terminate TLS in front of ctrl — see [docs/security-tls.md](docs/security-tls.md).
 
@@ -45,7 +45,7 @@ Build from source (`nix develop` then `cargo build --release`). The flake does n
 }
 ```
 
-**Other Linux.** Copy [contrib/russel-ctrl.service](contrib/russel-ctrl.service) to `~/.config/systemd/user/` and follow the comments in that file.
+**Other Linux.** Copy [contrib/russel-ctrl.service](contrib/russel-ctrl.service) to `~/.config/systemd/user/` and follow the comments in that file. Client binary: [docs/install.md](docs/install.md) or `./contrib/install.sh cli`.
 
 Typical VPS has no KVM. Set `type = "container"` in every Russelfile. Full checklist: [docs/vps-one-dev.md](docs/vps-one-dev.md).
 
@@ -54,7 +54,8 @@ Typical VPS has no KVM. Set `type = "container"` in every Russelfile. Full check
 | Doc | What it covers |
 |-----|----------------|
 | [Architecture](docs/architecture.md) | Control plane, runtimes, networking |
-| [API & CLI](docs/api.md) | HTTP endpoints, auth, `russel-cli` |
+| [Install](docs/install.md) | `russel` on the laptop, `russel-ctrl` on the host |
+| [API & CLI](docs/api.md) | HTTP endpoints, auth, `russel` |
 | [Russelfile](docs/russelfile.md) | Service config reference |
 | [Deployment](docs/deployment.md) | Packaging an app for Russel |
 | [Examples](docs/examples.md) | Sample services in `examples/` |
@@ -71,13 +72,13 @@ Typical VPS has no KVM. Set `type = "container"` in every Russelfile. Full check
 | Path | Role |
 |------|------|
 | `crates/core` | Shared types (`Russelfile`, API) |
-| `crates/cli` | `russel-cli` |
+| `crates/cli` | `russel` (crate name `russel-cli`) |
 | `crates/ctrl` | `russel-ctrl` control plane |
 | `crates/agent` | `russel-agent` (multi-host lifecycle RPC) |
 | `dashboard/` | Static web UI |
 | `examples/` | Deployable sample apps |
 | `nix/modules/` | NixOS `services.russel` |
-| `contrib/` | systemd user unit |
+| `contrib/` | `install.sh`, systemd user unit |
 | `docs/` | Operator and contributor docs |
 
 ## License
