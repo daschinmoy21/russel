@@ -9,7 +9,7 @@ use tokio::process::Command;
 
 /// Default service state directory: `/var/lib/russel/<service_id>`.
 pub fn default_base_dir(service_id: &str) -> PathBuf {
-    PathBuf::from(format!("/var/lib/russel/{service_id}"))
+    russel_core::paths::service_dir(service_id)
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub struct RootfsSpec {
     pub debug: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PreparedRootfs {
     pub rootfs_path: PathBuf,
     /// Absolute path as seen inside the container (e.g. `/bin/<bin_name>`).

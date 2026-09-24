@@ -874,15 +874,4 @@ fn test_write_catalog_emits_valid_json() {
         serde_json::from_str(&encoded).expect("catalog deserializes as JSON");
     assert_eq!(parsed["schema_version"], 1);
     assert_eq!(parsed["services"]["cat-svc"]["host_port"], 4000);
-
-    // Disk write path may fail without /var/lib/russel; if it succeeds, file is JSON.
-    if let Ok(()) = state.write_catalog() {
-        let path = std::path::Path::new("/var/lib/russel/ctrl-catalog.json");
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            let from_disk: serde_json::Value =
-                serde_json::from_str(&raw).expect("on-disk catalog is valid JSON");
-            assert_eq!(from_disk["schema_version"], 1);
-            assert_eq!(from_disk["services"]["cat-svc"]["status"], "deployed");
-        }
-    }
 }

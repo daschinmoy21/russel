@@ -1,0 +1,26 @@
+# vaultwarden: Bitwarden-compatible server from nixpkgs, no flake.nix needed.
+# `service.package` wraps the nixpkgs attr at deploy when the repo has no
+# committed flake.nix. A committed flake.nix wins over `package`.
+# The package is the vaultwarden binary, not the upstream Docker image.
+# The binary default data folder is the relative directory `data`, not
+# `/data`. With workdir `/` that relative path currently hits this mount,
+# and it stops doing so if the workdir changes. DATA_FOLDER=/data pins
+# the database, attachments, and keys to the volume.
+# `keep = true` survives `russel destroy` unless `--delete-volumes` is passed.
+
+[service]
+name = "vaultwarden"
+source = "."
+port = 8000
+memory = "512mb"
+type = "container"
+package = "vaultwarden"
+
+[service.env]
+DATA_FOLDER = "/data"
+
+[[volumes]]
+name = "data"
+guest = "/data"
+rw = true
+keep = true

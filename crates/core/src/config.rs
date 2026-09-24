@@ -3,6 +3,11 @@ use std::{fmt, fs, path::Path, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::volumes::{
+    ExtraPortSpec, VolumeSpec, validate_extra_ports, validate_package_attr, validate_restart,
+    validate_service_args, validate_userns, validate_volumes,
+};
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Russelfile {
@@ -13,6 +18,15 @@ pub struct Russelfile {
     /// their config.
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
+    #[serde(default)]
+    pub ingress: Option<IngressConfig>,
+    /// Bind mounts. Container runtime only. Rootfs stays read-only.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
+    /// Extra published ports besides `service.port` / `[ingress].port`.
+    /// Container runtime only.
+    #[serde(default)]
+    pub ports: Vec<ExtraPortSpec>,
 }
 
 impl Russelfile {
@@ -23,7 +37,7 @@ impl Russelfile {
 
     /// Parse from a string — shared by `load` and tests.
     pub fn load_from_str(contents: &str) -> anyhow::Result<Self> {
-        let config: Self = toml::from_str(contents)?;
+        let mut config: Self = toml::from_str(contents)?;
         // Reject database config at parse time — it's not implemented yet.
         if let Some(ref db) = config.database
             && (db.postgres.as_ref().is_some_and(|p| p.enabled)
@@ -36,6 +50,33 @@ impl Russelfile {
         if config.service.port == 0 {
             anyhow::bail!("service.port must not be 0");
         }
+        if let Some(ref mut ingress) = config.ingress {
+            if let Some(host) = ingress.host.as_mut() {
+                let normalized = host.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    anyhow::bail!("ingress.host must not be empty");
+                }
+                if !is_valid_dns_name(&normalized) {
+                    anyhow::bail!("ingress.host {host:?} is not a valid DNS name");
+                }
+                *host = normalized;
+            }
+            if let Some(port) = ingress.port {
+                if port == 0 {
+                    anyhow::bail!("ingress.port must not be 0");
+                }
+                if port < 1024 {
+                    anyhow::bail!(
+                        "ingress.port {port} is privileged (< 1024); Traefik owns 80/443"
+                    );
+                }
+                if port == 7878 || port == 7946 {
+                    anyhow::bail!(
+                        "ingress.port {port} collides with the default ctrl (7878) or agent (7946) listen port"
+                    );
+                }
+            }
+        }
         if config.service.cpus < 1 || config.service.cpus > 32 {
             anyhow::bail!("service.cpus must be 1..=32 (got {})", config.service.cpus);
         }
@@ -46,8 +87,45 @@ impl Russelfile {
             );
         }
         validate_source_path(&config.service.source)?;
+        let is_container = config.service.runtime == RuntimeKind::Container;
+        if let Some(ref package) = config.service.package {
+            validate_package_attr(package)?;
+        }
+        validate_service_args(&config.service.args)?;
+        validate_userns(config.service.userns.as_deref(), is_container)?;
+        validate_restart(config.service.restart.as_deref(), is_container)?;
+        validate_volumes(&config.volumes, is_container)?;
+        validate_extra_ports(
+            &config.ports,
+            is_container,
+            config.service.port,
+            config.ingress.as_ref().and_then(|i| i.port),
+        )?;
         Ok(config)
     }
+}
+
+/// Validate that `name` is a sane DNS-style name.
+///
+/// Rules: labels contain only `[A-Za-z0-9-]`, each label is 1..=63 chars,
+/// no leading/trailing hyphen in a label, and total length is at most 253.
+/// Single-label names are allowed.
+pub fn is_valid_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+    }
+    true
 }
 
 /// Validate `service.source` path: must be relative, no `..`, not absolute, not empty.
@@ -156,6 +234,89 @@ pub fn resolve_runtime(file: RuntimeKind, cli: Option<RuntimeKind>) -> anyhow::R
     }
 }
 
+/// Resolve the effective ingress host. The Russelfile is the source of truth;
+/// a CLI host may only match it, case-insensitively and after trimming.
+/// Both sides are DNS-validated so a bad `Host()` value fails before Traefik.
+pub fn resolve_ingress_host(
+    file: Option<&str>,
+    cli: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let file = file.map(normalize_ingress_host).transpose()?;
+    let cli = cli.map(normalize_ingress_host).transpose()?;
+
+    match (file, cli) {
+        (Some(file), None) => Ok(Some(file)),
+        (Some(file), Some(cli)) if file == cli => Ok(Some(file)),
+        (Some(file), Some(cli)) => {
+            anyhow::bail!("CLI --host {cli} does not match Russelfile ingress.host ({file})")
+        }
+        (None, None) => Ok(None),
+        (None, Some(cli)) => {
+            anyhow::bail!("CLI --host {cli} does not match Russelfile (no [ingress].host)")
+        }
+    }
+}
+
+fn normalize_ingress_host(host: &str) -> anyhow::Result<String> {
+    let normalized = host.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("ingress.host must not be empty");
+    }
+    if !is_valid_dns_name(&normalized) {
+        anyhow::bail!("ingress.host {host:?} is not a valid DNS name");
+    }
+    Ok(normalized)
+}
+
+/// Reject a host-side ingress port that file pins already reject at load:
+/// 0, privileged (< 1024), and the default ctrl/agent binds as a hint.
+/// The live `RUSSEL_CTRL_ADDR` / `RUSSEL_AGENT_ADDR` collision check stays
+/// deploy-time in the pipeline, which sees the live process env.
+fn validate_ingress_port(port: u16) -> anyhow::Result<()> {
+    if port == 0 {
+        anyhow::bail!("ingress.port must not be 0");
+    }
+    if port < 1024 {
+        anyhow::bail!("ingress.port {port} is privileged (< 1024); Traefik owns 80/443");
+    }
+    if port == 7878 || port == 7946 {
+        anyhow::bail!(
+            "ingress.port {port} collides with the default ctrl (7878) or agent (7946) listen port"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the effective host-side ingress port. A CLI-only port remains a
+/// supported escape hatch; when both values exist they must match. The CLI
+/// side is validated here so `-p 80:guest` cannot bypass the file-pin checks.
+pub fn resolve_ingress_port(
+    file: Option<u16>,
+    cli_port: Option<u16>,
+) -> anyhow::Result<Option<u16>> {
+    match (file, cli_port) {
+        (Some(file), None) => Ok(Some(file)),
+        (Some(file), Some(cli)) if file == cli => Ok(Some(file)),
+        (Some(file), Some(cli)) => {
+            anyhow::bail!("CLI -p host {cli} does not match Russelfile ingress.port ({file})")
+        }
+        (None, Some(cli)) => {
+            validate_ingress_port(cli)?;
+            Ok(Some(cli))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngressConfig {
+    /// Exact Traefik Host() value, e.g. "abc.com" or "api.abc.com".
+    pub host: Option<String>,
+    /// Host-side backend port (Traefik + publish). Not the guest listen port.
+    pub port: Option<u16>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
@@ -187,6 +348,19 @@ pub struct ServiceConfig {
     /// Defaults to 1 when omitted.
     #[serde(default = "default_cpus")]
     pub cpus: u8,
+    /// nixpkgs attribute to wrap when no committed `flake.nix` exists
+    /// (e.g. `"navidrome"`). A committed flake always wins.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Extra argv after the entrypoint binary.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Container-only. Only `"keep-id"` is accepted.
+    #[serde(default)]
+    pub userns: Option<String>,
+    /// Container-only. Only `"unless-stopped"` is accepted.
+    #[serde(default)]
+    pub restart: Option<String>,
 }
 
 pub fn default_cpus() -> u8 {
@@ -194,8 +368,25 @@ pub fn default_cpus() -> u8 {
 }
 
 impl ServiceConfig {
+    /// Entrypoint under `$out/bin/`. Prefers explicit `bin`, else `name`.
+    ///
+    /// Ignores `package` so a committed flake cannot select the wrong binary
+    /// via the package attr. When the build wraps `service.package`, call
+    /// [`Self::bin_name_for_build`] with `using_package = true`.
     pub fn bin_name(&self) -> &str {
-        self.bin.as_deref().unwrap_or(&self.name)
+        self.bin_name_for_build(false)
+    }
+
+    /// Like [`Self::bin_name`]. When `using_package` is true and `bin` is
+    /// unset, use the last component of `service.package`.
+    pub fn bin_name_for_build(&self, using_package: bool) -> &str {
+        if let Some(bin) = self.bin.as_deref() {
+            return bin;
+        }
+        if using_package && let Some(package) = self.package.as_deref() {
+            return package.rsplit('.').next().unwrap_or(package);
+        }
+        &self.name
     }
 }
 
@@ -228,6 +419,8 @@ const RESERVED_ENV_KEYS: &[&str] = &[
     "IFS",
     "PATH",
     "LD_PRELOAD",
+    // glibc runs an audit module from LD_AUDIT the same way LD_PRELOAD injects a library.
+    "LD_AUDIT",
     "LD_LIBRARY_PATH",
     "BASH_ENV",
     "ENV",
@@ -331,6 +524,15 @@ impl<'de> Deserialize<'de> for Memory {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn minimal_russelfile(ingress: Option<&str>) -> String {
+        let ingress = ingress
+            .map(|fields| format!("\n[ingress]\n{fields}"))
+            .unwrap_or_default();
+        format!(
+            "\n[service]\nname = \"app\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"{ingress}\n"
+        )
+    }
 
     #[test]
     fn parse_minimal_russelfile() {
@@ -570,6 +772,245 @@ guest = "ubuntu"
     }
 
     #[test]
+    fn ingress_table_parses_all_supported_shapes() {
+        let host_only =
+            Russelfile::load_from_str(&minimal_russelfile(Some("host = \"ABC.com\""))).unwrap();
+        let ingress = host_only.ingress.unwrap();
+        assert_eq!(ingress.host.as_deref(), Some("abc.com"));
+        assert_eq!(ingress.port, None);
+
+        let port_only =
+            Russelfile::load_from_str(&minimal_russelfile(Some("port = 4000"))).unwrap();
+        let ingress = port_only.ingress.unwrap();
+        assert_eq!(ingress.host, None);
+        assert_eq!(ingress.port, Some(4000));
+
+        let both = Russelfile::load_from_str(&minimal_russelfile(Some(
+            "host = \"api.abc.com\"\nport = 4000",
+        )))
+        .unwrap();
+        let ingress = both.ingress.unwrap();
+        assert_eq!(ingress.host.as_deref(), Some("api.abc.com"));
+        assert_eq!(ingress.port, Some(4000));
+
+        let empty = Russelfile::load_from_str(&minimal_russelfile(Some(""))).unwrap();
+        let ingress = empty.ingress.unwrap();
+        assert_eq!(ingress.host, None);
+        assert_eq!(ingress.port, None);
+
+        let omitted = Russelfile::load_from_str(&minimal_russelfile(None)).unwrap();
+        assert!(omitted.ingress.is_none());
+    }
+
+    #[test]
+    fn ingress_unknown_fields_are_rejected() {
+        for field in [
+            "domain = \"abc.com\"",
+            "host_port = 4000",
+            "hosts = [\"abc.com\"]",
+            "tunnel = \"cloudflared\"",
+        ] {
+            let err = Russelfile::load_from_str(&minimal_russelfile(Some(field))).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected {field:?} to be rejected as unknown: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_hosts_are_validated_and_normalized_at_load() {
+        let config =
+            Russelfile::load_from_str(&minimal_russelfile(Some("host = \"  API.Example.COM  \"")))
+                .unwrap();
+        assert_eq!(
+            config.ingress.unwrap().host.as_deref(),
+            Some("api.example.com")
+        );
+
+        let too_long = format!(
+            "host = \"{}.{}.{}.{}\"",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        );
+        for (host, expected) in [
+            ("", "ingress.host must not be empty"),
+            ("   ", "ingress.host must not be empty"),
+            ("bad`name", "is not a valid DNS name"),
+            ("bad name", "is not a valid DNS name"),
+            ("-bad.example", "is not a valid DNS name"),
+            ("bad-.example", "is not a valid DNS name"),
+            ("bad..example", "is not a valid DNS name"),
+            ("bad.example.", "is not a valid DNS name"),
+            ("bad_example", "is not a valid DNS name"),
+            ("éxample.com", "is not a valid DNS name"),
+        ] {
+            let err =
+                Russelfile::load_from_str(&minimal_russelfile(Some(&format!("host = {host:?}"))))
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "expected {host:?} to produce {expected:?}: {err}"
+            );
+        }
+        let err = Russelfile::load_from_str(&minimal_russelfile(Some(&too_long))).unwrap_err();
+        assert!(err.to_string().contains("is not a valid DNS name"));
+    }
+
+    #[test]
+    fn ingress_ports_are_validated_at_load() {
+        for (port, expected) in [
+            (0, "ingress.port must not be 0"),
+            (
+                80,
+                "ingress.port 80 is privileged (< 1024); Traefik owns 80/443",
+            ),
+            (
+                443,
+                "ingress.port 443 is privileged (< 1024); Traefik owns 80/443",
+            ),
+            (
+                7878,
+                "ingress.port 7878 collides with the default ctrl (7878) or agent (7946) listen port",
+            ),
+            (
+                7946,
+                "ingress.port 7946 collides with the default ctrl (7878) or agent (7946) listen port",
+            ),
+        ] {
+            let err =
+                Russelfile::load_from_str(&minimal_russelfile(Some(&format!("port = {port}"))))
+                    .unwrap_err();
+            assert_eq!(err.to_string(), expected);
+        }
+
+        let config = Russelfile::load_from_str(&minimal_russelfile(Some("port = 4000"))).unwrap();
+        assert_eq!(config.ingress.unwrap().port, Some(4000));
+    }
+
+    #[test]
+    fn valid_dns_names_are_accepted() {
+        assert!(is_valid_dns_name("russel.local"));
+        assert!(is_valid_dns_name("example.com"));
+        assert!(is_valid_dns_name("sub.example.com"));
+        assert!(is_valid_dns_name("a-b.c-123.local"));
+        assert!(is_valid_dns_name("Example.COM"));
+        assert!(is_valid_dns_name("localhost"));
+        assert!(is_valid_dns_name(&format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        )));
+    }
+
+    #[test]
+    fn invalid_dns_names_are_rejected() {
+        assert!(!is_valid_dns_name(""));
+        assert!(!is_valid_dns_name("russel local"));
+        assert!(!is_valid_dns_name("russel`local"));
+        assert!(!is_valid_dns_name("-russel.local"));
+        assert!(!is_valid_dns_name("russel-.local"));
+        assert!(!is_valid_dns_name("russel..local"));
+        assert!(!is_valid_dns_name(".russel.local"));
+        assert!(!is_valid_dns_name("russel.local."));
+        assert!(!is_valid_dns_name("russel_local"));
+        assert!(!is_valid_dns_name("éxample.com"));
+        assert!(!is_valid_dns_name(&"a".repeat(64)));
+        assert!(!is_valid_dns_name(&format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        )));
+    }
+
+    #[test]
+    fn resolve_ingress_host_matches_the_file_or_omits_it() {
+        assert_eq!(resolve_ingress_host(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_ingress_host(Some("  ABC.com  "), None).unwrap(),
+            Some("abc.com".to_string())
+        );
+        assert_eq!(
+            resolve_ingress_host(Some("ABC.com"), Some(" abc.COM ")).unwrap(),
+            Some("abc.com".to_string())
+        );
+
+        let err = resolve_ingress_host(Some("abc.com"), Some("other.com")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CLI --host other.com does not match Russelfile ingress.host (abc.com)"
+        );
+
+        let err = resolve_ingress_host(None, Some("abc.com")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CLI --host abc.com does not match Russelfile (no [ingress].host)"
+        );
+
+        for value in [Some(""), Some("   ")] {
+            let err = resolve_ingress_host(value, None).unwrap_err();
+            assert_eq!(err.to_string(), "ingress.host must not be empty");
+        }
+        let err = resolve_ingress_host(None, Some(" ")).unwrap_err();
+        assert_eq!(err.to_string(), "ingress.host must not be empty");
+
+        for bad in ["bad`name", "not a host", "-lead.example.com", "a..b"] {
+            let err = resolve_ingress_host(Some(bad), None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("ingress.host {bad:?} is not a valid DNS name")
+            );
+            let err = resolve_ingress_host(None, Some(bad)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("ingress.host {bad:?} is not a valid DNS name")
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_ingress_port_matches_or_allows_cli_only_pin() {
+        assert_eq!(resolve_ingress_port(None, None).unwrap(), None);
+        assert_eq!(resolve_ingress_port(Some(4000), None).unwrap(), Some(4000));
+        assert_eq!(resolve_ingress_port(None, Some(4000)).unwrap(), Some(4000));
+        assert_eq!(
+            resolve_ingress_port(Some(4000), Some(4000)).unwrap(),
+            Some(4000)
+        );
+
+        let err = resolve_ingress_port(Some(4000), Some(5000)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CLI -p host 5000 does not match Russelfile ingress.port (4000)"
+        );
+
+        for (port, expected) in [
+            (0, "ingress.port must not be 0"),
+            (
+                80,
+                "ingress.port 80 is privileged (< 1024); Traefik owns 80/443",
+            ),
+            (
+                7878,
+                "ingress.port 7878 collides with the default ctrl (7878) or agent (7946) listen port",
+            ),
+            (
+                7946,
+                "ingress.port 7946 collides with the default ctrl (7878) or agent (7946) listen port",
+            ),
+        ] {
+            let err = resolve_ingress_port(None, Some(port)).unwrap_err();
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn service_env_defaults_to_empty() {
         let toml = r#"
 [service]
@@ -631,6 +1072,7 @@ FEATURE_X = "1"
             "IFS",
             "PATH",
             "LD_PRELOAD",
+            "LD_AUDIT",
             "LD_LIBRARY_PATH",
             "BASH_ENV",
             "ENV",
@@ -847,5 +1289,120 @@ cpus = 33
             err.to_string().contains("cpus"),
             "expected cpus rejection: {err}"
         );
+    }
+
+    #[test]
+    fn package_and_volumes_load_for_container() {
+        let toml = r#"
+[service]
+name = "navidrome"
+source = "."
+port = 4533
+memory = "512mb"
+type = "container"
+package = "navidrome"
+userns = "keep-id"
+restart = "unless-stopped"
+args = ["--loglevel", "info"]
+
+[[volumes]]
+name = "data"
+guest = "/data"
+rw = true
+keep = true
+
+[[ports]]
+host = 4534
+guest = 4534
+"#;
+        let config = Russelfile::load_from_str(toml).unwrap();
+        assert_eq!(config.service.package.as_deref(), Some("navidrome"));
+        assert_eq!(config.service.bin_name(), "navidrome");
+        assert_eq!(config.volumes.len(), 1);
+        assert!(config.volumes[0].keep);
+        assert_eq!(config.ports[0].host, 4534);
+    }
+
+    #[test]
+    fn navidrome_and_vaultwarden_examples_pin_data_dirs() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let navidrome = Russelfile::load(&root.join("examples/navidrome/Russelfile.toml")).unwrap();
+        assert_eq!(
+            navidrome
+                .service
+                .env
+                .get("ND_DATAFOLDER")
+                .map(String::as_str),
+            Some("/data")
+        );
+        assert_eq!(
+            navidrome
+                .service
+                .env
+                .get("ND_MUSICFOLDER")
+                .map(String::as_str),
+            Some("/music")
+        );
+        let data = navidrome
+            .volumes
+            .iter()
+            .find(|v| v.guest == "/data")
+            .unwrap();
+        assert!(data.rw && data.keep);
+        let music = navidrome
+            .volumes
+            .iter()
+            .find(|v| v.guest == "/music")
+            .unwrap();
+        assert!(!music.rw && music.keep);
+
+        let vaultwarden =
+            Russelfile::load(&root.join("examples/vaultwarden/Russelfile.toml")).unwrap();
+        assert_eq!(
+            vaultwarden
+                .service
+                .env
+                .get("DATA_FOLDER")
+                .map(String::as_str),
+            Some("/data")
+        );
+        assert_eq!(vaultwarden.volumes.len(), 1);
+        assert_eq!(vaultwarden.volumes[0].guest, "/data");
+        assert!(vaultwarden.volumes[0].rw && vaultwarden.volumes[0].keep);
+    }
+
+    #[test]
+    fn volumes_rejected_on_microvm() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+
+[[volumes]]
+name = "data"
+guest = "/data"
+"#;
+        let err = Russelfile::load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("container"));
+    }
+
+    #[test]
+    fn bin_name_ignores_package_unless_build_uses_it() {
+        let toml = r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+type = "container"
+package = "nodePackages.foo-bar"
+"#;
+        let config = Russelfile::load_from_str(toml).unwrap();
+        // Committed flake / default path: package must not override name.
+        assert_eq!(config.service.bin_name(), "app");
+        assert_eq!(config.service.bin_name_for_build(false), "app");
+        assert_eq!(config.service.bin_name_for_build(true), "foo-bar");
     }
 }

@@ -98,6 +98,9 @@ impl PortAllocator {
         if port == 0 {
             anyhow::bail!("port 0 is not a fixed publish port (ephemeral bind is not supported)");
         }
+        if port < 1024 {
+            anyhow::bail!("ingress.port {port} is privileged (< 1024); Traefik owns 80/443");
+        }
         let bind = publish_bind_addr();
         let mut registry = port_registry();
         let existing_port = registry.allocations.get(service_id).copied();
@@ -147,6 +150,24 @@ impl PortAllocator {
         };
         // Close the listening socket outside the registry mutex.
         drop(hold);
+    }
+
+    /// Release the primary publish port and any extra `[[ports]]` keys
+    /// (`{id}::xN`) for this service.
+    pub fn release_service(service_id: &str) {
+        let keys: Vec<String> = {
+            let registry = port_registry();
+            let prefix = format!("{service_id}::x");
+            registry
+                .allocations
+                .keys()
+                .filter(|k| *k == service_id || k.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+        for key in keys {
+            Self::release(&key);
+        }
     }
 
     /// Port currently registered for `service_id`, if any.

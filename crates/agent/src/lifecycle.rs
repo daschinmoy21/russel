@@ -67,16 +67,22 @@ fn metadata_path(data_root: &Path, service_id: &str) -> PathBuf {
 /// Mirrors `russel_ctrl::metadata::resolve_lifecycle_runtime`: valid metadata
 /// missing the `runtime` key falls back to `Microvm` with a warning. Missing
 /// or unparseable metadata → 404 (the control plane treats that as unknown).
+/// A path that exists but cannot be read (directory, permissions) is 500,
+/// not missing. Assuming microVM would take the wrong teardown path.
 fn resolve_service(data_root: &Path, service_id: &str) -> Result<ResolvedService, LifecycleError> {
     let path = metadata_path(data_root, service_id);
-    if !path.is_file() {
-        return Err(LifecycleError::not_found(format!(
-            "service {service_id} not found (no metadata at {})",
-            path.display()
-        )));
+    if let Err(e) = std::fs::read_to_string(&path) {
+        return Err(if e.kind() == std::io::ErrorKind::NotFound {
+            LifecycleError::not_found(format!(
+                "service {service_id} not found (no metadata at {})",
+                path.display()
+            ))
+        } else {
+            LifecycleError::internal(format!("failed to read metadata for {service_id}: {e}"))
+        });
     }
     // Corrupt / partially-written metadata is an unknown service to callers
-    // (same contract as missing file) — not a 500.
+    // (same contract as missing file), not a 500.
     let record = load_service_disk_record_from(&path).ok_or_else(|| {
         LifecycleError::not_found(format!(
             "service {service_id} not found (invalid metadata at {})",
@@ -259,8 +265,8 @@ fn microvm_pid_is_alive(pid: u32, service_id: &str) -> bool {
 /// Pure identity check for unit tests (no /proc).
 ///
 /// Requires `cloud-hypervisor` **and** the service data dir
-/// (`/var/lib/russel/{service_id}/`) in the command line. A bare
-/// `cmdline.contains(service_id)` is too weak — e.g. service id `api` matches
+/// (`{data_root}/{service_id}/`) in the command line. A bare
+/// `cmdline.contains(service_id)` is too weak: service id `api` matches
 /// `--api-socket`. TAP needles are optional (agent status does not always
 /// have the TAP key).
 pub fn cloud_hypervisor_cmdline_matches(cmdline: &str, service_id: &str) -> bool {
@@ -271,7 +277,10 @@ pub fn cloud_hypervisor_cmdline_matches(cmdline: &str, service_id: &str) -> bool
         return false;
     }
     // Service-scoped paths used at boot (API sock, cfg under the service dir).
-    cmdline.contains(&format!("/var/lib/russel/{service_id}/"))
+    cmdline.contains(&format!(
+        "{}/",
+        russel_core::paths::service_dir(service_id).display()
+    ))
 }
 
 /// Wall-clock seconds a process has been running, from `/proc`:
@@ -458,6 +467,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directory_metadata_is_internal_error() {
+        let root = temp_root();
+        let dir = root.join("svc-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("metadata.json")).unwrap();
+        let err = stop(&root, "svc-dir").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("failed to read metadata"));
+        let err = destroy(&root, "svc-dir").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn status_reports_stopped_for_container_without_running_container() {
         let root = temp_root();
         write_metadata(
@@ -518,8 +540,16 @@ mod tests {
 
     #[test]
     fn cloud_hypervisor_identity_requires_ch_and_service_dir() {
+        let api_sock = format!(
+            "{}/cloud-hypervisor.sock",
+            russel_core::paths::service_dir("api").display()
+        );
+        let other_sock = format!(
+            "{}/cloud-hypervisor.sock",
+            russel_core::paths::service_dir("other").display()
+        );
         assert!(cloud_hypervisor_cmdline_matches(
-            "cloud-hypervisor --api-socket /var/lib/russel/api/cloud-hypervisor.sock",
+            &format!("cloud-hypervisor --api-socket {api_sock}"),
             "api"
         ));
         // Unrelated process with reused PID shape.
@@ -529,7 +559,7 @@ mod tests {
         ));
         // CH for a different service — must not match "api" via --api-socket.
         assert!(!cloud_hypervisor_cmdline_matches(
-            "cloud-hypervisor --api-socket /var/lib/russel/other/cloud-hypervisor.sock",
+            &format!("cloud-hypervisor --api-socket {other_sock}"),
             "api"
         ));
         assert!(!cloud_hypervisor_cmdline_matches(

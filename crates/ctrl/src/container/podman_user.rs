@@ -37,6 +37,28 @@ pub(crate) fn configured_podman_user() -> Option<String> {
     resolve_podman_user(explicit.as_deref(), sudo_user.as_deref(), euid)
 }
 
+/// Numeric `uid` and `gid` for a user (`id -u` / `id -g`).
+async fn podman_user_ids(user: &str) -> anyhow::Result<(String, String)> {
+    let uid = id_number(user, "-u").await?;
+    let gid = id_number(user, "-g").await?;
+    Ok((uid, gid))
+}
+
+async fn id_number(user: &str, flag: &str) -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("id")
+        .args([flag, user])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("id {flag} {user}: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "id {flag} {user} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Where the active podman identity came from (for startup logs / errors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodmanUserSource {
@@ -265,30 +287,7 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
         .await
         .map_err(|e| anyhow::anyhow!("create service dir {}: {e}", base.display()))?;
 
-    let uid = tokio::process::Command::new("id")
-        .args(["-u", &user])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("id -u {user}: {e}"))?;
-    if !uid.status.success() {
-        anyhow::bail!(
-            "id -u {user} failed: {}",
-            String::from_utf8_lossy(&uid.stderr).trim()
-        );
-    }
-    let gid = tokio::process::Command::new("id")
-        .args(["-g", &user])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("id -g {user}: {e}"))?;
-    if !gid.status.success() {
-        anyhow::bail!(
-            "id -g {user} failed: {}",
-            String::from_utf8_lossy(&gid.stderr).trim()
-        );
-    }
-    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
-    let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
+    let (uid, gid) = podman_user_ids(&user).await?;
     let base_s = base.display().to_string();
 
     // Keep service dir root-owned (NOT chowned to the podman user).
@@ -359,7 +358,7 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
 
     // Best-effort: allow the podman user to traverse /var/lib/russel without
     // world a+rx. User execute-only ACL; skip on failure.
-    let russel_root = Path::new("/var/lib/russel");
+    let russel_root = russel_core::paths::data_root();
     if russel_root.exists() {
         let root_s = russel_root.display().to_string();
         let output = tokio::process::Command::new("setfacl")
@@ -414,6 +413,115 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
     if !output.status.success() {
         anyhow::bail!(
             "chown rootfs to {user} ({uid}:{gid}) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+/// Make a managed volume directory usable by the rootless podman user.
+///
+/// `volumes/<name>` is created root-owned 0700, so rootless podman cannot open
+/// the bind source and `podman run` fails. Only the named volume is handed to
+/// the podman user; the `volumes/` parent stays root-owned and non-writable
+/// (traverse-only ACL, or `root:gid` 0750 fallback) so the container cannot
+/// unlink sibling volume directories.
+pub(super) async fn ensure_volume_dir_owned_by_podman_user(
+    volume_dir: &Path,
+) -> anyhow::Result<()> {
+    let Some(user) = configured_podman_user() else {
+        return Ok(());
+    };
+
+    let volumes_dir = volume_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "managed volume {} has no parent directory",
+            volume_dir.display()
+        )
+    })?;
+    let volumes_s = volumes_dir.display().to_string();
+    let (uid, gid) = podman_user_ids(&user).await?;
+
+    // Keep the volumes dir root-owned (NOT chowned to the podman user).
+    let output = tokio::process::Command::new("chown")
+        .args(["root:root", &volumes_s])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chown volumes dir root:root failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    // 0750: owner rwx, group rx, other none — never group/other write.
+    let output = tokio::process::Command::new("chmod")
+        .args(["0750", &volumes_s])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chmod 0750 volumes dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    // Traverse without write, so the container cannot unlink sibling volume
+    // dirs. Prefer ACL; fall back to root:gid 0750.
+    let acl = tokio::process::Command::new("setfacl")
+        .args(["-m", &format!("u:{user}:rx"), &volumes_s])
+        .output()
+        .await;
+    let acl_failed = match &acl {
+        Ok(out) if out.status.success() => false,
+        Ok(out) => {
+            tracing::debug!(
+                path = %volumes_s,
+                user = %user,
+                gid = %gid,
+                err = %String::from_utf8_lossy(&out.stderr).trim(),
+                "setfacl on volumes dir failed; falling back to root:gid 0750"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %volumes_s,
+                user = %user,
+                gid = %gid,
+                error = %e,
+                "setfacl unavailable; falling back to root:gid 0750"
+            );
+            true
+        }
+    };
+    if acl_failed {
+        let output = tokio::process::Command::new("chown")
+            .args([&format!("root:{gid}"), &volumes_s])
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "chown volumes dir root:{gid} fallback failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+
+    // Recursive: persisted data may predate the current podman user (e.g. after
+    // RUSSEL_PODMAN_USER changes), and the container writes as that user.
+    let output = tokio::process::Command::new("chown")
+        .args([
+            "-R",
+            &format!("{uid}:{gid}"),
+            &volume_dir.display().to_string(),
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chown volume dir to {user} ({uid}:{gid}) failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }

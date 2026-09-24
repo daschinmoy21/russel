@@ -47,6 +47,24 @@ fn token_min_length_rejects_short() {
 }
 
 #[test]
+fn unauthorized_response_identifies_control_plane() {
+    // Local probes (install.sh host/connect/status) treat HTTP 401 as a
+    // Russel endpoint only when this marker is present, so an unrelated
+    // listener on 127.0.0.1:7878 cannot pass compatibility.
+    let res = super::auth::unauthorized_response();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let header = res
+        .headers()
+        .get(axum::http::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        header.contains("Bearer") && header.contains("russel"),
+        "unexpected WWW-Authenticate: {header}"
+    );
+}
+
+#[test]
 fn token_min_length_accepts_floor_and_longer() {
     assert!(check_api_token_min_length(&"a".repeat(MIN_API_TOKEN_LEN)).is_ok());
     assert!(check_api_token_min_length(&"b".repeat(64)).is_ok()); // openssl rand -hex 32
@@ -108,11 +126,11 @@ fn parse_max_concurrent_deploys_clamps() {
 #[test]
 fn resolve_lifecycle_runtime_uses_state_over_disk_default() {
     assert_eq!(
-        resolve_lifecycle_runtime(Some(RuntimeKind::Container), "missing"),
+        resolve_lifecycle_runtime(Some(RuntimeKind::Container), "missing").unwrap(),
         RuntimeKind::Container
     );
     assert_eq!(
-        resolve_lifecycle_runtime(None, "missing"),
+        resolve_lifecycle_runtime(None, "missing").unwrap(),
         RuntimeKind::Microvm
     );
 }
@@ -224,4 +242,117 @@ async fn deploy_null_vm_id_returns_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
     assert!(body.contains("vm_id is required"), "body={body}");
+}
+
+fn mini_dashboard() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "<html>overview</html>").unwrap();
+    std::fs::create_dir(dir.path().join("deploy")).unwrap();
+    std::fs::write(
+        dir.path().join("deploy/index.html"),
+        "<html>deploy-page</html>",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("settings")).unwrap();
+    std::fs::write(
+        dir.path().join("settings/index.html"),
+        "<html>settings</html>",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("_astro")).unwrap();
+    std::fs::write(dir.path().join("_astro/app.js"), "console.log(1)").unwrap();
+    std::fs::write(dir.path().join("favicon.svg"), "<svg></svg>").unwrap();
+    dir
+}
+
+async fn get_path(app: axum::Router, uri: &str) -> (StatusCode, String, Option<String>) {
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    let ctype = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let status = res.status();
+    let bytes = res.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned(), ctype)
+}
+
+#[tokio::test]
+async fn dashboard_get_pages_are_public() {
+    let dist = mini_dashboard();
+    let app = router_with_dashboard(AppState::default(), dist.path());
+    let (status, body, ctype) = get_path(app, "/").await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(body.contains("overview"), "body={body}");
+    assert!(
+        ctype.as_deref().is_some_and(|c| c.starts_with("text/html")),
+        "ctype={ctype:?}"
+    );
+
+    let app = router_with_dashboard(AppState::default(), dist.path());
+    let (status, body, _) = get_path(app, "/deploy").await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(body.contains("deploy-page"), "body={body}");
+
+    let app = router_with_dashboard(AppState::default(), dist.path());
+    let (status, body, ctype) = get_path(app, "/_astro/app.js").await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(body.contains("console.log"), "body={body}");
+    assert!(
+        ctype
+            .as_deref()
+            .is_some_and(|c| c.contains("javascript") || c.contains("text/plain")),
+        "ctype={ctype:?}"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_post_deploy_stays_the_api() {
+    let dist = mini_dashboard();
+    let app = router_with_dashboard(AppState::default(), dist.path());
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/deploy")
+        .header("content-type", "application/json");
+    if let Some(token) = normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref()) {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let res = app
+        .oneshot(
+            builder
+                .body(Body::from(
+                    r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml"}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    let status = res.status();
+    let bytes = res.into_body().collect().await.expect("body").to_bytes();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(body.contains("vm_id is required"), "body={body}");
+}
+
+#[tokio::test]
+async fn dashboard_nests_api_prefix() {
+    let dist = mini_dashboard();
+    let app = router_with_dashboard(AppState::default(), dist.path());
+    let mut builder = Request::builder().uri("/api/vms");
+    if let Some(token) = normalize_api_token(std::env::var("RUSSEL_API_TOKEN").ok().as_deref()) {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let res = app
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
 }

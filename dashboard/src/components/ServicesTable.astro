@@ -58,9 +58,16 @@ function getHostPort(svc: ServiceVM): number | null {
                   class="port-link port-link-static mono-text"
                   data-host-port={getHostPort(svc)}
                 >port {getHostPort(svc)}</span>
+                {svc.route_host ? (
+                  <span class="mono-text route-host" title="Traefik Host rule">route {svc.route_host}</span>
+                ) : null}
               </div>
             ) : (
-              <span class="mono-text">—</span>
+              svc.route_host ? (
+                <span class="mono-text route-host" title="Traefik Host rule">route {svc.route_host}</span>
+              ) : (
+                <span class="mono-text">—</span>
+              )
             )}
           </td>
           <td>

@@ -1,13 +1,15 @@
 //! HTTP router and service lifecycle handlers.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
+    extract::{Extension, Path, Query, State},
+    http::{HeaderValue, StatusCode, Uri, header::CONTENT_TYPE},
     middleware,
+    response::IntoResponse,
     routing::{delete, get, post},
 };
 use russel_core::api::{
@@ -18,11 +20,13 @@ use russel_core::config::RuntimeKind;
 use russel_core::reserved::is_reserved_service_dir;
 use tokio::process::Child;
 use tokio_stream::StreamExt;
+use tower_http::services::ServeDir;
 
 use super::auth::{auth_middleware, deploy_semaphore, max_concurrent_deploys};
 use super::secrets::{secrets_delete, secrets_list, secrets_set};
 use crate::{
     container::{ContainerRunner, container_log_path},
+    dashboard::DashboardDir,
     deploy::DeployPipeline,
     deployments,
     ingress::default_ingress,
@@ -33,9 +37,36 @@ use crate::{
     state::{AppState, LifecycleClaim},
 };
 
+/// Control-plane API only (CLI paths). Tests and `--no-dashboard` use this.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/deploy", post(deploy))
+    router_inner(state, None)
+}
+
+/// API at `/` and `/api/*`, plus the static dashboard on GET `/`, `/deploy`, …
+pub fn router_with_dashboard(state: AppState, dashboard_dir: impl Into<PathBuf>) -> Router {
+    router_inner(state, Some(dashboard_dir.into()))
+}
+
+fn router_inner(state: AppState, dashboard_dir: Option<PathBuf>) -> Router {
+    let routes = if let Some(dir) = dashboard_dir.as_ref() {
+        // GET /deploy is the UI page; POST /deploy stays the API. Nested `/api`
+        // is the dashboard's default base (Vite used to strip that prefix).
+        api_routes(true)
+            .nest_service("/_astro", ServeDir::new(dir.join("_astro")))
+            .nest("/api", api_routes(false))
+    } else {
+        api_routes(false)
+    };
+    let routes = routes.layer(middleware::from_fn(auth_middleware));
+    let routes = match dashboard_dir {
+        Some(dir) => routes.layer(Extension(DashboardDir(dir))),
+        None => routes,
+    };
+    routes.with_state(state)
+}
+
+fn api_routes(dashboard: bool) -> Router<AppState> {
+    let r = Router::new()
         .route("/vm/{service_id}/status", get(vm_status))
         .route("/vm/{service_id}/logs", get(vm_logs))
         .route("/vm/{service_id}/deployments", get(vm_deployments))
@@ -47,9 +78,47 @@ pub fn router(state: AppState) -> Router {
         .route("/vm/{service_id}/update", post(vm_update))
         .route("/vm/{service_id}", delete(vm_destroy))
         .route("/secrets", get(secrets_list))
-        .route("/secrets/{name}", post(secrets_set).delete(secrets_delete))
-        .layer(middleware::from_fn(auth_middleware))
-        .with_state(state)
+        .route("/secrets/{name}", post(secrets_set).delete(secrets_delete));
+
+    if dashboard {
+        r.route("/", get(serve_dashboard))
+            .route("/services", get(serve_dashboard))
+            .route("/services/", get(serve_dashboard))
+            .route("/service-detail", get(serve_dashboard))
+            .route("/service-detail/", get(serve_dashboard))
+            .route("/settings", get(serve_dashboard))
+            .route("/settings/", get(serve_dashboard))
+            .route("/favicon.svg", get(serve_dashboard))
+            .route("/deploy/", get(serve_dashboard))
+            .route("/deploy", get(serve_dashboard).post(deploy))
+    } else {
+        r.route("/deploy", post(deploy))
+    }
+}
+
+async fn serve_dashboard(
+    uri: Uri,
+    Extension(dir): Extension<DashboardDir>,
+) -> axum::response::Response {
+    let Some(path) = crate::dashboard::dashboard_page_file(&dir.0, uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let ctype = match path.extension().and_then(|e| e.to_str()) {
+                Some("svg") => "image/svg+xml",
+                Some("js") => "application/javascript",
+                Some("css") => "text/css",
+                _ => "text/html; charset=utf-8",
+            };
+            let mut response = axum::response::Response::new(bytes.into());
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(ctype));
+            response
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Build an `application/x-ndjson` streaming response from a deploy-event
@@ -214,6 +283,7 @@ async fn vm_status(
             runtime: agent_status.runtime,
             host_port: agent_status.host_port,
             guest_port: agent_status.guest_port,
+            route_host: None,
         }));
     }
 
@@ -235,8 +305,20 @@ async fn vm_logs(
         format!("service {} not found", service_id),
     ))?;
 
-    let runtime = resolve_lifecycle_runtime(state.runtime_for_service(&service_id), &service_id);
-    if runtime == RuntimeKind::Container {
+    // Unreadable metadata is 500 on stop/destroy. Logs still return the snapshot.
+    let runtime =
+        match resolve_lifecycle_runtime(state.runtime_for_service(&service_id), &service_id) {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                tracing::warn!(
+                    service_id = %service_id,
+                    error = %e,
+                    "metadata unreadable; returning in-memory logs without podman tail"
+                );
+                None
+            }
+        };
+    if runtime == Some(RuntimeKind::Container) {
         append_podman_logs(&service_id, &mut resp.output).await;
     }
 
@@ -322,7 +404,11 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
         .collect();
     let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
-    for base in &["/var/lib/russel", "/var/lib/microvms"] {
+    let bases = [
+        russel_core::paths::data_root(),
+        PathBuf::from("/var/lib/microvms"),
+    ];
+    for base in &bases {
         let Ok(mut entries) = tokio::fs::read_dir(base).await else {
             continue;
         };
@@ -358,9 +444,10 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
                 .as_ref()
                 .map(|s| s.status.clone())
                 .unwrap_or_else(|| "stopped".to_string());
+            // Unreadable metadata is already logged; do not treat it as missing.
             let runtime = cached
                 .and_then(|s| s.runtime)
-                .or_else(|| prior_runtime_from_disk(id));
+                .or_else(|| prior_runtime_from_disk(id).ok().flatten());
             ServiceSummary {
                 service_id: id.clone(),
                 runtime,
@@ -375,6 +462,30 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
         vms.len()
     );
     Json(VmsResponse { vms, services })
+}
+
+/// Map a Podman container name to a service id.
+///
+/// Accepts `russel-{id}` and the dual-live generation name
+/// `russel-{id}_g` + exactly 8 lowercase hex digits (`new_generation_id`).
+/// Shorter or non-hex suffixes are part of the id. Names without the
+/// `russel-` prefix are ignored.
+fn service_id_from_container_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("russel-")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let Some((base, hex)) = rest.rsplit_once("_g") else {
+        return Some(rest);
+    };
+    if !base.is_empty()
+        && hex.len() == 8
+        && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Some(base)
+    } else {
+        Some(rest)
+    }
 }
 
 async fn discover_podman_containers(
@@ -412,9 +523,14 @@ async fn discover_podman_containers(
             Some((n, s)) => (n.trim(), s.trim().to_ascii_lowercase()),
             None => (line, String::new()),
         };
-        let Some(service_id) = name.strip_prefix("russel-") else {
+        // `russel-{id}_g{8 hex}` is a dual-live generation container, not a
+        // second service. Other suffixes stay intact.
+        let Some(service_id) = service_id_from_container_name(name) else {
             continue;
         };
+        if is_reserved_service_dir(service_id) {
+            continue;
+        }
 
         // Always re-init known services so ports can be reclaimed after ctrl restart.
         state.ensure_service(service_id);
@@ -565,6 +681,7 @@ async fn vm_rollback(
         .and_then(|d| d.guest_port)
         .or(target.guest_port)
         .unwrap_or(3000);
+    let ingress_host = ds.and_then(|d| d.ingress_host.clone());
     let env = ds.map(|d| d.env.clone()).unwrap_or_default();
     let podman_args = ds.map(|d| d.podman_args.clone()).unwrap_or_default();
 
@@ -576,6 +693,7 @@ async fn vm_rollback(
             host,
             guest: guest_port,
         }),
+        host: ingress_host,
         runtime,
         env,
         podman_args,
@@ -615,7 +733,7 @@ async fn vm_update(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let body = body.map(|j| j.0).unwrap_or_default();
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let path = crate::metadata::metadata_path(&service_id);
 
     // Async metadata read (F-25-api): tokio::fs on the async hot path, no std::fs blocking.
     let meta: serde_json::Value = match tokio::fs::read_to_string(&path).await {
@@ -695,6 +813,7 @@ async fn vm_update(
 
     let host_port = ds.host_port.or(top_host_port);
     let guest_port = ds.guest_port.or(top_guest_port).unwrap_or(3000);
+    let ingress_host = ds.ingress_host;
     let runtime = ds.runtime.or(top_runtime);
 
     let request = DeployRequest {
@@ -705,6 +824,7 @@ async fn vm_update(
             host,
             guest: guest_port,
         }),
+        host: ingress_host,
         runtime,
         env: ds.env,
         podman_args: ds.podman_args,
@@ -715,17 +835,50 @@ async fn vm_update(
     spawn_deploy_stream(state, request, service_id, "update")
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct DestroyQuery {
+    #[serde(default)]
+    keep_volumes: Option<bool>,
+}
+
 async fn vm_destroy(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
+    Query(query): Query<DestroyQuery>,
 ) -> Result<Json<String>, (StatusCode, String)> {
     MicrovmRunner::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let policy = russel_core::VolumeDestroyPolicy::from_keep_override(query.keep_volumes);
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
+
+    // Resolve runtime and reject unsupported query params BEFORE claiming
+    // Destroying. Returning Err after claim leaves status stuck.
+    // Unreadable metadata is 500 — assuming microVM would destroy a container.
+    let runtime = require_lifecycle_runtime(&state, &service_id)?;
+    // Container service-dir cleanup is owned by destroy_with_policy
+    // (FollowFile / KeepAll / DeleteAll). The agent RPC path has no policy
+    // slot yet, so an explicit keep_volumes query against agent mode is
+    // rejected instead of silently following the file.
+    if runtime == RuntimeKind::Container
+        && crate::agent_client::agent_mode_enabled()
+        && query.keep_volumes.is_some()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "keep_volumes is not supported in agent mode (unset RUSSEL_AGENT_URL or omit the query)"
+                .into(),
+        ));
+    }
 
     let (runtime, handle) =
         claim_lifecycle_operation(&state, &service_id, ServiceStatus::Destroying)?;
-    let result = handle.lifecycle.destroy(&service_id).await;
+    let result = if runtime == RuntimeKind::Container && !crate::agent_client::agent_mode_enabled()
+    {
+        crate::container::destroy_with_policy_for(&service_id, policy).await
+    } else {
+        // MicroVM destroy ignores the keep_volumes query.
+        handle.lifecycle.destroy(&service_id).await
+    };
 
     let label = runtime_label(runtime);
 
@@ -734,7 +887,7 @@ async fn vm_destroy(
     // error paths. Runner also releases for in-process callers; the API path
     // covers agent mode and ensures inventory is never permanently held when
     // destroy returns an error. Failed status is preserved below for retry.
-    PortAllocator::release(&service_id);
+    PortAllocator::release_service(&service_id);
     if runtime == RuntimeKind::Microvm {
         release_subnet(&service_id);
     }
@@ -747,12 +900,9 @@ async fn vm_destroy(
             {
                 reap_children(vm, aux).await;
             }
-            if handle.runtime == RuntimeKind::Container {
-                let base = crate::container::default_base_dir(&service_id);
-                if base.exists() {
-                    let _ = tokio::fs::remove_dir_all(&base).await;
-                }
-            }
+            // Container service-dir cleanup is owned by
+            // destroy_with_policy (FollowFile / KeepAll / DeleteAll).
+            // No extra remove_dir_all here: it would delete kept volumes.
             // Deregister from ingress so the proxy stops routing to this (now destroyed) backend.
             let ingress = default_ingress();
             if let Err(e) = ingress.deregister(&service_id).await {
@@ -792,6 +942,18 @@ struct LifecycleClaimHandle {
     prior_vm_state: VmState,
 }
 
+fn require_lifecycle_runtime(
+    state: &AppState,
+    service_id: &str,
+) -> Result<RuntimeKind, (StatusCode, String)> {
+    resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read metadata for {service_id}: {e}"),
+        )
+    })
+}
+
 pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
     match runtime {
         RuntimeKind::Microvm => "microvm",
@@ -804,7 +966,7 @@ fn claim_lifecycle_operation(
     service_id: &str,
     target_status: ServiceStatus,
 ) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
-    let runtime = resolve_lifecycle_runtime(state.runtime_for_service(service_id), service_id);
+    let runtime = require_lifecycle_runtime(state, service_id)?;
 
     let (prior_status, prior_vm_state, claim_generation) =
         match state.begin_lifecycle_operation(service_id, target_status, VmState::Pending) {
@@ -853,5 +1015,30 @@ async fn reap_child(mut child: Child) {
     if !matches!(wait, Ok(Ok(_))) {
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_id_from_container_name;
+
+    #[test]
+    fn service_id_from_container_name_strips_generation_suffix() {
+        assert_eq!(service_id_from_container_name("russel-api"), Some("api"));
+        assert_eq!(
+            service_id_from_container_name("russel-api_gdeadbeef"),
+            Some("api")
+        );
+        // 7 hex digits is not a generation id — do not strip.
+        assert_eq!(
+            service_id_from_container_name("russel-api_gdeadbee"),
+            Some("api_gdeadbee")
+        );
+        assert_eq!(
+            service_id_from_container_name("russel-foo_g12345678"),
+            Some("foo")
+        );
+        assert_eq!(service_id_from_container_name("api"), None);
+        assert_eq!(service_id_from_container_name("russel-"), None);
     }
 }

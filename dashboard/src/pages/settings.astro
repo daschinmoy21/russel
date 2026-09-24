@@ -16,7 +16,7 @@ import { isDemoMode } from '../lib/api';
     <div class="card-panel settings-panel">
       <h2 class="section-title mb-4">Russel API Connection</h2>
 
-      <form id="settingsForm">
+      <form id="settingsForm" novalidate>
         <div class="form-group">
           <label class="form-label" for="apiUrl">Control Plane HTTP API Base URL</label>
           <input
@@ -24,9 +24,15 @@ import { isDemoMode } from '../lib/api';
             id="apiUrl"
             class="form-input"
             placeholder="/api"
+            aria-describedby="apiUrlHint"
             required
           />
-          <span class="field-hint">Default <code>/api</code> uses the dev proxy. Set to absolute URL for production.</span>
+          <div class="preset-row" aria-label="API base presets">
+            <button type="button" class="btn btn-secondary btn-sm" data-api-preset="/api">Same-origin <code>/api</code></button>
+            <button type="button" class="btn btn-secondary btn-sm" data-api-preset="/api" title="Vite proxies /api to the SSH-forwarded local 7878">Tunneled development <code>/api</code></button>
+            <button type="button" class="btn btn-secondary btn-sm" id="btnCustomHttps">Custom HTTPS…</button>
+          </div>
+          <span class="field-hint" id="apiUrlHint">Use <code>/api</code> for same-origin production or tunneled Vite development. The SSH tunnel must be up for tunneled <code>/api</code>. Do not use <code>http://127.0.0.1:7878</code> from <code>bun run dev</code>.</span>
         </div>
 
         <div class="form-group">
@@ -37,26 +43,26 @@ import { isDemoMode } from '../lib/api';
             class="form-input"
             placeholder="Leave empty if unconfigured"
           />
-          <span class="field-hint">Passed as <code>Authorization: Bearer &lt;token&gt;</code> on HTTP calls. Enter at runtime only — never bake into the build via <code>PUBLIC_*</code> env vars.</span>
+          <span class="field-hint">Passed as <code>Authorization: Bearer &lt;token&gt;</code> on HTTP calls. Token storage is tab-scoped <code>sessionStorage</code>; CLI <code>config.toml</code> does not fill the dashboard. Paste the same token as <code>~/.config/russel/env</code>. Enter at runtime only, never via <code>PUBLIC_*</code> env vars.</span>
         </div>
 
         <div class="demo-toggle-section">
           <div class="demo-toggle-row">
             <div class="demo-toggle-info">
-              <span class="demo-toggle-label">Demo Mode</span>
+              <span class="demo-toggle-label" id="demoModeLabel">Demo Mode</span>
               <span class="demo-toggle-desc">
                 Demo mode loads mock services without contacting russel-ctrl. When off, the dashboard uses the live API; if the daemon is down you will see Offline/empty state.
               </span>
             </div>
             <label class="switch">
-              <input type="checkbox" id="demoModeToggle" />
+              <input type="checkbox" id="demoModeToggle" aria-labelledby="demoModeLabel" />
               <span class="switch-slider"></span>
             </label>
           </div>
         </div>
 
         <div class="form-actions-row">
-          <button type="button" id="btnTestConn" class="btn btn-secondary">
+          <button type="button" id="btnTestConn" class="btn btn-secondary" aria-busy="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
             </svg>
@@ -68,7 +74,7 @@ import { isDemoMode } from '../lib/api';
           </button>
         </div>
 
-        <div id="settingsToast" class="toast hidden"></div>
+        <div id="settingsToast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
       </form>
     </div>
 
@@ -78,34 +84,18 @@ import { isDemoMode } from '../lib/api';
 
       <div class="faq-list">
         <div class="faq-item">
-          <h3 class="faq-q">How does Russel connect to microVMs vs containers?</h3>
-          <p class="faq-a">
-            Russel manages Cloud-Hypervisor microVMs using tap network devices and Linux kernel images. Container workloads run rootless via Podman socket invocations.
-          </p>
+          <h3 class="faq-q">Topology A: same host</h3>
+          <p class="faq-a">Serve the dashboard and a reverse proxy on the same host as russel-ctrl. Use <code>/api</code>; the proxy keeps ctrl on loopback.</p>
         </div>
 
         <div class="faq-item">
-          <h3 class="faq-q">Where are settings stored?</h3>
-          <p class="faq-a">
-            API base URL and demo mode use <code>localStorage</code> (<code>RUSSEL_API_URL</code>, <code>RUSSEL_DEMO_MODE</code>).
-            The bearer token is kept in <code>sessionStorage</code> (<code>RUSSEL_API_TOKEN</code>) so it is tab-scoped and cleared when the tab closes — not long-lived across sessions.
-            Never set <code>PUBLIC_RUSSEL_API_TOKEN</code>; tokens must be entered here at runtime.
-          </p>
+          <h3 class="faq-q">Topology B: SSH tunnel and <code>/api</code></h3>
+          <p class="faq-a">Run <code>./contrib/install.sh connect &lt;user@host&gt;</code>, then <code>bun run dev</code>. Vite proxies same-origin <code>/api</code> to the forwarded local port, so the browser does not need CORS.</p>
         </div>
 
         <div class="faq-item">
-          <h3 class="faq-q">What endpoints does the API expose?</h3>
-          <p class="faq-a">
-            <code>GET /vms</code>, <code>GET /vm/{'{id}'}/status</code>, <code>GET /vm/{'{id}'}/logs</code>, <code>POST /deploy</code>, <code>POST /vm/{'{id}'}/stop</code>, <code>POST /vm/{'{id}'}/update</code>, <code>DELETE /vm/{'{id}'}</code>.
-            See <a href="/docs/">docs/</a> for full API mapping.
-          </p>
-        </div>
-
-        <div class="faq-item">
-          <h3 class="faq-q">What is the /api proxy?</h3>
-          <p class="faq-a">
-            In development (<code>bun run dev</code>), Vite proxies <code>/api/*</code> -> <code>http://127.0.0.1:7878/*</code> so the browser avoids CORS issues. Set <code>RUSSEL_API_PROXY</code> env var to override the target.
-          </p>
+          <h3 class="faq-q">Topology C: HTTPS same-origin</h3>
+          <p class="faq-a">In production, serve the dashboard over HTTPS and map same-origin <code>/api/</code> to russel-ctrl through the reverse proxy. Read the <a href="https://github.com/daschinmoy21/russel/blob/main/docs/install.md" target="_blank" rel="noreferrer">install guide</a> for the setup.</p>
         </div>
       </div>
     </div>
@@ -124,6 +114,8 @@ import { isDemoMode } from '../lib/api';
     apiBaseValidationError,
     assertCleartextTokenOk,
     joinApiUrl,
+    classifyConnectionResult,
+    connectionResultMessage,
   } from '../lib/api';
 
   const apiUrlInput = document.getElementById('apiUrl') as HTMLInputElement | null;
@@ -137,6 +129,16 @@ import { isDemoMode } from '../lib/api';
   if (apiUrlInput) apiUrlInput.value = getApiBase() || '/';
   if (apiTokenInput) apiTokenInput.value = getApiToken() || '';
   if (demoModeToggle) demoModeToggle.checked = isDemoMode();
+
+  function clearUrlValidation() {
+    apiUrlInput?.removeAttribute('aria-invalid');
+  }
+
+  function showUrlValidation(message: string) {
+    apiUrlInput?.setAttribute('aria-invalid', 'true');
+    showToast(message, true);
+    apiUrlInput?.focus();
+  }
 
   function showToast(msg: string, isError = false) {
     if (!toast) return;
@@ -152,10 +154,31 @@ import { isDemoMode } from '../lib/api';
     location.reload();
   });
 
+  apiUrlInput?.addEventListener('input', clearUrlValidation);
+
+  document.querySelectorAll<HTMLButtonElement>('[data-api-preset]').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (!apiUrlInput) return;
+      apiUrlInput.value = button.dataset.apiPreset || '/api';
+      clearUrlValidation();
+    });
+  });
+
+  document.getElementById('btnCustomHttps')?.addEventListener('click', () => {
+    apiUrlInput?.focus();
+  });
+
   form?.addEventListener('submit', (e) => {
     e.preventDefault();
+    const formBaseRaw = (apiUrlInput?.value ?? '').trim();
+    const normalized = validateApiBase(formBaseRaw);
+    if (normalized === null) {
+      showUrlValidation(apiBaseValidationError(formBaseRaw));
+      return;
+    }
+    clearUrlValidation();
     try {
-      if (apiUrlInput) setApiBase(apiUrlInput.value.trim());
+      setApiBase(formBaseRaw);
       if (apiTokenInput) setApiToken(apiTokenInput.value.trim());
       showToast('API settings saved! Reload page to apply.');
     } catch (err: any) {
@@ -165,18 +188,20 @@ import { isDemoMode } from '../lib/api';
 
   btnTest?.addEventListener('click', async () => {
     btnTest.setAttribute('disabled', 'true');
+    btnTest.setAttribute('aria-busy', 'true');
+    const formBaseRaw = (apiUrlInput?.value ?? '').trim();
+    const formToken = (apiTokenInput?.value ?? '').trim() || null;
+    const normalized = validateApiBase(formBaseRaw);
     try {
       // Read the form field as shown (no silent fallback to saved base). Empty
       // input must fail validation the same way as submit — not test getApiBase().
       // UI root representation "/" still normalizes via validateApiBase.
-      const formBaseRaw = (apiUrlInput?.value ?? '').trim();
-      const formToken = (apiTokenInput?.value ?? '').trim() || null;
-      const normalized = validateApiBase(formBaseRaw);
       // "" is valid same-origin root — only null is rejection
       if (normalized === null) {
-        showToast(apiBaseValidationError(formBaseRaw), true);
+        showUrlValidation(apiBaseValidationError(formBaseRaw));
         return;
       }
+      clearUrlValidation();
 
       // Cleartext Bearer policy against the form URL + form token
       assertCleartextTokenOk(normalized, formToken);
@@ -188,17 +213,20 @@ import { isDemoMode } from '../lib/api';
         headers,
         signal: AbortSignal.timeout(3000),
       });
-      if (res.ok) {
-        const data = await res.json();
+      const result = classifyConnectionResult(res);
+      if (result.kind === 'success') {
+        const data = await result.response.json();
         const count = data.services?.length ?? data.vms?.length ?? 0;
         showToast(`Connected! Found ${count} services on the control plane.`);
       } else {
-        showToast(`Connection failed: HTTP ${res.status}`, true);
+        showToast(connectionResultMessage(result, normalized, window.location.origin), true);
       }
     } catch (e: any) {
-      showToast(`Connection error: ${e.message || 'network unreachable'}`, true);
+      const result = classifyConnectionResult(e);
+      showToast(connectionResultMessage(result, normalized ?? formBaseRaw, window.location.origin), true);
     } finally {
       btnTest.removeAttribute('disabled');
+      btnTest.setAttribute('aria-busy', 'false');
     }
   });
 </script>
@@ -225,6 +253,13 @@ import { isDemoMode } from '../lib/api';
   .field-hint code {
     font-family: var(--font-mono);
     color: var(--accent-primary);
+  }
+
+  .preset-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
   }
 
   .demo-toggle-section {
@@ -311,6 +346,8 @@ import { isDemoMode } from '../lib/api';
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
     margin-top: 1.5rem;
   }
 

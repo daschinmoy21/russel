@@ -68,13 +68,14 @@ const services: ServiceVM[] = [];
     api,
     escapeHtml,
     formatUptime,
+    getApiBase,
     isApiBaseLoopback,
     isServiceRunning,
     overviewMetricsForConnection,
     overviewServicesEmptyCopy,
     probeEndpointPort,
   } from '../lib/api';
-  import { renderOfflineState, renderEmptyState } from '../lib/offline_state';
+  import { renderOfflineState, renderUnauthorizedState, renderEmptyState } from '../lib/offline_state';
   import { renderPortCell } from '../lib/ports';
   import type { FleetStatus, ServiceVM } from '../lib/api';
 
@@ -484,10 +485,10 @@ const services: ServiceVM[] = [];
 
     // Update metrics via pure shell helpers (unit-tested; keeps Loading… contract locked)
     const grid = document.getElementById('metricsGrid');
-    if (grid && (connection === 'demo' || connection === 'live' || connection === 'offline')) {
+    if (grid && (connection === 'demo' || connection === 'live' || connection === 'offline' || connection === 'unauthorized')) {
       const cards = overviewMetricsForConnection(connection, status, services)!;
       const healthPct =
-        connection !== 'offline' && status.total_vms > 0
+        connection !== 'offline' && connection !== 'unauthorized' && status.total_vms > 0
           ? Math.round((status.running_vms / status.total_vms) * 100)
           : 0;
       grid.innerHTML = cards
@@ -530,12 +531,14 @@ const services: ServiceVM[] = [];
         if (afterHeader) afterHeader.remove();
         if (headerRow) headerRow.insertAdjacentHTML('afterend', tableHtml);
       } else {
-        const empty = overviewServicesEmptyCopy(connection === 'demo' ? 'demo' : connection === 'offline' ? 'offline' : 'live');
+        const empty = overviewServicesEmptyCopy(connection);
         const afterHeader = section.querySelector('.data-table-container, .empty-state');
         if (afterHeader) afterHeader.remove();
         if (headerRow) {
           if (empty.kind === 'offline') {
-            headerRow.insertAdjacentHTML('afterend', renderOfflineState(empty.primary));
+            headerRow.insertAdjacentHTML('afterend', renderOfflineState(empty.primary, getApiBase(), window.location.origin));
+          } else if (empty.kind === 'unauthorized') {
+            headerRow.insertAdjacentHTML('afterend', renderUnauthorizedState(empty.primary));
           } else {
             headerRow.insertAdjacentHTML('afterend', renderEmptyState(empty.primary));
           }

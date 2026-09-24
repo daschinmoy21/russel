@@ -754,6 +754,12 @@ impl AppState {
         };
 
         let disk = crate::metadata::load_metadata_from_disk(service_id);
+        let route_host = disk
+            .as_ref()
+            .and_then(|m| m.ingress_host.clone())
+            .or_else(|| {
+                crate::traefik::TraefikFileIngress::from_env().host_from_dynamic_config(service_id)
+            });
         Some(StatusResponse {
             service_id: service_id.to_string(),
             status,
@@ -762,6 +768,7 @@ impl AppState {
             runtime: runtime.or_else(|| disk.as_ref().and_then(|m| m.runtime)),
             host_port: host_port.or_else(|| disk.as_ref().and_then(|m| m.host_port)),
             guest_port: guest_port.or_else(|| disk.as_ref().and_then(|m| m.guest_port)),
+            route_host,
         })
     }
 
@@ -773,16 +780,31 @@ impl AppState {
             (s.logs.clone(), s.runtime)
         };
 
-        let runtime = runtime.unwrap_or_else(|| {
-            crate::metadata::prior_runtime_from_disk(service_id).unwrap_or(RuntimeKind::Microvm)
-        });
+        let runtime = match runtime {
+            Some(rt) => Some(rt),
+            None => match crate::metadata::prior_runtime_from_disk(service_id) {
+                Ok(Some(rt)) => Some(rt),
+                // Missing or unparsable metadata keeps the historical default.
+                Ok(None) => Some(RuntimeKind::Microvm),
+                // Unreadable is not "no file". Do not tail console.log for a
+                // service that may be a container. The read already logged.
+                Err(_) => None,
+            },
+        };
 
         let mut output = logs_snapshot;
         let max_file_read: u64 = 256 * 1024; // 256 KiB cap per file
 
+        let Some(runtime) = runtime else {
+            return Some(LogsResponse { output });
+        };
+
         match runtime {
             RuntimeKind::Microvm => {
-                let console_path = format!("/var/lib/russel/{service_id}/console.log");
+                let console_path = russel_core::paths::service_dir(service_id)
+                    .join("console.log")
+                    .display()
+                    .to_string();
                 if let Some(console) = read_tail_of_file(&console_path, max_file_read)
                     && !console.is_empty()
                 {
@@ -864,5 +886,33 @@ impl AppState {
     /// `metadata.json` remains the source of truth for runtime details.
     pub fn write_catalog(&self) -> anyhow::Result<()> {
         crate::metadata::write_ctrl_catalog(&self.build_catalog())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::deployments::DesiredStateSnapshot;
+
+    fn ingress_host_from_metadata(meta: &serde_json::Value) -> Option<String> {
+        DesiredStateSnapshot::from_metadata_desired_state(meta).ingress_host
+    }
+
+    #[test]
+    fn status_route_host_reads_desired_state() {
+        let metadata = serde_json::json!({
+            "desired_state": {
+                "ingress_host": "api.example.com"
+            }
+        });
+        assert_eq!(
+            ingress_host_from_metadata(&metadata).as_deref(),
+            Some("api.example.com")
+        );
+    }
+
+    #[test]
+    fn status_route_host_is_none_without_desired_host() {
+        let metadata = serde_json::json!({"desired_state": {"runtime": "container"}});
+        assert_eq!(ingress_host_from_metadata(&metadata), None);
     }
 }

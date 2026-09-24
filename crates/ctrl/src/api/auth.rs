@@ -3,7 +3,7 @@
 use axum::{
     http::{Request, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 
 /// Minimum accepted length for `RUSSEL_API_TOKEN` after trim (when set).
@@ -84,12 +84,24 @@ pub(crate) fn deploy_semaphore() -> &'static tokio::sync::Semaphore {
 ///
 /// Env: `RUSSEL_API_TOKEN` (min length enforced at process start), optional
 /// `RUSSEL_REQUIRE_AUTH=1|true|yes` to fail closed without a token on loopback.
-pub(super) async fn auth_middleware(
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
+///
+/// Rejections carry `WWW-Authenticate: Bearer realm="russel-ctrl"` so local
+/// probes (`install.sh host/connect/status`) can tell this control plane
+/// apart from an unrelated listener that also returns HTTP 401.
+pub(super) async fn auth_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
+    // Dashboard HTML/JS is public; the client sends Bearer on `/api/*`.
+    // Only skip when a dashboard dist is actually mounted (Extension present).
+    if crate::dashboard::is_public_dashboard_request(request.method(), request.uri().path())
+        && request
+            .extensions()
+            .get::<crate::dashboard::DashboardDir>()
+            .is_some()
+    {
+        return next.run(request).await;
+    }
+
     let Some(expected) = configured_api_token() else {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     };
 
     let header = request
@@ -101,8 +113,21 @@ pub(super) async fn auth_middleware(
     let provided = russel_core::tokens::bearer_token_from_header(header).unwrap_or("");
 
     if !russel_core::tokens::constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return unauthorized_response();
     }
 
-    Ok(next.run(request).await)
+    next.run(request).await
+}
+
+/// Identifiable 401 for Bearer rejections (see [`auth_middleware`]).
+pub(super) fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            "Bearer realm=\"russel-ctrl\"",
+        )],
+        "unauthorized\n",
+    )
+        .into_response()
 }

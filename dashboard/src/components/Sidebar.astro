@@ -73,7 +73,7 @@ const { activePath } = Astro.props;
         </span>
         <span class="nav-label">Settings</span>
       </a>
-      <a href="#" class="nav-item" target="_blank" rel="noreferrer">
+      <a href="https://github.com/daschinmoy21/russel/blob/main/docs/install.md" class="nav-item" target="_blank" rel="noreferrer">
         <span class="nav-icon">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
         </span>
@@ -88,7 +88,7 @@ const { activePath } = Astro.props;
       <div class="user-avatar">O</div>
       <div class="user-info">
         <span class="user-name">Operator</span>
-        <span class="user-host" id="sidebarApiHost">127.0.0.1:7878</span>
+        <span class="user-host" id="sidebarApiHost">/api</span>
       </div>
     </div>
     <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle color theme">
@@ -108,7 +108,16 @@ const { activePath } = Astro.props;
   // Show API base in footer
   const hostEl = document.getElementById('sidebarApiHost');
   if (hostEl) {
-    try { hostEl.textContent = getApiBase().replace(/^https?:\/\//, '') || '127.0.0.1:7878'; } catch (_) {}
+    try {
+      const apiBase = getApiBase();
+      if (/^https?:\/\//i.test(apiBase)) {
+        hostEl.textContent = new URL(apiBase).host || apiBase;
+      } else {
+        hostEl.textContent = apiBase || '/';
+      }
+    } catch (_) {
+      hostEl.textContent = '/api';
+    }
   }
 
   // Theme toggle

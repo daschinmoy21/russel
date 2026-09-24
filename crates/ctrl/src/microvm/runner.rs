@@ -12,8 +12,8 @@ use crate::ch_api;
 
 use super::agent::{AGENT_BUSYBOX_APPLETS, AGENT_INIT_SCRIPT, AGENT_INITRAMFS_BASENAME};
 use super::process::{
-    BootOutput, cloud_hypervisor_stop_pattern, network_alloc_for_service, read_metadata,
-    stop_tap_identity, terminate_owned_process, wait_for_process_exit,
+    BootOutput, cloud_hypervisor_stop_pattern, escape_pkill_literal, network_alloc_for_service,
+    read_metadata, stop_tap_identity, terminate_owned_process, wait_for_process_exit,
 };
 use super::spec::{KernelInfo, VmSpec};
 
@@ -67,9 +67,12 @@ impl MicrovmRunner {
     /// Resolution order:
     ///   1. In-memory cache
     ///   2. `RUSSEL_KERNEL_PATH` env var → drivers_builtin=true
-    ///   3. `nix build .#microvm-kernel` (flake attr, detected via flake.nix)
-    ///   4. `./result/bzImage` relative file (user ran nix build without --no-link)
-    ///   5. Stock nixpkgs.linux fallback (drivers =m)
+    ///   3. `RUSSEL_KERNEL_POOL` env var, else `/var/lib/russel/_pool/kernel/bzImage`
+    ///      → drivers_builtin=true
+    ///   4. `nix build .#microvm-kernel` (flake attr, detected via flake.nix)
+    ///   5. Hard error naming the pool path, `RUSSEL_KERNEL_PATH`, and
+    ///      `nix build .#microvm-kernel` — never falls back to the stock
+    ///      nixpkgs linux kernel (drivers =m breaks microVM boot)
     ///
     /// Result is cached in-memory for the lifetime of the runner.
     pub async fn ensure_kernel(&self) -> anyhow::Result<KernelInfo> {
@@ -95,6 +98,25 @@ impl MicrovmRunner {
             tracing::warn!("RUSSEL_KERNEL_PATH={env_path} does not exist, continuing");
         }
 
+        let pool = match std::env::var("RUSSEL_KERNEL_POOL") {
+            Ok(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
+            _ => russel_core::paths::data_root().join("_pool/kernel/bzImage"),
+        };
+        if pool.is_file() {
+            let info = KernelInfo {
+                path: pool,
+                drivers_builtin: true,
+            };
+            self.store_kernel_cache(info.clone());
+            tracing::info!(
+                kernel = %info.path.display(),
+                source = "kernel-pool",
+                "microvm kernel cached (drivers built-in)"
+            );
+            return Ok(info);
+        }
+        tracing::debug!(pool = %pool.display(), "kernel pool has no kernel file");
+
         if let Some(repo_root) = Self::find_repo_root()
             && repo_root.join("flake.nix").exists()
         {
@@ -113,43 +135,21 @@ impl MicrovmRunner {
                     return Ok(info);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "flake kernel build failed; trying next source"
-                    );
+                    tracing::warn!(error = %e, "flake kernel build failed");
                 }
             }
         }
 
-        let result_bzimage = PathBuf::from("result/bzImage");
-        if result_bzimage.exists() {
-            let abs =
-                std::fs::canonicalize(&result_bzimage).unwrap_or_else(|_| result_bzimage.clone());
-            let info = KernelInfo {
-                path: abs,
-                drivers_builtin: true,
-            };
-            self.store_kernel_cache(info.clone());
-            tracing::info!(
-                kernel = %info.path.display(),
-                source = "result/bzImage",
-                "microvm kernel cached (drivers built-in)"
-            );
-            return Ok(info);
-        }
-
-        let path = self.build_stock_kernel().await?;
-        let info = KernelInfo {
-            path,
-            drivers_builtin: false,
-        };
-        self.store_kernel_cache(info.clone());
-        tracing::info!(
-            kernel = %info.path.display(),
-            source = "stock",
-            "stock kernel cached (drivers =m)"
+        anyhow::bail!(
+            "no microVM kernel available: there is no kernel file at {pool}, \
+             RUSSEL_KERNEL_PATH is unset or points to a missing file, and \
+             `nix build .#microvm-kernel` did not produce a kernel. Place a \
+             bzImage at {pool} (override the location with RUSSEL_KERNEL_POOL), \
+             set RUSSEL_KERNEL_PATH, or run `nix build .#microvm-kernel` in the \
+             repo root. Refusing to fall back to the stock nixpkgs linux kernel \
+             (virtio drivers =m breaks microVM boot).",
+            pool = pool.display()
         );
-        Ok(info)
     }
 
     /// Find the repo root by looking for flake.nix upward from
@@ -198,34 +198,6 @@ impl MicrovmRunner {
                 kernel.display()
             );
         }
-        Ok(kernel)
-    }
-
-    async fn build_stock_kernel(&self) -> anyhow::Result<PathBuf> {
-        let system = crate::build::current_system();
-        tracing::info!(system = %system, "building stock kernel from nixpkgs");
-        let output = Command::new("nix")
-            .args([
-                "build",
-                "--no-link",
-                "--print-out-paths",
-                "-f",
-                "<nixpkgs>",
-                "--argstr",
-                "system",
-                system,
-                "linux",
-            ])
-            .stderr(std::process::Stdio::inherit())
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            anyhow::bail!("failed to build stock kernel from nixpkgs");
-        }
-
-        let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let kernel = PathBuf::from(format!("{}/bzImage", store_path));
         Ok(kernel)
     }
 
@@ -283,10 +255,10 @@ impl MicrovmRunner {
         Ok(path)
     }
 
-    // Kernel modules (only needed when falling back to stock kernel).
+    // Kernel modules (only needed when drivers are not built-in).
 
-    /// Resolve kernel modules for the stock kernel fallback path.
-    /// Returns `None` when the microvm kernel is in use (drivers built-in).
+    /// Resolve kernel modules when the kernel does not have drivers built in.
+    /// Returns `None` for the microvm kernel (drivers built-in).
     pub async fn ensure_kernel_modules(&self) -> anyhow::Result<Option<PathBuf>> {
         let kernel = self.ensure_kernel().await?;
         if kernel.drivers_builtin {
@@ -378,7 +350,7 @@ impl MicrovmRunner {
 
         let busybox_path = self.ensure_busybox().await?;
         let kernel_modules_path = self.ensure_kernel_modules().await?;
-        let pool_dir = PathBuf::from("/var/lib/russel/_pool");
+        let pool_dir = russel_core::paths::data_root().join("_pool");
         std::fs::create_dir_all(&pool_dir)?;
 
         // Unique temp dir so concurrent deploys never share a work dir (F-18).
@@ -645,7 +617,7 @@ impl MicrovmRunner {
             .api_socket
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("/var/lib/russel"));
+            .unwrap_or_else(russel_core::paths::data_root);
 
         std::fs::create_dir_all(&sock_dir)?;
         #[cfg(unix)]
@@ -859,7 +831,10 @@ impl MicrovmRunner {
         Self::validate_service_id(service_id)?;
 
         let metadata = read_metadata(service_id);
-        let api_socket = format!("/var/lib/russel/{service_id}/cloud-hypervisor.sock");
+        let api_socket = russel_core::paths::service_dir(service_id)
+            .join("cloud-hypervisor.sock")
+            .display()
+            .to_string();
         if metadata.is_none() && !Path::new(&api_socket).exists() {
             return Ok(());
         }
@@ -903,7 +878,11 @@ impl MicrovmRunner {
         }
 
         // Kill virtiofsd processes (plural — deploy writes an array).
-        let virtiofsd_pattern = format!("(^|[[:space:]])virtiofsd .*russel/{service_id}/");
+        let virtiofsd_path = escape_pkill_literal(&format!(
+            "{}/",
+            russel_core::paths::service_dir(service_id).display()
+        ));
+        let virtiofsd_pattern = format!("(^|[[:space:]])virtiofsd .*{virtiofsd_path}");
         let mut virtiofsd_killed = false;
         if let Some(ref meta) = metadata {
             for &pid in &meta.virtiofsd_pids {
@@ -1004,7 +983,9 @@ impl MicrovmRunner {
 
         for dir in &[
             format!("/var/lib/microvms/{service_id}"),
-            format!("/var/lib/russel/{service_id}"),
+            russel_core::paths::service_dir(service_id)
+                .display()
+                .to_string(),
         ] {
             let path = std::path::Path::new(dir);
             if path.exists() {
@@ -1051,10 +1032,10 @@ impl MicrovmRunner {
         }
         if !service_id
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             anyhow::bail!(
-                "service_id can only contain alphanumeric characters, dashes, and underscores"
+                "service_id can only contain ASCII alphanumeric characters, dashes, and underscores"
             );
         }
         // Reject host state trees (secrets/traefik/_pool/*.bak) so deploy/destroy

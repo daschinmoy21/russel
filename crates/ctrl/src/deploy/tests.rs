@@ -1,7 +1,7 @@
 //! Unit tests for deploy helpers (generation ids, config path containment, podman args).
 
 use super::config::{MAX_CONFIG_BYTES, load_russelfile_under_repo};
-use super::pipeline::{build_desired_state, new_generation_id};
+use super::pipeline::{DesiredExtras, build_desired_state, new_generation_id};
 use crate::metadata::build_microvm_metadata_with_gen;
 use crate::microvm::MicrovmRunner;
 use std::io::Write;
@@ -244,6 +244,8 @@ fn desired_state_for_toml(body: &str) -> serde_json::Value {
         &std::collections::HashMap::new(),
         &[],
         None,
+        None,
+        DesiredExtras::default(),
     )
 }
 
@@ -294,6 +296,8 @@ fn persist_repo_url_drops_http_userinfo() {
         &std::collections::HashMap::new(),
         &[],
         None,
+        None,
+        DesiredExtras::default(),
     );
     assert_eq!(ds["repo_url"], "https://github.com/org/app.git");
     assert_eq!(ds["guest"], "busybox");
@@ -305,6 +309,30 @@ fn persist_repo_url_drops_http_userinfo() {
         &std::collections::HashMap::new(),
         &[],
         None,
+        None,
+        DesiredExtras::default(),
     );
     assert_eq!(plain["repo_url"], "https://github.com/org/app.git");
+}
+
+#[test]
+fn desired_state_records_file_only_ingress_pin_and_host() {
+    let pin = russel_core::api::PortMapping {
+        host: 4000,
+        guest: 3000,
+    };
+    let ds = build_desired_state(
+        "https://example.com/app.git",
+        "Russelfile.toml",
+        RuntimeKind::Container,
+        GuestKind::Busybox,
+        &std::collections::HashMap::new(),
+        &[],
+        Some(&pin),
+        Some("abc.com"),
+        DesiredExtras::default(),
+    );
+    assert_eq!(ds["port"]["host"], 4000);
+    assert_eq!(ds["port"]["guest"], 3000);
+    assert_eq!(ds["ingress_host"], "abc.com");
 }

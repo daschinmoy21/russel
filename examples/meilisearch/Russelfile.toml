@@ -1,0 +1,33 @@
+# meilisearch: meilisearch from nixpkgs via `service.package`, no flake.nix.
+# A committed flake.nix would win over `package`.
+# Data lives in a managed volume (/var/lib/russel/<id>/volumes/data).
+# `keep = true` survives `russel destroy` unless `--delete-volumes` is passed.
+# MEILI_DB_PATH puts the LMDB index on that volume; the rootfs stays read-only.
+# `--http-addr 0.0.0.0:7700` is required for ordinary Podman/Docker `-p`:
+# pasta targets the container IP, not guest loopback (the default is
+# 127.0.0.1:7700).
+# MEILI_MASTER_KEY is the public demo string below, same idea as the
+# filebrowser demo password: change it before exposing anything, and override
+# with "secret://MEILI_MASTER_KEY" in production.
+
+[service]
+name = "meilisearch"
+source = "."
+port = 7700
+memory = "512mb"
+type = "container"
+package = "meilisearch"
+bin = "meilisearch"
+args = ["--http-addr", "0.0.0.0:7700"]
+
+[service.env]
+# Production: printf '%s' 'your-key' | russel secrets set MEILI_MASTER_KEY
+# then replace the value with "secret://MEILI_MASTER_KEY".
+MEILI_MASTER_KEY = "demo-only-not-for-production"
+MEILI_DB_PATH = "/data"
+
+[[volumes]]
+name = "data"
+guest = "/data"
+rw = true
+keep = true

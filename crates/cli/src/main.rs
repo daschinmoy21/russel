@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         Command::Logs(args) => commands::logs(args, &resolved.control_plane).await?,
         Command::Ps => commands::ps(&resolved.control_plane).await?,
         Command::Stop(args) => commands::stop_vm(&args.id, &resolved.control_plane).await?,
-        Command::Destroy(args) => commands::destroy_vm(&args.id, &resolved.control_plane).await?,
+        Command::Destroy(args) => commands::destroy_vm(&args, &resolved.control_plane).await?,
         Command::Update(args) => commands::update(args, &resolved.control_plane).await?,
         Command::Secrets { action } => commands::secrets(action, &resolved.control_plane).await?,
     }

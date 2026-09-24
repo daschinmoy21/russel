@@ -76,11 +76,12 @@ fn resolve_probe_target(
 
 /// Build a `PortMapping` for restart, rejecting zero ports.
 ///
-/// `host` of `None` or zero means "let the pipeline allocate". Guest defaults
-/// to 3000 when missing or zero.
+/// `host` of `None` or zero means "let the pipeline allocate". Guest must also
+/// be present and non-zero — a missing guest is not port 3000, and restarting
+/// against 3000 sends traffic at a service that listens elsewhere.
 fn restart_port_mapping(host: Option<u16>, guest: Option<u16>) -> Option<PortMapping> {
     let host = host.filter(|p| *p > 0)?;
-    let guest = guest.filter(|p| *p > 0).unwrap_or(3000);
+    let guest = guest.filter(|p| *p > 0)?;
     Some(PortMapping { host, guest })
 }
 
@@ -257,6 +258,7 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
         config_path: meta.config_path,
         vm_id: Some(service_id.to_string()),
         port: restart_port_mapping(meta.host_port, meta.guest_port),
+        host: meta.ingress_host,
         runtime: meta.runtime,
         env: meta.env,
         podman_args: meta.podman_args,
@@ -312,13 +314,14 @@ struct SourceMeta {
     config_path: String,
     host_port: Option<u16>,
     guest_port: Option<u16>,
+    ingress_host: Option<String>,
     runtime: Option<russel_core::config::RuntimeKind>,
     env: HashMap<String, String>,
     podman_args: Vec<String>,
 }
 
 fn load_source_from_metadata(service_id: &str) -> Option<SourceMeta> {
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let path = crate::metadata::metadata_path(service_id);
     let content = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
 
@@ -358,6 +361,7 @@ fn load_source_from_metadata(service_id: &str) -> Option<SourceMeta> {
             .unwrap_or_else(|| "Russelfile.toml".into()),
         host_port: ds.host_port.or(top_host_port),
         guest_port: ds.guest_port.or(top_guest_port),
+        ingress_host: ds.ingress_host,
         runtime: ds.runtime.or(top_runtime),
         env: ds.env,
         podman_args: ds.podman_args,
@@ -490,13 +494,11 @@ mod tests {
     fn restart_port_mapping_rejects_zero_host_and_guest() {
         assert!(restart_port_mapping(None, Some(3000)).is_none());
         assert!(restart_port_mapping(Some(0), Some(3000)).is_none());
-        let m = restart_port_mapping(Some(8080), Some(0)).unwrap();
-        assert_eq!(m.host, 8080);
-        assert_eq!(m.guest, 3000);
+        assert!(restart_port_mapping(Some(8080), Some(0)).is_none());
+        assert!(restart_port_mapping(Some(9000), None).is_none());
+        assert!(restart_port_mapping(None, None).is_none());
         let m = restart_port_mapping(Some(9000), Some(4000)).unwrap();
         assert_eq!(m.host, 9000);
         assert_eq!(m.guest, 4000);
-        let m = restart_port_mapping(Some(9000), None).unwrap();
-        assert_eq!(m.guest, 3000);
     }
 }

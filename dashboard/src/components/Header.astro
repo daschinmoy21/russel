@@ -35,7 +35,7 @@ const { label: badgeLabel, className: badgeClass, title: badgeTitle } =
 </header>
 
 <script>
-  import { getApiBase, isDemoMode, api } from '../lib/api';
+  import { getApiBase, isDemoMode, api, headerBadgeMeta } from '../lib/api';
 
   const tag = document.getElementById('apiBaseTag');
   if (tag) tag.textContent = getApiBase();
@@ -43,28 +43,23 @@ const { label: badgeLabel, className: badgeClass, title: badgeTitle } =
   // Client-side probe: SSR can't see localStorage, so re-evaluate connection state
   const badgeEl = document.getElementById('connBadge');
   if (badgeEl) {
+    function applyBadge(state: 'live' | 'demo' | 'offline' | 'unauthorized') {
+      const meta = headerBadgeMeta(state, getApiBase(), window.location.origin);
+      badgeEl!.className = `badge ${meta.className}`;
+      badgeEl!.innerHTML = `<span class="badge-dot"></span>${meta.label}`;
+      badgeEl!.title = meta.title;
+    }
+
     (async () => {
       if (isDemoMode()) {
-        badgeEl.className = 'badge badge-demo';
-        badgeEl.innerHTML = '<span class="badge-dot"></span>DEMO';
-        badgeEl.title = 'Demo mode — mock data (Settings)';
+        applyBadge('demo');
         return;
       }
       try {
         const { connection } = await api.getFleetStatus();
-        if (connection === 'live') {
-          badgeEl.className = 'badge badge-online';
-          badgeEl.innerHTML = '<span class="badge-dot"></span>LIVE';
-          badgeEl.title = 'Connected to russel-ctrl';
-        } else {
-          badgeEl.className = 'badge badge-offline';
-          badgeEl.innerHTML = '<span class="badge-dot"></span>OFFLINE';
-          badgeEl.title = 'Control plane unreachable — start russel-ctrl or enable Demo mode';
-        }
+        applyBadge(connection);
       } catch {
-        badgeEl.className = 'badge badge-offline';
-        badgeEl.innerHTML = '<span class="badge-dot"></span>OFFLINE';
-        badgeEl.title = 'Control plane unreachable — start russel-ctrl or enable Demo mode';
+        applyBadge('offline');
       }
     })();
   }

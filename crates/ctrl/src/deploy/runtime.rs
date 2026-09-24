@@ -36,6 +36,7 @@ impl DeployPipeline {
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
         generation_id: Option<&str>,
         desired_state: Option<&serde_json::Value>,
+        using_package: bool,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         let alloc: SubnetAllocation = subnet_for(service_id)?;
         tracing::info!(
@@ -46,7 +47,7 @@ impl DeployPipeline {
             "allocated"
         );
 
-        let bin_name = config.service.bin_name().to_string();
+        let bin_name = config.service.bin_name_for_build(using_package).to_string();
         validate_bin_name(&bin_name)?;
         let mem_mb = config.service.memory.as_mebibytes();
         let app_path = format!("{}/bin/{bin_name}", store_path.display());
@@ -59,7 +60,10 @@ impl DeployPipeline {
             })
             .await;
 
-        let cfg_dir = format!("/var/lib/russel/{}/cfg", service_id);
+        let cfg_dir = russel_core::paths::service_dir(service_id)
+            .join("cfg")
+            .display()
+            .to_string();
         super::write_deploy_env(
             &cfg_dir,
             &alloc.vm_ip,
@@ -109,7 +113,9 @@ impl DeployPipeline {
             )
             .await?;
 
-        let metadata_path = format!("/var/lib/russel/{}/metadata.json", service_id);
+        let metadata_path = crate::metadata::metadata_path(service_id)
+            .display()
+            .to_string();
         let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
         let mut meta = build_microvm_metadata_with_gen(
             service_id,
@@ -170,7 +176,10 @@ impl DeployPipeline {
             TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10)).await;
         let ready_ms = t.elapsed().as_millis();
         if !up {
-            let console_log = format!("/var/lib/russel/{}/console.log", service_id);
+            let console_log = russel_core::paths::service_dir(service_id)
+                .join("console.log")
+                .display()
+                .to_string();
             let cfg_env = format!("{cfg_dir}/deploy.env");
             let mut detail = String::from("VM not reachable in 10s");
             detail.push_str(&format!(
@@ -241,6 +250,8 @@ impl DeployPipeline {
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
         generation_id: Option<&str>,
         desired_state: Option<&serde_json::Value>,
+        volumes: &[russel_core::volumes::ResolvedVolume],
+        using_package: bool,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
             service_id,
@@ -249,7 +260,7 @@ impl DeployPipeline {
             "allocated container port"
         );
 
-        let bin_name = config.service.bin_name().to_string();
+        let bin_name = config.service.bin_name_for_build(using_package).to_string();
         validate_bin_name(&bin_name)?;
         let mem_mb = config.service.memory.as_mebibytes();
         let base_dir = default_base_dir(service_id);
@@ -289,6 +300,11 @@ impl DeployPipeline {
             memory_mb: mem_mb,
             env: build_container_env(port.guest, env),
             extra_args: podman_args.to_vec(),
+            volumes: volumes.to_vec(),
+            extra_ports: config.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            args: config.service.args.clone(),
+            userns_keep_id: config.service.userns.as_deref() == Some("keep-id"),
+            restart: config.service.restart.clone(),
         };
         let running = self.containers.start(&start_spec).await?;
         let start_ms = t_start.elapsed().as_millis();

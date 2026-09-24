@@ -58,7 +58,7 @@ const STATUS_ROLLED_BACK: &str = "rolled_back";
 
 /// On-disk path for a service's deployments journal.
 pub fn deployments_path(service_id: &str) -> PathBuf {
-    PathBuf::from(format!("/var/lib/russel/{service_id}/deployments.json"))
+    russel_core::paths::service_dir(service_id).join("deployments.json")
 }
 
 /// Journal path under an arbitrary base dir (tests).
@@ -81,6 +81,8 @@ pub struct DesiredStateSnapshot {
     pub host_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_host: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -111,6 +113,8 @@ impl<'de> Deserialize<'de> for DesiredStateSnapshot {
             #[serde(default)]
             guest_port: Option<u16>,
             #[serde(default)]
+            ingress_host: Option<String>,
+            #[serde(default)]
             port: Option<RawPort>,
             #[serde(default)]
             env: std::collections::HashMap<String, String>,
@@ -133,6 +137,7 @@ impl<'de> Deserialize<'de> for DesiredStateSnapshot {
             runtime: raw.runtime,
             host_port: raw.host_port,
             guest_port: raw.guest_port,
+            ingress_host: raw.ingress_host,
             env: raw.env,
             podman_args: raw.podman_args,
         };
@@ -158,13 +163,16 @@ impl DesiredStateSnapshot {
         let mut snap = desired
             .and_then(|d| serde_json::from_value::<Self>(d.clone()).ok())
             .unwrap_or_default();
-        // The deploy's actual ports take precedence over any port recorded in
-        // the desired_state blob (which only carries a port when -p was given).
-        if host_port.is_some() {
-            snap.host_port = host_port;
+        // A pinned port in desired_state is the operator's requested ingress
+        // pin. Only fill missing values from the live workload, whose backend
+        // may be ephemeral after a dual-live cutover. Port 0 is never a valid
+        // pin (reserve rejects it; the pipeline filters it from `fixed_host`),
+        // so treat it as absent on both sides.
+        if snap.host_port.filter(|&h| h != 0).is_none() {
+            snap.host_port = host_port.filter(|&h| h != 0);
         }
-        if guest_port.is_some() {
-            snap.guest_port = guest_port;
+        if snap.guest_port.filter(|&g| g != 0).is_none() {
+            snap.guest_port = guest_port.filter(|&g| g != 0);
         }
         snap
     }
@@ -566,6 +574,7 @@ mod tests {
             runtime: Some(RuntimeKind::Container),
             host_port: Some(8080),
             guest_port: Some(3000),
+            ingress_host: Some("app.example.com".into()),
             env: Default::default(),
             podman_args: vec![],
         }
@@ -704,7 +713,8 @@ mod tests {
             "config_path": "Russelfile.toml",
             "runtime": "microvm",
             "env": {"LOG_LEVEL": "debug"},
-            "port": {"host": 9000, "guest": 3000}
+            "port": {"host": 9000, "guest": 3000},
+            "ingress_host": "ABC.example.com"
         });
         let snap = DesiredStateSnapshot::from_desired_json(Some(&json), None, None);
         assert_eq!(
@@ -713,8 +723,31 @@ mod tests {
         );
         assert_eq!(snap.runtime, Some(RuntimeKind::Microvm));
         assert_eq!(snap.host_port, Some(9000));
+        assert_eq!(snap.ingress_host.as_deref(), Some("ABC.example.com"));
         assert_eq!(snap.env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
         assert!(snap.is_rollback_ready());
+    }
+
+    #[test]
+    fn desired_state_pin_wins_over_live_backend() {
+        let json = serde_json::json!({
+            "port": {"host": 4000, "guest": 3000},
+            "ingress_host": "abc.com"
+        });
+        let snap = DesiredStateSnapshot::from_desired_json(Some(&json), Some(3107), Some(3000));
+        assert_eq!(snap.host_port, Some(4000));
+        assert_eq!(snap.guest_port, Some(3000));
+        assert_eq!(snap.ingress_host.as_deref(), Some("abc.com"));
+    }
+
+    #[test]
+    fn desired_state_zero_pin_falls_back_to_live_backend() {
+        let json = serde_json::json!({
+            "port": {"host": 0, "guest": 0},
+        });
+        let snap = DesiredStateSnapshot::from_desired_json(Some(&json), Some(3107), Some(3000));
+        assert_eq!(snap.host_port, Some(3107));
+        assert_eq!(snap.guest_port, Some(3000));
     }
 
     #[test]
@@ -727,7 +760,8 @@ mod tests {
                 "runtime": "container",
                 "env": {"LOG_LEVEL": "info"},
                 "podman_args": ["--network", "bridge"],
-                "port": {"host": 9000, "guest": 3000}
+                "port": {"host": 9000, "guest": 3000},
+                "ingress_host": "abc.com"
             }
         });
         let snap = DesiredStateSnapshot::from_metadata_desired_state(&meta);
@@ -738,6 +772,7 @@ mod tests {
         assert_eq!(snap.runtime, Some(RuntimeKind::Container));
         assert_eq!(snap.host_port, Some(9000));
         assert_eq!(snap.guest_port, Some(3000));
+        assert_eq!(snap.ingress_host.as_deref(), Some("abc.com"));
         assert_eq!(snap.env.get("LOG_LEVEL").map(String::as_str), Some("info"));
         assert_eq!(snap.podman_args, vec!["--network", "bridge"]);
     }
@@ -759,11 +794,13 @@ mod tests {
         let json = serde_json::json!({
             "repo_url": "https://example.com/app.git",
             "host_port": 8080,
-            "guest_port": 3000
+            "guest_port": 3000,
+            "ingress_host": "abc.com"
         });
         let snap: DesiredStateSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(snap.host_port, Some(8080));
         assert_eq!(snap.guest_port, Some(3000));
+        assert_eq!(snap.ingress_host.as_deref(), Some("abc.com"));
     }
 
     #[test]

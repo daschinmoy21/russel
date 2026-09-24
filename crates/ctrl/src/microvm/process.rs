@@ -22,7 +22,9 @@ pub(super) struct ProcessMetadata {
 }
 
 pub(super) fn read_metadata(service_id: &str) -> Option<ProcessMetadata> {
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let path = crate::metadata::metadata_path(service_id)
+        .display()
+        .to_string();
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let virtiofsd_pids = value
@@ -127,9 +129,9 @@ pub(super) fn escape_pkill_literal(s: &str) -> String {
 /// `pkill -f` pattern for Cloud Hypervisor stop fallback.
 ///
 /// - With a known TAP: match that TAP only (literal-escaped).
-/// - Without: match the service path marker under `russel/{service_id}/` so
-///   cleanup cannot select another service's CH process via preferred hash.
-///   `service_id` is regex-escaped so metacharacters cannot broaden the match.
+/// - Without: match this service's data dir (trailing slash) so cleanup cannot
+///   select another service's CH process via preferred hash. The path is
+///   regex-escaped so metacharacters cannot broaden the match.
 pub(super) fn cloud_hypervisor_stop_pattern(service_id: &str, tap: Option<&str>) -> String {
     match tap {
         Some(tap) => {
@@ -137,8 +139,11 @@ pub(super) fn cloud_hypervisor_stop_pattern(service_id: &str, tap: Option<&str>)
             format!("(^|[[:space:]])cloud-hypervisor .*tap={tap}(,|$)")
         }
         None => {
-            let sid = escape_pkill_literal(service_id);
-            format!("(^|[[:space:]])cloud-hypervisor .*russel/{sid}/")
+            let path = escape_pkill_literal(&format!(
+                "{}/",
+                russel_core::paths::service_dir(service_id).display()
+            ));
+            format!("(^|[[:space:]])cloud-hypervisor .*{path}")
         }
     }
 }
@@ -217,8 +222,7 @@ pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
     }
 
     let tap_ids = owned_tap_ids(service_id);
-    let trusted_path = format!("/var/lib/russel/{service_id}/");
-    let path_marker = format!("russel/{service_id}/");
+    let trusted_path = format!("{}/", russel_core::paths::service_dir(service_id).display());
 
     // cloud-hypervisor: real executable + owned TAP device argument.
     if base == "cloud-hypervisor" {
@@ -229,9 +233,7 @@ pub(super) fn verify_process_ownership(pid: u32, service_id: &str) -> bool {
 
     // virtiofsd: real executable + trusted socket/path under this service tree.
     if base == "virtiofsd" {
-        return args
-            .iter()
-            .any(|arg| arg.contains(&trusted_path) || arg.contains(&path_marker));
+        return args.iter().any(|arg| arg.contains(&trusted_path));
     }
 
     // socat: real executable must be socat; retitled argv0 is only a title marker

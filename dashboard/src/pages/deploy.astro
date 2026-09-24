@@ -49,12 +49,19 @@ import { isDemoMode } from '../lib/api';
           <div class="form-group">
             <label class="form-label" for="hostPort">Host Port</label>
             <input type="number" id="hostPort" class="form-input" placeholder="e.g. 8080" min="1" max="65535" />
+            <span class="field-hint">Must match <code>[ingress].port</code> when the Russelfile pins one. Must be ≥1024 and not 7878/7946.</span>
           </div>
 
           <div class="form-group">
             <label class="form-label" for="guestPort">Guest Port</label>
             <input type="number" id="guestPort" class="form-input" placeholder="e.g. 3000" min="1" max="65535" />
           </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="ingressHost">Ingress Host (optional)</label>
+          <input type="text" id="ingressHost" class="form-input" placeholder="e.g. abc.com" />
+          <span class="field-hint">Exact Traefik <code>Host()</code> value. Must match <code>[ingress].host</code> when the Russelfile sets one; omitted means <code>&lt;service&gt;.russel.local</code>.</span>
         </div>
 
         <div class="form-group">
@@ -112,6 +119,7 @@ import { isDemoMode } from '../lib/api';
     const runtime = (runtimeVal === 'microvm' || runtimeVal === 'container') ? runtimeVal as 'microvm' | 'container' : undefined;
     const hostPortStr = (document.getElementById('hostPort') as HTMLInputElement).value.trim();
     const guestPortStr = (document.getElementById('guestPort') as HTMLInputElement).value.trim();
+    const ingressHostRaw = (document.getElementById('ingressHost') as HTMLInputElement).value.trim();
     const envRaw = (document.getElementById('envVars') as HTMLTextAreaElement).value.trim();
 
     /** Parse a port field: integer 1–65535, or null if empty/invalid. */
@@ -146,6 +154,20 @@ import { isDemoMode } from '../lib/api';
       port = { host, guest };
     }
 
+    // Ingress host: exact Traefik Host() value; ctrl enforces match-or-omit
+    // against [ingress].host. Client-side guard for the reserved/port rules.
+    let host: string | undefined;
+    if (ingressHostRaw) {
+      if (ingressHostRaw.length > 253 || !/^[A-Za-z0-9.-]+$/.test(ingressHostRaw)) {
+        deployConsole.textContent = '[Error] Ingress host must be a valid DNS name (letters, digits, dots, hyphens, max 253 chars).\n';
+        streamStatus.textContent = 'Failed';
+        streamStatus.className = 'badge badge-stopped';
+        btnSubmit.removeAttribute('disabled');
+        return;
+      }
+      host = ingressHostRaw;
+    }
+
     const env: Record<string, string> = {};
     if (envRaw) {
       for (const line of envRaw.split('\n')) {
@@ -169,7 +191,7 @@ import { isDemoMode } from '../lib/api';
       deployConsole.scrollTop = deployConsole.scrollHeight;
     };
 
-    const result = await api.deployService({ repo_url, config_path, vm_id, port, runtime, env }, handleEvent);
+    const result = await api.deployService({ repo_url, config_path, vm_id, port, host, runtime, env }, handleEvent);
 
     streamStatus.textContent = result.success ? 'Complete' : 'Failed';
     streamStatus.className = result.success ? 'badge badge-running' : 'badge badge-stopped';

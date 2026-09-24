@@ -6,8 +6,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	apiBaseValidationError,
 	getApiBase,
+	getApiToken,
 	joinApiUrl,
 	setApiBase,
+	setApiToken,
 	validateApiBase,
 } from "./api";
 
@@ -125,6 +127,7 @@ describe("apiBaseValidationError", () => {
 
 describe("getApiBase / setApiBase", () => {
 	const store = new Map<string, string>();
+	const sessionStore = new Map<string, string>();
 	const memoryStorage = {
 		getItem(key: string) {
 			return store.has(key) ? store.get(key)! : null;
@@ -145,16 +148,34 @@ describe("getApiBase / setApiBase", () => {
 			return store.size;
 		},
 	};
+	const memorySessionStorage = {
+		getItem(key: string) {
+			return sessionStore.has(key) ? sessionStore.get(key)! : null;
+		},
+		setItem(key: string, value: string) {
+			sessionStore.set(key, String(value));
+		},
+		removeItem(key: string) {
+			sessionStore.delete(key);
+		},
+		clear() {
+			sessionStore.clear();
+		},
+	};
 
 	beforeEach(() => {
 		store.clear();
+		sessionStore.clear();
 		// get/setApiBase gate on `window`; bun test has no DOM by default.
 		(globalThis as any).window = globalThis;
 		(globalThis as any).localStorage = memoryStorage;
+		(globalThis as any).sessionStorage = memorySessionStorage;
 	});
 	afterEach(() => {
 		store.clear();
+		sessionStore.clear();
 		delete (globalThis as any).localStorage;
+		delete (globalThis as any).sessionStorage;
 		// leave window alone if other suites need it; only remove our stub if we set it
 		if ((globalThis as any).window === globalThis) {
 			delete (globalThis as any).window;
@@ -192,5 +213,17 @@ describe("getApiBase / setApiBase", () => {
 	test("invalid stored value falls back to /api", () => {
 		memoryStorage.setItem("RUSSEL_API_URL", "javascript:alert(1)");
 		expect(getApiBase()).toBe("/api");
+	});
+
+	test("token is session-scoped and migrates once from legacy localStorage", () => {
+		store.set("RUSSEL_API_TOKEN", "legacy-token");
+		expect(getApiToken()).toBe("legacy-token");
+		expect(memorySessionStorage.getItem("RUSSEL_API_TOKEN")).toBe("legacy-token");
+		expect(memoryStorage.getItem("RUSSEL_API_TOKEN")).toBeNull();
+
+		setApiToken("new-token");
+		expect(getApiToken()).toBe("new-token");
+		expect(memoryStorage.getItem("RUSSEL_API_TOKEN")).toBeNull();
+		expect(memorySessionStorage.getItem("RUSSEL_API_TOKEN")).toBe("new-token");
 	});
 });

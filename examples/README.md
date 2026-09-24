@@ -11,8 +11,14 @@ Self-contained apps for trying **container** (default) and **microVM** deploys.
 | [shortlink](shortlink/) | container | Go in-memory shortener | 3000 | POST / + GET /{id}; Dockerfile |
 | [filebrowser](filebrowser/) | container | nixpkgs filebrowser | 8080 | Auth on; guest binds `0.0.0.0`; host publish stays loopback; demo password; Dockerfile optional |
 | [static-test](static-test/) | container | Python http.server | 8000 | Static HTML; Dockerfile |
+| [navidrome](navidrome/) | container | nixpkgs `navidrome` via `service.package` | 4533 | `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music`; music volume starts empty; `keep = true` |
+| [vaultwarden](vaultwarden/) | container | nixpkgs `vaultwarden` via `service.package` | 8000 | `DATA_FOLDER=/data`; `keep = true` |
+| [postgres](postgres/) | container | nixpkgs `postgresql` via `service.package` | 5432 | Needs a prepared `host` PGDATA under `RUSSEL_VOLUME_ROOTS` |
+| [redis](redis/) | container | nixpkgs `redis` via `service.package` | 6379 | Managed `data` volume; `--dir`, `--bind 0.0.0.0`, demo password |
+| [caddy](caddy/) | container | nixpkgs `caddy` via `service.package` | 8080 | Stateless `file-server`; no volume |
+| [meilisearch](meilisearch/) | container | nixpkgs `meilisearch` via `service.package` | 7700 | Managed `data` volume; demo master key |
 
-All examples ship a `Dockerfile` so `./bench.sh` can race Russel against raw podman/docker.
+The container examples with a committed `Dockerfile` (the Go, Rust, Python, and filebrowser set) can race Russel against raw podman/docker via `./bench.sh`. The `service.package` demos build from nixpkgs and ship no Dockerfile.
 
 ## Prerequisites
 

@@ -1,72 +1,68 @@
-# Russel Control Plane Web Dashboard
+# Russel control plane web dashboard
 
-Web dashboard for the **Russel** self-hosted deploy platform (microVMs + containers). Built with **Astro**, **TypeScript**, and **Bun**, styled in a dark Zed-like aesthetic.
+Web dashboard for the Russel self-hosted deploy platform. It is built with Astro, TypeScript, and Bun.
 
-## Quick Start
+## Quick start
 
 ```bash
 cd dashboard
-nix develop          # enter bun/dev shell
+nix develop
 bun install
-bun run dev          # http://127.0.0.1:4321 (loopback only)
-bun run build        # production static build → dist/
+bun run dev
+bun run build
 ```
 
-## Network bind (security)
+The development server is available at `http://127.0.0.1:4321` and binds to loopback by default. Operators do not need this: `russel-ctrl` serves `dist/` on the control-plane listener (`http://127.0.0.1:7878/`). Use Vite when editing the dashboard.
 
-**Default is loopback only** (`127.0.0.1:4321`). `bun run dev`, `start`, and `preview` do **not** expose the dashboard on the LAN.
+## Network bind and proxy
 
-The Vite dev proxy forwards `/api/*` to the control plane on loopback (`http://127.0.0.1:7878`). If the dashboard listens on `0.0.0.0`, any host on your network can reach that proxy and obtain full control-plane access. **This proxy is not a production front door.**
+`bun run dev`, `bun run start`, and `bun run preview` bind to `127.0.0.1`. The optional `dev:lan` and `preview:lan` scripts bind all interfaces and should only be used intentionally on a trusted network.
 
-| Script | Bind | When to use |
-|--------|------|-------------|
-| `bun run dev` / `start` / `preview` | `127.0.0.1` | Default / safe |
-| `bun run dev:lan` / `preview:lan` | `0.0.0.0` (all interfaces) | Only when you intentionally need LAN access |
+The dashboard API base is `/api` by default. Vite proxies `/api/*` to the local forwarded control-plane port at `127.0.0.1:7878` during development. The browser request remains same-origin, so the dashboard does not need CORS.
 
-**Never use `--host` / `*:lan` scripts on a shared network without `RUSSEL_API_TOKEN` set on the control plane.** Prefer SSH port-forwarding or VPN over LAN bind.
+Do not fetch `http://127.0.0.1:7878` from the dashboard origin. In particular, tunneled `bun run dev` uses `/api` in Settings, not an absolute `:7878` URL. Do not add CORS to russel-ctrl or bind its HTTP API publicly.
 
-## Dev Proxy
+## Development topology
 
-The dev server proxies `/api/*` → `http://127.0.0.1:7878/*` (override via `RUSSEL_API_PROXY`). This avoids CORS issues when the browser talks to the control plane. It is a **local development convenience only** — not an authenticated production gateway.
+For an SSH-tunneled VPS, run the tunnel and dashboard in separate terminals:
 
-## Demo Mode
+```bash
+./contrib/install.sh connect <user@host>
+cd dashboard
+bun run dev
+```
 
-Enable in **Settings** → Demo Mode toggle, or set `localStorage.RUSSEL_DEMO_MODE=1`. All API calls return mock data — no control plane needed.
+Keep the Settings API base at `/api`. Vite sends that path to the SSH-forwarded local port.
 
-## Settings & API token (security)
+For production, serve the dashboard over HTTPS and configure the same-origin reverse proxy to map `/api/` to the loopback russel-ctrl API. The production dashboard also keeps `/api` as its API base. It does not contact `:7878` directly and does not require CORS.
 
-Configure API base URL, bearer token, and demo mode on the `/settings` page.
+## Demo mode
+
+Enable Demo Mode in Settings, or set `localStorage.RUSSEL_DEMO_MODE=1` in the browser. Demo mode uses mock data and does not contact russel-ctrl.
+
+## Settings and API token security
 
 | Key | Storage | Purpose |
 |-----|---------|---------|
-| `RUSSEL_API_URL` | `localStorage` | API base URL (default `/api`) |
-| `RUSSEL_API_TOKEN` | **`sessionStorage`** | Bearer token (tab-scoped; cleared when the tab closes) |
-| `RUSSEL_DEMO_MODE` | `localStorage` | `"1"` = mock data, no control plane |
+| `RUSSEL_API_URL` | `localStorage` | API base URL, default `/api` |
+| `RUSSEL_API_TOKEN` | `sessionStorage` | Bearer token for the current browser tab |
+| `RUSSEL_DEMO_MODE` | `localStorage` | `1` enables mock data |
+
+The token is runtime-only and tab-scoped. The CLI login and CLI `config.toml` do not populate the dashboard. Paste the same token used in `~/.config/russel/env` into Settings. The dashboard never reads `PUBLIC_RUSSEL_API_TOKEN`.
 
 ### Never bake the token into the client bundle
 
-**Do not set `PUBLIC_RUSSEL_API_TOKEN`.** Astro/`PUBLIC_*` vars are inlined into the built JS and would ship the secret to every browser that loads the dashboard. The client **ignores** that env var (and logs a one-time console warning if it is present). Enter the token only via **Settings** at runtime.
+Do not set `PUBLIC_RUSSEL_API_TOKEN`. Astro and Vite inline `PUBLIC_*` values into browser JavaScript. Enter the token in Settings at runtime instead.
 
-Also avoid any other `PUBLIC_*` secret: only non-sensitive config (e.g. a public API base URL) belongs there.
-
-### XSS / token exfiltration note
-
-The bearer token is readable by any script that runs in the dashboard origin. Prefer:
-
-- Loopback bind (default) or an authenticated reverse proxy
-- Short-lived tab sessions (`sessionStorage`)
-- Escaping user/control-plane strings when building HTML (service IDs, statuses, etc.)
-
-If you serve the static `dist/` behind a reverse proxy, consider a Content-Security-Policy that restricts `script-src` (note: Astro may use inline scripts for FOUC/theme — adjust CSP carefully, e.g. hashes or nonces).
+The bearer token is readable by scripts running on the dashboard origin. Prefer loopback binding or an authenticated HTTPS reverse proxy, and consider a Content Security Policy for a deployed static `dist/` directory.
 
 ## Documentation
 
-See the repo [README](../README.md) and [docs/](../docs/) — especially
-[architecture](../docs/architecture.md) and [API & CLI](../docs/api.md).
+Operator docs: [Installation](../docs/getting-started/installation.md) and [Dashboard](../docs/getting-started/dashboard.md).
 
-## Project Structure
+## Project structure
 
-```
+```text
 dashboard/
 ├── flake.nix
 ├── package.json
@@ -76,7 +72,7 @@ dashboard/
 └── src/
     ├── components/       # Header, Sidebar, MetricCard, ServicesTable, ActivityChart
     ├── layouts/          # Layout.astro
-    ├── lib/              # api.ts — RusselClient + types
+    ├── lib/              # api.ts and connection helpers
     ├── pages/            # index, services, service-detail, deploy, settings
     └── styles/           # global.css
 ```

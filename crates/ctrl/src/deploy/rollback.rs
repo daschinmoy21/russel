@@ -7,6 +7,7 @@ use std::{
 };
 
 use russel_core::config::RuntimeKind;
+use russel_core::volumes::extra_port_key;
 
 use crate::{
     container::{
@@ -49,9 +50,18 @@ fn desired_state_env(old_meta: &serde_json::Value) -> HashMap<String, String> {
 /// 2. If no metadata (None), probe for a podman container named `russel-{service_id}`.
 /// 3. If no container but the internal dirs exist, treat as legacy Microvm.
 /// 4. Otherwise None (first deploy).
-pub(crate) async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKind> {
-    if let Some(runtime) = prior_runtime_from_disk(service_id) {
-        return Some(runtime);
+///
+/// An unreadable metadata file is an error. Falling through to the legacy
+/// microVM path would destroy a container.
+pub(crate) async fn resolve_prior_runtime(service_id: &str) -> anyhow::Result<Option<RuntimeKind>> {
+    match prior_runtime_from_disk(service_id) {
+        Ok(Some(runtime)) => return Ok(Some(runtime)),
+        Ok(None) => {}
+        Err(e) => {
+            anyhow::bail!(
+                "metadata.json for {service_id} cannot be read ({e}); refusing to assume microvm"
+            );
+        }
     }
 
     // Probe podman for a running/stopped container with the russel label.
@@ -69,22 +79,35 @@ pub(crate) async fn resolve_prior_runtime(service_id: &str) -> Option<RuntimeKin
             container = %container_name,
             "discovered existing podman container (no metadata)"
         );
-        return Some(RuntimeKind::Container);
+        return Ok(Some(RuntimeKind::Container));
     }
 
     // No metadata and no container: if any russel/microvms directory exists,
     // assume legacy Microvm so teardown can proceed correctly.
-    let russel_dir = format!("/var/lib/russel/{}", service_id);
+    // A destroy that kept volumes leaves only `volumes/` and no metadata.
+    // That is not a VM; microVM destroy would remove_dir_all the data.
+    let russel_dir = russel_core::paths::service_dir(service_id)
+        .display()
+        .to_string();
     let microvms_dir = format!("/var/lib/microvms/{}", service_id);
-    if Path::new(&russel_dir).exists() || Path::new(&microvms_dir).exists() {
+    let russel_path = Path::new(&russel_dir);
+    let microvms_path = Path::new(&microvms_dir);
+    if russel_path.exists() || microvms_path.exists() {
+        if !microvms_path.exists() && crate::container::dir_is_kept_volumes_only(russel_path) {
+            tracing::info!(
+                service_id,
+                "service dir has only kept volumes; not treating it as a microvm"
+            );
+            return Ok(None);
+        }
         tracing::info!(
             service_id,
             "no metadata but dirs exist — treating prior as legacy Microvm"
         );
-        return Some(RuntimeKind::Microvm);
+        return Ok(Some(RuntimeKind::Microvm));
     }
 
-    None
+    Ok(None)
 }
 
 /// Kill + wait (with timeout) all old children so ports are free.
@@ -108,13 +131,15 @@ pub(crate) async fn destroy_prior_runtime(
     prior: RuntimeKind,
     service_id: &str,
     microvm_runner: &MicrovmRunner,
-    container_runner: &ContainerRunner,
+    _container_runner: &ContainerRunner,
 ) -> anyhow::Result<()> {
     match prior {
         RuntimeKind::Microvm => microvm_runner.destroy(service_id).await,
         RuntimeKind::Container => {
-            container_runner.destroy(service_id).await?;
-            PortAllocator::release(service_id);
+            // Redeploy must not apply destroy's keep policy. The new generation
+            // bind-mounts the same managed directories.
+            crate::container::destroy_preserving_volumes(service_id).await?;
+            PortAllocator::release_service(service_id);
             Ok(())
         }
     }
@@ -124,13 +149,13 @@ pub(crate) async fn cleanup_failed_deploy(
     runtime: RuntimeKind,
     service_id: &str,
     microvm_runner: &MicrovmRunner,
-    container_runner: &ContainerRunner,
+    _container_runner: &ContainerRunner,
 ) {
     let _ = match runtime {
         RuntimeKind::Microvm => microvm_runner.destroy(service_id).await,
         RuntimeKind::Container => {
-            let result = container_runner.destroy(service_id).await;
-            PortAllocator::release(service_id);
+            let result = crate::container::destroy_preserving_volumes(service_id).await;
+            PortAllocator::release_service(service_id);
             result
         }
     };
@@ -143,7 +168,19 @@ pub(crate) async fn restore_backup_dirs(
     microvms_bak: &str,
     has_microvms_backup: bool,
 ) {
-    let _ = tokio::fs::rename(russel_bak, russel_dir).await;
+    if let Err(e) = crate::container::restore_backed_up_service_dir(
+        Path::new(russel_dir),
+        Path::new(russel_bak),
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            russel_dir,
+            russel_bak,
+            "failed to restore service dir from backup"
+        );
+    }
     if has_microvms_backup {
         let _ = tokio::fs::rename(microvms_bak, microvms_dir).await;
     }
@@ -232,8 +269,9 @@ pub(crate) async fn attempt_microvm_rollback(
     let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 
     // All validations passed — now rename safely.
-    // 1. Restore backup dirs
-    tokio::fs::rename(russel_bak, russel_dir).await?;
+    // 1. Restore backup dirs, putting stashed volumes back on the live path.
+    crate::container::restore_backed_up_service_dir(Path::new(russel_dir), Path::new(russel_bak))
+        .await?;
     if has_microvms_backup {
         tokio::fs::rename(microvms_bak, microvms_dir).await?;
     }
@@ -270,7 +308,7 @@ pub(crate) async fn attempt_microvm_rollback(
             tracing::warn!(service_id, error = %e, "failed to destroy partial rollback microVM");
         }
         let _ = TapForwarder::teardown(alloc).await;
-        PortAllocator::release(service_id);
+        PortAllocator::release_service(service_id);
     }
 
     let rollback_cpus: u8 = old_meta["cpus"]
@@ -475,10 +513,25 @@ pub(crate) async fn attempt_container_rollback(
     // Resolve secret:// refs
     let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
 
-    // All validations passed — rename safely.
-    tokio::fs::rename(russel_bak, russel_dir).await?;
+    // All validations passed — rename safely, preserving managed volumes.
+    crate::container::restore_backed_up_service_dir(Path::new(russel_dir), Path::new(russel_bak))
+        .await?;
+
+    let old_extra_ports: Vec<russel_core::volumes::ExtraPortSpec> = old_meta
+        .get("desired_state")
+        .and_then(|ds| ds.get("extra_ports"))
+        .and_then(|v| {
+            serde_json::from_value::<Vec<russel_core::volumes::ExtraPortSpec>>(v.clone()).ok()
+        })
+        .unwrap_or_default();
 
     PortAllocator::reserve(service_id, old_host_port)?;
+    for (i, extra) in old_extra_ports.iter().enumerate() {
+        if let Err(e) = PortAllocator::reserve(&extra_port_key(service_id, i), extra.host) {
+            PortAllocator::release_service(service_id);
+            return Err(e);
+        }
+    }
 
     // Build container env: PORT first, then user env (PORT filtered out).
     let mut env: Vec<(String, String)> = vec![("PORT".to_string(), old_guest_port.to_string())];
@@ -499,20 +552,39 @@ pub(crate) async fn attempt_container_rollback(
         memory_mb: old_mem_mb,
         env,
         extra_args: old_podman_args.clone(),
+        volumes: old_meta
+            .get("desired_state")
+            .and_then(|ds| ds.get("volumes"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+        extra_ports: old_extra_ports.iter().map(|p| (p.host, p.guest)).collect(),
+        args: old_meta
+            .get("desired_state")
+            .and_then(|ds| ds.get("args"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+        userns_keep_id: old_meta
+            .pointer("/desired_state/userns")
+            .and_then(|v| v.as_str())
+            == Some("keep-id"),
+        restart: old_meta
+            .pointer("/desired_state/restart")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     };
     let running = containers.start(&start_spec).await?;
 
     // Do not mark deployed until the restored container is reachable.
     let ready = TapForwarder::wait_for_host_port(old_host_port, Duration::from_secs(10)).await;
     if !ready {
-        if let Err(e) = containers.destroy(service_id).await {
+        if let Err(e) = crate::container::destroy_preserving_volumes(service_id).await {
             tracing::warn!(
                 service_id,
                 error = %e,
                 "failed to destroy unready rolled-back container"
             );
         }
-        PortAllocator::release(service_id);
+        PortAllocator::release_service(service_id);
         anyhow::bail!(
             "rolled-back container not reachable on host port {old_host_port} within 10s"
         );

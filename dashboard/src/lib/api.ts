@@ -10,6 +10,7 @@ export interface DeployRequest {
 	config_path: string;
 	vm_id?: string;
 	port?: PortMapping;
+	host?: string;
 	runtime?: "microvm" | "container";
 	podman_args?: string[];
 	env?: Record<string, string>;
@@ -64,6 +65,7 @@ export interface StatusResponse {
 	runtime?: "microvm" | "container";
 	host_port?: number;
 	guest_port?: number;
+	route_host?: string | null;
 }
 
 export interface LogsResponse {
@@ -103,6 +105,7 @@ export interface ServiceVM {
 	host_port?: number;
 	guest_port?: number;
 	ports?: string; // "host:guest" display string
+	route_host?: string | null;
 }
 
 export interface FleetStatus {
@@ -143,7 +146,165 @@ export function isServiceFailed(svc: {
 
 // ---- Connection state ----
 
-export type ConnectionState = "live" | "demo" | "offline";
+export type ConnectionState = "live" | "demo" | "offline" | "unauthorized";
+
+export type ConnectionResultKind =
+	| "success"
+	| "unauthorized"
+	| "http_error"
+	| "network"
+	| "cleartext";
+
+export type ConnectionResult =
+	| { kind: "success"; response: Response }
+	| { kind: "unauthorized"; status: 401; response: Response }
+	| { kind: "http_error"; status: number; response: Response }
+	| { kind: "network"; error: unknown }
+	| { kind: "cleartext"; message: string; error: unknown };
+
+/**
+ * Classify a fetch response or a fetch rejection without consulting browser
+ * state. HTTP 401 is deliberately separate from transport failure.
+ */
+export function classifyConnectionResult(value: unknown): ConnectionResult {
+	if (
+		value !== null &&
+		typeof value === "object" &&
+		"ok" in value &&
+		"status" in value &&
+		typeof (value as { ok?: unknown }).ok === "boolean" &&
+		typeof (value as { status?: unknown }).status === "number"
+	) {
+		const response = value as Response;
+		if (response.ok) return { kind: "success", response };
+		if (response.status === 401) {
+			return { kind: "unauthorized", status: 401, response };
+		}
+		return { kind: "http_error", status: response.status, response };
+	}
+
+	if (isCleartextPolicyError(value)) {
+		return {
+			kind: "cleartext",
+			message: errorMessage(value),
+			error: value,
+		};
+	}
+	return { kind: "network", error: value };
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error
+		? error.message
+		: typeof error === "string"
+			? error
+			: "network unreachable";
+}
+
+/** Error name used by the cleartext Bearer policy below. */
+export class CleartextTokenError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CleartextTokenError";
+	}
+}
+
+export function isCleartextPolicyError(error: unknown): boolean {
+	if (error instanceof CleartextTokenError) return true;
+	if (!error || typeof error !== "object") return false;
+	const candidate = error as { name?: unknown; message?: unknown };
+	return (
+		candidate.name === "CleartextTokenError" ||
+		(typeof candidate.message === "string" &&
+			/refusing to send api token over cleartext http/i.test(candidate.message))
+	);
+}
+
+export type ApiTopology =
+	| "relative-loopback"
+	| "relative-same-origin"
+	| "absolute-loopback"
+	| "absolute-remote-https"
+	| "absolute-remote-http"
+	| "invalid";
+
+export interface ApiTopologyInfo {
+	kind: ApiTopology;
+	host: string;
+}
+
+/** Purely classify an API base against the browser origin that will call it. */
+export function classifyApiTopology(
+	apiBase: string,
+	browserOrigin = "http://127.0.0.1:4321",
+): ApiTopologyInfo {
+	const rawBase = apiBase.trim();
+	if (!/^https?:\/\//i.test(rawBase)) {
+		try {
+			const origin = new URL(browserOrigin);
+			return {
+				kind: isLoopbackHost(origin.hostname)
+					? "relative-loopback"
+					: "relative-same-origin",
+				host: origin.host || origin.hostname,
+			};
+		} catch {
+			return { kind: "invalid", host: rawBase || "the configured API" };
+		}
+	}
+
+	try {
+		const url = new URL(rawBase);
+		if (isLoopbackHost(url.hostname)) {
+			return {
+				kind: "absolute-loopback",
+				host: url.host || url.hostname,
+			};
+		}
+		return {
+			kind: url.protocol === "https:" ? "absolute-remote-https" : "absolute-remote-http",
+			host: url.host || url.hostname,
+		};
+	} catch {
+		return { kind: "invalid", host: rawBase || "the configured API" };
+	}
+}
+
+/** Pure, user-facing guidance for a failed connection attempt. */
+export function connectionResultMessage(
+	result: ConnectionResult,
+	apiBase = "/api",
+	browserOrigin = "http://127.0.0.1:4321",
+): string {
+	switch (result.kind) {
+		case "success":
+			return "Connected.";
+		case "unauthorized":
+			return "API token missing or wrong. Open Settings to update it.";
+		case "http_error":
+			return `Connection failed: HTTP ${result.status}.`;
+		case "cleartext":
+			return result.message;
+		case "network": {
+			const topology = classifyApiTopology(apiBase, browserOrigin);
+			switch (topology.kind) {
+				case "relative-loopback":
+					return `No control plane is reachable on this browser host (${topology.host}). For a VPS, open the SSH tunnel with ./contrib/install.sh connect <user@host> and retry. For local ctrl, start the user unit.`;
+				case "relative-same-origin":
+					return `The same-origin reverse proxy for /api/ is not reachable (${topology.host}). Check the proxy. Do not start russel-ctrl on the laptop.`;
+				case "absolute-loopback":
+					return `Nothing is listening on local API host ${topology.host}. A local ctrl or SSH tunnel must be up before retrying.`;
+				case "absolute-remote-https":
+					return `The remote HTTPS API host ${topology.host} is not reachable from this dashboard. Check the reverse proxy. Do not start russel-ctrl on the laptop.`;
+				case "absolute-remote-http":
+					return `The remote API host ${topology.host} uses cleartext HTTP. Check the HTTPS reverse proxy. Do not start russel-ctrl on the laptop.`;
+				case "invalid":
+				default:
+					return "The configured API is not reachable. Check the API base in Settings.";
+			}
+		}
+	}
+}
 
 /** Header may also show pre-probe state for static shells (#316). */
 export type HeaderConnectionState = ConnectionState | "loading";
@@ -156,6 +317,8 @@ export function getConnectionLabel(c: ConnectionState): string {
 			return "Demo";
 		case "offline":
 			return "Offline";
+		case "unauthorized":
+			return "Unauthorized";
 	}
 }
 
@@ -173,7 +336,11 @@ export function resolveHeaderConnection(
 	return "loading";
 }
 
-export function headerBadgeMeta(state: HeaderConnectionState): {
+export function headerBadgeMeta(
+	state: HeaderConnectionState,
+	apiBase = "/api",
+	browserOrigin = "http://127.0.0.1:4321",
+): {
 	label: string;
 	className: string;
 	title: string;
@@ -196,7 +363,15 @@ export function headerBadgeMeta(state: HeaderConnectionState): {
 				label: "OFFLINE",
 				className: "badge-offline",
 				title:
-					"Control plane unreachable — start russel-ctrl or enable Demo mode",
+					classifyApiTopology(apiBase, browserOrigin).kind === "relative-loopback"
+						? "Control plane unreachable — tunnel? Open the SSH tunnel or start the local user unit"
+						: "Control plane unreachable — check the API topology or enable Demo mode",
+			};
+		case "unauthorized":
+			return {
+				label: "UNAUTHORIZED",
+				className: "badge-warning",
+				title: "API token missing or wrong — open Settings",
 			};
 		case "loading":
 			return {
@@ -225,7 +400,7 @@ export type OverviewMetricsCard = {
 };
 
 /**
- * Pure metrics for overview hydrate states (live/demo/offline/loading shell).
+ * Pure metrics for overview hydrate states (live/demo/offline/unauthorized/loading shell).
  * Used by client hydrate and unit tests so shell contracts stay locked.
  */
 export function overviewMetricsForConnection(
@@ -281,6 +456,30 @@ export function overviewMetricsForConnection(
 			},
 		];
 	}
+	if (connection === "unauthorized") {
+		return [
+			{
+				title: "Fleet Health",
+				value: "—",
+				subtext: "API token missing or wrong",
+			},
+			{
+				title: "Longest Uptime",
+				value: "—",
+				subtext: "Authorization required",
+			},
+			{
+				title: "API Latency",
+				value: "—",
+				subtext: "Open Settings",
+			},
+			{
+				title: "Services",
+				value: "—",
+				subtext: "Authorization required",
+			},
+		];
+	}
 	// live | demo
 	const active = services.filter((s) => isServiceRunning(s)).length;
 	const uptime =
@@ -317,9 +516,12 @@ export function overviewMetricsForConnection(
 /** Empty-state copy under Active Fleet Status after hydrate. */
 export function overviewServicesEmptyCopy(
 	connection: ConnectionState,
-): { primary: string; kind: "offline" | "empty" } {
+): { primary: string; kind: "offline" | "unauthorized" | "empty" } {
 	if (connection === "offline") {
 		return { primary: "Control plane offline.", kind: "offline" };
+	}
+	if (connection === "unauthorized") {
+		return { primary: "API token missing or wrong.", kind: "unauthorized" };
 	}
 	return { primary: "No services configured.", kind: "empty" };
 }
@@ -504,6 +706,11 @@ export function getApiToken(): string | null {
 	if (typeof window === "undefined") return null;
 
 	let token = sessionStorage.getItem(TOKEN_KEY);
+	if (token) {
+		// Remove any stale pre-session copy even when a session token already exists.
+		localStorage.removeItem(TOKEN_KEY);
+		return token;
+	}
 	if (!token) {
 		// One-time migrate from pre-#198 localStorage storage
 		const legacy = localStorage.getItem(TOKEN_KEY);
@@ -591,7 +798,7 @@ export function assertCleartextTokenOk(
 	if (url.protocol !== "http:") return;
 	const host = url.hostname;
 	if (isLoopbackHost(host)) return;
-	throw new Error(
+	throw new CleartextTokenError(
 		`Refusing to send API token over cleartext HTTP to non-loopback host "${host}". ` +
 			`Use HTTPS (reverse proxy in front of russel-ctrl; see docs/security-tls.md), ` +
 			`a loopback API URL, or set localStorage RUSSEL_INSECURE_CLEARTEXT=1.`,
@@ -909,21 +1116,48 @@ export class RusselClient {
 		return headers;
 	}
 
+	/** Run an API request through the shared response/error classifier. */
+	private async request(
+		path: string,
+		init: RequestInit = {},
+	): Promise<ConnectionResult> {
+		try {
+			const res = await fetch(joinApiUrl(getApiBase(), path), {
+				...init,
+				headers: {
+					...this.getHeaders(),
+					...(init.headers as Record<string, string> | undefined),
+				},
+			});
+			return classifyConnectionResult(res);
+		} catch (error) {
+			return classifyConnectionResult(error);
+		}
+	}
+
 	// Shared concurrency-4 batched status fetcher for getServices + getFleetStatus
 	private async fetchStatuses(
 		ids: string[],
-	): Promise<Map<string, StatusResponse>> {
+	): Promise<{ statuses: Map<string, StatusResponse>; unauthorized: boolean }> {
 		const map = new Map<string, StatusResponse>();
+		let unauthorized = false;
 		const concurrency = 4;
 		for (let i = 0; i < ids.length; i += concurrency) {
 			const batch = ids.slice(i, i + concurrency);
 			const results = await Promise.allSettled(
-				batch.map((id) =>
-					fetch(joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/status`), {
-						headers: this.getHeaders(),
-						signal: AbortSignal.timeout(3000),
-					}).then((r) => (r.ok ? (r.json() as Promise<StatusResponse>) : null)),
-				),
+				batch.map(async (id) => {
+					const result = await this.request(
+						`/vm/${encodeURIComponent(id)}/status`,
+						{ signal: AbortSignal.timeout(3000) },
+					);
+					if (result.kind === "unauthorized") unauthorized = true;
+					if (result.kind !== "success") return null;
+					try {
+						return (await result.response.json()) as StatusResponse;
+					} catch {
+						return null;
+					}
+				}),
 			);
 			for (const r of results) {
 				if (r.status === "fulfilled" && r.value) {
@@ -931,7 +1165,7 @@ export class RusselClient {
 				}
 			}
 		}
-		return map;
+		return { statuses: map, unauthorized };
 	}
 
 	async getServices(): Promise<{
@@ -941,17 +1175,26 @@ export class RusselClient {
 	}> {
 		if (isDemoMode())
 			return { services: MOCK_SERVICES, connection: "demo", isDemo: true };
+		const result = await this.request("/vms", {
+			signal: AbortSignal.timeout(3000),
+		});
+		if (result.kind !== "success") {
+			return {
+				services: [],
+				connection: result.kind === "unauthorized" ? "unauthorized" : "offline",
+				isDemo: false,
+			};
+		}
 		try {
-			const res = await fetch(joinApiUrl(getApiBase(), "/vms"), {
-				headers: this.getHeaders(),
-				signal: AbortSignal.timeout(3000),
-			});
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data: VmsResponse = await res.json();
+			const data: VmsResponse = await result.response.json();
 			const summaries = data.services || [];
-			const statuses = await this.fetchStatuses(
+			const statusResult = await this.fetchStatuses(
 				summaries.map((s) => s.service_id),
 			);
+			if (statusResult.unauthorized) {
+				return { services: [], connection: "unauthorized", isDemo: false };
+			}
+			const statuses = statusResult.statuses;
 			const services: ServiceVM[] = summaries.map((s) => {
 				const st = statuses.get(s.service_id);
 				if (st) {
@@ -964,6 +1207,7 @@ export class RusselClient {
 						host_port: st.host_port,
 						guest_port: st.guest_port,
 						ports: portDisplay(st.host_port, st.guest_port),
+						route_host: st.route_host ?? null,
 					};
 				}
 				return {
@@ -1005,13 +1249,26 @@ export class RusselClient {
 		}
 
 		const start = performance.now();
+		const result = await this.request("/vms", {
+			signal: AbortSignal.timeout(3000),
+		});
+		if (result.kind !== "success") {
+			return {
+				status: {
+					online: false,
+					total_vms: 0,
+					running_vms: 0,
+					stopped_vms: 0,
+					failed_vms: 0,
+					api_latency_ms: 0,
+					max_uptime_seconds: 0,
+				},
+				connection: result.kind === "unauthorized" ? "unauthorized" : "offline",
+				isDemo: false,
+			};
+		}
 		try {
-			const res = await fetch(joinApiUrl(getApiBase(), "/vms"), {
-				headers: this.getHeaders(),
-				signal: AbortSignal.timeout(3000),
-			});
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data: VmsResponse = await res.json();
+			const data: VmsResponse = await result.response.json();
 			const latency = Math.round(performance.now() - start);
 
 			const summaries = data.services || [];
@@ -1021,9 +1278,25 @@ export class RusselClient {
 			let maxUptime = 0;
 
 			// Fetch per-service status in parallel with concurrency ~4
-			const statuses = await this.fetchStatuses(
+			const statusResult = await this.fetchStatuses(
 				summaries.map((s) => s.service_id),
 			);
+			if (statusResult.unauthorized) {
+				return {
+					status: {
+						online: false,
+						total_vms: 0,
+						running_vms: 0,
+						stopped_vms: 0,
+						failed_vms: 0,
+						api_latency_ms: 0,
+						max_uptime_seconds: 0,
+					},
+					connection: "unauthorized",
+					isDemo: false,
+				};
+			}
+			const statuses = statusResult.statuses;
 
 			for (const s of statuses.values()) {
 				if (isServiceRunning(s)) running++;
@@ -1084,16 +1357,19 @@ export class RusselClient {
 				MOCK_SERVICES[0];
 			return { service: found, connection: "demo", isDemo: true };
 		}
+		const result = await this.request(
+			`/vm/${encodeURIComponent(id)}/status`,
+			{ signal: AbortSignal.timeout(3000) },
+		);
+		if (result.kind !== "success") {
+			return {
+				service: null,
+				connection: result.kind === "unauthorized" ? "unauthorized" : "offline",
+				isDemo: false,
+			};
+		}
 		try {
-			const res = await fetch(
-				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/status`),
-				{
-					headers: this.getHeaders(),
-					signal: AbortSignal.timeout(3000),
-				},
-			);
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data: StatusResponse = await res.json();
+			const data: StatusResponse = await result.response.json();
 			const svc: ServiceVM = {
 				id: data.service_id,
 				runtime: data.runtime || "microvm",
@@ -1103,6 +1379,7 @@ export class RusselClient {
 				host_port: data.host_port,
 				guest_port: data.guest_port,
 				ports: portDisplay(data.host_port, data.guest_port),
+				route_host: data.route_host ?? null,
 			};
 			return { service: svc, connection: "live", isDemo: false };
 		} catch {
@@ -1131,16 +1408,22 @@ export class RusselClient {
 			}
 			return { data: null, connection: "demo", supported: false };
 		}
-		try {
-			const res = await fetch(
-				joinApiUrl(getApiBase(), `/vm/${encodeURIComponent(id)}/deployments`),
-				{ headers: this.getHeaders(), signal: AbortSignal.timeout(5000) },
-			);
-			if (res.status === 404) {
+		const result = await this.request(
+			`/vm/${encodeURIComponent(id)}/deployments`,
+			{ signal: AbortSignal.timeout(5000) },
+		);
+		if (result.kind === "http_error" && result.status === 404) {
 				return { data: null, connection: "live", supported: false };
-			}
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data: DeploymentsResponse = await res.json();
+		}
+		if (result.kind !== "success") {
+			return {
+				data: null,
+				connection: result.kind === "unauthorized" ? "unauthorized" : "offline",
+				supported: false,
+			};
+		}
+		try {
+			const data: DeploymentsResponse = await result.response.json();
 			return { data, connection: "live", supported: true };
 		} catch {
 			return { data: null, connection: "offline", supported: false };

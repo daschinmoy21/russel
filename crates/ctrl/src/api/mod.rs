@@ -11,7 +11,7 @@ pub use auth::{
     MIN_API_TOKEN_LEN, check_api_token_min_length, configured_api_token, normalize_api_token,
     parse_max_concurrent_deploys, require_auth_from_env,
 };
-pub use router::router;
+pub use router::{router, router_with_dashboard};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

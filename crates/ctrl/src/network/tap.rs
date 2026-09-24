@@ -59,11 +59,7 @@ impl TapForwarder {
         vm_ip: &str,
         guest_port: u16,
     ) -> anyhow::Result<tokio::process::Child> {
-        let listen = format!(
-            "TCP-LISTEN:{},fork,reuseaddr,bind={}",
-            host_port,
-            publish_bind_addr()
-        );
+        let listen = socat_listen_arg(&publish_bind_addr(), host_port);
         let connect = format!("TCP:{}:{}", vm_ip, guest_port);
         tracing::info!(
             host_port,
@@ -126,13 +122,52 @@ impl TapForwarder {
     /// Poll until a TCP connect to the configured publish bind address succeeds.
     pub async fn wait_for_host_port(host_port: u16, timeout: Duration) -> bool {
         let bind = publish_bind_addr();
-        // Connect target: loopback for 0.0.0.0 listeners; otherwise the bind IP.
-        let connect_host = if bind == "0.0.0.0" || bind == "::" {
-            "127.0.0.1"
-        } else {
-            bind.as_str()
-        };
-        wait_for_tcp_addr(&format!("{connect_host}:{host_port}"), timeout).await
+        wait_for_tcp_addr(
+            &tcp_dial_addr(host_port_probe_host(&bind), host_port),
+            timeout,
+        )
+        .await
+    }
+}
+
+/// Strip one pair of surrounding brackets so `[::1]` is treated as `::1`.
+fn unbracket_ip(addr: &str) -> &str {
+    addr.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(addr)
+}
+
+/// Socat listen argument for the publish bind.
+///
+/// IPv6 literals need `TCP6-LISTEN` and a bracketed `bind=` or socat rejects
+/// the address. IPv4 and hostnames stay on `TCP-LISTEN`.
+fn socat_listen_arg(bind: &str, port: u16) -> String {
+    let bind = unbracket_ip(bind);
+    if bind.contains(':') {
+        format!("TCP6-LISTEN:{port},fork,reuseaddr,bind=[{bind}]")
+    } else {
+        format!("TCP-LISTEN:{port},fork,reuseaddr,bind={bind}")
+    }
+}
+
+/// TCP connect target. Bracket hosts that contain `:` so `TcpStream::connect`
+/// can parse IPv6 (`::1:3100` is not a valid socket address).
+fn tcp_dial_addr(host: &str, port: u16) -> String {
+    let host = unbracket_ip(host);
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Loopback probe host for a publish bind. `::` may not accept IPv4, so it
+/// maps to `::1` rather than `127.0.0.1`.
+fn host_port_probe_host(bind: &str) -> &str {
+    match unbracket_ip(bind) {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
     }
 }
 
@@ -162,4 +197,41 @@ pub(crate) async fn run_ip(args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_port_probe_host, socat_listen_arg, tcp_dial_addr};
+
+    #[test]
+    fn tcp_dial_addr_brackets_ipv6_only() {
+        assert_eq!(tcp_dial_addr("::1", 3100), "[::1]:3100");
+        assert_eq!(tcp_dial_addr("[::1]", 3100), "[::1]:3100");
+        assert_eq!(tcp_dial_addr("127.0.0.1", 3100), "127.0.0.1:3100");
+    }
+
+    #[test]
+    fn socat_listen_arg_uses_tcp6_for_ipv6_bind() {
+        assert_eq!(
+            socat_listen_arg("::1", 3100),
+            "TCP6-LISTEN:3100,fork,reuseaddr,bind=[::1]"
+        );
+        assert_eq!(
+            socat_listen_arg("[::1]", 3100),
+            "TCP6-LISTEN:3100,fork,reuseaddr,bind=[::1]"
+        );
+        assert_eq!(
+            socat_listen_arg("127.0.0.1", 3100),
+            "TCP-LISTEN:3100,fork,reuseaddr,bind=127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn host_port_probe_host_maps_wildcards() {
+        assert_eq!(host_port_probe_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(host_port_probe_host("::"), "::1");
+        assert_eq!(host_port_probe_host("[::]"), "::1");
+        assert_eq!(host_port_probe_host("::1"), "::1");
+        assert_eq!(host_port_probe_host("127.0.0.1"), "127.0.0.1");
+    }
 }

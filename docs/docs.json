@@ -1,0 +1,41 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Russel",
+  "description": "Self-hosted Nix deployment platform — microVMs or rootless containers.",
+  "colors": {
+    "primary": "#16a34a"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting started",
+        "pages": ["index", "quickstart", "getting-started/installation", "getting-started/first-deploy", "getting-started/dashboard"]
+      },
+      {
+        "group": "Concepts",
+        "pages": ["concepts/architecture", "concepts/runtimes", "concepts/networking", "concepts/lifecycle", "concepts/builds"]
+      },
+      {
+        "group": "Guides",
+        "pages": ["guides/vps-one-dev", "guides/tls-reverse-proxy", "guides/traefik-ingress", "guides/env-secrets", "guides/update-rollback", "guides/troubleshooting", "guides/benchmarks"]
+      },
+      {
+        "group": "Reference",
+        "pages": ["reference/cli", "reference/api", "reference/russelfile", "reference/environment", "reference/examples"]
+      },
+      {
+        "group": "Security",
+        "pages": ["security/overview", "security/nix-builds"]
+      },
+      {
+        "group": "Operations",
+        "pages": ["operations/systemd-nixos", "operations/upgrades-backup"]
+      },
+      {
+        "group": "Project",
+        "pages": ["project/development", "project/releases"]
+      }
+    ]
+  }
+}

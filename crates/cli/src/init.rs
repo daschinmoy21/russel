@@ -44,13 +44,13 @@ pub struct InitArgs {
     pub memory: String,
 
     /// Runtime kind written to `service.type`.
-    #[arg(
-        long = "type",
-        visible_alias = "runtime",
-        value_name = "RUNTIME",
-        default_value_t = RuntimeKind::Microvm
-    )]
-    pub runtime: RuntimeKind,
+    #[arg(long = "type", visible_alias = "runtime", value_name = "RUNTIME")]
+    pub runtime: Option<RuntimeKind>,
+
+    /// nixpkgs attribute for container services without a flake
+    /// (e.g. `--package navidrome`). Implies `--type container`.
+    #[arg(long, value_name = "ATTR")]
+    pub package: Option<String>,
 
     /// Binary name produced by the build (default: service name).
     #[arg(long)]
@@ -108,7 +108,25 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     let hints = detect_project(&root);
     let mut name = resolve_name(args.name.as_deref(), hints.inferred_name.as_deref(), &root)?;
-    let mut bin = resolve_bin(args.bin.as_deref(), &name)?;
+    if let Some(package) = args.package.as_deref() {
+        russel_core::volumes::validate_package_attr(package.trim())
+            .map_err(|e| anyhow!("invalid --package {package:?}: {e}"))?;
+    }
+    let package = args
+        .package
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if package.is_some() && args.with_flake {
+        bail!(
+            "--package cannot be combined with --with-flake (committed flake wins over package; omit --with-flake to deploy the nixpkgs attr)"
+        );
+    }
+    let mut bin = match (args.bin.as_deref(), package) {
+        (Some(explicit), _) => resolve_bin(Some(explicit), &name)?,
+        (None, Some(pkg)) => resolve_bin(Some(pkg.rsplit('.').next().unwrap_or(pkg)), &name)?,
+        (None, None) => resolve_bin(None, &name)?,
+    };
     validate_port(args.port)?;
     validate_memory(&args.memory)?;
     validate_source_path(".")?;
@@ -136,7 +154,18 @@ pub fn run(args: InitArgs) -> Result<()> {
     let keep_russelfile = russelfile_existed && !args.force;
     let mut port = args.port;
     let mut memory = args.memory.clone();
-    let mut runtime = args.runtime;
+    // --package implies container; an explicit --type still applies.
+    let mut runtime = args.runtime.unwrap_or_else(|| {
+        if package.is_some() {
+            RuntimeKind::Container
+        } else {
+            RuntimeKind::Microvm
+        }
+    });
+    if package.is_some() && runtime != RuntimeKind::Container {
+        bail!("--package requires --type container (package auto-flake is container-only)");
+    }
+    let mut keep_package: Option<String> = package.map(str::to_string);
     if keep_russelfile {
         let existing = Russelfile::load(&russelfile_path)
             .with_context(|| format!("failed to read {}", russelfile_path.display()))?;
@@ -145,32 +174,53 @@ pub fn run(args: InitArgs) -> Result<()> {
         port = existing.service.port;
         memory = format!("{}mb", existing.service.memory.as_mebibytes());
         runtime = existing.service.runtime;
+        keep_package = existing.service.package.clone();
     }
+
+    let russelfile_backup = if !keep_russelfile && russelfile_existed {
+        Some(fs::read(&russelfile_path).with_context(|| {
+            format!(
+                "failed to read {} before overwrite",
+                russelfile_path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let russelfile_created = !keep_russelfile && !russelfile_existed;
 
     let rf_outcome = if keep_russelfile {
         WriteOutcome::LeftInPlace
     } else {
-        let manifest = render_russelfile(&name, port, &memory, runtime, &bin);
+        let manifest =
+            render_russelfile(&name, port, &memory, runtime, &bin, keep_package.as_deref());
         // Fail closed: never write a manifest the current parser would reject.
         Russelfile::load_from_str(&manifest)
             .context("internal error: generated Russelfile.toml failed to parse")?;
         write_text_file(&russelfile_path, &manifest, args.force, russelfile_existed)?
     };
 
-    let mut flake_outcome = None;
-    if args.with_flake {
-        if !args.force && flake_existed {
-            flake_outcome = Some(WriteOutcome::LeftInPlace);
-        } else {
-            let flake = render_flake(hints.kind, &name, &bin, hints.go_vendor);
-            flake_outcome = Some(write_text_file(
-                &flake_path,
-                &flake,
-                args.force,
-                flake_existed,
-            )?);
+    let flake_outcome = match write_flake(
+        &args,
+        hints.kind,
+        &name,
+        &bin,
+        hints.go_vendor,
+        &flake_path,
+        flake_existed,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if let Err(restore_err) = restore_russelfile(
+                &russelfile_path,
+                russelfile_backup.as_deref(),
+                russelfile_created,
+            ) {
+                return Err(err.context(restore_err));
+            }
+            return Err(err);
         }
-    }
+    };
 
     print_summary(
         &root,
@@ -517,7 +567,16 @@ fn render_russelfile(
     memory: &str,
     runtime: RuntimeKind,
     bin: &str,
+    package: Option<&str>,
 ) -> String {
+    let package_line = package
+        .map(|p| format!("\n# nixpkgs attr used when no flake.nix exists. Committed flake wins.\npackage = \"{p}\"\n"))
+        .unwrap_or_default();
+    let volumes_block = if package.is_some() {
+        "\n# Managed data dir (/var/lib/russel/<id>/volumes/data). keep=true survives destroy\n# unless --delete-volumes. Absolute host binds are never deleted.\n# [[volumes]]\n# name = \"data\"\n# guest = \"/data\"\n# rw = true\n# keep = true\n"
+    } else {
+        ""
+    };
     format!(
         "\
 # Generated by `russel init`. Uncomment optional fields below as needed.
@@ -528,7 +587,8 @@ fn render_russelfile(
 #   --port PORT              service.port   (default: 3000, must not be 0)
 #   --memory SIZE            service.memory (default: 256mb; suffix mb or mib, min 16mb)
 #   --type / --runtime KIND  service.type   (microvm | container, default: microvm)
-#   --bin BIN                service.bin    (default: service.name)
+#   --bin BIN                service.bin    (default: service.name, or package last part)
+#   --package ATTR           nixpkgs attr for containers (implies --type container)
 #   --with-flake             also write flake.nix (Rust / Go / static)
 #   --force                  overwrite existing Russelfile.toml / flake.nix
 #
@@ -544,6 +604,8 @@ fn render_russelfile(
 #   russel logs {name}
 #   russel stop {name}
 #   russel destroy {name}
+#   russel destroy {name} --keep-volumes    # keep managed [[volumes]] dirs
+#   russel destroy {name} --delete-volumes  # delete managed [[volumes]] dirs
 
 [service]
 # Unique service name. Hint for --vm-id. Default binary name if `bin` is omitted.
@@ -565,7 +627,7 @@ memory = \"{memory}\"
 #   microvm    — KVM / Cloud Hypervisor (needs /dev/kvm, TAP)
 #   container  — rootless Podman --rootfs (typical VPS / no KVM)
 type = \"{runtime}\"
-
+{package_line}
 # Guest userspace. Orthogonal to type (isolation). Default busybox.
 # linux is parsed but rejected until implemented (host-built NixOS userspace).
 # guest = \"busybox\"
@@ -573,7 +635,7 @@ type = \"{runtime}\"
 # Binary produced by the Nix build, executed as $out/bin/<bin>.
 # Defaults to `name` when omitted. Allowed: A-Za-z0-9._+- (max 256).
 bin = \"{bin}\"
-
+{volumes_block}
 # Guest vCPUs for microVM (1..=32, default 1). Ignored for containers.
 # cpus = 1
 
@@ -597,6 +659,14 @@ bin = \"{bin}\"
 # enabled = false
 # [database.redis]
 # enabled = false
+
+# Optional HTTP ingress. Omit for Host(<service_id>.<RUSSEL_TRAEFIK_DOMAIN>)
+# and an allocated backend port.
+# host is the exact Traefik Host() value (apex or subdomain), not a suffix.
+# port is the host-side backend (like -p HOST:guest), not service.port.
+# [ingress]
+# host = \"abc.com\"
+# port = 4000
 "
     )
 }
@@ -737,6 +807,49 @@ fn path_exists(path: &Path) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("failed to stat {}", path.display())),
     }
+}
+
+fn write_flake(
+    args: &InitArgs,
+    kind: ProjectKind,
+    name: &str,
+    bin: &str,
+    go_vendor: GoVendorMode,
+    flake_path: &Path,
+    flake_existed: bool,
+) -> Result<Option<WriteOutcome>> {
+    if !args.with_flake {
+        return Ok(None);
+    }
+    if !args.force && flake_existed {
+        return Ok(Some(WriteOutcome::LeftInPlace));
+    }
+    let flake = render_flake(kind, name, bin, go_vendor);
+    Ok(Some(write_text_file(
+        flake_path,
+        &flake,
+        args.force,
+        flake_existed,
+    )?))
+}
+
+fn restore_russelfile(path: &Path, backup: Option<&[u8]>, created: bool) -> Result<()> {
+    if let Some(bytes) = backup {
+        fs::write(path, bytes).with_context(|| {
+            format!(
+                "failed to restore {} after flake write failed",
+                path.display()
+            )
+        })?;
+    } else if created {
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "failed to remove newly written {} after flake write failed",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn write_text_file(
@@ -990,7 +1103,14 @@ version = "0.1.0"
 
     #[test]
     fn generated_manifest_parses() {
-        let body = render_russelfile("my-app", 3000, "256mb", RuntimeKind::Container, "my-app");
+        let body = render_russelfile(
+            "my-app",
+            3000,
+            "256mb",
+            RuntimeKind::Container,
+            "my-app",
+            None,
+        );
         let cfg = Russelfile::load_from_str(&body).unwrap();
         assert_eq!(cfg.service.name, "my-app");
         assert_eq!(cfg.service.port, 3000);
@@ -1013,6 +1133,7 @@ version = "0.1.0"
             "512mb",
             RuntimeKind::Container,
             "custom-bin",
+            None,
         );
         for needle in [
             "name = \"my-app\"",
@@ -1031,6 +1152,13 @@ version = "0.1.0"
             "# [database.postgres]",
             "# [database.redis]",
             "# enabled = false",
+            "# Optional HTTP ingress. Omit for Host(<service_id>.<RUSSEL_TRAEFIK_DOMAIN>)",
+            "# and an allocated backend port.",
+            "# host is the exact Traefik Host() value (apex or subdomain), not a suffix.",
+            "# port is the host-side backend (like -p HOST:guest), not service.port.",
+            "# [ingress]",
+            "# host = \"abc.com\"",
+            "# port = 4000",
             "--name NAME",
             "--port PORT",
             "--memory SIZE",
@@ -1101,8 +1229,9 @@ version = "0.1.0"
             name: Some("demo".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1128,8 +1257,9 @@ version = "0.1.0"
             name: None,
             port: 8080,
             memory: "128mb".into(),
-            runtime: RuntimeKind::Container,
+            runtime: Some(RuntimeKind::Container),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1154,8 +1284,9 @@ version = "0.1.0"
             name: None,
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1174,8 +1305,9 @@ version = "0.1.0"
             name: None,
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1193,8 +1325,9 @@ version = "0.1.0"
             name: Some("demo".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1218,8 +1351,9 @@ version = "0.1.0"
             name: Some("fresh".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: true,
         })
@@ -1237,8 +1371,9 @@ version = "0.1.0"
             name: None,
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: true,
             force: false,
         })
@@ -1265,8 +1400,9 @@ version = "0.1.0"
             name: None,
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: true,
             force: false,
         })
@@ -1292,8 +1428,9 @@ version = "0.1.0"
             name: Some("ignored".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: true,
             force: false,
         })
@@ -1308,6 +1445,36 @@ version = "0.1.0"
     }
 
     #[test]
+    fn init_force_with_flake_restores_manifest_when_flake_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let russelfile = dir.path().join(RUSSELFILE_NAME);
+        let original =
+            "[service]\nname = \"kept\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n";
+        fs::write(&russelfile, original).unwrap();
+        // Directory named flake.nix: write_text_file refuses non-regular files.
+        fs::create_dir(dir.path().join(FLAKE_NAME)).unwrap();
+        let err = run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: Some("replaced".into()),
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: Some(RuntimeKind::Microvm),
+            bin: None,
+            package: None,
+            with_flake: true,
+            force: true,
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file") || msg.contains("flake.nix"),
+            "got: {msg}"
+        );
+        let after = fs::read_to_string(&russelfile).unwrap();
+        assert_eq!(after, original, "existing Russelfile.toml must be restored");
+    }
+
+    #[test]
     fn init_creates_missing_directory() {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("brand-new");
@@ -1316,8 +1483,9 @@ version = "0.1.0"
             name: Some("brand-new".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1335,8 +1503,9 @@ version = "0.1.0"
             name: Some("demo".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1359,8 +1528,9 @@ version = "0.1.0"
             name: Some("demo".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: true,
         })
@@ -1376,8 +1546,9 @@ version = "0.1.0"
             name: Some("demo".into()),
             port: 0,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1393,8 +1564,9 @@ version = "0.1.0"
             name: Some("demo".into()),
             port: 3000,
             memory: "512gb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1413,8 +1585,9 @@ version = "0.1.0"
             name: Some("has space".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: None,
+            package: None,
             with_flake: false,
             force: false,
         })
@@ -1441,7 +1614,7 @@ version = "0.1.0"
         assert_eq!(args.name.as_deref(), Some("svc"));
         assert_eq!(args.port, 8080);
         assert_eq!(args.memory, "512mb");
-        assert_eq!(args.runtime, RuntimeKind::Container);
+        assert_eq!(args.runtime, Some(RuntimeKind::Container));
         assert!(args.with_flake);
         assert!(args.force);
     }
@@ -1449,7 +1622,7 @@ version = "0.1.0"
     #[test]
     fn clap_accepts_runtime_alias() {
         let args = parse_init(&["--runtime", "container"]);
-        assert_eq!(args.runtime, RuntimeKind::Container);
+        assert_eq!(args.runtime, Some(RuntimeKind::Container));
     }
 
     #[test]
@@ -1460,13 +1633,121 @@ version = "0.1.0"
             name: Some("my-app".into()),
             port: 3000,
             memory: "256mb".into(),
-            runtime: RuntimeKind::Microvm,
+            runtime: Some(RuntimeKind::Microvm),
             bin: Some("custom-bin".into()),
+            package: None,
             with_flake: false,
             force: false,
         })
         .unwrap();
         let cfg = Russelfile::load(&dir.path().join(RUSSELFILE_NAME)).unwrap();
         assert_eq!(cfg.service.bin_name(), "custom-bin");
+    }
+
+    #[test]
+    fn package_implies_container_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: Some("navidrome".into()),
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: None,
+            bin: None,
+            package: Some("navidrome".into()),
+            with_flake: false,
+            force: false,
+        })
+        .unwrap();
+        let cfg = Russelfile::load(&dir.path().join(RUSSELFILE_NAME)).unwrap();
+        assert_eq!(cfg.service.runtime, RuntimeKind::Container);
+        assert_eq!(cfg.service.package.as_deref(), Some("navidrome"));
+        assert_eq!(cfg.service.bin_name(), "navidrome");
+    }
+
+    #[test]
+    fn package_rejects_explicit_microvm() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: Some("demo".into()),
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: Some(RuntimeKind::Microvm),
+            bin: None,
+            package: Some("navidrome".into()),
+            with_flake: false,
+            force: false,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--package requires --type container"),
+            "unexpected err: {err}"
+        );
+        assert!(!dir.path().join(RUSSELFILE_NAME).exists());
+    }
+
+    #[test]
+    fn package_bin_defaults_to_last_attr_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: Some("demo".into()),
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: None,
+            bin: None,
+            package: Some("nodePackages.foo".into()),
+            with_flake: false,
+            force: false,
+        })
+        .unwrap();
+        let cfg = Russelfile::load(&dir.path().join(RUSSELFILE_NAME)).unwrap();
+        assert_eq!(cfg.service.package.as_deref(), Some("nodePackages.foo"));
+        assert_eq!(cfg.service.bin_name(), "foo");
+        assert_eq!(cfg.service.runtime, RuntimeKind::Container);
+    }
+
+    #[test]
+    fn render_russelfile_with_package_loads_package_set() {
+        let body = render_russelfile(
+            "demo",
+            3000,
+            "256mb",
+            RuntimeKind::Container,
+            "foo",
+            Some("nodePackages.foo"),
+        );
+        let cfg = Russelfile::load_from_str(&body).unwrap();
+        assert_eq!(cfg.service.package.as_deref(), Some("nodePackages.foo"));
+        assert_eq!(cfg.service.bin_name(), "foo");
+        assert_eq!(cfg.service.runtime, RuntimeKind::Container);
+        assert!(body.contains("package = \"nodePackages.foo\""));
+        assert!(body.contains("[[volumes]]"));
+    }
+
+    #[test]
+    fn package_rejects_with_flake() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: Some("demo".into()),
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: None,
+            bin: None,
+            package: Some("navidrome".into()),
+            with_flake: true,
+            force: false,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--package cannot be combined with --with-flake"),
+            "unexpected err: {msg}"
+        );
+        assert!(!dir.path().join(RUSSELFILE_NAME).exists());
+        assert!(!dir.path().join(FLAKE_NAME).exists());
     }
 }

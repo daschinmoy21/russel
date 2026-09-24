@@ -1,0 +1,36 @@
+# navidrome: music server from nixpkgs, no flake.nix needed.
+# `service.package` wraps the nixpkgs attr at deploy when the repo has no
+# committed flake.nix. A committed flake.nix wins over `package`.
+# The package is the navidrome binary. Its data-folder default is the
+# working directory, and its music-folder default is the relative path
+# `music`. The container workdir is `/` and the rootfs is read-only, so
+# the database would be created on `/` and the library path would be a
+# missing `/music`. ND_DATAFOLDER and ND_MUSICFOLDER pin both to volumes.
+# The music volume starts empty. To serve a library you already have,
+# replace that row with an absolute `host` bind under RUSSEL_VOLUME_ROOTS
+# (same shape as examples/postgres). Music stays read-only (`rw` defaults
+# to false). `keep = true` survives `russel destroy` unless
+# `--delete-volumes` is passed.
+
+[service]
+name = "navidrome"
+source = "."
+port = 4533
+memory = "512mb"
+type = "container"
+package = "navidrome"
+
+[service.env]
+ND_DATAFOLDER = "/data"
+ND_MUSICFOLDER = "/music"
+
+[[volumes]]
+name = "data"
+guest = "/data"
+rw = true
+keep = true
+
+[[volumes]]
+name = "music"
+guest = "/music"
+keep = true

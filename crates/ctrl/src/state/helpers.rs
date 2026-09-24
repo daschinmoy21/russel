@@ -21,7 +21,9 @@ pub(super) fn push_capped(buf: &mut String, s: &str) {
 }
 
 /// Parse RFC3339 timestamp (second precision UTC) to Instant for uptime back-dating.
-/// Returns None if parsing fails or the timestamp is in the future.
+///
+/// Returns None if parsing fails, the timestamp is in the future, or the age
+/// predates the monotonic clock (adoption then uses `Instant::now`).
 pub(super) fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
     let unix_secs = russel_core::timeutil::rfc3339_to_unix_secs(rfc3339)?;
 
@@ -36,24 +38,83 @@ pub(super) fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
     }
 
     let elapsed_secs = (now_secs - unix_secs) as u64;
-    Some(Instant::now() - Duration::from_secs(elapsed_secs))
+    // `Instant` is monotonic since boot. `Instant::now() - duration` panics
+    // when `duration` exceeds that (suspend, clock step, or `deployed_at`
+    // from before boot). `checked_sub` returns `None` so adoption can fall
+    // back to `Instant::now`.
+    Instant::now().checked_sub(Duration::from_secs(elapsed_secs))
 }
 
-/// Check if a container is still running via `podman inspect`.
-pub(crate) async fn check_container_running(container_id: &str) -> bool {
-    let Ok(output) = crate::container::podman_command()
-        .await
-        .args(["inspect", container_id, "--format", "{{.State.Running}}"])
-        .output()
-        .await
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
+/// Result of `podman inspect` for `.State.Running`.
+///
+/// [`ContainerProbe::Unknown`] means the probe did not run or podman failed
+/// unexpectedly. Callers that only need a bool (see [`check_container_running`])
+/// treat that as not running; startup reconcile must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerProbe {
+    Running,
+    NotRunning,
+    Unknown,
+}
+
+/// Classify `podman inspect` stdout/stderr for `.State.Running` without spawning.
+///
+/// Spawn/IO errors are [`ContainerProbe::Unknown`] and are not passed here.
+/// Podman exit 125 means the binary could not be invoked (daemon down, connect
+/// failure). That is unknown, not missing. A missing container is recognized
+/// only from stderr (`no such object` / `no such container`).
+pub(crate) fn classify_podman_inspect(
+    status_success: bool,
+    _code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> ContainerProbe {
+    if status_success {
+        return if stdout.trim() == "true" {
+            ContainerProbe::Running
+        } else {
+            ContainerProbe::NotRunning
+        };
     }
+    let stderr_l = stderr.to_ascii_lowercase();
+    if stderr_l.contains("no such object") || stderr_l.contains("no such container") {
+        ContainerProbe::NotRunning
+    } else {
+        ContainerProbe::Unknown
+    }
+}
+
+/// Bound for `podman inspect` so a hung daemon cannot stall reconcile.
+const PODMAN_INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probe whether a container is running.
+///
+/// A spawn/IO error, timeout, or unexpected inspect failure is
+/// [`ContainerProbe::Unknown`], not stopped. A missing container (stderr
+/// "no such object" / "no such container") is [`ContainerProbe::NotRunning`].
+pub(crate) async fn probe_container(container_id: &str) -> ContainerProbe {
+    let mut cmd = crate::container::podman_command().await;
+    cmd.args(["inspect", container_id, "--format", "{{.State.Running}}"]);
+    let output = match tokio::time::timeout(PODMAN_INSPECT_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) | Err(_) => return ContainerProbe::Unknown,
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim() == "true"
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_podman_inspect(
+        output.status.success(),
+        output.status.code(),
+        &stdout,
+        &stderr,
+    )
+}
+
+/// Whether `podman inspect` reports the container running.
+///
+/// [`ContainerProbe::Unknown`] collapses to `false` for bool callers. Reconcile
+/// uses [`probe_container`] so a broken podman is not treated as stopped.
+pub(crate) async fn check_container_running(container_id: &str) -> bool {
+    matches!(probe_container(container_id).await, ContainerProbe::Running)
 }
 
 /// Check if a PID is still alive via /proc/{pid}/stat.
@@ -82,4 +143,99 @@ pub(super) fn read_tail_of_file(
         buf = buf[pos + 1..].to_string();
     }
     Some(buf)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    use super::parse_rfc3339_to_instant;
+
+    fn rfc3339_secs_from_now(delta_secs: i64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs() as i64;
+        let secs = now.checked_add(delta_secs).expect("timestamp overflow");
+        assert!(secs >= 0, "timestamp before unix epoch");
+        russel_core::timeutil::rfc3339_from_unix(secs as u64)
+    }
+
+    #[test]
+    fn far_past_timestamp_does_not_panic() {
+        // ~10 years ago is longer than monotonic time since boot on any
+        // realistic host. `None` is expected; `Some` is also fine if uptime
+        // exceeds that age. The bug was a panic.
+        let ts = rfc3339_secs_from_now(-(10 * 365 * 24 * 60 * 60));
+        if let Some(started) = parse_rfc3339_to_instant(&ts) {
+            assert!(started <= Instant::now());
+        }
+    }
+
+    #[test]
+    fn recent_timestamp_returns_some() {
+        let ts = rfc3339_secs_from_now(-5);
+        assert!(parse_rfc3339_to_instant(&ts).is_some());
+    }
+
+    #[test]
+    fn future_timestamp_returns_none() {
+        let ts = rfc3339_secs_from_now(3_600);
+        assert!(parse_rfc3339_to_instant(&ts).is_none());
+    }
+
+    #[test]
+    fn classify_podman_inspect_states() {
+        use super::{ContainerProbe, classify_podman_inspect};
+
+        assert_eq!(
+            classify_podman_inspect(true, Some(0), "true\n", ""),
+            ContainerProbe::Running
+        );
+        assert_eq!(
+            classify_podman_inspect(true, Some(0), "false\n", ""),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(true, Some(0), "  \n", ""),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(125), "", "Error: cannot connect"),
+            ContainerProbe::Unknown
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(125), "", ""),
+            ContainerProbe::Unknown
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(125), "", "Error: no such object: abc"),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(1), "", "Error: no such object: abc"),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(1), "", "No such container: abc"),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(125), "", "No such container: abc"),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(false, None, "", "No such container: abc"),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_podman_inspect(false, Some(1), "", "cannot connect to Podman socket"),
+            ContainerProbe::Unknown
+        );
+        assert_eq!(
+            classify_podman_inspect(false, None, "", "killed"),
+            ContainerProbe::Unknown
+        );
+    }
 }

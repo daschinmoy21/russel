@@ -51,7 +51,7 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Match docs/contributing.md: lint tests too (`--all-targets`).
+      # Match CONTRIBUTING.md: lint tests too (`--all-targets`).
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -94,6 +94,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
         working-directory: dashboard
+      - run: bun test
+        working-directory: dashboard
       - run: bun run build
         working-directory: dashboard
 
@@ -109,3 +111,29 @@ jobs:
           SHELLCHECK_OPTS: -x
         with:
           ignore_paths: guide dashboard examples
+
+  installer:
+    name: Installer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Pinned to actions/checkout v4 (immutable SHA, not the mutable tag).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run installer tests
+        run: bash contrib/tests/install_test.sh
+      - name: Verify systemd user unit
+        run: |
+          set -euo pipefail
+          cleanup() {
+            sudo rm -f /usr/local/bin/russel-ctrl
+            sudo rmdir /var/lib/russel 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          mkdir -p "$HOME/.config/russel"
+          : >"$HOME/.config/russel/env"
+          chmod 600 "$HOME/.config/russel/env"
+          sudo install -m 755 /bin/true /usr/local/bin/russel-ctrl
+          sudo mkdir -p /var/lib/russel
+          systemd-analyze verify contrib/russel-ctrl.service

@@ -38,7 +38,7 @@ pub const NODE_ID_ENV: &str = "RUSSEL_NODE_ID";
 
 /// On-disk path for a service's metadata.json.
 pub fn metadata_path(service_id: &str) -> PathBuf {
-    PathBuf::from(format!("/var/lib/russel/{service_id}/metadata.json"))
+    russel_core::paths::service_dir(service_id).join("metadata.json")
 }
 
 /// Resolve the node id written into service `metadata.json`.
@@ -105,6 +105,8 @@ pub struct LoadedMetadata {
     pub container_id: Option<String>,
     /// microVM TAP guest address (absent for container-only metadata).
     pub vm_ip: Option<String>,
+    /// Ingress host from the `desired_state` blob (`ingress_host`), if any.
+    pub ingress_host: Option<String>,
 }
 
 /// Full on-disk record for a service, used by startup reconcile to rehydrate
@@ -146,12 +148,73 @@ pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Read prior runtime from disk, returning None when no metadata exists
-/// or the file is corrupt/unreadable.
-pub fn prior_runtime_from_disk(service_id: &str) -> Option<RuntimeKind> {
-    let path = metadata_path(service_id);
-    let content = std::fs::read_to_string(&path).ok()?;
-    prior_runtime_from_metadata(&content)
+/// Outcome of reading `runtime` from on-disk metadata.
+///
+/// `Missing` is only a file that is not there. An existing path that cannot
+/// be read is `Unreadable` — callers must not treat that as "no metadata"
+/// and assume a microVM.
+#[derive(Debug)]
+pub enum MetadataRead {
+    Found(RuntimeKind),
+    Missing,
+    Unreadable(std::io::Error),
+}
+
+enum MetadataIo {
+    Content(String),
+    Missing,
+    Unreadable(std::io::Error),
+}
+
+fn read_metadata_io_at(service_id: &str, path: &Path) -> MetadataIo {
+    match std::fs::read_to_string(path) {
+        Ok(content) => MetadataIo::Content(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => MetadataIo::Missing,
+        Err(e) => {
+            tracing::error!(
+                service_id,
+                path = %path.display(),
+                error = %e,
+                "failed to read metadata.json; refusing to treat it as missing"
+            );
+            MetadataIo::Unreadable(e)
+        }
+    }
+}
+
+fn classify_metadata_read(service_id: &str, path: &Path) -> MetadataRead {
+    match read_metadata_io_at(service_id, path) {
+        MetadataIo::Missing => MetadataRead::Missing,
+        MetadataIo::Unreadable(err) => MetadataRead::Unreadable(err),
+        MetadataIo::Content(content) => match prior_runtime_from_metadata(&content) {
+            Some(runtime) => MetadataRead::Found(runtime),
+            None => {
+                tracing::warn!(
+                    service_id,
+                    "valid metadata.json missing 'runtime' key — defaulting to microvm"
+                );
+                MetadataRead::Found(RuntimeKind::Microvm)
+            }
+        },
+    }
+}
+
+/// Read `runtime` for `service_id` from its metadata file.
+pub fn metadata_runtime_from_disk(service_id: &str) -> MetadataRead {
+    classify_metadata_read(service_id, &metadata_path(service_id))
+}
+
+/// Read prior runtime from disk.
+///
+/// `Ok(None)` when the file is missing, unparseable, or has no `runtime` key.
+/// `Err` when the path cannot be read (permissions, a directory, other I/O).
+/// That error is not "no file".
+pub fn prior_runtime_from_disk(service_id: &str) -> Result<Option<RuntimeKind>, std::io::Error> {
+    match read_metadata_io_at(service_id, &metadata_path(service_id)) {
+        MetadataIo::Missing => Ok(None),
+        MetadataIo::Unreadable(err) => Err(err),
+        MetadataIo::Content(content) => Ok(prior_runtime_from_metadata(&content)),
+    }
 }
 
 pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
@@ -179,6 +242,8 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        ingress_host: crate::deployments::DesiredStateSnapshot::from_metadata_desired_state(&value)
+            .ingress_host,
     })
 }
 
@@ -256,7 +321,10 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
 
 /// Atomic write of the control plane catalog JSON to `/var/lib/russel/ctrl-catalog.json`.
 pub fn write_ctrl_catalog(catalog: &serde_json::Value) -> anyhow::Result<()> {
-    write_ctrl_catalog_to(&PathBuf::from("/var/lib/russel/ctrl-catalog.json"), catalog)
+    write_ctrl_catalog_to(
+        &russel_core::paths::data_root().join("ctrl-catalog.json"),
+        catalog,
+    )
 }
 
 /// Atomic write of the control plane catalog JSON to an arbitrary path.
@@ -359,25 +427,21 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
 /// Resolve lifecycle runtime: prefer in-memory state, else on-disk metadata.
 /// Defaults to `Microvm` only when no metadata file exists at all (first deploy).
 /// Warns when valid metadata JSON is missing the `runtime` key (legacy).
+///
+/// Returns `Err` when the metadata path exists but cannot be read. Callers
+/// must fail the stop/destroy instead of assuming microVM.
 pub fn resolve_lifecycle_runtime(
     state_runtime: Option<RuntimeKind>,
     service_id: &str,
-) -> RuntimeKind {
+) -> Result<RuntimeKind, std::io::Error> {
     if let Some(rt) = state_runtime {
-        return rt;
+        return Ok(rt);
     }
-    let Some(content) = std::fs::read_to_string(metadata_path(service_id)).ok() else {
-        return RuntimeKind::Microvm;
-    };
-    if let Some(runtime) = prior_runtime_from_metadata(&content) {
-        return runtime;
+    match metadata_runtime_from_disk(service_id) {
+        MetadataRead::Found(runtime) => Ok(runtime),
+        MetadataRead::Missing => Ok(RuntimeKind::Microvm),
+        MetadataRead::Unreadable(err) => Err(err),
     }
-
-    tracing::warn!(
-        service_id,
-        "valid metadata.json missing 'runtime' key — defaulting to microvm"
-    );
-    RuntimeKind::Microvm
 }
 
 /// Build versioned metadata JSON for a microVM deployment.
@@ -536,6 +600,7 @@ pub fn build_container_metadata_with_gen(
         "store_path": store_path,
         "container_id": container_id,
         "container_name": container_name,
+        "container_running": true,
         "rootfs_path": rootfs_path,
         "mem_mb": mem_mb,
         "deployed_at": deployed_at_now(),
@@ -563,6 +628,33 @@ pub fn rewrite_metadata_service_id(path: impl AsRef<Path>, service_id: &str) -> 
     write_metadata(path, &value)
 }
 
+/// Record whether the container process is running.
+///
+/// Stop leaves `container_id` in place so a later start can find the podman
+/// name. Heartbeat must not treat that leftover id as a live workload.
+/// Missing file is fine (destroy already removed it).
+pub fn set_container_running(service_id: &str, running: bool) -> anyhow::Result<()> {
+    let path = metadata_path(service_id);
+    if !path.is_file() {
+        return Ok(());
+    }
+    set_container_running_at(&path, running)
+}
+
+pub fn set_container_running_at(path: &Path, running: bool) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read metadata {}: {e}", path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("parse metadata {}: {e}", path.display()))?;
+    // Heartbeat treats a leftover container_id with no runtime as running.
+    // Skip only explicit microVMs so stop still flips the flag on legacy files.
+    if value.get("runtime").and_then(|v| v.as_str()) == Some("microvm") {
+        return Ok(());
+    }
+    value["container_running"] = serde_json::json!(running);
+    write_metadata(path, &value)
+}
+
 pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> anyhow::Result<()> {
     let content = serde_json::to_string_pretty(metadata)
         .map_err(|e| anyhow::anyhow!("failed to serialize metadata: {}", e))?;
@@ -585,6 +677,52 @@ pub fn deployed_at_now() -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn metadata_runtime_from_path(path: &Path) -> MetadataRead {
+        classify_metadata_read(&path.to_string_lossy(), path)
+    }
+
+    #[test]
+    fn set_container_running_at_marks_stopped_without_clearing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let meta = build_container_metadata(
+            "svc",
+            8080,
+            3000,
+            "/nix/store/x",
+            "abc",
+            "russel-svc",
+            "/var/lib/russel/svc/rootfs",
+            256,
+            None,
+            &[],
+        );
+        assert_eq!(meta["container_running"], serde_json::json!(true));
+        write_metadata(&path, &meta).unwrap();
+        set_container_running_at(&path, false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["container_id"], "abc");
+        assert_eq!(value["container_running"], false);
+    }
+
+    #[test]
+    fn set_container_running_at_writes_legacy_container_id_without_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let meta = serde_json::json!({
+            "service_id": "svc",
+            "container_id": "abc",
+        });
+        write_metadata(&path, &meta).unwrap();
+        set_container_running_at(&path, false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["container_id"], "abc");
+        assert_eq!(value["container_running"], false);
+        assert!(value.get("runtime").is_none());
+    }
 
     #[test]
     fn resolve_node_id_prefers_env() {
@@ -751,9 +889,60 @@ mod tests {
     #[test]
     fn resolve_lifecycle_runtime_prefers_state() {
         assert_eq!(
-            resolve_lifecycle_runtime(Some(RuntimeKind::Container), "api"),
+            resolve_lifecycle_runtime(Some(RuntimeKind::Container), "api").unwrap(),
             RuntimeKind::Container
         );
+    }
+
+    #[test]
+    fn unreadable_metadata_is_not_treated_as_microvm() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let as_dir = tmp.path().join("metadata.json");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(
+            matches!(
+                metadata_runtime_from_path(&as_dir),
+                MetadataRead::Unreadable(_)
+            ),
+            "a directory at the metadata path is not a missing microvm"
+        );
+        std::fs::remove_dir(&as_dir).unwrap();
+
+        let missing = tmp.path().join("absent.json");
+        assert!(matches!(
+            metadata_runtime_from_path(&missing),
+            MetadataRead::Missing
+        ));
+
+        let file = tmp.path().join("metadata.json");
+        std::fs::write(&file, r#"{"runtime":"container"}"#).unwrap();
+        assert!(matches!(
+            metadata_runtime_from_path(&file),
+            MetadataRead::Found(RuntimeKind::Container)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut locked = std::fs::metadata(&file).unwrap().permissions();
+            locked.set_mode(0o000);
+            std::fs::set_permissions(&file, locked).unwrap();
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            let probe_failed = std::fs::File::open(&file).is_err();
+            let classified = metadata_runtime_from_path(&file);
+            let mut restore = std::fs::metadata(&file).unwrap().permissions();
+            restore.set_mode(0o600);
+            std::fs::set_permissions(&file, restore).unwrap();
+            // Root (and some capability sets) can still read mode 000. Skip
+            // rather than fail the assertion when the restriction does not stick.
+            if mode == 0 && probe_failed {
+                assert!(
+                    matches!(classified, MetadataRead::Unreadable(_)),
+                    "mode 000 metadata must be Unreadable, not Microvm/Missing: {classified:?}"
+                );
+            }
+        }
     }
 
     #[test]

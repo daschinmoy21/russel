@@ -2,10 +2,11 @@ use super::passthrough::validate_nix_store_source;
 use super::podman_user::{configured_podman_user, resolve_podman_user};
 use super::rootfs::select_nix_tool_store_path;
 use super::runner::{
-    NIX_STORE_MOUNT, is_trusted_container_name, resolve_container_name, rootless_required_error,
+    NIX_STORE_MOUNT, is_trusted_container_name, prepare_managed_volume_dirs,
+    resolve_container_name, rootless_required_error,
 };
 use super::*;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 fn fake_store(base: &Path, hash: &str, bin_name: &str, contents: &[u8]) -> PathBuf {
@@ -229,6 +230,7 @@ fn container_name_rejects_invalid_service_id_in_run_args() {
         memory_mb: 256,
         env: vec![],
         extra_args: vec![],
+        ..Default::default()
     };
     let err = build_run_args(&spec, &container_log_path("evil")).unwrap_err();
     assert!(err.to_string().contains("path separators"));
@@ -250,6 +252,7 @@ fn build_run_args_includes_rootfs_mount_ports_memory_and_labels() {
             ("RUSSEL".into(), "1".into()),
         ],
         extra_args: vec![],
+        ..Default::default()
     };
     let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
     let args = build_run_args(&spec, &log_path).unwrap();
@@ -418,6 +421,7 @@ fn managed_port_appears_after_passthrough_env() {
         memory_mb: 512,
         env: vec![("PORT".into(), "3000".into())],
         extra_args: vec!["-e".into(), "FOO=bar".into()],
+        ..Default::default()
     };
     let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
     let args = build_run_args(&spec, &log_path).unwrap();
@@ -1113,6 +1117,7 @@ fn build_run_args_reasserts_hardening_after_passthrough() {
             "--network".into(),
             "bridge".into(),
         ],
+        ..Default::default()
     };
     let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
     let args = build_run_args(&spec, &log_path).unwrap();
@@ -1344,6 +1349,7 @@ fn build_run_args_inserts_passthrough_before_entrypoint() {
             "--network".into(),
             "bridge".into(),
         ],
+        ..Default::default()
     };
     let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
     let args = build_run_args(&spec, &log_path).unwrap();
@@ -1360,6 +1366,448 @@ fn container_log_path_is_under_service_base_dir() {
     assert_eq!(
         container_log_path("demo"),
         PathBuf::from("/var/lib/russel/demo/container.log")
+    );
+}
+
+#[test]
+fn build_run_args_rejects_comma_in_volume_paths() {
+    let spec = ContainerStartSpec {
+        service_id: "navi".into(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from("/var/lib/russel/navi/rootfs"),
+            entrypoint: PathBuf::from("/bin/navidrome"),
+        },
+        host_port: 4533,
+        guest_port: 4533,
+        memory_mb: 512,
+        volumes: vec![russel_core::volumes::ResolvedVolume {
+            guest: "/data,bind-propagation=rshared".into(),
+            host_path: PathBuf::from("/var/lib/russel/navi/volumes/data"),
+            rw: true,
+            keep: true,
+            managed: true,
+            name: Some("data".into()),
+        }],
+        ..Default::default()
+    };
+    let err = build_run_args(&spec, &PathBuf::from("/tmp/navi.log")).unwrap_err();
+    assert!(err.to_string().contains("comma"), "{err}");
+}
+
+#[test]
+fn build_run_args_rejects_newline_in_volume_guest() {
+    let spec = ContainerStartSpec {
+        service_id: "navi".into(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from("/var/lib/russel/navi/rootfs"),
+            entrypoint: PathBuf::from("/bin/navidrome"),
+        },
+        host_port: 4533,
+        guest_port: 4533,
+        memory_mb: 512,
+        volumes: vec![russel_core::volumes::ResolvedVolume {
+            guest: "/data\nfoo".into(),
+            host_path: PathBuf::from("/var/lib/russel/navi/volumes/data"),
+            rw: true,
+            keep: true,
+            managed: true,
+            name: Some("data".into()),
+        }],
+        ..Default::default()
+    };
+    let err = build_run_args(&spec, &PathBuf::from("/tmp/navi.log")).unwrap_err();
+    assert!(
+        err.to_string().contains("newline") || err.to_string().contains("comma"),
+        "{err}"
+    );
+}
+
+#[test]
+fn build_run_args_adds_rw_volume_and_keeps_rootfs_readonly() {
+    let spec = ContainerStartSpec {
+        service_id: "navi".into(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from("/var/lib/russel/navi/rootfs"),
+            entrypoint: PathBuf::from("/bin/navidrome"),
+        },
+        host_port: 4533,
+        guest_port: 4533,
+        memory_mb: 512,
+        volumes: vec![russel_core::volumes::ResolvedVolume {
+            guest: "/data".into(),
+            host_path: PathBuf::from("/var/lib/russel/navi/volumes/data"),
+            rw: true,
+            keep: true,
+            managed: true,
+            name: Some("data".into()),
+        }],
+        extra_ports: vec![(50300, 50300)],
+        args: vec!["--loglevel".into(), "info".into()],
+        userns_keep_id: true,
+        restart: Some("unless-stopped".into()),
+        ..Default::default()
+    };
+    let args = build_run_args(&spec, &PathBuf::from("/var/lib/russel/navi/container.log")).unwrap();
+    assert!(args.contains(&"--read-only".to_string()));
+    assert!(
+        args.iter()
+            .any(|a| a.contains("destination=/data") && !a.contains("ro=true"))
+    );
+    assert!(args.contains(&"--userns".to_string()));
+    assert!(args.contains(&"keep-id".to_string()));
+    assert!(args.contains(&"--restart".to_string()));
+    assert!(args.contains(&"unless-stopped".to_string()));
+    assert_eq!(args[args.len() - 2], "--loglevel");
+    assert_eq!(args.last().unwrap(), "info");
+    let extra_p = args.iter().any(|a| a.contains("50300:50300"));
+    assert!(extra_p, "expected extra port mapping in {args:?}");
+}
+
+#[test]
+fn prepare_managed_volume_dirs_skips_host_binds_and_keeps_0700() {
+    let tmp = tempfile::tempdir().unwrap();
+    let managed = tmp.path().join("svc/volumes/data");
+    let operator_owned = tmp.path().join("operator-owned");
+    let volumes = vec![
+        russel_core::volumes::ResolvedVolume {
+            guest: "/data".into(),
+            host_path: managed.clone(),
+            rw: true,
+            keep: true,
+            managed: true,
+            name: Some("data".into()),
+        },
+        russel_core::volumes::ResolvedVolume {
+            guest: "/music".into(),
+            host_path: operator_owned.clone(),
+            rw: true,
+            keep: false,
+            managed: false,
+            name: None,
+        },
+    ];
+
+    with_russel_podman_user_env(None, || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(prepare_managed_volume_dirs(&volumes))
+            .unwrap();
+    });
+
+    let meta = std::fs::metadata(&managed).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+    // No podman user resolved: ownership must be left alone.
+    let parent = std::fs::metadata(tmp.path()).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (parent.uid(), parent.gid()));
+    assert!(
+        !operator_owned.exists(),
+        "absolute host bind must not be created or chowned"
+    );
+}
+
+#[test]
+fn prepare_managed_volume_dirs_reports_unknown_podman_user() {
+    let tmp = tempfile::tempdir().unwrap();
+    let managed = tmp.path().join("svc/volumes/data");
+    let volumes = vec![russel_core::volumes::ResolvedVolume {
+        guest: "/data".into(),
+        host_path: managed,
+        rw: true,
+        keep: true,
+        managed: true,
+        name: Some("data".into()),
+    }];
+    let user = "__russel_no_such_podman_user__";
+
+    let err = with_russel_podman_user_env(Some(user), || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(prepare_managed_volume_dirs(&volumes))
+            .unwrap_err()
+    });
+
+    assert!(err.to_string().contains(user), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn cleanup_keeps_named_volume_when_keep_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("svc");
+    let data = base.join("volumes").join("data");
+    let scratch = base.join("volumes").join("scratch");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(data.join("db"), b"keep-me").unwrap();
+    std::fs::write(scratch.join("tmp"), b"gone").unwrap();
+    std::fs::write(base.join("metadata.json"), b"{}").unwrap();
+    std::fs::create_dir_all(base.join("rootfs")).unwrap();
+
+    let volumes = vec![
+        russel_core::volumes::ResolvedVolume {
+            guest: "/data".into(),
+            host_path: data.clone(),
+            rw: true,
+            keep: true,
+            managed: true,
+            name: Some("data".into()),
+        },
+        russel_core::volumes::ResolvedVolume {
+            guest: "/scratch".into(),
+            host_path: scratch.clone(),
+            rw: true,
+            keep: false,
+            managed: true,
+            name: Some("scratch".into()),
+        },
+    ];
+    super::runner::cleanup_service_dir_in(
+        &base,
+        &volumes,
+        russel_core::VolumeDestroyPolicy::FollowFile,
+    )
+    .await
+    .unwrap();
+
+    assert!(data.join("db").exists(), "kept volume data must survive");
+    assert!(!scratch.exists(), "keep=false volume must be deleted");
+    assert!(!base.join("metadata.json").exists());
+    assert!(!base.join("rootfs").exists());
+    assert!(base.join("volumes").exists());
+}
+
+#[tokio::test]
+async fn redeploy_stash_roundtrip_keeps_volume_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("svc");
+    let data = live.join("volumes").join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("db"), b"keep-me").unwrap();
+    std::fs::write(live.join("metadata.json"), b"{}").unwrap();
+
+    super::runner::detach_managed_volumes(&live).await.unwrap();
+    assert!(!data.exists());
+    let stash = super::runner::volumes_stash_path(&live);
+    assert!(stash.join("data").join("db").is_file());
+
+    let bak = tmp.path().join("svc.bak");
+    std::fs::rename(&live, &bak).unwrap();
+    super::runner::attach_managed_volumes(&live).await.unwrap();
+    assert_eq!(
+        std::fs::read(live.join("volumes/data/db")).unwrap(),
+        b"keep-me"
+    );
+    assert!(!stash.exists());
+
+    // Failed deploy left a new tree that also has the volume. Restore must
+    // put the backup's other files back without dropping the data file.
+    std::fs::write(live.join("metadata.json"), b"new").unwrap();
+    super::runner::restore_backed_up_service_dir(&live, &bak)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(live.join("metadata.json")).unwrap(), b"{}");
+    assert_eq!(
+        std::fs::read(live.join("volumes/data/db")).unwrap(),
+        b"keep-me"
+    );
+    assert!(!super::runner::dir_is_kept_volumes_only(&live));
+}
+
+#[tokio::test]
+async fn redeploy_stash_restore_when_stash_and_empty_live_volumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("svc");
+    let bak = tmp.path().join("svc.bak");
+    let stash = super::runner::volumes_stash_path(&live);
+
+    std::fs::create_dir_all(&bak).unwrap();
+    std::fs::write(bak.join("metadata.json"), b"{}").unwrap();
+
+    // Failed attach left empty live/volumes plus a populated stash.
+    std::fs::create_dir_all(live.join("volumes")).unwrap();
+    std::fs::write(live.join("metadata.json"), b"new").unwrap();
+    std::fs::create_dir_all(stash.join("data")).unwrap();
+    std::fs::write(stash.join("data").join("db"), b"keep-me").unwrap();
+
+    super::runner::restore_backed_up_service_dir(&live, &bak)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(live.join("metadata.json")).unwrap(), b"{}");
+    assert_eq!(
+        std::fs::read(live.join("volumes/data/db")).unwrap(),
+        b"keep-me"
+    );
+    assert!(!stash.exists());
+    assert!(!bak.exists());
+}
+
+#[tokio::test]
+async fn redeploy_stash_restore_bails_when_both_have_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("svc");
+    let bak = tmp.path().join("svc.bak");
+    let stash = super::runner::volumes_stash_path(&live);
+
+    std::fs::create_dir_all(&bak).unwrap();
+    std::fs::write(bak.join("metadata.json"), b"old").unwrap();
+    std::fs::create_dir_all(live.join("volumes").join("data")).unwrap();
+    std::fs::write(live.join("volumes/data/db"), b"live").unwrap();
+    std::fs::write(live.join("metadata.json"), b"new").unwrap();
+    std::fs::create_dir_all(stash.join("data")).unwrap();
+    std::fs::write(stash.join("data").join("db"), b"stash").unwrap();
+
+    let err = super::runner::restore_backed_up_service_dir(&live, &bak)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to overwrite"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        std::fs::read(live.join("volumes/data/db")).unwrap(),
+        b"live"
+    );
+    assert_eq!(
+        std::fs::read(stash.join("data").join("db")).unwrap(),
+        b"stash"
+    );
+    assert_eq!(std::fs::read(bak.join("metadata.json")).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn redeploy_stash_detach_noop_when_volumes_already_parked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("svc");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("metadata.json"), b"{}").unwrap();
+    let stash = super::runner::volumes_stash_path(&live);
+    std::fs::create_dir_all(stash.join("data")).unwrap();
+    std::fs::write(stash.join("data").join("db"), b"keep-me").unwrap();
+
+    super::runner::detach_managed_volumes(&live).await.unwrap();
+
+    assert!(!live.join("volumes").exists());
+    assert_eq!(
+        std::fs::read(stash.join("data").join("db")).unwrap(),
+        b"keep-me"
+    );
+    assert_eq!(std::fs::read(live.join("metadata.json")).unwrap(), b"{}");
+}
+
+#[tokio::test]
+async fn promote_keeps_volumes_when_target_dir_remains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stable = tmp.path().join("svc");
+    let generation = tmp.path().join("svc_gdeadbeef");
+    let data = stable.join("volumes").join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("db"), b"keep-me").unwrap();
+    std::fs::write(stable.join("metadata.json"), b"old").unwrap();
+    std::fs::create_dir_all(&generation).unwrap();
+    std::fs::write(generation.join("metadata.json"), b"new").unwrap();
+
+    super::runner::detach_managed_volumes(&stable)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&stable).unwrap();
+    std::fs::rename(&generation, &stable).unwrap();
+    super::runner::attach_managed_volumes(&stable)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(stable.join("metadata.json")).unwrap(), b"new");
+    assert_eq!(
+        std::fs::read(stable.join("volumes/data/db")).unwrap(),
+        b"keep-me"
+    );
+}
+
+#[test]
+fn kept_volumes_only_dir_is_recognized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("svc");
+    std::fs::create_dir_all(base.join("volumes").join("data")).unwrap();
+    assert!(super::runner::dir_is_kept_volumes_only(&base));
+    std::fs::write(base.join("metadata.json"), b"{}").unwrap();
+    assert!(!super::runner::dir_is_kept_volumes_only(&base));
+}
+
+#[test]
+fn kept_volumes_only_dir_is_false_when_read_dir_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope");
+    assert!(!super::runner::dir_is_kept_volumes_only(&missing));
+
+    let file = tmp.path().join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(!super::runner::dir_is_kept_volumes_only(&file));
+}
+
+#[tokio::test]
+async fn cleanup_delete_all_wipes_stale_volume_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("svc");
+    let current = base.join("volumes").join("data");
+    let stale = base.join("volumes").join("old-name");
+    std::fs::create_dir_all(&current).unwrap();
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(current.join("db"), b"x").unwrap();
+    std::fs::write(stale.join("leftover"), b"y").unwrap();
+
+    let volumes = vec![russel_core::volumes::ResolvedVolume {
+        guest: "/data".into(),
+        host_path: current.clone(),
+        rw: true,
+        keep: true,
+        managed: true,
+        name: Some("data".into()),
+    }];
+    super::runner::cleanup_service_dir_in(
+        &base,
+        &volumes,
+        russel_core::VolumeDestroyPolicy::DeleteAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !base.join("volumes").exists(),
+        "DeleteAll must wipe volumes/ including stale dirs"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_refuses_path_outside_volumes_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("svc");
+    let volumes_root = base.join("volumes");
+    std::fs::create_dir_all(&volumes_root).unwrap();
+    let escape = tmp.path().join("outside");
+    std::fs::create_dir_all(&escape).unwrap();
+    std::fs::write(escape.join("secret"), b"nope").unwrap();
+
+    let volumes = vec![russel_core::volumes::ResolvedVolume {
+        guest: "/data".into(),
+        host_path: escape.clone(),
+        rw: true,
+        keep: false,
+        managed: true,
+        name: Some("data".into()),
+    }];
+    let err = super::runner::cleanup_service_dir_in(
+        &base,
+        &volumes,
+        russel_core::VolumeDestroyPolicy::FollowFile,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("escapes volumes root"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        escape.join("secret").exists(),
+        "path outside volumes/ must not be deleted"
     );
 }
 
@@ -1398,6 +1846,7 @@ async fn e2e_podman_container_lifecycle() {
         memory_mb: 128,
         env: vec![("PORT".into(), "8080".into())],
         extra_args: vec![],
+        ..Default::default()
     };
 
     let running = runner.start(&start_spec).await.unwrap();

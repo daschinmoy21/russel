@@ -13,7 +13,7 @@ use russel_core::{
         DeployEvent, DeployRequest, DeployResponse, LogsResponse, PortMapping, ServiceStatus,
         StatusResponse, VmsResponse,
     },
-    config::{Russelfile, merge_env_maps, resolve_runtime, validate_env_map},
+    config::{Russelfile, merge_env_maps, resolve_ingress_host, resolve_runtime, validate_env_map},
 };
 
 use crate::config::{self, Resolved};
@@ -24,10 +24,14 @@ use crate::ui;
 ///
 /// Token handling matches ctrl `normalize_api_token`: trim whitespace; blank → no auth.
 ///
-/// When a token is present and the control-plane URL is plain `http://`:
+/// When a token is present and the control-plane URL uses scheme `http`
+/// (any case — `HTTP://` is cleartext too):
 /// - **non-loopback host** → hard-fail (F-05 / #189) unless `--insecure` or
 ///   `RUSSEL_INSECURE_CLEARTEXT=1|true|yes`
 /// - **loopback host** → one-time stderr warning only
+///
+/// `https` (any case) is allowed. Any other `scheme://` is refused so a
+/// bearer token is not sent on a scheme this client does not treat as TLS.
 ///
 /// Returns an error when the token value cannot be parsed into a valid HTTP
 /// header value (F-47).
@@ -104,14 +108,32 @@ fn insecure_cleartext_allowed() -> bool {
 
 /// Enforce cleartext Bearer policy when a non-empty token will be sent.
 ///
-/// - `https://` → ok
-/// - `http://` + loopback → warn once, ok
-/// - `http://` + non-loopback → error unless insecure escape hatch (then warn once)
+/// Scheme match is case-insensitive (`HTTP:` is cleartext; `HTTPS:` is not).
+/// - no RFC 3986 scheme → ok (unclassified URL)
+/// - `https` → ok
+/// - `http` + loopback → warn once, ok
+/// - `http` + non-loopback → error unless insecure escape hatch (then warn once)
+/// - any other scheme → error
 fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
-    let rest = match control_plane.strip_prefix("http://") {
-        Some(r) => r,
-        None => return Ok(()), // https:// or other schemes
+    let Some((scheme, rest)) = split_url_scheme(control_plane) else {
+        return Ok(());
     };
+    if scheme.eq_ignore_ascii_case("https") {
+        return Ok(());
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Err(anyhow!(
+            "refusing to send RUSSEL_API_TOKEN over non-HTTP(S) scheme `{scheme}`\n\
+             \n\
+             Use HTTPS (terminate TLS at a reverse proxy in front of russel-ctrl — see docs/security-tls.md),\n\
+             or target a loopback URL (e.g. http://127.0.0.1:7878)."
+        ));
+    }
+    // `control_plane_host` splits on `/` first, so `//host` would yield empty.
+    let rest = rest
+        .strip_prefix("//")
+        .or_else(|| rest.strip_prefix('/'))
+        .unwrap_or(rest);
     let host = control_plane_host(rest);
     if is_loopback_host(host) {
         // Warn-only on loopback (local dev still cleartext, but not on-path WAN risk).
@@ -140,6 +162,27 @@ fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
          or target a loopback URL (e.g. http://127.0.0.1:7878),\n\
          or override with --insecure / RUSSEL_INSECURE_CLEARTEXT=1 (not recommended)."
     ))
+}
+
+/// Split on the first `:` after an RFC 3986 scheme token.
+///
+/// Scheme is ALPHA, then ALPHA / DIGIT / "+" / "-" / ".". Rest is whatever
+/// follows the colon (`://` is the authority marker, not the scheme).
+/// Returned as written; callers compare it case-insensitively.
+fn split_url_scheme(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once(':')?;
+    let bytes = scheme.as_bytes();
+    let first = bytes.first()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some((scheme, rest))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -203,12 +246,58 @@ fn control_plane_host(control_plane: &str) -> &str {
     host_port.split(':').next().unwrap_or(host_port)
 }
 
+/// Extract the port from a control-plane URL (`http://host:port` /
+/// `https://host:port/...`). Returns the default `7878` when the URL carries
+/// no explicit port (covers `RUSSEL_CTRL_ADDR` overrides and custom binds).
+fn control_plane_port(control_plane: &str) -> &str {
+    let rest = control_plane
+        .strip_prefix("https://")
+        .or_else(|| control_plane.strip_prefix("http://"))
+        .unwrap_or(control_plane);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    // Bracketed IPv6: [::1]:7878
+    if let Some(after_bracket) = host_port
+        .strip_prefix('[')
+        .and_then(|inside| inside.split_once(']'))
+        .map(|(_, rest)| rest)
+    {
+        return after_bracket
+            .strip_prefix(':')
+            .filter(|p| !p.is_empty())
+            .unwrap_or("7878");
+    }
+    match host_port.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => port,
+        _ => "7878",
+    }
+}
+
 /// Map a reqwest error into a user-friendly message when the control plane is unreachable.
 fn map_control_plane_error(err: reqwest::Error, control_plane: &str) -> anyhow::Error {
     if err.is_connect() {
-        anyhow::anyhow!(
-            "cannot reach control plane at {control_plane} (is russel-ctrl running? restart it, then retry)"
-        )
+        let host = control_plane_host(control_plane);
+        if is_loopback_host(host) {
+            let port = control_plane_port(control_plane);
+            anyhow::anyhow!(
+                "cannot reach control plane at {control_plane}: nothing is listening on this machine.\n\
+                 \n\
+                 Inspect the local service with:\n\
+                   systemctl --user status russel-ctrl\n\
+                   systemctl status russel-ctrl  # system unit / NixOS (services.russel)\n\
+                 If the controller runs on another machine, create a local tunnel with:\n\
+                   ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:{port}:127.0.0.1:{port} <user@host>"
+            )
+        } else {
+            anyhow::anyhow!(
+                "cannot reach control plane at {control_plane}: host cannot be reached.\n\
+                 \n\
+                 Check routing/VPN connectivity and the HTTPS/TLS reverse proxy in front of russel-ctrl."
+            )
+        }
     } else {
         anyhow::Error::from(err)
     }
@@ -217,6 +306,7 @@ fn map_control_plane_error(err: reqwest::Error, control_plane: &str) -> anyhow::
 #[derive(Debug, Parser)]
 #[command(
     name = "russel",
+    version,
     about = "Talk to russel-ctrl: deploy, list, logs, secrets"
 )]
 pub struct Cli {
@@ -320,6 +410,10 @@ pub struct DeployArgs {
     #[arg(long, value_name = "RUNTIME")]
     pub runtime: Option<String>,
 
+    /// Exact Traefik Host() value. Must match Russelfile [ingress].host when set.
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
+
     /// Extra `podman run` arguments (container runtime only). Use `--` before flags if needed.
     #[arg(
         long_help = "Extra arguments forwarded to `podman run` when using container runtime. \
@@ -362,6 +456,12 @@ pub struct LogsArgs {
 pub struct DestroyArgs {
     #[arg(value_name = "ID")]
     pub id: String,
+    /// Keep all managed volume directories on destroy.
+    #[arg(long, conflicts_with = "delete_volumes")]
+    pub keep_volumes: bool,
+    /// Delete all managed volume directories on destroy.
+    #[arg(long, conflicts_with = "keep_volumes")]
+    pub delete_volumes: bool,
 }
 
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
@@ -369,6 +469,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     let repo_url = normalize_repo_arg(&args.repo)?;
     warn_remote_local_path_deploy(control_plane, &repo_url);
     let runtime = resolve_deploy_runtime(&args.repo, &args.config, args.runtime.as_deref())?;
+    let host = resolve_deploy_host(&repo_url, &args.config, args.host.as_deref())?;
     match runtime {
         Some(RuntimeKind::Microvm) if !args.podman_args.is_empty() => {
             anyhow::bail!(
@@ -440,6 +541,7 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             config_path: args.config,
             vm_id: Some(vm_id),
             port,
+            host,
             runtime,
             podman_args: args.podman_args,
             env: cli_env,
@@ -702,6 +804,30 @@ fn resolve_deploy_runtime(
         return Ok(Some(resolved));
     }
     Ok(cli)
+}
+
+fn resolve_deploy_host(
+    repo: &str,
+    config_path: &str,
+    cli_host: Option<&str>,
+) -> Result<Option<String>> {
+    let path = PathBuf::from(repo);
+    if path.exists() {
+        let repo_root = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize local repo path {repo}"))?;
+        let russelfile_path = repo_root.join(config_path);
+        let config = Russelfile::load(&russelfile_path)
+            .with_context(|| format!("failed to load {}", russelfile_path.display()))?;
+        return resolve_ingress_host(
+            config.ingress.as_ref().and_then(|i| i.host.as_deref()),
+            cli_host,
+        );
+    }
+
+    // Remote repositories are resolved by ctrl after cloning, when the
+    // Russelfile is available. Preserve the CLI value for that check.
+    Ok(cli_host.map(str::to_owned))
 }
 
 fn normalize_repo_arg(repo: &str) -> Result<String> {
@@ -1140,8 +1266,8 @@ fn parse_token_input(raw: &str) -> Result<String> {
 }
 
 pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
-    let url = match args.service_id {
-        Some(id) => format!("{control_plane}/vm/{id}/status"),
+    let url = match &args.service_id {
+        Some(id) => service_vm_url(control_plane, id, "/status")?,
         None => format!("{control_plane}/status"),
     };
     let r = http_client(control_plane)?
@@ -1175,7 +1301,7 @@ fn print_status(r: &StatusResponse) {
 
 pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
     let url = match &args.service_id {
-        Some(id) => format!("{control_plane}/vm/{id}/logs"),
+        Some(id) => service_vm_url(control_plane, id, "/logs")?,
         None => format!("{control_plane}/logs"),
     };
     let r = http_client(control_plane)?
@@ -1276,8 +1402,9 @@ pub async fn ps(control_plane: &str) -> Result<()> {
 }
 
 async fn fetch_status_row(control_plane: &str, id: &str) -> Result<StatusResponse> {
+    let url = service_vm_url(control_plane, id, "/status")?;
     http_client(control_plane)?
-        .get(format!("{control_plane}/vm/{id}/status"))
+        .get(url)
         .send()
         .await
         .map_err(|e| map_control_plane_error(e, control_plane))
@@ -1288,8 +1415,9 @@ async fn fetch_status_row(control_plane: &str, id: &str) -> Result<StatusRespons
 }
 
 pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
+    let url = service_vm_url(control_plane, id, "/stop")?;
     let r = http_client(control_plane)?
-        .post(format!("{control_plane}/vm/{id}/stop"))
+        .post(url)
         .send()
         .await
         .map_err(|e| map_control_plane_error(e, control_plane))
@@ -1304,6 +1432,7 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
 }
 
 pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
+    let url = service_vm_url(control_plane, &args.id, "/update")?;
     let wall = Instant::now();
     println!();
     println!("  \x1b[1;36mrussel update\x1b[0m  {}", args.id);
@@ -1321,7 +1450,7 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
 
     let client = http_client(control_plane)?;
     let mut response = client
-        .post(format!("{control_plane}/vm/{}/update", args.id))
+        .post(url)
         .json(&body)
         .send()
         .await
@@ -1445,9 +1574,104 @@ fn handle_deploy_event(
     Ok(())
 }
 
-pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
+/// Reject a service id before it is interpolated into a control-plane path.
+///
+/// Empty, longer than 128 bytes, or any character other than ASCII
+/// alphanumeric, `-`, and `_`. Dots and slashes are rejected so `..` cannot
+/// be resolved by the URL parser into another route. This is the path-safety
+/// half of ctrl `MicrovmRunner::validate_service_id` (ASCII-only; reserved
+/// names are still enforced server-side).
+fn require_service_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("invalid service id: cannot be empty");
+    }
+    if id.len() > 128 {
+        anyhow::bail!("invalid service id: too long (max 128 bytes)");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!(
+            "invalid service id `{id}`: only ASCII letters, digits, '-' and '_' are allowed"
+        );
+    }
+    Ok(())
+}
+
+/// Mirror ctrl `validate_secret_name` (`crates/ctrl/src/secrets.rs`).
+///
+/// Length 1..=64, `[A-Za-z0-9_-]`, must not start with `-` or `.`.
+fn require_secret_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        anyhow::bail!("secret name must be 1..=64 characters");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!("secret name may only contain [A-Za-z0-9_-]");
+    }
+    if name.starts_with('-') || name.starts_with('.') {
+        anyhow::bail!("secret name must not start with '-' or '.'");
+    }
+    Ok(())
+}
+
+/// Percent-encode one URL path segment.
+///
+/// ASCII alphanumeric, `-`, and `_` are unchanged. Callers reject unsafe ids
+/// first; encoding is defense in depth for that remaining charset.
+fn encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for b in segment.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => out.push(b as char),
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// `/vm/{id}{suffix}` after [`require_service_id`]. `suffix` is a trusted
+/// constant (`""`, `/status`, `/stop`, `/logs`, `/update`), not user input.
+fn service_vm_url(base: &str, id: &str, suffix: &str) -> Result<String> {
+    require_service_id(id)?;
+    let id = encode_path_segment(id);
+    Ok(format!("{base}/vm/{id}{suffix}"))
+}
+
+/// `/secrets/{name}` after [`require_secret_name`].
+fn secret_url(base: &str, name: &str) -> Result<String> {
+    require_secret_name(name)?;
+    let name = encode_path_segment(name);
+    Ok(format!("{base}/secrets/{name}"))
+}
+
+fn destroy_url(base: &str, id: &str, keep_volumes: bool, delete_volumes: bool) -> Result<String> {
+    let mut url = service_vm_url(base, id, "")?;
+    if keep_volumes {
+        url.push_str("?keep_volumes=true");
+    } else if delete_volumes {
+        url.push_str("?keep_volumes=false");
+    }
+    Ok(url)
+}
+
+pub async fn destroy_vm(args: &DestroyArgs, control_plane: &str) -> Result<()> {
+    let url = destroy_url(
+        control_plane,
+        &args.id,
+        args.keep_volumes,
+        args.delete_volumes,
+    )?;
     let resp = http_client(control_plane)?
-        .delete(format!("{control_plane}/vm/{id}"))
+        .delete(url)
         .send()
         .await
         .map_err(|e| map_control_plane_error(e, control_plane))?;
@@ -1462,7 +1686,7 @@ pub async fn destroy_vm(id: &str, control_plane: &str) -> Result<()> {
     }
     let r = resp.json::<String>().await?;
     ui::heading("destroy");
-    ui::kv("id", &ui::sanitize(id));
+    ui::kv("id", &ui::sanitize(&args.id));
     ui::kv("result", &ui::sanitize(&r));
     println!();
     Ok(())
@@ -1472,6 +1696,7 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
     match action {
         SecretsCommand::Set { name } => {
             use std::io::Read;
+            let url = secret_url(control_plane, &name)?;
             let mut value = String::new();
             std::io::stdin()
                 .read_to_string(&mut value)
@@ -1487,7 +1712,7 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
                 anyhow::bail!("secret value is empty (read value from stdin)");
             }
             let resp = http_client(control_plane)?
-                .post(format!("{control_plane}/secrets/{name}"))
+                .post(url)
                 .json(&serde_json::json!({ "value": value }))
                 .send()
                 .await
@@ -1527,8 +1752,9 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             println!();
         }
         SecretsCommand::Delete { name } => {
+            let url = secret_url(control_plane, &name)?;
             let resp = http_client(control_plane)?
-                .delete(format!("{control_plane}/secrets/{name}"))
+                .delete(url)
                 .send()
                 .await
                 .map_err(|e| map_control_plane_error(e, control_plane))?;
@@ -1551,6 +1777,85 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn destroy_url_maps_keep_and_delete_volume_flags() {
+        let base = "http://127.0.0.1:7878";
+        assert_eq!(
+            destroy_url(base, "svc", false, false).unwrap(),
+            "http://127.0.0.1:7878/vm/svc"
+        );
+        assert_eq!(
+            destroy_url(base, "svc", true, false).unwrap(),
+            "http://127.0.0.1:7878/vm/svc?keep_volumes=true"
+        );
+        assert_eq!(
+            destroy_url(base, "svc", false, true).unwrap(),
+            "http://127.0.0.1:7878/vm/svc?keep_volumes=false"
+        );
+    }
+
+    #[test]
+    fn destroy_url_rejects_path_escape_service_ids() {
+        let base = "http://127.0.0.1:7878";
+        let traversal = destroy_url(base, "../secrets/token", false, false).unwrap_err();
+        assert!(
+            traversal.to_string().contains("invalid service id"),
+            "got: {traversal}"
+        );
+        assert!(destroy_url(base, "foo/bar", false, false).is_err());
+        assert!(require_service_id("../secrets/token").is_err());
+        assert!(require_service_id("foo/bar").is_err());
+        assert!(require_service_id("foo/../../secrets/token").is_err());
+        assert!(require_service_id("").is_err());
+        assert!(require_service_id(&"a".repeat(129)).is_err());
+        assert!(require_service_id("has.dot").is_err());
+        // Service ids are directory names and URL path segments; keep ASCII.
+        assert!(require_service_id("café").is_err());
+        assert!(require_service_id("svc.with.dot").is_err());
+    }
+
+    #[test]
+    fn destroy_url_accepts_normal_service_id() {
+        let url = destroy_url("http://127.0.0.1:7878", "my-svc_1", false, false).unwrap();
+        assert_eq!(url, "http://127.0.0.1:7878/vm/my-svc_1");
+        assert!(url.split('?').next().unwrap().ends_with("/vm/my-svc_1"));
+        require_service_id("my-svc_1").unwrap();
+        assert_eq!(encode_path_segment("my-svc_1"), "my-svc_1");
+        // Unsafe bytes are encoded, but callers reject them before building a URL.
+        assert_eq!(
+            encode_path_segment("../secrets/token"),
+            "%2E%2E%2Fsecrets%2Ftoken"
+        );
+    }
+
+    #[test]
+    fn require_secret_name_rejects_path_escape() {
+        assert!(require_secret_name("../secrets/token").is_err());
+        assert!(require_secret_name("foo/bar").is_err());
+        assert!(require_secret_name("-leading").is_err());
+        assert!(require_secret_name("").is_err());
+        require_secret_name("good_name-1").unwrap();
+        let url = secret_url("http://127.0.0.1:7878", "good_name-1").unwrap();
+        assert_eq!(url, "http://127.0.0.1:7878/secrets/good_name-1");
+    }
+
+    #[test]
+    fn destroy_keep_and_delete_volumes_conflict_in_clap() {
+        let err = Cli::try_parse_from([
+            "russel",
+            "destroy",
+            "svc",
+            "--keep-volumes",
+            "--delete-volumes",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--keep-volumes") && msg.contains("--delete-volumes"),
+            "unexpected err: {msg}"
+        );
+    }
 
     #[test]
     fn deploy_status_success_only_deployed() {
@@ -1739,6 +2044,86 @@ mod tests {
     }
 
     #[test]
+    fn deploy_parses_host_flag() {
+        let cli = Cli::try_parse_from([
+            "russel",
+            "deploy",
+            "https://github.com/org/app.git",
+            "--host",
+            "ABC.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Deploy(args) => assert_eq!(args.host.as_deref(), Some("ABC.com")),
+            _ => panic!("expected deploy subcommand"),
+        }
+    }
+
+    #[test]
+    fn local_deploy_host_mismatch_uses_canonical_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Russelfile.toml"),
+            r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+
+[ingress]
+host = "app.example.com"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_deploy_host(
+            tmp.path().to_str().unwrap(),
+            "Russelfile.toml",
+            Some("other.example.com"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CLI --host other.example.com does not match Russelfile ingress.host (app.example.com)"
+        );
+    }
+
+    #[test]
+    fn local_deploy_host_without_file_host_uses_canonical_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Russelfile.toml"),
+            r#"
+[service]
+name = "app"
+source = "."
+port = 3000
+memory = "256mb"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_deploy_host(
+            tmp.path().to_str().unwrap(),
+            "Russelfile.toml",
+            Some("app.example.com"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CLI --host app.example.com does not match Russelfile (no [ingress].host)"
+        );
+    }
+
+    #[test]
+    fn version_flag_is_display_version() {
+        let err = Cli::try_parse_from(["russel", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains("0.1.0"));
+    }
+
+    #[test]
     fn ps_list_vms_aliases_parse() {
         for name in ["ps", "list", "vms"] {
             let cli = Cli::try_parse_from(["russel", name]).unwrap();
@@ -1803,7 +2188,7 @@ mod tests {
             Command::Init(args) => {
                 assert_eq!(args.path, PathBuf::from("./svc"));
                 assert_eq!(args.name.as_deref(), Some("svc"));
-                assert_eq!(args.runtime, RuntimeKind::Container);
+                assert_eq!(args.runtime, Some(RuntimeKind::Container));
                 assert!(args.with_flake);
             }
             _ => panic!("expected init subcommand"),
@@ -2079,6 +2464,52 @@ mod tests {
     }
 
     #[test]
+    fn cleartext_policy_scheme_is_case_insensitive() {
+        // Scheme compare is case-insensitive. Other schemes fail closed.
+        // RFC 3986 scheme is `scheme:`; `://` is not required to classify.
+        with_cleartext_env(None, false, || {
+            let err = ensure_cleartext_token_ok("HTTP://203.0.113.5:7878").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("refusing to send RUSSEL_API_TOKEN"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("203.0.113.5"), "got: {msg}");
+
+            ensure_cleartext_token_ok("HTTPS://example.com").unwrap();
+            ensure_cleartext_token_ok("Http://127.0.0.1:7878").unwrap();
+
+            let err = ensure_cleartext_token_ok("http:/203.0.113.5").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("refusing to send RUSSEL_API_TOKEN"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("203.0.113.5"), "got: {msg}");
+
+            let err = ensure_cleartext_token_ok("http:203.0.113.5").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("refusing to send RUSSEL_API_TOKEN"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("203.0.113.5"), "got: {msg}");
+
+            for url in [
+                "file:///tmp/sock",
+                "file:/tmp/sock",
+                "unix:///tmp/russel.sock",
+            ] {
+                let err = ensure_cleartext_token_ok(url).unwrap_err();
+                assert!(
+                    err.to_string().contains("non-HTTP(S) scheme"),
+                    "{url}: {err}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn cleartext_policy_loopback_http_ok() {
         // Loopback is warn-only (should not error).
         with_cleartext_env(None, false, || {
@@ -2134,21 +2565,127 @@ mod tests {
         assert!(matches!(cli.command, Command::Ps));
     }
 
-    #[tokio::test]
-    async fn map_control_plane_error_connect() {
-        // Trigger a real connect error by hitting an unroutable port.
-        let err = reqwest::Client::new()
-            .get("http://127.0.0.1:1")
+    async fn connect_error_to_closed_ephemeral_loopback() -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
             .send()
             .await
             .unwrap_err();
-        let mapped = map_control_plane_error(err, "http://127.0.0.1:7878");
-        let msg = mapped.to_string();
-        assert!(msg.contains("cannot reach control plane at"), "got: {msg}");
-        assert!(msg.contains("is russel-ctrl running?"), "got: {msg}");
+        assert!(err.is_connect(), "expected a connect error, got: {err}");
+        err
     }
 
-    // Non-connect branch is just Error::from(err) — nothing worth unit-testing.
+    #[test]
+    fn control_plane_port_parses_urls() {
+        assert_eq!(control_plane_port("http://127.0.0.1:7878"), "7878");
+        assert_eq!(control_plane_port("http://127.0.0.1:9999"), "9999");
+        assert_eq!(
+            control_plane_port("https://ctrl.example.com:8443/api"),
+            "8443"
+        );
+        assert_eq!(control_plane_port("http://[::1]:7878"), "7878");
+        assert_eq!(control_plane_port("http://[::1]:9999/vms"), "9999");
+        // No explicit port (default bind, bare host, userinfo) → default.
+        assert_eq!(control_plane_port("http://127.0.0.1"), "7878");
+        assert_eq!(control_plane_port("http://localhost/vms"), "7878");
+        assert_eq!(
+            control_plane_port("http://user@ctrl.example.com/vms"),
+            "7878"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_control_plane_error_connect_loopback() {
+        let err = connect_error_to_closed_ephemeral_loopback().await;
+        let mapped = map_control_plane_error(err, "http://127.0.0.1:7878");
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains("nothing is listening on this machine"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("systemctl --user status russel-ctrl"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("systemctl status russel-ctrl"), "got: {msg}");
+        assert!(
+            msg.contains(
+                "ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:7878:127.0.0.1:7878 <user@host>"
+            ),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("routing/VPN"), "got: {msg}");
+        assert!(!msg.contains("HTTPS/TLS reverse proxy"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn map_control_plane_error_connect_loopback_custom_port() {
+        let err = connect_error_to_closed_ephemeral_loopback().await;
+        let mapped = map_control_plane_error(err, "http://127.0.0.1:9999");
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains(
+                "ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:9999:127.0.0.1:9999 <user@host>"
+            ),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("127.0.0.1:7878"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn map_control_plane_error_connect_remote() {
+        let err = connect_error_to_closed_ephemeral_loopback().await;
+        let mapped = map_control_plane_error(err, "https://ctrl.example.com:7878");
+        let msg = mapped.to_string();
+        assert!(msg.contains("host cannot be reached"), "got: {msg}");
+        assert!(msg.contains("routing/VPN"), "got: {msg}");
+        assert!(msg.contains("HTTPS/TLS reverse proxy"), "got: {msg}");
+        assert!(
+            !msg.contains("systemctl --user status russel-ctrl"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("ssh -f -N"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn map_control_plane_error_preserves_non_connect_error() {
+        let err = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get("not a URL")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is_connect(),
+            "expected a non-connect error, got: {err}"
+        );
+
+        let original = err.to_string();
+        let mapped = map_control_plane_error(err, "http://127.0.0.1:7878");
+        let msg = mapped.to_string();
+        assert_eq!(msg, original);
+        for guidance in [
+            "nothing is listening on this machine",
+            "systemctl --user status russel-ctrl",
+            "ssh -f -N",
+            "host cannot be reached",
+            "routing/VPN",
+            "HTTPS/TLS reverse proxy",
+        ] {
+            assert!(
+                !msg.contains(guidance),
+                "unexpected topology guidance: {msg}"
+            );
+        }
+    }
 
     #[test]
     fn deploy_parses_mount_style_podman_args() {

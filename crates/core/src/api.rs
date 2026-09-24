@@ -10,6 +10,9 @@ pub struct DeployRequest {
     pub config_path: String,
     pub vm_id: Option<String>,
     pub port: Option<PortMapping>,
+    /// Exact Traefik Host() value. Match-or-omit against Russelfile `ingress.host`.
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     pub runtime: Option<RuntimeKind>,
     /// Extra `podman run` arguments (container runtime only).
@@ -239,6 +242,8 @@ pub struct StatusResponse {
     pub host_port: Option<u16>,
     #[serde(default)]
     pub guest_port: Option<u16>,
+    #[serde(default)]
+    pub route_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -527,6 +532,7 @@ mod tests {
                 host: 8080,
                 guest: 3000,
             }),
+            host: None,
             runtime: Some(RuntimeKind::Container),
             podman_args: vec!["-v".into(), "/data:/data:ro".into()],
             env: HashMap::new(),
@@ -555,6 +561,7 @@ mod tests {
             config_path: "Russelfile.toml".into(),
             vm_id: None,
             port: None,
+            host: None,
             runtime: None,
             podman_args: vec![],
             env,
@@ -580,6 +587,7 @@ mod tests {
             config_path: "Russelfile.toml".into(),
             vm_id: None,
             port: None,
+            host: None,
             runtime: Some(RuntimeKind::Container),
             podman_args: vec![
                 "--mount".into(),
@@ -622,6 +630,7 @@ mod tests {
             runtime: None,
             host_port: None,
             guest_port: None,
+            route_host: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -639,12 +648,28 @@ mod tests {
             runtime: Some(RuntimeKind::Container),
             host_port: Some(3100),
             guest_port: Some(3000),
+            route_host: Some("api.example.com".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"runtime\":\"container\""));
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.runtime, Some(RuntimeKind::Container));
         assert_eq!(parsed.host_port, Some(3100));
+        assert_eq!(parsed.route_host.as_deref(), Some("api.example.com"));
+    }
+
+    #[test]
+    fn status_response_route_host_defaults_for_legacy_json() {
+        let parsed: StatusResponse = serde_json::from_str(
+            r#"{
+                "service_id":"api",
+                "status":"deployed",
+                "vm_state":"running",
+                "uptime_seconds":42
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.route_host, None);
     }
 
     #[test]

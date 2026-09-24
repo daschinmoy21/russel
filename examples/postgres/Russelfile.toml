@@ -1,0 +1,19 @@
+# postgres — PostgreSQL from nixpkgs. Russel does not run initdb.
+# Point `host` at a directory you already initialized (initdb -D ...),
+# and list that prefix in RUSSEL_VOLUME_ROOTS (e.g. /srv/russel).
+# A committed flake.nix would win over `package`.
+
+[service]
+name = "postgres"
+source = "."
+port = 5432
+memory = "512mb"
+type = "container"
+package = "postgresql"
+bin = "postgres"
+args = ["-D", "/var/lib/postgresql/data"]
+
+[[volumes]]
+host = "/srv/russel/postgres-data"
+guest = "/var/lib/postgresql/data"
+rw = true

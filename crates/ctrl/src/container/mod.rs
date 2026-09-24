@@ -15,8 +15,10 @@ pub use rootfs::{
     validate_entrypoint,
 };
 pub use runner::{
-    ContainerRunner, ContainerStartSpec, RunningContainer, build_run_args, container_log_path,
-    is_trusted_container_name, parse_podman_rootless,
+    ContainerRunner, ContainerStartSpec, RunningContainer, attach_managed_volumes, build_run_args,
+    cleanup_service_dir, cleanup_service_dir_in, container_log_path, destroy_preserving_volumes,
+    destroy_with_policy_for, detach_managed_volumes, dir_is_kept_volumes_only,
+    is_trusted_container_name, parse_podman_rootless, restore_backed_up_service_dir,
 };
 
 #[cfg(test)]

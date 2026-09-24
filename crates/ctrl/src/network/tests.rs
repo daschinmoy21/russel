@@ -254,6 +254,16 @@ fn port_allocator_rejects_port_zero() {
     assert!(err.to_string().contains("port 0"), "unexpected err: {err}");
 }
 
+#[test]
+fn port_allocator_rejects_privileged_ports_with_ingress_message() {
+    let _g = super::port_test_lock();
+    let err = PortAllocator::reserve("privileged-svc", 80).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ingress.port 80 is privileged (< 1024); Traefik owns 80/443"
+    );
+}
+
 /// Fixed ports in 40xx — outside the typical ephemeral bind(0) range used by
 /// other unit tests (agent mock servers, etc.), and serialized via port_test_lock.
 const HOLD_TEST_PORT: u16 = 4010;
@@ -420,14 +430,19 @@ fn pkill_socat_pattern_anchored() {
 
 #[test]
 fn pkill_virtiofsd_pattern_no_prefix_collision() {
-    // The virtiofsd pattern uses "russel/{id}/" with trailing slash
-    // which acts as a natural boundary. Verify.
-    let pat_needle = "russel/foo/";
-    let cmdline_foo = "/var/lib/russel/foo/virtiofs.sock";
-    let cmdline_foobar = "/var/lib/russel/foobar/virtiofs.sock";
-    assert!(cmdline_foo.contains(pat_needle), "foo should match itself");
+    // virtiofsd stop uses the service dir with a trailing slash as a boundary.
+    let pat_needle = format!("{}/", russel_core::paths::service_dir("foo").display());
+    let cmdline_foo = format!(
+        "{}/virtiofs.sock",
+        russel_core::paths::service_dir("foo").display()
+    );
+    let cmdline_foobar = format!(
+        "{}/virtiofs.sock",
+        russel_core::paths::service_dir("foobar").display()
+    );
+    assert!(cmdline_foo.contains(&pat_needle), "foo should match itself");
     assert!(
-        !cmdline_foobar.contains(pat_needle),
+        !cmdline_foobar.contains(&pat_needle),
         "foobar should NOT match foo pattern"
     );
 }
@@ -474,6 +489,41 @@ fn port_allocator_claim_existing_registers_port() {
     PortAllocator::release("claimed-svc");
     PortAllocator::claim_existing("other-svc", 9000).unwrap();
     PortAllocator::release("other-svc");
+}
+
+#[test]
+fn release_service_does_not_collide_with_sibling_underscore_x_ids() {
+    let _g = super::port_test_lock();
+    // Old key form `{id}__xN` collided with a valid sibling service id.
+    // New form uses `::`, which validate_service_id rejects.
+    let primary = "foo";
+    let sibling = "foo__x0";
+    let extra = russel_core::volumes::extra_port_key(primary, 0);
+    PortAllocator::release(primary);
+    PortAllocator::release(sibling);
+    PortAllocator::release(&extra);
+
+    PortAllocator::claim_existing(primary, 9101).unwrap();
+    PortAllocator::claim_existing(&extra, 9102).unwrap();
+    PortAllocator::claim_existing(sibling, 9103).unwrap();
+
+    PortAllocator::release_service(primary);
+
+    assert!(
+        PortAllocator::allocated_port(primary).is_none(),
+        "primary must be released"
+    );
+    assert!(
+        PortAllocator::allocated_port(&extra).is_none(),
+        "extra key under primary must be released"
+    );
+    assert_eq!(
+        PortAllocator::allocated_port(sibling),
+        Some(9103),
+        "sibling service foo__x0 must survive release_service(foo)"
+    );
+
+    PortAllocator::release(sibling);
 }
 
 #[test]

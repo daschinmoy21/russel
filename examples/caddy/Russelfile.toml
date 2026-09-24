@@ -1,0 +1,17 @@
+# caddy: caddy from nixpkgs via `service.package`, no flake.nix needed.
+# A committed flake.nix would win over `package`.
+# Stateless `caddy file-server` on :8080. No config file and no data volume.
+# `--listen :8080` binds all interfaces, required for ordinary Podman/Docker
+# `-p` (pasta targets the container IP, not guest loopback).
+# Serving from a host Caddyfile would need an absolute `host =` volume bind
+# under RUSSEL_VOLUME_ROOTS, so this demo stays stateless.
+
+[service]
+name = "caddy"
+source = "."
+port = 8080
+memory = "128mb"
+type = "container"
+package = "caddy"
+bin = "caddy"
+args = ["file-server", "--listen", ":8080"]

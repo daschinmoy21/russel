@@ -7,6 +7,13 @@ use super::spec::service_fs_mounts;
 use crate::network::{PortAllocator, lookup_subnet, release_subnet, subnet_for};
 use std::path::{Path, PathBuf};
 
+fn service_dir_pkill_needle(service_id: &str) -> String {
+    escape_pkill_literal(&format!(
+        "{}/",
+        russel_core::paths::service_dir(service_id).display()
+    ))
+}
+
 #[test]
 fn stop_tap_prefers_metadata_over_registry() {
     crate::network::test_with_empty_registry(|| {
@@ -44,7 +51,7 @@ fn stop_tap_uses_registry_when_metadata_absent() {
         let pattern = cloud_hypervisor_stop_pattern(svc, Some(&leased.tap_id));
         assert!(pattern.contains(&format!("tap={}", leased.tap_id)));
         assert!(
-            !pattern.contains(&format!("russel/{svc}/")),
+            !pattern.contains(&service_dir_pkill_needle(svc)),
             "TAP path should not use service-path marker"
         );
         release_subnet(svc);
@@ -60,7 +67,7 @@ fn stop_pattern_falls_back_to_service_path_without_identity() {
 
         let pattern = cloud_hypervisor_stop_pattern(svc, None);
         assert!(
-            pattern.contains(&format!("russel/{svc}/")),
+            pattern.contains(&service_dir_pkill_needle(svc)),
             "expected service-path marker: {pattern}"
         );
         assert!(
@@ -79,12 +86,14 @@ fn cloud_hypervisor_stop_pattern_escapes_service_id_metacharacters() {
     assert_eq!(escaped, r"svc\.a\*b\|c");
 
     let pattern = cloud_hypervisor_stop_pattern(evil, None);
+    let escaped_path = service_dir_pkill_needle(evil);
     assert!(
-        pattern.contains(r"russel/svc\.a\*b\|c/"),
+        pattern.contains(&escaped_path),
         "expected escaped service path in pattern: {pattern}"
     );
+    let raw_path = format!("{}/", russel_core::paths::service_dir(evil).display());
     assert!(
-        !pattern.contains("russel/svc.a*b|c/"),
+        !pattern.contains(&raw_path),
         "raw metacharacters must not appear unescaped: {pattern}"
     );
 
@@ -109,14 +118,14 @@ fn stop_pattern_does_not_select_other_service_identity() {
 
         // Must not match B's TAP or B's service path.
         assert!(!pattern_a.contains(&lease_b.tap_id));
-        assert!(!pattern_a.contains(&format!("russel/{svc_b}/")));
-        assert!(pattern_a.contains(&format!("russel/{svc_a}/")));
+        assert!(!pattern_a.contains(&service_dir_pkill_needle(svc_b)));
+        assert!(pattern_a.contains(&service_dir_pkill_needle(svc_a)));
 
         // Service B with its own TAP must not match A's path either.
         let pattern_b = cloud_hypervisor_stop_pattern(svc_b, Some(&lease_b.tap_id));
         assert!(pattern_b.contains(&format!("tap={}", lease_b.tap_id)));
-        assert!(!pattern_b.contains(&format!("russel/{svc_a}/")));
-        assert!(!pattern_b.contains(&format!("russel/{svc_b}/")));
+        assert!(!pattern_b.contains(&service_dir_pkill_needle(svc_a)));
+        assert!(!pattern_b.contains(&service_dir_pkill_needle(svc_b)));
 
         release_subnet(svc_a);
         release_subnet(svc_b);
@@ -129,6 +138,7 @@ fn validate_service_id_accepts_normal_ids() {
     MicrovmRunner::validate_service_id("basic-http-tester").unwrap();
     MicrovmRunner::validate_service_id("svc_01").unwrap();
     MicrovmRunner::validate_service_id("pooltpl").unwrap();
+    MicrovmRunner::validate_service_id("my-svc_1").unwrap();
 }
 
 #[test]
@@ -157,6 +167,18 @@ fn validate_service_id_rejects_empty_and_path_chars() {
     assert!(MicrovmRunner::validate_service_id("../etc").is_err());
     assert!(MicrovmRunner::validate_service_id("a/b").is_err());
     assert!(MicrovmRunner::validate_service_id("a\\b").is_err());
+}
+
+#[test]
+fn validate_service_id_rejects_unicode_dots_and_slashes() {
+    MicrovmRunner::validate_service_id("my-svc_1").unwrap();
+    let cafe = MicrovmRunner::validate_service_id("café").unwrap_err();
+    assert!(
+        cafe.to_string().contains("ASCII"),
+        "Unicode letters must fail the ASCII charset check, got: {cafe}"
+    );
+    assert!(MicrovmRunner::validate_service_id("svc.with.dot").is_err());
+    assert!(MicrovmRunner::validate_service_id("foo/bar").is_err());
 }
 
 #[test]
@@ -393,31 +415,34 @@ fn network_alloc_ignores_preferred_key_owned_by_other_service() {
 /// Covers the contract that TAP teardown issues must not permanently hold
 /// inventory (release is unconditional after stop/TAP attempts), including
 /// dropping any net-03 `TcpListener` hold so the OS port is bindable again.
-#[tokio::test]
-async fn destroy_releases_port_and_subnet_with_partial_state() {
+#[test]
+fn destroy_releases_port_and_subnet_with_partial_state() {
     let svc = "destroy-partial-lease-svc";
-    // Unique free port under locks (not across .await — clippy await_holding_lock).
-    // Avoids racing a fixed port with parallel tests after destroy.
-    let port = {
-        let _subnet = crate::network::subnet_test_lock();
-        let _port = crate::network::port_test_lock();
-        crate::network::test_clear_subnet_registry();
-        PortAllocator::release(svc);
-        let _ = subnet_for(svc).unwrap();
-        let port = PortAllocator.next(svc).expect("allocate free port");
-        assert!(lookup_subnet(svc).is_some(), "precondition: subnet leased");
-        assert_eq!(PortAllocator::allocated_port(svc), Some(port));
-        assert!(
-            PortAllocator::has_hold(svc),
-            "precondition: next must open a hold listener"
-        );
-        port
-    };
+    // Hold both locks through destroy and cleanup so setup, release, and the
+    // final registry/port assertions form one isolated transaction.
+    let _port = crate::network::port_test_lock();
+    let _subnet = crate::network::subnet_test_lock();
+    crate::network::test_clear_subnet_registry();
+    PortAllocator::release(svc);
+    let _ = subnet_for(svc).unwrap();
+    let port = PortAllocator.next(svc).expect("allocate free port");
+    assert!(lookup_subnet(svc).is_some(), "precondition: subnet leased");
+    assert_eq!(PortAllocator::allocated_port(svc), Some(port));
+    assert!(
+        PortAllocator::has_hold(svc),
+        "precondition: next must open a hold listener"
+    );
+
+    // Use a local runtime so the test locks can stay held without an `.await`.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
 
     // No metadata under /var/lib/russel — stop is a no-op; TAP teardown targets
     // the registry lease and treats a missing device as success (or records a
     // teardown error). Either way, inventory must be free afterward.
-    let result = MicrovmRunner::new().destroy(svc).await;
+    let result = runtime.block_on(MicrovmRunner::new().destroy(svc));
     // Prefer Ok when only inventory existed; tolerate partial-failure Err so
     // the assertion below still checks the inventory contract.
     if let Err(e) = &result {
@@ -428,26 +453,73 @@ async fn destroy_releases_port_and_subnet_with_partial_state() {
         );
     }
 
-    {
-        let _subnet = crate::network::subnet_test_lock();
-        let _port = crate::network::port_test_lock();
-        assert!(
-            lookup_subnet(svc).is_none(),
-            "subnet must be released after destroy (partial runtime state)"
-        );
-        assert!(
-            PortAllocator::allocated_port(svc).is_none(),
-            "port allocation must be cleared after destroy"
-        );
-        assert!(
-            !PortAllocator::has_hold(svc),
-            "port hold TcpListener must be dropped after destroy so the OS port is free"
-        );
-        // Re-claim proves registry + OS bind are free for a later deploy.
-        PortAllocator::reserve(svc, port)
-            .expect("port must be free after destroy so a later deploy can claim it");
-        PortAllocator::release(svc);
-        release_subnet(svc);
-        crate::network::test_clear_subnet_registry();
+    assert!(
+        lookup_subnet(svc).is_none(),
+        "subnet must be released after destroy (partial runtime state)"
+    );
+    assert!(
+        PortAllocator::allocated_port(svc).is_none(),
+        "port allocation must be cleared after destroy"
+    );
+    assert!(
+        !PortAllocator::has_hold(svc),
+        "port hold TcpListener must be dropped after destroy so the OS port is free"
+    );
+    // Re-claim proves registry + OS bind are free for a later deploy.
+    PortAllocator::reserve(svc, port)
+        .expect("port must be free after destroy so a later deploy can claim it");
+    PortAllocator::release(svc);
+    release_subnet(svc);
+    crate::network::test_clear_subnet_registry();
+}
+
+/// Restore `RUSSEL_KERNEL_POOL` / `RUSSEL_KERNEL_PATH` on every exit path.
+/// No other test in this binary reads or writes these two variables, so the
+/// process-global mutation stays isolated from the parallel test harness.
+struct KernelEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl Drop for KernelEnvRestore {
+    fn drop(&mut self) {
+        // SAFETY: only this test mutates these variables; exclusive until drop.
+        for (name, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
+}
+
+/// A kernel placed in the pool (RUSSEL_KERNEL_POOL) resolves with
+/// drivers_builtin=true before any flake/nix build is attempted.
+#[test]
+fn ensure_kernel_resolves_kernel_pool() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kernel = dir.path().join("bzImage");
+    std::fs::write(&kernel, b"fake bzImage").expect("write pool kernel");
+
+    let _restore = KernelEnvRestore(vec![
+        ("RUSSEL_KERNEL_POOL", std::env::var_os("RUSSEL_KERNEL_POOL")),
+        ("RUSSEL_KERNEL_PATH", std::env::var_os("RUSSEL_KERNEL_PATH")),
+    ]);
+    // SAFETY: only this test mutates these variables; values restored on drop.
+    unsafe {
+        std::env::remove_var("RUSSEL_KERNEL_PATH");
+        std::env::set_var("RUSSEL_KERNEL_POOL", &kernel);
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let info = runtime
+        .block_on(MicrovmRunner::new().ensure_kernel())
+        .expect("pool kernel must resolve");
+    assert_eq!(info.path, kernel);
+    assert!(
+        info.drivers_builtin,
+        "pool kernel must be treated as drivers_builtin"
+    );
 }

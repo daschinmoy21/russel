@@ -33,8 +33,13 @@ use crate::{
 };
 
 /// Pool state directories (under `/var/lib/russel/_pool/`).
-const POOL_BASE: &str = "/var/lib/russel/_pool";
-const GOLDEN_DIR: &str = "/var/lib/russel/_pool/golden";
+fn pool_base() -> std::path::PathBuf {
+    russel_core::paths::data_root().join("_pool")
+}
+
+fn golden_dir() -> std::path::PathBuf {
+    pool_base().join("golden")
+}
 
 /// Internal service_id used for the template VM during prepare.
 /// Must pass `validate_service_id` (alphanumeric + dash + underscore only).
@@ -133,7 +138,7 @@ impl WarmPool {
 
         // 3. Create template TAP + config dir.
         let alloc = network::subnet_for(POOL_TEMPLATE_ID)?;
-        let sock_dir = format!("{POOL_BASE}/template");
+        let sock_dir = pool_base().join("template").display().to_string();
         std::fs::create_dir_all(&sock_dir)?;
 
         let cfg_dir = format!("{sock_dir}/cfg");
@@ -202,14 +207,14 @@ impl WarmPool {
         tracing::info!("template VM agent ready — pausing for snapshot");
 
         // 7. Pause + snapshot.
-        std::fs::create_dir_all(GOLDEN_DIR)?;
+        std::fs::create_dir_all(golden_dir())?;
 
         ch_api::vm_pause(&api_socket).await?;
 
-        let snapshot_url = format!("file://{GOLDEN_DIR}");
+        let snapshot_url = format!("file://{}", golden_dir().display());
         ch_api::vm_snapshot(&api_socket, &snapshot_url).await?;
 
-        tracing::info!("warm pool snapshot saved to {GOLDEN_DIR}");
+        tracing::info!("warm pool snapshot saved to {}", golden_dir().display());
 
         // 8. Tear down template cleanly.
         Self::cleanup_template(&alloc, &sock_dir, vm_child, children).await;
@@ -339,7 +344,9 @@ impl WarmPool {
         cpus_boot: u8,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
-        let sock_dir = format!("/var/lib/russel/{service_id}");
+        let sock_dir = russel_core::paths::service_dir(service_id)
+            .display()
+            .to_string();
         std::fs::create_dir_all(&sock_dir)?;
         let scratch_dir = PathBuf::from(format!("{sock_dir}/scratch"));
         ensure_private_dir(&scratch_dir)?;
@@ -379,7 +386,9 @@ impl WarmPool {
         // (or another restore) cannot race the golden snapshot being read.
         let _lock = self.restore_mutex.lock().await;
 
-        let sock_dir = format!("/var/lib/russel/{service_id}");
+        let sock_dir = russel_core::paths::service_dir(service_id)
+            .display()
+            .to_string();
         std::fs::create_dir_all(&sock_dir)?;
 
         let restore_dir = format!("{sock_dir}/restore");
@@ -392,7 +401,7 @@ impl WarmPool {
 
         // Symlink memory-ranges and state.json (read-only, shareable).
         for file in &["memory-ranges", "state.json"] {
-            let src = format!("{GOLDEN_DIR}/{file}");
+            let src = golden_dir().join(file);
             let dst = format!("{restore_dir}/{file}");
             if Path::new(&src).exists() {
                 std::os::unix::fs::symlink(&src, &dst)?;
@@ -402,7 +411,7 @@ impl WarmPool {
         }
 
         // Copy and patch config.json for this service.
-        let golden_config = format!("{GOLDEN_DIR}/config.json");
+        let golden_config = golden_dir().join("config.json");
         let restore_config = format!("{restore_dir}/config.json");
 
         if !Path::new(&golden_config).exists() {
@@ -667,9 +676,15 @@ mod tests {
     #[test]
     fn golden_dir_layout_is_stable() {
         // The pool + golden snapshot live under a reserved `_pool` service dir;
-        // a template id must pass `validate_service_id`.
-        assert_eq!(POOL_BASE, "/var/lib/russel/_pool");
-        assert_eq!(GOLDEN_DIR, "/var/lib/russel/_pool/golden");
+        // a template id must pass `validate_service_id`. Assert the default
+        // layout without reading live RUSSEL_DATA_DIR.
+        let root = russel_core::paths::data_root_from(None);
+        let expected = PathBuf::from(russel_core::paths::DEFAULT_DATA_ROOT);
+        assert_eq!(root.join("_pool"), expected.join("_pool"));
+        assert_eq!(
+            root.join("_pool").join("golden"),
+            expected.join("_pool").join("golden")
+        );
         assert_eq!(POOL_TEMPLATE_ID, "pooltpl");
     }
 

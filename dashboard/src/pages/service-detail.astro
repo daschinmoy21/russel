@@ -40,6 +40,10 @@ import OfflineState from '../components/OfflineState.astro';
             <span class="stat-value mono" id="statPorts">—</span>
           </div>
           <div class="stat-item">
+            <span class="stat-label">Route (Traefik Host)</span>
+            <span class="stat-value mono" id="statRoute">—</span>
+          </div>
+          <div class="stat-item">
             <span class="stat-label">VM State</span>
             <span class="stat-value mono" id="statVmState">—</span>
           </div>
@@ -137,8 +141,8 @@ import OfflineState from '../components/OfflineState.astro';
 </Layout>
 
 <script>
-  import { api, escapeHtml, formatUptime, isServiceRunning } from '../lib/api';
-  import { renderOfflineState } from '../lib/offline_state';
+  import { api, escapeHtml, formatUptime, getApiBase, isServiceRunning } from '../lib/api';
+  import { renderOfflineState, renderUnauthorizedState } from '../lib/offline_state';
 
   const params = new URLSearchParams(window.location.search);
   const serviceId = params.get('id');
@@ -169,7 +173,9 @@ import OfflineState from '../components/OfflineState.astro';
   async function loadDetail(id: string) {
     const { service, connection } = await api.getServiceDetail(id);
     if (!service) {
-      document.getElementById('detailRoot')!.innerHTML = renderOfflineState("Service unavailable");
+      document.getElementById('detailRoot')!.innerHTML = connection === 'unauthorized'
+        ? renderUnauthorizedState()
+        : renderOfflineState("Service unavailable", getApiBase(), window.location.origin);
       return;
     }
     document.title = `Service: ${service.name || service.id} — Russel Control Plane`;
@@ -185,10 +191,12 @@ import OfflineState from '../components/OfflineState.astro';
     if (statusText) statusText.textContent = service.status;
     const statRuntime = document.getElementById('statRuntime');
     const statPorts = document.getElementById('statPorts');
+    const statRoute = document.getElementById('statRoute');
     const statVmState = document.getElementById('statVmState');
     const statUptime = document.getElementById('statUptime');
     if (statRuntime) statRuntime.textContent = service.runtime === 'microvm' ? 'Cloud-Hypervisor (MicroVM)' : 'Podman (Container)';
     if (statPorts) statPorts.textContent = service.ports || 'None';
+    if (statRoute) statRoute.textContent = service.route_host || '—';
     if (statVmState) statVmState.textContent = service.vm_state || 'unknown';
     if (statUptime) statUptime.textContent = formatUptime(service.uptime_seconds);
     // Update header badge via connection (Header's client probe handles this, but update inline too)
@@ -198,6 +206,7 @@ import OfflineState from '../components/OfflineState.astro';
         demo: { cls: 'badge badge-demo', label: 'DEMO', title: 'Demo mode — mock data (Settings)' },
         live: { cls: 'badge badge-online', label: 'LIVE', title: 'Connected to russel-ctrl' },
         offline: { cls: 'badge badge-offline', label: 'OFFLINE', title: 'Control plane unreachable — start russel-ctrl or enable Demo mode' },
+        unauthorized: { cls: 'badge badge-warning', label: 'UNAUTHORIZED', title: 'API token missing or wrong — open Settings' },
       };
       const b = map[connection] || map.live;
       connBadge.className = b.cls;
@@ -345,11 +354,13 @@ import OfflineState from '../components/OfflineState.astro';
     deployBody.innerHTML = '<p style="color: var(--text-muted);">Loading deployment history&hellip;</p>';
     const result = await api.getDeployments(id);
     if (!result.supported) {
-      if (result.connection === 'offline') {
-        deployBody.innerHTML = '<p style="color: var(--text-muted);">Unavailable while control plane is offline.</p>';
+      if (result.connection === 'unauthorized') {
+        deployBody.innerHTML = renderUnauthorizedState();
+      } else if (result.connection === 'offline') {
+        deployBody.innerHTML = renderOfflineState('Unavailable while control plane is offline.', getApiBase(), window.location.origin);
       } else {
         deployBody.innerHTML =
-          '<p style="color: var(--text-muted);">Deployment history requires russel-ctrl with the history API.</p>';
+          '<p style="color: var(--text-muted);">Deployment history requires russel-ctrl with history API (<a href="https://github.com/daschinmoy21/russel/issues/177">issue #177</a>).</p>';
       }
       return;
     }
@@ -380,7 +391,7 @@ import OfflineState from '../components/OfflineState.astro';
       rollbackModal?.classList.add('hidden');
       const res = await api.rollbackService(serviceId, pendingRollbackVersion);
       if (!res.supported) {
-        showFeedback('Rollback not supported by this control plane.', true);
+        showFeedback('Rollback not supported by this control plane (issue #177).', true);
         return;
       }
       showFeedback(res.message, !res.success);

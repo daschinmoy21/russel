@@ -15,8 +15,155 @@ impl Backend {
         }
     }
 
+    /// Traefik backend for a published host port.
+    ///
+    /// Host is `RUSSEL_TRAEFIK_BACKEND` when set, else the publish bind
+    /// (`RUSSEL_PUBLISH_BIND`). Wildcard binds map to loopback so a Traefik
+    /// in the same netns can reach the port. Rootless Traefik in another
+    /// netns needs `RUSSEL_TRAEFIK_BACKEND` (e.g. `10.89.0.1`).
+    pub fn from_publish(port: u16) -> Self {
+        Self {
+            host: ingress_backend_host(),
+            port,
+        }
+    }
+
     pub fn url(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        // IPv6 literals need brackets in URL authorities (`http://[::1]:80`).
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("http://[{}]:{}", self.host, self.port)
+        } else {
+            format!("http://{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// Map a publish bind to the host Traefik should dial.
+///
+/// Wildcard binds are not reachable as a destination; same-netns Traefik
+/// dials loopback instead.
+fn backend_host_for_bind(bind: &str) -> String {
+    if bind == "0.0.0.0" || bind == "::" {
+        "127.0.0.1".into()
+    } else {
+        bind.to_string()
+    }
+}
+
+/// Host Traefik should dial for a published backend port.
+pub fn ingress_backend_host() -> String {
+    if let Ok(v) = std::env::var("RUSSEL_TRAEFIK_BACKEND") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    backend_host_for_bind(&crate::network::publish_bind_addr())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn with_traefik_backend_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: exclusive LOCK held; only test code mutates this var.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("RUSSEL_TRAEFIK_BACKEND", v),
+                        None => std::env::remove_var("RUSSEL_TRAEFIK_BACKEND"),
+                    }
+                }
+            }
+        }
+
+        let prev = std::env::var_os("RUSSEL_TRAEFIK_BACKEND");
+        let _restore = EnvRestore(prev);
+        // SAFETY: exclusive lock held for the duration of the mutation + body.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("RUSSEL_TRAEFIK_BACKEND", v),
+                None => std::env::remove_var("RUSSEL_TRAEFIK_BACKEND"),
+            }
+        }
+        f()
+    }
+
+    #[test]
+    fn url_brackets_ipv6_hosts() {
+        let bare = Backend {
+            host: "::1".into(),
+            port: 8080,
+        };
+        assert_eq!(bare.url(), "http://[::1]:8080");
+
+        let full = Backend {
+            host: "2001:db8::1".into(),
+            port: 3000,
+        };
+        assert_eq!(full.url(), "http://[2001:db8::1]:3000");
+
+        let already = Backend {
+            host: "[::1]".into(),
+            port: 80,
+        };
+        assert_eq!(already.url(), "http://[::1]:80");
+    }
+
+    #[test]
+    fn url_leaves_ipv4_and_hostnames_unchanged() {
+        assert_eq!(Backend::localhost(3000).url(), "http://127.0.0.1:3000");
+        let named = Backend {
+            host: "backend.local".into(),
+            port: 9000,
+        };
+        assert_eq!(named.url(), "http://backend.local:9000");
+    }
+
+    #[test]
+    fn backend_host_for_bind_maps_wildcards_to_loopback() {
+        assert_eq!(backend_host_for_bind("0.0.0.0"), "127.0.0.1");
+        assert_eq!(backend_host_for_bind("::"), "127.0.0.1");
+        assert_eq!(backend_host_for_bind("10.89.0.1"), "10.89.0.1");
+        assert_eq!(backend_host_for_bind("::1"), "::1");
+    }
+
+    #[test]
+    fn ingress_backend_host_prefers_env_override() {
+        with_traefik_backend_env(Some("10.89.0.1"), || {
+            assert_eq!(ingress_backend_host(), "10.89.0.1");
+            let b = Backend::from_publish(8080);
+            assert_eq!(b.host, "10.89.0.1");
+            assert_eq!(b.port, 8080);
+        });
+        with_traefik_backend_env(Some("  ::1  "), || {
+            assert_eq!(ingress_backend_host(), "::1");
+            assert_eq!(Backend::from_publish(80).url(), "http://[::1]:80");
+        });
+    }
+
+    #[test]
+    fn ingress_backend_host_empty_or_whitespace_falls_back_to_publish_bind() {
+        let expected = backend_host_for_bind(&crate::network::publish_bind_addr());
+        with_traefik_backend_env(None, || {
+            assert_eq!(ingress_backend_host(), expected);
+        });
+        with_traefik_backend_env(Some(""), || {
+            assert_eq!(ingress_backend_host(), expected);
+        });
+        with_traefik_backend_env(Some("   "), || {
+            assert_eq!(ingress_backend_host(), expected);
+        });
     }
 }
 
@@ -50,7 +197,12 @@ pub trait Ingress: Send + Sync {
 
     /// Point an existing service at a new backend without dropping the route
     /// (zero-downtime generation swap). v1 may re-write the same file.
-    async fn swap(&self, service_id: &str, new_backend: &Backend) -> anyhow::Result<()>;
+    async fn swap(
+        &self,
+        service_id: &str,
+        new_backend: &Backend,
+        host_rules: &[HostRule],
+    ) -> anyhow::Result<()>;
 
     /// Primary public host for CLI display (first rule or derived default).
     fn primary_host(&self, service_id: &str) -> Option<String>;

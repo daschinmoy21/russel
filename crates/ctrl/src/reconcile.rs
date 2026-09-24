@@ -9,7 +9,7 @@ use russel_core::reserved::is_reserved_service_dir;
 
 use crate::metadata::{self, ServiceDiskRecord};
 use crate::network::PortAllocator;
-use crate::state::{AppState, check_container_running};
+use crate::state::{AppState, ContainerProbe, probe_container};
 
 /// Outcome of reconciling a single service directory.
 #[derive(Debug)]
@@ -17,6 +17,15 @@ enum ReconcileOutcome {
     Running,
     Stopped,
     Skipped,
+}
+
+/// Liveness of one on-disk service. `Unknown` is not alive and not dead:
+/// reconcile must not adopt it and must not mark it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkloadProbe {
+    Alive,
+    NotAlive,
+    Unknown,
 }
 
 /// Summary report produced by a startup reconcile pass.
@@ -30,7 +39,7 @@ pub struct ReconcileReport {
 
 /// Reconcile all services under `/var/lib/russel`.
 pub async fn reconcile_startup(state: &AppState) -> ReconcileReport {
-    reconcile_startup_in(state, Path::new("/var/lib/russel")).await
+    reconcile_startup_in(state, &russel_core::paths::data_root()).await
 }
 
 /// Reconcile all services under an arbitrary base directory (for tests).
@@ -106,66 +115,84 @@ async fn reconcile_service(
 
     let runtime = record.runtime.unwrap_or(RuntimeKind::Microvm);
 
-    let alive = match runtime {
-        RuntimeKind::Microvm => probe_microvm_alive(&record, record.tap_id.as_deref()),
+    let probe = match runtime {
+        RuntimeKind::Microvm => {
+            if probe_microvm_alive(&record, record.tap_id.as_deref()) {
+                WorkloadProbe::Alive
+            } else {
+                WorkloadProbe::NotAlive
+            }
+        }
         RuntimeKind::Container => probe_container_alive(&record).await,
     };
 
-    if alive {
-        let host_port = record.host_port.unwrap_or(0);
-        let guest_port = record.guest_port.unwrap_or(0);
-
-        // Claim the port so the allocator knows it's taken.
-        if host_port > 0
-            && let Err(e) = PortAllocator::claim_existing(service_id, host_port)
-        {
+    match probe {
+        // Podman did not answer. Leave the service out of adopted and stopped
+        // counts so a broken podman cannot mark a live container stopped.
+        WorkloadProbe::Unknown => {
             tracing::warn!(
                 service_id = %service_id,
+                "container probe inconclusive; not adopting or marking stopped"
+            );
+            return Ok(ReconcileOutcome::Skipped);
+        }
+        WorkloadProbe::NotAlive => {
+            // Service on disk but processes are dead — ensure stopped entry exists
+            // with port/runtime fields so status APIs work without /vms first.
+            state.mark_stopped_from_disk(service_id, runtime, record.host_port, record.guest_port);
+            return Ok(ReconcileOutcome::Stopped);
+        }
+        WorkloadProbe::Alive => {}
+    }
+
+    let host_port = record.host_port.unwrap_or(0);
+    let guest_port = record.guest_port.unwrap_or(0);
+
+    // Claim the port so the allocator knows it's taken.
+    if host_port > 0
+        && let Err(e) = PortAllocator::claim_existing(service_id, host_port)
+    {
+        tracing::warn!(
+            service_id = %service_id,
+            host_port,
+            error = %e,
+            "failed to claim existing port during reconcile"
+        );
+    }
+
+    match runtime {
+        RuntimeKind::Microvm => {
+            state.adopt_running_microvm(
+                service_id,
                 host_port,
-                error = %e,
-                "failed to claim existing port during reconcile"
+                guest_port,
+                record.vm_pid,
+                record.deployed_at.as_deref(),
             );
         }
-
-        match runtime {
-            RuntimeKind::Microvm => {
-                state.adopt_running_microvm(
+        RuntimeKind::Container => {
+            if let Some(container_id) = &record.container_id {
+                state.adopt_running_container(
                     service_id,
+                    container_id,
                     host_port,
                     guest_port,
-                    record.vm_pid,
                     record.deployed_at.as_deref(),
                 );
-            }
-            RuntimeKind::Container => {
-                if let Some(container_id) = &record.container_id {
-                    state.adopt_running_container(
-                        service_id,
-                        container_id,
-                        host_port,
-                        guest_port,
-                        record.deployed_at.as_deref(),
-                    );
-                } else {
-                    // Container metadata without a container_id — treat as stopped.
-                    state.mark_stopped_from_disk(
-                        service_id,
-                        runtime,
-                        record.host_port,
-                        record.guest_port,
-                    );
-                    return Ok(ReconcileOutcome::Stopped);
-                }
+            } else {
+                // Container metadata without a container_id — treat as stopped.
+                state.mark_stopped_from_disk(
+                    service_id,
+                    runtime,
+                    record.host_port,
+                    record.guest_port,
+                );
+                return Ok(ReconcileOutcome::Stopped);
             }
         }
-
-        Ok(ReconcileOutcome::Running)
-    } else {
-        // Service on disk but processes are dead — ensure stopped entry exists
-        // with port/runtime fields so status APIs work without /vms first.
-        state.mark_stopped_from_disk(service_id, runtime, record.host_port, record.guest_port);
-        Ok(ReconcileOutcome::Stopped)
     }
+
+    Ok(ReconcileOutcome::Running)
 }
 
 /// Check whether a microVM's cloud-hypervisor process is alive *and* matches
@@ -183,9 +210,11 @@ fn probe_microvm_alive(record: &ServiceDiskRecord, tap_id: Option<&str>) -> bool
 
 /// Identity check for cloud-hypervisor PIDs.
 ///
-/// Requires `cloud-hypervisor` in cmdline AND either the service_id OR the
-/// exact TAP needle (`tap=rsl-<key>`). Drops the loose `/var/lib/russel/`
-/// or generic `tap=` fallback that previously accepted unrelated VMs (F-06).
+/// Requires `cloud-hypervisor` in the cmdline and either the service
+/// directory `/var/lib/russel/{service_id}/` or the exact TAP needle
+/// `tap={tap}` (F-06). A bare `contains(service_id)` is not used:
+/// `--api-socket` matches service id `api`, and `api` is a prefix of
+/// `api-gateway`.
 fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
     if pid == 0 {
         return false;
@@ -197,14 +226,17 @@ fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
         Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
         Err(_) => return false,
     };
+    ch_cmdline_matches(&cmdline, service_id, tap_id)
+}
+
+/// Pure cmdline identity check (no `/proc`).
+fn ch_cmdline_matches(cmdline: &str, service_id: &str, tap_id: Option<&str>) -> bool {
     if !cmdline.contains("cloud-hypervisor") {
         return false;
     }
-    // Accept if the service_id appears anywhere in the cmdline.
-    if !service_id.is_empty() && cmdline.contains(service_id) {
+    if !service_id.is_empty() && cmdline.contains(&format!("/var/lib/russel/{service_id}/")) {
         return true;
     }
-    // Accept if the exact TAP needle `tap=rsl-<key>` appears.
     if let Some(tap) = tap_id
         && !tap.is_empty()
         && cmdline.contains(&format!("tap={tap}"))
@@ -214,22 +246,43 @@ fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
     false
 }
 
-/// Check whether a container is still running via `podman inspect`.
-async fn probe_container_alive(record: &ServiceDiskRecord) -> bool {
-    if let Some(container_id) = &record.container_id {
-        if check_container_running(container_id).await {
-            return true;
-        }
-        // Fallback: try the Russel naming convention `russel-{service_id}`.
-        let name = format!(
-            "russel-{}",
-            record.service_id.as_deref().unwrap_or("unknown")
-        );
-        if check_container_running(&name).await {
-            return true;
-        }
+/// Combine an id probe with the `russel-{service_id}` name fallback.
+///
+/// [`ContainerProbe::Unknown`] never becomes [`WorkloadProbe::NotAlive`]: a
+/// later definitive Running can still adopt, but a failed inspect must not
+/// mark the service stopped.
+fn container_probe_outcome(primary: ContainerProbe, fallback: ContainerProbe) -> WorkloadProbe {
+    match primary {
+        ContainerProbe::Running => WorkloadProbe::Alive,
+        ContainerProbe::NotRunning => match fallback {
+            ContainerProbe::Running => WorkloadProbe::Alive,
+            ContainerProbe::NotRunning => WorkloadProbe::NotAlive,
+            ContainerProbe::Unknown => WorkloadProbe::Unknown,
+        },
+        ContainerProbe::Unknown => match fallback {
+            ContainerProbe::Running => WorkloadProbe::Alive,
+            ContainerProbe::NotRunning | ContainerProbe::Unknown => WorkloadProbe::Unknown,
+        },
     }
-    false
+}
+
+/// Check whether a container is still running via `podman inspect`.
+///
+/// Missing metadata is not alive. An inconclusive inspect is [`WorkloadProbe::Unknown`].
+async fn probe_container_alive(record: &ServiceDiskRecord) -> WorkloadProbe {
+    let Some(container_id) = record.container_id.as_deref() else {
+        return WorkloadProbe::NotAlive;
+    };
+    let primary = probe_container(container_id).await;
+    if primary == ContainerProbe::Running {
+        return WorkloadProbe::Alive;
+    }
+    // Fallback: try the Russel naming convention `russel-{service_id}`.
+    let name = format!(
+        "russel-{}",
+        record.service_id.as_deref().unwrap_or("unknown")
+    );
+    container_probe_outcome(primary, probe_container(&name).await)
 }
 
 #[cfg(test)]
@@ -325,8 +378,9 @@ mod tests {
         child
     }
 
-    /// Spawn a long-lived shell whose argv contains "cloud-hypervisor" and the
-    /// `service_id`, mimicking a cloud-hypervisor process for F-06 identity checks.
+    /// Spawn a long-lived shell whose argv contains `cloud-hypervisor` and
+    /// `/var/lib/russel/{service_id}/`, mimicking a cloud-hypervisor process
+    /// for F-06 identity checks.
     fn spawn_fake_cloud_hypervisor(service_id: &str) -> std::process::Child {
         let mut command = std::process::Command::new("/bin/sh");
         #[cfg(unix)]
@@ -334,8 +388,10 @@ mod tests {
             use std::os::unix::process::CommandExt;
             command.arg0(format!("cloud-hypervisor-{service_id}"));
         }
+        let service_dir = format!("/var/lib/russel/{service_id}/");
         let child = command
             .args(["-c", "sleep 30; wait"])
+            .arg(&service_dir)
             .spawn()
             .expect("spawn fake cloud-hypervisor");
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -633,6 +689,31 @@ mod tests {
     }
 
     #[test]
+    fn ch_cmdline_matches_rejects_api_socket_without_service_dir() {
+        assert!(!ch_cmdline_matches(
+            "cloud-hypervisor --api-socket /tmp/x",
+            "api",
+            None
+        ));
+        // `api` must not match as a prefix of `api-gateway`.
+        assert!(!ch_cmdline_matches(
+            "cloud-hypervisor --api-socket /var/lib/russel/api-gateway/cloud-hypervisor.sock",
+            "api",
+            None
+        ));
+        assert!(ch_cmdline_matches(
+            "cloud-hypervisor --api-socket /var/lib/russel/api/cloud-hypervisor.sock",
+            "api",
+            None
+        ));
+        assert!(!ch_cmdline_matches(
+            "cloud-hypervisor --api-socket /var/lib/russel/api/cloud-hypervisor.sock",
+            "",
+            None
+        ));
+    }
+
+    #[test]
     fn ch_pid_matches_rejects_without_service_id_or_tap() {
         // F-06: ch_pid_matches must require either service_id OR tap_id.
         // Neither present → reject, even if cloud-hypervisor is in cmdline.
@@ -740,5 +821,37 @@ mod tests {
         assert_eq!(status.vm_state, "none");
         let _ = fake.kill();
         let _ = fake.wait();
+    }
+
+    #[test]
+    fn container_probe_unknown_does_not_count_as_stopped() {
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::Unknown, ContainerProbe::Unknown),
+            WorkloadProbe::Unknown
+        );
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::Unknown, ContainerProbe::NotRunning),
+            WorkloadProbe::Unknown
+        );
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::NotRunning, ContainerProbe::Unknown),
+            WorkloadProbe::Unknown
+        );
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::NotRunning, ContainerProbe::NotRunning),
+            WorkloadProbe::NotAlive
+        );
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::Running, ContainerProbe::NotRunning),
+            WorkloadProbe::Alive
+        );
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::NotRunning, ContainerProbe::Running),
+            WorkloadProbe::Alive
+        );
+        assert_eq!(
+            container_probe_outcome(ContainerProbe::Unknown, ContainerProbe::Running),
+            WorkloadProbe::Alive
+        );
     }
 }

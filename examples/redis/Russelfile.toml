@@ -1,0 +1,27 @@
+# redis: redis-server from nixpkgs via `service.package`, no flake.nix needed.
+# A committed flake.nix would win over `package`.
+# Data lives in a managed volume (/var/lib/russel/<id>/volumes/data).
+# `keep = true` survives `russel destroy` unless `--delete-volumes` is passed.
+# `--dir` puts RDB/AOF on that volume; the rootfs stays read-only.
+# `--bind 0.0.0.0` is required for ordinary Podman/Docker `-p`: pasta targets
+# the container IP, not guest loopback.
+# Under pasta, peers look remote, so protected-mode rejects an unauthenticated
+# 0.0.0.0 bind. `--requirepass` below is the alternative to
+# `--protected-mode no`. The demo password is public; change it before exposing
+# anything.
+
+[service]
+name = "redis"
+source = "."
+port = 6379
+memory = "256mb"
+type = "container"
+package = "redis"
+bin = "redis-server"
+args = ["--dir", "/data", "--bind", "0.0.0.0", "--requirepass", "demo-only-not-for-production"]
+
+[[volumes]]
+name = "data"
+guest = "/data"
+rw = true
+keep = true

@@ -11,15 +11,17 @@
 #   umask 077
 #   printf 'RUSSEL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > ~/.config/russel/env
 #   sudo mkdir -p /var/lib/russel
-#   sudo chown "$USER:" /var/lib/russel
+#   sudo chown "$(id -un):$(id -gn)" /var/lib/russel
 #   sudo chmod 700 /var/lib/russel
-#   loginctl enable-linger "$USER"
+#   loginctl enable-linger "$(id -un)"
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now russel-ctrl.service
 #
 # TLS: reverse proxy to 127.0.0.1:7878. Do not expose :7878.
 # See docs/security-tls.md and docs/traefik.md.
 # KVM/TAP/cloud-hypervisor are optional. Container-only VPS uses rootless Podman.
+# Dashboard: GET / from the same process. Logs: /var/lib/russel/ctrl.log
+# (stderr is warnings unless you add --debug to ExecStart).
 
 [Unit]
 Description=Russel control plane
@@ -47,6 +49,9 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/russel /run/user
 PrivateTmp=yes
 Delegate=yes
+# Workloads (pasta/conmon) are children of this unit. control-group would
+# kill them on restart even though ctrl detaches. process kills only ctrl.
+KillMode=process
 
 [Install]
 WantedBy=default.target

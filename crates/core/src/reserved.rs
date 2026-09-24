@@ -6,11 +6,16 @@
 /// deployable services (e.g. dashboard `GET /vms`).
 ///
 /// - `*.bak` — dual-live / destroy backups
+/// - `*.volumes-stash` — managed volumes parked outside the service dir during redeploy
 /// - `traefik` — ingress dynamic config root
 /// - `secrets` — host secrets store
 /// - `_pool` — warm-pool snapshot state
 pub fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak") || name == "traefik" || name == "secrets" || name == "_pool"
+    name.ends_with(".bak")
+        || name.ends_with(".volumes-stash")
+        || name == "traefik"
+        || name == "secrets"
+        || name == "_pool"
 }
 
 #[cfg(test)]
@@ -19,7 +24,14 @@ mod tests {
 
     #[test]
     fn reserved_names_rejected() {
-        for name in ["traefik", "secrets", "_pool", "api.bak", "svc.bak"] {
+        for name in [
+            "traefik",
+            "secrets",
+            "_pool",
+            "api.bak",
+            "svc.bak",
+            "api.volumes-stash",
+        ] {
             assert!(is_reserved_service_dir(name), "{name:?} should be reserved");
         }
     }

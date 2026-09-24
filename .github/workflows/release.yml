@@ -1,0 +1,197 @@
+name: Release
+
+# Tag pushes publish the binaries, dashboard dist, and the Russel microVM
+# kernel that contrib/install.sh download mode consumes.
+#   RUSSEL_VERSION=<tag> RUSSEL_RELEASE_BASE=<base> ./contrib/install.sh host
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: Binaries ${{ github.ref_name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      # ubuntu-22.04 is glibc 2.35. ubuntu-latest (24.04) binaries fail to
+      # start on Debian 12 and Ubuntu 22.04 VPS images.
+      # Every action is pinned to an immutable commit SHA: this workflow's
+      # publish job holds `contents: write`.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Build release binaries
+        run: cargo build --release -p russel-cli -p russel-ctrl
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Build dashboard dist
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run build
+        working-directory: dashboard
+
+      - name: Package x86_64 assets
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          test -x target/release/russel
+          test -x target/release/russel-ctrl
+          test -f dashboard/dist/index.html
+          install -m 0755 target/release/russel "russel-${tag}-x86_64"
+          install -m 0755 target/release/russel-ctrl "russel-ctrl-${tag}-x86_64"
+          install -m 0644 contrib/russel-ctrl.service "russel-ctrl-${tag}.service"
+          tar -czf "russel-dashboard-${tag}.tar.gz" -C dashboard/dist .
+          ls -l "russel-${tag}-x86_64" "russel-ctrl-${tag}-x86_64" \
+            "russel-ctrl-${tag}.service" "russel-dashboard-${tag}.tar.gz"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-binaries
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            russel-${{ github.ref_name }}-x86_64
+            russel-ctrl-${{ github.ref_name }}-x86_64
+            russel-ctrl-${{ github.ref_name }}.service
+            russel-dashboard-${{ github.ref_name }}.tar.gz
+
+  kernel:
+    name: Kernel ${{ github.ref_name }}
+    runs-on: ubuntu-22.04
+    # The kernel override rebuilds linux from source, which dominates the run.
+    timeout-minutes: 180
+    steps:
+      - name: Free disk for the Nix kernel build
+        run: |
+          set -euo pipefail
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
+            /usr/share/miniconda /usr/lib/jvm || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = auto
+            cores = 0
+
+      - name: Build microVM kernel
+        run: |
+          set -euo pipefail
+          nix build .#microvm-kernel --out-link result-kernel -L
+          test -e result-kernel/bzImage
+          ls -lh result-kernel/bzImage
+          install -m 0644 result-kernel/bzImage \
+            "russel-kernel-${GITHUB_REF_NAME}-x86_64.bzImage"
+          # Stock empty/stub files are a few KB. The virtio-builtin bzImage
+          # is tens of MB (locally ~14MB). Refuse anything that cannot boot.
+          size="$(wc -c <"russel-kernel-${GITHUB_REF_NAME}-x86_64.bzImage")"
+          if [ "${size}" -lt 1000000 ]; then
+            echo "kernel artifact is ${size} bytes; expected a real bzImage" >&2
+            exit 1
+          fi
+          ls -l "russel-kernel-${GITHUB_REF_NAME}-x86_64.bzImage"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-kernel
+          if-no-files-found: error
+          retention-days: 7
+          path: russel-kernel-${{ github.ref_name }}-x86_64.bzImage
+
+  publish:
+    name: Publish ${{ github.ref_name }}
+    needs: [binaries, kernel]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cd artifacts
+          assets=(
+            "russel-${tag}-x86_64"
+            "russel-ctrl-${tag}-x86_64"
+            "russel-ctrl-${tag}.service"
+            "russel-dashboard-${tag}.tar.gz"
+            "russel-kernel-${tag}-x86_64.bzImage"
+          )
+          for asset in "${assets[@]}"; do
+            if [[ ! -f "${asset}" ]]; then
+              echo "missing release asset: ${asset}" >&2
+              ls -la >&2
+              exit 1
+            fi
+          done
+          sha256sum "${assets[@]}" >SHA256SUMS
+          grep -F "russel-kernel-${tag}-x86_64.bzImage" SHA256SUMS
+          cat SHA256SUMS
+          ls -l "${assets[@]}" SHA256SUMS
+
+          notes="$(mktemp)"
+          cat >"${notes}" <<EOF
+          # Russel ${tag}
+
+          First tagged one-operator release.
+
+          ## Compatibility
+
+          - Architecture: x86_64 Linux
+          - glibc >= 2.35 (Ubuntu 22.04, Debian 12, and newer)
+          - NixOS: \`services.russel\`, not these binaries
+          - Typical VPS (no KVM): containers only (\`type = "container"\`)
+
+          ## Install
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \\
+            | RUSSEL_VERSION=${tag} bash -s -- host
+          \`\`\`
+
+          On a KVM host, \`host\` also downloads \`russel-kernel-${tag}-x86_64.bzImage\`
+          and installs it at \`/var/lib/russel/_pool/kernel/bzImage\`. Without
+          \`/dev/kvm\` that step is skipped. \`all\` never fetches the kernel.
+
+          ## Assets
+
+          - \`russel-${tag}-x86_64\`
+          - \`russel-ctrl-${tag}-x86_64\`
+          - \`russel-ctrl-${tag}.service\`
+          - \`russel-dashboard-${tag}.tar.gz\`
+          - \`russel-kernel-${tag}-x86_64.bzImage\`
+          - \`SHA256SUMS\`
+          EOF
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" --clobber "${assets[@]}" SHA256SUMS
+            gh release edit "${tag}" --title "Russel ${tag}" --notes-file "${notes}"
+          else
+            gh release create "${tag}" --title "Russel ${tag}" --notes-file "${notes}" \
+              "${assets[@]}" SHA256SUMS
+          fi
+          gh release view "${tag}"

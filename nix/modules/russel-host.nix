@@ -252,6 +252,9 @@ in
         PrivateTmp = true;
         # cgroup delegation for rootless Podman. Harmless if unused.
         Delegate = true;
+        # Workloads (pasta/conmon) are children of this unit. control-group
+        # would kill them on restart even though ctrl detaches.
+        KillMode = "process";
       }
       // lib.optionalAttrs (resolvedGroup != null) {
         Group = resolvedGroup;

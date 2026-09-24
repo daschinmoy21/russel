@@ -9,15 +9,24 @@ use std::{
 
 use russel_core::{
     api::{DeployEvent, DeployRequest, DeployResponse, DeployTiming, PortMapping},
-    config::{GuestKind, RuntimeKind, merge_env_maps, resolve_runtime, validate_env_map},
+    config::{
+        GuestKind, RuntimeKind, merge_env_maps, resolve_ingress_host, resolve_ingress_port,
+        resolve_runtime, validate_env_map,
+    },
+    volumes::{
+        ExtraPortSpec, ResolvedVolume, extra_port_key, resolve_volumes, volume_roots_from_env,
+    },
 };
 
 use crate::{
     build::{self, BuildBackend},
-    container::{ContainerRunner, validate_podman_args_for_runtime},
+    container::{
+        ContainerRunner, attach_managed_volumes, destroy_preserving_volumes,
+        detach_managed_volumes, restore_backed_up_service_dir, validate_podman_args_for_runtime,
+    },
     deployments::{self, AppendSuccess, DesiredStateSnapshot},
     git::{GitClient, redact_repo_url},
-    ingress::{self, Backend, Ingress},
+    ingress::{self, Backend, HostRule, Ingress},
     metadata::{rewrite_metadata_service_id, write_metadata},
     microvm::{self, MicrovmRunner},
     network::{PortAllocator, SubnetAllocation, TapForwarder},
@@ -51,28 +60,43 @@ pub(crate) async fn promote_generation(runtime_key: &str, service_id: &str) -> a
     if runtime_key == service_id {
         return Ok(());
     }
-    let pairs = [
-        (
-            format!("/var/lib/russel/{runtime_key}"),
-            format!("/var/lib/russel/{service_id}"),
-        ),
-        (
-            format!("/var/lib/microvms/{runtime_key}"),
-            format!("/var/lib/microvms/{service_id}"),
-        ),
-    ];
-    for (from, to) in pairs {
-        if !Path::new(&from).exists() {
-            continue;
+    // Managed volumes live in the stable service dir, which destroy-of-prior
+    // leaves in place. Park them, replace the dir with the generation tree,
+    // then put the data back. Otherwise promote fails with "target already exists"
+    // whenever `keep` left `volumes/` behind.
+    let russel_from = russel_core::paths::service_dir(runtime_key);
+    let russel_to = russel_core::paths::service_dir(service_id);
+    if russel_from.exists() {
+        if russel_to.exists() {
+            detach_managed_volumes(&russel_to).await?;
+            tokio::fs::remove_dir_all(&russel_to).await.map_err(|e| {
+                anyhow::anyhow!("remove promote target {}: {e}", russel_to.display())
+            })?;
         }
-        if Path::new(&to).exists() {
-            anyhow::bail!("promote target already exists: {to}");
-        }
-        tokio::fs::rename(&from, &to)
+        tokio::fs::rename(&russel_from, &russel_to)
             .await
-            .map_err(|e| anyhow::anyhow!("rename {from} -> {to}: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "rename {} -> {}: {e}",
+                    russel_from.display(),
+                    russel_to.display()
+                )
+            })?;
+        attach_managed_volumes(&russel_to).await?;
     }
-    let meta_path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let micro_from = format!("/var/lib/microvms/{runtime_key}");
+    let micro_to = format!("/var/lib/microvms/{service_id}");
+    if Path::new(&micro_from).exists() {
+        if Path::new(&micro_to).exists() {
+            anyhow::bail!("promote target already exists: {micro_to}");
+        }
+        tokio::fs::rename(&micro_from, &micro_to)
+            .await
+            .map_err(|e| anyhow::anyhow!("rename {micro_from} -> {micro_to}: {e}"))?;
+    }
+    let meta_path = crate::metadata::metadata_path(service_id)
+        .display()
+        .to_string();
     if Path::new(&meta_path).exists() {
         rewrite_metadata_service_id(&meta_path, service_id)?;
     }
@@ -90,7 +114,9 @@ pub(crate) fn record_source_in_metadata(
     repo_url: &str,
     config_path: &str,
 ) -> anyhow::Result<()> {
-    let path = format!("/var/lib/russel/{service_id}/metadata.json");
+    let path = crate::metadata::metadata_path(service_id)
+        .display()
+        .to_string();
     let content = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("read metadata for source record: {e}"))?;
     let mut value: serde_json::Value = serde_json::from_str(&content)
@@ -115,6 +141,17 @@ pub(crate) fn record_source_in_metadata(
 ///
 /// Env is the pre-secret-resolution map so rollback and health restart
 /// re-resolve `secret://` refs. `guest` is always present (default busybox).
+/// Optional Russelfile extras stored in `desired_state` for rollback/update.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DesiredExtras<'a> {
+    pub volumes: &'a [ResolvedVolume],
+    pub extra_ports: &'a [ExtraPortSpec],
+    pub package: Option<&'a str>,
+    pub args: &'a [String],
+    pub userns: Option<&'a str>,
+    pub restart: Option<&'a str>,
+}
+
 pub(crate) fn build_desired_state(
     repo_url: &str,
     config_path: &str,
@@ -123,6 +160,8 @@ pub(crate) fn build_desired_state(
     env: &HashMap<String, String>,
     podman_args: &[String],
     port: Option<&PortMapping>,
+    ingress_host: Option<&str>,
+    extras: DesiredExtras<'_>,
 ) -> serde_json::Value {
     let mut ds = serde_json::Map::new();
     let env_obj: serde_json::Map<String, serde_json::Value> = env
@@ -160,7 +199,75 @@ pub(crate) fn build_desired_state(
         port_obj.insert("guest".into(), serde_json::json!(p.guest));
         ds.insert("port".into(), serde_json::Value::Object(port_obj));
     }
+    if let Some(host) = ingress_host {
+        ds.insert(
+            "ingress_host".into(),
+            serde_json::Value::String(host.into()),
+        );
+    }
+    if !extras.volumes.is_empty()
+        && let Ok(v) = serde_json::to_value(extras.volumes)
+    {
+        ds.insert("volumes".into(), v);
+    }
+    if !extras.extra_ports.is_empty()
+        && let Ok(v) = serde_json::to_value(extras.extra_ports)
+    {
+        ds.insert("extra_ports".into(), v);
+    }
+    if let Some(package) = extras.package {
+        ds.insert("package".into(), serde_json::Value::String(package.into()));
+    }
+    if !extras.args.is_empty()
+        && let Ok(v) = serde_json::to_value(extras.args)
+    {
+        ds.insert("args".into(), v);
+    }
+    if let Some(userns) = extras.userns {
+        ds.insert("userns".into(), serde_json::Value::String(userns.into()));
+    }
+    if let Some(restart) = extras.restart {
+        ds.insert("restart".into(), serde_json::Value::String(restart.into()));
+    }
     serde_json::Value::Object(ds)
+}
+
+/// Return the configured listen port from an address environment variable.
+/// The controller and agent use `host:port` strings; taking the final colon
+/// also handles bracketed IPv6 addresses without resolving hostnames here.
+fn configured_listen_port(var: &str, default: u16) -> u16 {
+    std::env::var(var)
+        .ok()
+        .and_then(|addr| addr.rsplit_once(':').map(|(_, port)| port.to_string()))
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(default)
+}
+
+fn validate_live_ingress_port(port: Option<u16>) -> anyhow::Result<()> {
+    let Some(port) = port else {
+        return Ok(());
+    };
+    // Privileged pins are rejected here as well as in `PortAllocator::reserve`:
+    // dual-live redeploys allocate an ephemeral candidate backend and never
+    // reserve the pin, but the pin still returns via `fixed_host` reclaim.
+    reject_live_listen_collision(port, "ingress.port")
+}
+
+/// Host ports published on the machine, including `[[ports]]` rows.
+///
+/// Load-time checks only know the default 7878/7946. The process may be bound
+/// elsewhere via `RUSSEL_CTRL_ADDR` / `RUSSEL_AGENT_ADDR`.
+fn reject_live_listen_collision(port: u16, what: &str) -> anyhow::Result<()> {
+    if port < 1024 {
+        anyhow::bail!("{what} {port} is privileged (< 1024); Traefik owns 80/443");
+    }
+    if port == configured_listen_port("RUSSEL_CTRL_ADDR", 7878) {
+        anyhow::bail!("{what} {port} collides with the control-plane listen port");
+    }
+    if port == configured_listen_port("RUSSEL_AGENT_ADDR", 7946) {
+        anyhow::bail!("{what} {port} collides with the agent listen port");
+    }
+    Ok(())
 }
 
 /// Typed outcome of `deploy_inner` — success, rollback, or hard failure.
@@ -325,6 +432,9 @@ impl DeployPipeline {
                     runtime = %output.runtime,
                     "deploy succeeded"
                 );
+                let fixed_port_socat = output.fixed_port_socat;
+                let fixed_host_port = output.fixed_host_port;
+                let recorded_host = fixed_host_port.unwrap_or(host_port);
                 let (message, vm_ip, microvm_config_path) = match output.workload {
                     DeployWorkload::Microvm {
                         alloc,
@@ -336,11 +446,14 @@ impl DeployPipeline {
                     } => {
                         let mut aux = vec![*socat_child];
                         aux.extend(virtiofsd_children);
+                        if let Some(fixed) = fixed_port_socat {
+                            aux.push(fixed);
+                        }
                         self.state.mark_deployed_with_aux(
                             &service_id,
                             *vm_child,
                             aux,
-                            Some(host_port),
+                            Some(recorded_host),
                             Some(guest_port),
                         );
                         (
@@ -373,7 +486,9 @@ impl DeployPipeline {
                         )
                     }
                 };
-                let route_host = self.ingress.primary_host(&service_id);
+                let route_host = output
+                    .route_host
+                    .or_else(|| self.ingress.primary_host(&service_id));
                 DeployResponse {
                     service_id,
                     vm_id,
@@ -477,6 +592,51 @@ impl DeployPipeline {
         let merged_env = crate::secrets::resolve_env_secrets(&merged_env_pre_resolve)?;
         validate_env_map(&merged_env)?;
 
+        let ingress_host = resolve_ingress_host(
+            config.ingress.as_ref().and_then(|i| i.host.as_deref()),
+            request.host.as_deref(),
+        )?;
+        let pinned_host_port = resolve_ingress_port(
+            config.ingress.as_ref().and_then(|i| i.port),
+            request.port.as_ref().map(|p| p.host),
+        )?;
+        let file_pinned = config.ingress.as_ref().and_then(|i| i.port);
+        if let (Some(_), Some(p)) = (file_pinned, request.port.as_ref())
+            && p.guest != config.service.port
+        {
+            anyhow::bail!(
+                "CLI -p guest {} does not match Russelfile service.port ({})",
+                p.guest,
+                config.service.port
+            );
+        }
+        validate_live_ingress_port(pinned_host_port)?;
+
+        // One mapping represents the operator's pin. A dual-live candidate
+        // gets a separate ephemeral backend below.
+        let pin_mapping = pinned_host_port.map(|host| PortMapping {
+            host,
+            guest: if file_pinned.is_some() {
+                config.service.port
+            } else {
+                request
+                    .port
+                    .as_ref()
+                    .map(|p| p.guest)
+                    .unwrap_or(config.service.port)
+            },
+        });
+        let host_rules = ingress_host
+            .as_ref()
+            .map(|host| vec![HostRule { host: host.clone() }])
+            .unwrap_or_default();
+
+        let resolved_volumes = if runtime == RuntimeKind::Container {
+            resolve_volumes(service_id, &config.volumes, &volume_roots_from_env())?
+        } else {
+            Vec::new()
+        };
+
         // Build desired_state for rollback + health restart + update (F-04/08/09).
         let desired_state = Some(build_desired_state(
             &request.repo_url,
@@ -485,7 +645,16 @@ impl DeployPipeline {
             config.service.guest,
             &merged_env_pre_resolve,
             &request.podman_args,
-            request.port.as_ref(),
+            pin_mapping.as_ref(),
+            ingress_host.as_deref(),
+            DesiredExtras {
+                volumes: &resolved_volumes,
+                extra_ports: &config.ports,
+                package: config.service.package.as_deref(),
+                args: &config.service.args,
+                userns: config.service.userns.as_deref(),
+                restart: config.service.restart.as_deref(),
+            },
         ));
 
         let resolve_ms = t.elapsed().as_millis();
@@ -510,7 +679,10 @@ impl DeployPipeline {
                 description: build_description.into(),
             })
             .await;
-        let build = self.builder.build(&repo_path).await?;
+        let build = self
+            .builder
+            .build(&repo_path, config.service.package.as_deref())
+            .await?;
         let kernel = if runtime == RuntimeKind::Microvm {
             Some(self.runner.ensure_kernel().await?)
         } else {
@@ -548,8 +720,10 @@ impl DeployPipeline {
             );
         }
 
-        let prior_runtime = resolve_prior_runtime(service_id).await;
-        let dual_live = prior_runtime.is_some();
+        let prior_runtime = resolve_prior_runtime(service_id).await?;
+        // Extra pinned ports cannot move while the old generation still holds
+        // them, so skip dual-live and replace in place.
+        let dual_live = prior_runtime.is_some() && config.ports.is_empty();
 
         // Generation identity: when replacing a live service, boot the candidate
         // under `{service_id}_g{gen}` so the active generation keeps its TAP/port
@@ -563,7 +737,9 @@ impl DeployPipeline {
             service_id.to_string()
         };
 
-        let russel_dir = format!("/var/lib/russel/{}", service_id);
+        let russel_dir = russel_core::paths::service_dir(service_id)
+            .display()
+            .to_string();
         let microvms_dir = format!("/var/lib/microvms/{}", service_id);
         let russel_bak = format!("{}.bak", russel_dir);
         let microvms_bak = format!("{}.bak", microvms_dir);
@@ -581,13 +757,20 @@ impl DeployPipeline {
             // 3. kill+wait old children so ports are freed
             // 4. destroy_prior_runtime — cleans TAP/ports (rollback will re-create)
             if has_russel_dir {
+                let live = Path::new(&russel_dir);
+                // Park volumes outside the directory we are about to rename.
+                // Success deletes the .bak; the data must not be inside it.
+                if let Err(e) = detach_managed_volumes(live).await {
+                    anyhow::bail!("failed to stash managed volumes: {e}");
+                }
                 if let Err(e) = tokio::fs::rename(&russel_dir, &russel_bak).await {
+                    let _ = attach_managed_volumes(live).await;
                     anyhow::bail!("failed to backup russel directory: {}", e);
                 }
                 if has_microvms_dir
                     && let Err(e) = tokio::fs::rename(&microvms_dir, &microvms_bak).await
                 {
-                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                    let _ = restore_backed_up_service_dir(live, Path::new(&russel_bak)).await;
                     anyhow::bail!("failed to backup microvms directory: {}", e);
                 }
             }
@@ -605,7 +788,11 @@ impl DeployPipeline {
                         .await
             {
                 if has_backup {
-                    let _ = tokio::fs::rename(&russel_bak, &russel_dir).await;
+                    let _ = restore_backed_up_service_dir(
+                        Path::new(&russel_dir),
+                        Path::new(&russel_bak),
+                    )
+                    .await;
                     if has_microvms_dir {
                         let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
                     }
@@ -632,7 +819,22 @@ impl DeployPipeline {
         // H4: remember the fixed host port the operator requested so we can
         // try to re-claim it after dual-live cutover destroys the old gen.
         // Keep 0 out of recovery even if an invalid mapping slipped through.
-        let fixed_host = request.port.as_ref().map(|p| p.host).filter(|&h| h != 0);
+        let fixed_host = pin_mapping.as_ref().map(|p| p.host).filter(|&h| h != 0);
+
+        // Cold redeploy stashed volumes before the .bak rename. Put them back
+        // on the stable id before the new container bind-mounts that path.
+        // Dual-live has no stash; this is a no-op and the live tree stays put.
+        if let Err(e) = attach_managed_volumes(Path::new(&russel_dir)).await {
+            if has_backup {
+                let _ =
+                    restore_backed_up_service_dir(Path::new(&russel_dir), Path::new(&russel_bak))
+                        .await;
+                if has_microvms_dir {
+                    let _ = tokio::fs::rename(&microvms_bak, &microvms_dir).await;
+                }
+            }
+            return Err(e);
+        }
 
         let mut port_reservation = None;
         let deploy_result = async {
@@ -642,7 +844,7 @@ impl DeployPipeline {
                 // Always allocate a fresh backend port for the candidate so the
                 // active generation keeps its listener. Fixed -p is Traefik-facing
                 // after cutover; backend port may differ across generations.
-                if request.port.is_some() {
+                if pin_mapping.is_some() {
                     tracing::info!(
                         service_id,
                         "dual-live redeploy: ignoring fixed -p for candidate backend; \
@@ -657,7 +859,7 @@ impl DeployPipeline {
                     guest: config.service.port,
                 }
             } else {
-                match request.port.clone() {
+                match pin_mapping.clone() {
                     Some(p) => {
                         PortAllocator::reserve(&runtime_key, p.host)?;
                         p
@@ -673,8 +875,12 @@ impl DeployPipeline {
                     }
                 }
             };
-            // Arm reservation only after port is secured.
+            // Arm before extras so a failed extra reserve releases primary + prior extras.
             port_reservation = Some(PortReservation::new(&runtime_key));
+            for (i, extra) in config.ports.iter().enumerate() {
+                reject_live_listen_collision(extra.host, "[[ports]] host")?;
+                PortAllocator::reserve(&extra_port_key(&runtime_key, i), extra.host)?;
+            }
 
             match runtime {
                 RuntimeKind::Microvm => {
@@ -690,6 +896,7 @@ impl DeployPipeline {
                         &tx,
                         Some(generation_id.as_str()),
                         desired_state.as_ref(),
+                        build.using_package,
                     )
                     .await
                 }
@@ -704,6 +911,8 @@ impl DeployPipeline {
                         &tx,
                         Some(generation_id.as_str()),
                         desired_state.as_ref(),
+                        &resolved_volumes,
+                        build.using_package,
                     )
                     .await
                 }
@@ -799,7 +1008,11 @@ impl DeployPipeline {
             }
         };
 
-        let backend = Backend::localhost(workload.port().host);
+        // Populated when dual-live reclaims a pinned host port. The child is
+        // returned to the caller so mark_deployed_with_aux keeps it.
+        let mut fixed_port_socat = None;
+        let mut fixed_host_port = None;
+        let backend = Backend::from_publish(workload.port().host);
         let ingress_result = if dual_live {
             // Zero-downtime cutover: rewrite Traefik backend for the stable service id.
             tracing::info!(
@@ -808,9 +1021,11 @@ impl DeployPipeline {
                 generation_id = %generation_id,
                 "Ingress::swap — pointing stable route at candidate generation"
             );
-            self.ingress.swap(service_id, &backend).await
+            self.ingress.swap(service_id, &backend, &host_rules).await
         } else {
-            self.ingress.register(service_id, &backend, &[]).await
+            self.ingress
+                .register(service_id, &backend, &host_rules)
+                .await
         };
 
         if let Err(error) = ingress_result {
@@ -823,12 +1038,12 @@ impl DeployPipeline {
                     }
                 }
                 DeployWorkload::Container { .. } => {
-                    if let Err(e) = self.containers.destroy(&runtime_key).await {
+                    if let Err(e) = destroy_preserving_volumes(&runtime_key).await {
                         tracing::warn!(runtime_key = %runtime_key, error = %e, "failed to destroy container after ingress failure");
                     }
                 }
             }
-            PortAllocator::release(&runtime_key);
+            PortAllocator::release_service(&runtime_key);
             return Err(error);
         }
 
@@ -873,9 +1088,22 @@ impl DeployPipeline {
                     .attach_flake_path(&runtime_key, repo_path.clone());
             } else {
                 // Re-key port + in-memory state to the stable service id.
-                PortAllocator::release(&runtime_key);
+                PortAllocator::release_service(&runtime_key);
                 if let Err(e) = PortAllocator::claim_existing(service_id, workload.port().host) {
                     tracing::warn!(service_id, error = %e, "failed to claim port under service_id after promote");
+                }
+                for (i, extra) in config.ports.iter().enumerate() {
+                    if let Err(e) =
+                        PortAllocator::claim_existing(&extra_port_key(service_id, i), extra.host)
+                    {
+                        tracing::warn!(
+                            service_id,
+                            index = i,
+                            host = extra.host,
+                            error = %e,
+                            "failed to claim extra port under service_id after promote"
+                        );
+                    }
                 }
                 self.state.rekey_service(&runtime_key, service_id);
                 self.state.attach_flake_path(service_id, repo_path.clone());
@@ -913,11 +1141,8 @@ impl DeployPipeline {
                                 .await
                                 {
                                     Ok(socat) => {
-                                        let mut inner = self.state.lock_inner();
-                                        if let Some(s) = inner.services.get_mut(service_id) {
-                                            s.aux_processes.push(socat);
-                                            s.host_port = Some(fixed);
-                                        }
+                                        fixed_port_socat = Some(socat);
+                                        fixed_host_port = Some(fixed);
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -1022,7 +1247,10 @@ impl DeployPipeline {
                 network_ms,
                 ready_ms,
             },
+            route_host: ingress_host,
             workload,
+            fixed_port_socat,
+            fixed_host_port,
         })))
     }
 }
@@ -1048,7 +1276,7 @@ impl PortReservation {
 impl Drop for PortReservation {
     fn drop(&mut self) {
         if self.armed {
-            PortAllocator::release(&self.service_id);
+            PortAllocator::release_service(&self.service_id);
         }
     }
 }
@@ -1091,5 +1319,108 @@ pub(crate) struct DeployOutput {
     port: PortMapping,
     runtime: RuntimeKind,
     timing: DeployTiming,
+    route_host: Option<String>,
     workload: DeployWorkload,
+    /// Extra socat for the operator's pinned host port after dual-live cutover.
+    ///
+    /// Held here, not in `AppState`, until `mark_deployed_with_aux`. That call
+    /// replaces `aux_processes`, which dropped and killed a child pushed earlier.
+    fixed_port_socat: Option<tokio::process::Child>,
+    fixed_host_port: Option<u16>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ingress_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        ctrl: Option<std::ffi::OsString>,
+        agent: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn pin_defaults() -> Self {
+            Self::pin("127.0.0.1:7878", "127.0.0.1:7946")
+        }
+
+        fn pin_ctrl(ctrl: &str) -> Self {
+            Self::pin(ctrl, "127.0.0.1:7946")
+        }
+
+        fn pin(ctrl_addr: &str, agent_addr: &str) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ctrl = std::env::var_os("RUSSEL_CTRL_ADDR");
+            let agent = std::env::var_os("RUSSEL_AGENT_ADDR");
+            // SAFETY: `_lock` is held until drop, so tests in this module
+            // serialize mutation of these two vars and restore both on drop.
+            unsafe {
+                std::env::set_var("RUSSEL_CTRL_ADDR", ctrl_addr);
+                std::env::set_var("RUSSEL_AGENT_ADDR", agent_addr);
+            }
+            Self {
+                ctrl,
+                agent,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.ctrl.take() {
+                    Some(v) => std::env::set_var("RUSSEL_CTRL_ADDR", v),
+                    None => std::env::remove_var("RUSSEL_CTRL_ADDR"),
+                }
+                match self.agent.take() {
+                    Some(v) => std::env::set_var("RUSSEL_AGENT_ADDR", v),
+                    None => std::env::remove_var("RUSSEL_AGENT_ADDR"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_ingress_port_uses_canonical_default_collision_messages() {
+        let _guard = EnvGuard::pin_defaults();
+        assert_eq!(
+            validate_live_ingress_port(Some(7878))
+                .unwrap_err()
+                .to_string(),
+            "ingress.port 7878 collides with the control-plane listen port"
+        );
+        assert_eq!(
+            validate_live_ingress_port(Some(7946))
+                .unwrap_err()
+                .to_string(),
+            "ingress.port 7946 collides with the agent listen port"
+        );
+        assert_eq!(
+            validate_live_ingress_port(Some(80))
+                .unwrap_err()
+                .to_string(),
+            "ingress.port 80 is privileged (< 1024); Traefik owns 80/443"
+        );
+        validate_live_ingress_port(Some(4000)).unwrap();
+        validate_live_ingress_port(None).unwrap();
+    }
+
+    #[test]
+    fn extra_port_rejects_live_ctrl_listen() {
+        let _guard = EnvGuard::pin_ctrl("127.0.0.1:9000");
+        assert!(
+            reject_live_listen_collision(9000, "[[ports]] host")
+                .unwrap_err()
+                .to_string()
+                .contains("9000")
+        );
+        reject_live_listen_collision(7878, "[[ports]] host").unwrap();
+    }
 }

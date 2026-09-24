@@ -57,8 +57,8 @@ import OfflineState from '../components/OfflineState.astro';
 </Layout>
 
 <script>
-  import { api, escapeHtml, isDemoMode, isServiceRunning } from '../lib/api';
-  import { renderOfflineState, renderEmptyState } from '../lib/offline_state';
+  import { api, escapeHtml, getApiBase, isDemoMode, isServiceRunning } from '../lib/api';
+  import { renderOfflineState, renderUnauthorizedState, renderEmptyState } from '../lib/offline_state';
   import { renderPortCell } from '../lib/ports';
   import type { ConnectionState, ServiceVM } from '../lib/api';
 
@@ -93,7 +93,9 @@ import OfflineState from '../components/OfflineState.astro';
     if (!tableWrapper) return;
     if (services.length === 0) {
       if (conn === 'offline') {
-        tableWrapper.innerHTML = renderOfflineState();
+        tableWrapper.innerHTML = renderOfflineState('Control plane offline.', getApiBase(), window.location.origin);
+      } else if (conn === 'unauthorized') {
+        tableWrapper.innerHTML = renderUnauthorizedState();
       } else {
         tableWrapper.innerHTML = renderEmptyState();
       }

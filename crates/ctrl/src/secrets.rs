@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-const DEFAULT_SECRETS_DIR: &str = "/var/lib/russel/secrets";
+fn default_secrets_dir() -> PathBuf {
+    russel_core::paths::data_root().join("secrets")
+}
 
 /// Validate a secret name: alphanumeric, `_`, `-`, length 1..=64.
 pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
@@ -38,8 +40,11 @@ pub fn validate_secret_value(value: &str) -> anyhow::Result<()> {
 
 fn secrets_dir() -> PathBuf {
     std::env::var("RUSSEL_SECRETS_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SECRETS_DIR))
+        .unwrap_or_else(default_secrets_dir)
 }
 
 fn secret_path(name: &str) -> anyhow::Result<PathBuf> {

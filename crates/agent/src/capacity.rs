@@ -16,9 +16,6 @@ use russel_core::api::NodeCapacity;
 use russel_core::reserved::is_reserved_service_dir;
 use tokio::process::Command;
 
-/// Default Russel data root (service dirs live under here).
-pub const DEFAULT_DATA_ROOT: &str = "/var/lib/russel";
-
 /// Bound for `podman info` (rootless detection).
 const PODMAN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound for `nix eval … builtins.currentSystem`.
@@ -108,8 +105,9 @@ fn parse_meminfo_kb(rest: &str) -> Option<u64> {
 /// Only non-reserved dirs with a readable `metadata.json` are considered.
 /// Running is determined from on-disk metadata signals (same fields ctrl writes):
 /// - **microVM:** `vm_pid` present and process still alive (`/proc/{pid}` exists).
-/// - **container:** non-empty `container_id` (heartbeat stays cheap — no per-container
-///   `podman inspect`; absence of `container_id` means not running / never started).
+/// - **container:** non-empty `container_id` and `container_running` is not false.
+///   Stop keeps the id and sets `container_running` to false. Metadata written
+///   before that field existed still counts as running when the id is present.
 ///
 /// Metadata-only deploys with neither live `vm_pid` nor `container_id` are **not**
 /// counted (deployed ≠ running).
@@ -168,7 +166,7 @@ pub fn service_value_looks_running(value: &serde_json::Value) -> bool {
         .filter(|s| !s.is_empty());
 
     match runtime {
-        Some("container") => container_id.is_some(),
+        Some("container") => container_id.is_some() && container_running_flag(value) != Some(false),
         Some("microvm") => vm_pid.is_some_and(pid_is_alive),
         // Legacy / missing runtime: accept either authoritative live signal.
         _ => {
@@ -177,9 +175,15 @@ pub fn service_value_looks_running(value: &serde_json::Value) -> bool {
             {
                 return true;
             }
-            container_id.is_some()
+            container_id.is_some() && container_running_flag(value) != Some(false)
         }
     }
+}
+
+/// `None` means the field was not written (older metadata). Only an explicit
+/// false means stop has recorded that the container is down.
+fn container_running_flag(value: &serde_json::Value) -> Option<bool> {
+    value.get("container_running").and_then(|v| v.as_bool())
 }
 
 /// Linux: process exists if `/proc/{pid}` is present.
@@ -324,11 +328,7 @@ pub fn parse_node_labels(raw: Option<&str>) -> std::collections::HashMap<String,
 
 /// Data root from env or default.
 pub fn data_root_from_env() -> PathBuf {
-    std::env::var("RUSSEL_DATA_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_ROOT))
+    russel_core::paths::data_root()
 }
 
 #[cfg(test)]
@@ -427,6 +427,16 @@ mod tests {
         assert!(service_value_looks_running(&serde_json::json!({
             "runtime": "container",
             "container_id": "x"
+        })));
+        assert!(service_value_looks_running(&serde_json::json!({
+            "runtime": "container",
+            "container_id": "x",
+            "container_running": true
+        })));
+        assert!(!service_value_looks_running(&serde_json::json!({
+            "runtime": "container",
+            "container_id": "x",
+            "container_running": false
         })));
         assert!(!service_value_looks_running(&serde_json::json!({
             "runtime": "container"

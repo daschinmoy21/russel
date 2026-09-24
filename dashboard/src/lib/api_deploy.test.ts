@@ -9,6 +9,7 @@ import {
 	parseDeployEventLine,
 	reduceDeployEvents,
 	type DeployResponse,
+	type StatusResponse,
 } from "./api";
 
 const deployed: DeployResponse = {
@@ -195,5 +196,33 @@ describe("consumeNdjsonStream", () => {
 		const lines: string[] = [];
 		await consumeNdjsonStream(streamFromChunks([]), (l) => lines.push(l));
 		expect(lines).toEqual([]);
+	});
+});
+
+describe("route_host", () => {
+	test("Complete carries custom ingress host through", () => {
+		const withRoute: DeployResponse = { ...deployed, route_host: "abc.com" };
+		const ev = parseDeployEventLine(
+			JSON.stringify({ type: "Complete", payload: withRoute }),
+		);
+		expect(ev?.type).toBe("Complete");
+		if (ev?.type === "Complete") {
+			expect(ev.payload.route_host).toBe("abc.com");
+		}
+	});
+
+	test("StatusResponse accepts string, null, and absent route_host", () => {
+		const withHost = JSON.parse(
+			'{"service_id":"a","status":"deployed","vm_state":"running","uptime_seconds":1,"route_host":"abc.com"}',
+		) as StatusResponse;
+		expect(withHost.route_host).toBe("abc.com");
+		const withNull = JSON.parse(
+			'{"service_id":"a","status":"deployed","vm_state":"running","uptime_seconds":1,"route_host":null}',
+		) as StatusResponse;
+		expect(withNull.route_host).toBeNull();
+		const legacy = JSON.parse(
+			'{"service_id":"a","status":"deployed","vm_state":"running","uptime_seconds":1}',
+		) as StatusResponse;
+		expect(legacy.route_host).toBeUndefined();
 	});
 });

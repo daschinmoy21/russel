@@ -1,7 +1,10 @@
 //! `russel-ctrl` binary — thin entry point over the `russel_ctrl` library.
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow};
 use axum::Router;
+use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -10,21 +13,33 @@ use russel_ctrl::state::AppState;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+/// Russel control plane: HTTP API plus the web dashboard on the same listener.
+#[derive(Parser, Debug)]
+#[command(name = "russel-ctrl", version, about)]
+struct Cli {
+    /// Stream logs to stderr. They are always written to the log file.
+    #[arg(long)]
+    debug: bool,
+
+    /// Do not serve the web dashboard.
+    #[arg(long)]
+    no_dashboard: bool,
+
+    /// Directory of a built dashboard (`index.html` at the root).
+    #[arg(long, env = "RUSSEL_DASHBOARD_DIR")]
+    dashboard_dir: Option<PathBuf>,
+
+    /// Log file path (append, mode 0600).
+    #[arg(long, env = "RUSSEL_CTRL_LOG")]
+    log_file: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            fmt::layer()
-                .with_timer(tracing_subscriber::fmt::time::uptime())
-                .with_target(false),
-        )
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,russel_ctrl=debug")),
-        )
-        .init();
+    let cli = Cli::parse();
+    let requested_log = russel_ctrl::logging::resolve_log_path(cli.log_file.clone());
+    let (log_path, _log_guard) = russel_ctrl::logging::init(cli.debug, &requested_log)?;
+    let dashboard = resolve_dashboard(&cli)?;
 
     // Single-instance guard (F-30): /var/lib/russel state (service dirs, port
     // registry, TAP names) is not safe for concurrent controllers. Held for
@@ -72,7 +87,10 @@ async fn main() -> Result<()> {
     // after 3 consecutive failures when metadata records repo_url.
     russel_ctrl::health::spawn_health_loop(state.clone());
 
-    let app: Router = russel_ctrl::api::router(state.clone());
+    let app: Router = match dashboard.clone() {
+        Some(dir) => russel_ctrl::api::router_with_dashboard(state.clone(), dir),
+        None => russel_ctrl::api::router(state.clone()),
+    };
     let bind_addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
 
     // Bind first, then decide auth from the *actual* bound address (F-36).
@@ -127,6 +145,12 @@ async fn main() -> Result<()> {
     }
 
     info!("russel control plane listening on {}", local_addr);
+    print_startup_banner(
+        local_addr,
+        dashboard.as_deref(),
+        &log_path,
+        cli.no_dashboard,
+    );
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
@@ -147,6 +171,43 @@ async fn main() -> Result<()> {
 
     serve_result?;
     Ok(())
+}
+
+fn resolve_dashboard(cli: &Cli) -> Result<Option<PathBuf>> {
+    if cli.no_dashboard {
+        return Ok(None);
+    }
+    if let Some(ref path) = cli.dashboard_dir {
+        return russel_ctrl::dashboard::validate_dashboard_dir(path)
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow!(
+                    "dashboard dir {} has no index.html\n\
+                     build it with: cd dashboard && bun install && bun run build",
+                    path.display()
+                )
+            });
+    }
+    Ok(russel_ctrl::dashboard::find_dashboard_dir(None))
+}
+
+fn print_startup_banner(
+    local_addr: std::net::SocketAddr,
+    dashboard: Option<&Path>,
+    log_path: &Path,
+    no_dashboard: bool,
+) {
+    eprintln!("russel-ctrl {local_addr}");
+    match dashboard {
+        Some(_) => eprintln!("dashboard  http://{local_addr}/"),
+        None if no_dashboard => eprintln!("dashboard  off (--no-dashboard)"),
+        None => {
+            eprintln!(
+                "dashboard  off (no dist; cd dashboard && bun run build, or --dashboard-dir)"
+            );
+        }
+    }
+    eprintln!("logs       {}", log_path.display());
 }
 
 async fn shutdown_signal() {
@@ -185,16 +246,26 @@ async fn shutdown_signal() {
 /// `flock`. The returned fd must be held for the process lifetime; exiting
 /// releases the lock automatically, so no unlock path is needed.
 fn acquire_instance_lock() -> Result<std::os::fd::OwnedFd> {
+    acquire_instance_lock_at(&russel_core::paths::data_root().join("ctrl.lock"))
+}
+
+fn acquire_instance_lock_at(lock_path: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, OwnedFd};
 
-    const LOCK_PATH: &str = "/var/lib/russel/ctrl.lock";
-    std::fs::create_dir_all("/var/lib/russel")?;
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         // Never written to — the fd exists only to carry the flock.
         .truncate(false)
-        .open(LOCK_PATH)?;
+        .open(lock_path)
+        .with_context(|| format!("failed to open instance lock {}", lock_path.display()))?;
     // Safety: `file` is a valid open fd; flock does not retain it beyond the call.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
@@ -202,12 +273,35 @@ fn acquire_instance_lock() -> Result<std::os::fd::OwnedFd> {
         // Only EWOULDBLOCK/EAGAIN means another holder; surface other errno
         // (permissions, NFS, interrupted) with their real cause.
         if err.kind() == std::io::ErrorKind::WouldBlock {
-            anyhow::bail!("another russel-ctrl instance is running (lock: {LOCK_PATH})");
+            let port = ctrl_port_hint();
+            anyhow::bail!(
+                "another russel-ctrl instance is running (lock: {})\n\
+                 \n\
+                 Check the controller service and port:\n\
+                   systemctl --user status russel-ctrl\n\
+                   systemctl status russel-ctrl  # system unit / NixOS (services.russel)\n\
+                   ss -ltnp | grep {port}",
+                lock_path.display()
+            );
         }
-        return Err(anyhow::Error::new(err)
-            .context(format!("failed to acquire exclusive lock on {LOCK_PATH}")));
+        return Err(anyhow::Error::new(err).context(format!(
+            "failed to acquire exclusive lock on {}",
+            lock_path.display()
+        )));
     }
     Ok(OwnedFd::from(file))
+}
+
+/// Port hint for lock-contention diagnostics, from `RUSSEL_CTRL_ADDR`
+/// (`127.0.0.1:7878` default). Falls back to `7878` when unset/unparseable.
+fn ctrl_port_hint() -> String {
+    let addr = std::env::var("RUSSEL_CTRL_ADDR").unwrap_or_default();
+    match addr.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => {
+            port.to_string()
+        }
+        _ => "7878".to_string(),
+    }
 }
 
 /// F-36: true when the *bound* IP is loopback (used for auth policy).
@@ -305,7 +399,7 @@ fn live_service_tap_ids() -> std::collections::HashSet<String> {
     };
     let mut taps = std::collections::HashSet::new();
     let mut services = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/var/lib/russel") {
+    if let Ok(entries) = std::fs::read_dir(russel_core::paths::data_root()) {
         for entry in entries.flatten() {
             if let Ok(ft) = entry.file_type()
                 && ft.is_dir()
@@ -367,8 +461,11 @@ fn is_russel_tap(name: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{ip_is_loopback_for_auth, is_russel_tap};
+    use super::{
+        Cli, acquire_instance_lock_at, ip_is_loopback_for_auth, is_russel_tap, resolve_dashboard,
+    };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::path::PathBuf;
 
     #[test]
     fn loopback_ips_are_detected() {
@@ -406,5 +503,103 @@ mod tests {
         assert!(!is_russel_tap("docker0"));
         assert!(!is_russel_tap("rsl-A1B2C3D4")); // uppercase not lowercase hex
         assert!(!is_russel_tap("rsl-gggggggg")); // not hex
+    }
+
+    #[test]
+    fn instance_lock_contention_reports_operator_checks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let lock_path = tempdir.path().join("nested/ctrl.lock");
+        let first = acquire_instance_lock_at(&lock_path).unwrap();
+        let err = acquire_instance_lock_at(&lock_path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("another russel-ctrl instance is running"),
+            "got: {msg}"
+        );
+        assert!(msg.contains(&lock_path.display().to_string()), "got: {msg}");
+        assert!(
+            msg.contains("systemctl --user status russel-ctrl"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("ss -ltnp"), "got: {msg}");
+        assert!(msg.contains("7878"), "got: {msg}");
+        assert!(msg.contains("systemctl status russel-ctrl"), "got: {msg}");
+
+        drop(first);
+        let _third = acquire_instance_lock_at(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn instance_lock_filesystem_error_preserves_path_and_cause() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let file_parent = tempdir.path().join("not-a-directory");
+        std::fs::write(&file_parent, b"lock path blocker").unwrap();
+        let lock_path = file_parent.join("nested/ctrl.lock");
+
+        let err = acquire_instance_lock_at(&lock_path).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains(&file_parent.display().to_string()),
+            "got: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("not a directory"),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains("another russel-ctrl instance is running"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("systemctl"), "got: {msg}");
+        assert!(!msg.contains("ss -ltnp"), "got: {msg}");
+    }
+
+    #[test]
+    fn cli_debug_and_no_dashboard_parse() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["russel-ctrl", "--debug", "--no-dashboard"]).unwrap();
+        assert!(c.debug);
+        assert!(c.no_dashboard);
+    }
+
+    #[test]
+    fn cli_paths_parse() {
+        use clap::Parser;
+        use std::path::Path;
+        let c = Cli::try_parse_from([
+            "russel-ctrl",
+            "--dashboard-dir",
+            "/tmp/dash",
+            "--log-file",
+            "/tmp/ctrl.log",
+        ])
+        .unwrap();
+        assert_eq!(c.dashboard_dir.as_deref(), Some(Path::new("/tmp/dash")));
+        assert_eq!(c.log_file.as_deref(), Some(Path::new("/tmp/ctrl.log")));
+    }
+
+    #[test]
+    fn resolve_dashboard_respects_no_dashboard() {
+        let cli = Cli {
+            debug: false,
+            no_dashboard: true,
+            dashboard_dir: Some(PathBuf::from("/tmp/does-not-matter")),
+            log_file: None,
+        };
+        assert!(resolve_dashboard(&cli).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_dashboard_rejects_missing_explicit_dir() {
+        let cli = Cli {
+            debug: false,
+            no_dashboard: false,
+            dashboard_dir: Some(PathBuf::from("/no/such/russel-dashboard")),
+            log_file: None,
+        };
+        let err = resolve_dashboard(&cli).unwrap_err().to_string();
+        assert!(err.contains("index.html"), "got: {err}");
     }
 }
