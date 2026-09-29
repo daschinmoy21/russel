@@ -753,7 +753,7 @@ check_host_prereqs() {
     missing="$(microvm_missing_tools)"
     if [[ -n "$missing" ]]; then
       check_warn "microVMs (optional): missing ${missing}" \
-        "containers work without them; see docs/concepts/runtimes.md"
+        "containers work without them; see https://russel.mintlify.site/concepts/runtimes"
     else
       ch_major="$(cloud_hypervisor_major_version)"
       if [[ "$ch_major" =~ ^[0-9]+$ ]] && (( ch_major < 52 )); then

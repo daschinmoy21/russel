@@ -4,6 +4,8 @@ Self-hosted deploys for Nix-built services on your own Linux box. Point Russel a
 
 > **Status: v0.1, first public release.** Built for one trusted operator on one host. Containers are the default and the tested path. MicroVMs accept the same Russelfile and are marked experimental. Not multi-tenant, no clustering yet.
 
+**Docs: [russel.mintlify.site](https://russel.mintlify.site)** · [Quickstart](https://russel.mintlify.site/quickstart) · [Releases](https://github.com/daschinmoy21/russel/releases)
+
 ## Why this repo's history looks the way it does
 
 Development happens in a private repo (`russel-dev`), where each change lands as its own reviewed PR with CI: about 480 commits and 210 merged PRs since May 2026. This public repo gets that work as periodic `chore: sync …` commits, which is why a single commit here can add thousands of lines. Internal plans and audits stay private; code, docs, and open issues are mirrored. Issues and PRs are welcome here.
@@ -53,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/in
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 ```
 
-Then install the CLI where you work and log in. The [installation guide](docs/getting-started/installation.md) covers the laptop side, SSH tunnels vs HTTPS, and NixOS.
+Then install the CLI where you work and log in. The [installation guide](https://russel.mintlify.site/getting-started/installation) covers the laptop side, SSH tunnels vs HTTPS, and NixOS.
 
 ## Examples
 
@@ -61,11 +63,13 @@ Then install the CLI where you work and log in. The [installation guide](docs/ge
 
 ## Documentation
 
-- [Quickstart](docs/quickstart.md) and [first deploy](docs/getting-started/first-deploy.md)
-- [Russelfile reference](docs/reference/russelfile.md), [CLI](docs/reference/cli.md), [HTTP API](docs/reference/api.md)
-- [Architecture](docs/concepts/architecture.md), [runtimes](docs/concepts/runtimes.md), [networking](docs/concepts/networking.md)
-- [Security model](docs/security/overview.md) and [benchmarks](docs/guides/benchmarks.md)
-- [v0.1 status](docs/project/features/v0.1.md)
+The docs site is **[russel.mintlify.site](https://russel.mintlify.site)**. The same pages live in [`docs/`](docs/).
+
+- [Quickstart](https://russel.mintlify.site/quickstart) and [first deploy](https://russel.mintlify.site/getting-started/first-deploy)
+- [Russelfile reference](https://russel.mintlify.site/reference/russelfile), [CLI](https://russel.mintlify.site/reference/cli), [HTTP API](https://russel.mintlify.site/reference/api)
+- [Architecture](https://russel.mintlify.site/concepts/architecture), [runtimes](https://russel.mintlify.site/concepts/runtimes), [networking](https://russel.mintlify.site/concepts/networking)
+- [Security model](https://russel.mintlify.site/security/overview) and [benchmarks](https://russel.mintlify.site/guides/benchmarks)
+- [v0.1 status](https://russel.mintlify.site/project/features/v0.1) and [changelog](https://russel.mintlify.site/project/releases)
 
 ## Repo layout
 

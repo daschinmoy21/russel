@@ -301,7 +301,8 @@ fn map_control_plane_error(err: reqwest::Error, control_plane: &str) -> anyhow::
 #[command(
     name = "russel",
     version,
-    about = "Talk to russel-ctrl: deploy, list, logs, secrets"
+    about = "Talk to russel-ctrl: deploy, list, logs, secrets",
+    after_help = "Docs: https://russel.mintlify.site"
 )]
 pub struct Cli {
     /// Control plane URL. Overrides `RUSSEL_CONTROL_PLANE` and `russel login`.

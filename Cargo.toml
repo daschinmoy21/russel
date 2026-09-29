@@ -11,6 +11,7 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/daschinmoy21/russel"
+documentation = "https://russel.mintlify.site"
 version = "0.1.0"
 
 # Production code must not use unwrap/expect; #[cfg(test)] modules may allow them.

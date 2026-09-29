@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation.workspace = true
 description = "Russel worker agent — local runtime + heartbeat (horizontal scaling Phase 1)"
 
 [[bin]]

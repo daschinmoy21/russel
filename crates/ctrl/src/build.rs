@@ -223,7 +223,7 @@ impl NixBuilder {
                 if meta.file_type().is_symlink() || !meta.file_type().is_file() {
                     anyhow::bail!(
                         "RUSSEL_NIX_RESTRICTED=1 requires flake.nix to be a regular file \
-                         (not a symlink or directory). See docs/security/nix-builds.md"
+                         (not a symlink or directory). See https://russel.mintlify.site/security/nix-builds"
                     );
                 }
                 let content = std::fs::read_to_string(flake_path).map_err(|e| {
@@ -233,7 +233,7 @@ impl NixBuilder {
                     anyhow::bail!(
                         "RUSSEL_NIX_RESTRICTED=1 refuses auto-generated flake.nix \
                          (remove it and commit a pinned flake). \
-                         See docs/security/nix-builds.md"
+                         See https://russel.mintlify.site/security/nix-builds"
                     );
                 }
                 Ok(false)
@@ -242,7 +242,7 @@ impl NixBuilder {
                 anyhow::bail!(
                     "RUSSEL_NIX_RESTRICTED=1 requires a committed flake.nix \
                      (auto-generation is disabled for supply-chain hygiene). \
-                     See docs/security/nix-builds.md"
+                     See https://russel.mintlify.site/security/nix-builds"
                 );
             }
             Err(e) => Err(e.into()),

@@ -187,7 +187,7 @@ impl ContainerRunner {
             tracing::warn!(
                 service_id = %spec.service_id,
                 "service.cpus not applied: the cpu cgroup controller is not delegated to the \
-                 podman user (see service.cpus in docs/reference/russelfile.md)"
+                 podman user (see service.cpus in https://russel.mintlify.site/reference/russelfile)"
             );
             let unlimited = ContainerStartSpec {
                 cpus: None,

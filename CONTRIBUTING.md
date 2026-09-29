@@ -37,7 +37,7 @@ The `DCO` workflow runs `contrib/check-dco.sh` from the base branch (a PR cannot
 | `crates/cli` | `russel` CLI (crate name `russel-cli`) |
 | `crates/ctrl` | `russel-ctrl` control plane (deploy, microVM, container, API) |
 | `crates/agent` | `russel-agent` node-local agent for multi-host lifecycle RPC (heartbeat + stop/destroy/status proxies) |
-| `docs/` | Architecture and operator docs |
+| `docs/` | Architecture and operator docs, published at [russel.mintlify.site](https://russel.mintlify.site) |
 | `examples/` | Sample services |
 | `.github/workflows/ci.yml` | CI gates (must stay green) |
 

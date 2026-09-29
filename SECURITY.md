@@ -54,5 +54,5 @@ Out of scope:
 
 Details:
 
-- [Security overview](docs/security/overview.md): trust boundaries, open issues, operator rules.
-- [Nix build security](docs/security/nix-builds.md): the build threat model and restricted mode.
+- [Security overview](https://russel.mintlify.site/security/overview): trust boundaries, open issues, operator rules.
+- [Nix build security](https://russel.mintlify.site/security/nix-builds): the build threat model and restricted mode.
