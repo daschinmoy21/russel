@@ -5,7 +5,7 @@
 > password is public. Change it before you expose anything. Auth is required.
 > Do not copy `--noauth`. Do not publish the host port on `0.0.0.0`.
 
-Auth is on. The process binds `0.0.0.0` inside the guest so `-p` works with
+Auth is on. The process binds `0.0.0.0` inside the guest so host publishing works with
 ordinary Podman/Docker publish (slirp/pasta target the container IP, not guest
 loopback). Isolation for the demo is host-side. Russel default
 `RUSSEL_PUBLISH_BIND=127.0.0.1`.
@@ -19,15 +19,24 @@ loopback). Isolation for the demo is host-side. Russel default
 
 ## Deploy
 
-```bash
-./target/debug/russel-ctrl
-./target/debug/russel deploy examples/filebrowser -p 8081:8080 --vm-id files
+To pin a direct host port, add this to `examples/filebrowser/Russelfile.toml`:
+
+```toml
+[ingress]
+port = 8081
 ```
 
-Open `http://127.0.0.1:8081/` and sign in. Then:
+Then start the control plane and deploy:
 
 ```bash
-./target/debug/russel destroy files
+./target/debug/russel-ctrl
+./target/debug/russel deploy examples/filebrowser
+```
+
+Open `http://127.0.0.1:8081/` and sign in. Destroy the service with:
+
+```bash
+./target/debug/russel destroy filebrowser
 ```
 
 ## Password

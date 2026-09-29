@@ -3,7 +3,6 @@
 use super::config::{MAX_CONFIG_BYTES, load_russelfile_under_repo};
 use super::pipeline::{DesiredExtras, build_desired_state, new_generation_id};
 use crate::metadata::build_microvm_metadata_with_gen;
-use crate::microvm::MicrovmRunner;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +18,7 @@ fn generation_id_is_short_hex() {
 fn generation_runtime_key_is_valid_service_id() {
     let id = new_generation_id();
     let key = format!("api_g{id}");
-    MicrovmRunner::validate_service_id(&key).unwrap();
+    russel_core::ids::validate_service_id(&key).unwrap();
 }
 
 #[test]
@@ -335,4 +334,54 @@ fn desired_state_records_file_only_ingress_pin_and_host() {
     assert_eq!(ds["port"]["host"], 4000);
     assert_eq!(ds["port"]["guest"], 3000);
     assert_eq!(ds["ingress_host"], "abc.com");
+}
+
+#[test]
+fn render_argv_one_entry_per_line() {
+    let args = vec!["--listen".to_string(), ":8080".to_string(), String::new()];
+    assert_eq!(super::render_argv(&args).unwrap(), "--listen\n:8080\n\n");
+    assert_eq!(super::render_argv(&[]).unwrap(), "");
+    assert!(super::render_argv(&["a\nb".to_string()]).is_err());
+}
+
+#[test]
+fn write_deploy_env_writes_argv_and_user_and_clears_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("cfg");
+    let cfg = cfg.to_str().unwrap();
+    let env = std::collections::HashMap::new();
+    let args = vec!["file-server".to_string(), "--listen".to_string()];
+    super::write_deploy_env(
+        cfg,
+        "10.0.0.2",
+        "10.0.0.1",
+        3000,
+        "/nix/store/x/bin/a",
+        &env,
+        &args,
+        &[],
+        super::RunAs::App,
+    )
+    .unwrap();
+    let argv = std::fs::read_to_string(format!("{cfg}/argv")).unwrap();
+    assert_eq!(argv, "file-server\n--listen\n");
+    let (uid, gid) = super::microvm_app_ids();
+    assert_eq!(
+        std::fs::read_to_string(format!("{cfg}/user")).unwrap(),
+        format!("{uid} {gid}\n")
+    );
+    super::write_deploy_env(
+        cfg,
+        "10.0.0.2",
+        "10.0.0.1",
+        3000,
+        "/nix/store/x/bin/a",
+        &env,
+        &[],
+        &[],
+        super::RunAs::Root,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(format!("{cfg}/argv")).unwrap(), "");
+    assert!(!std::path::Path::new(&format!("{cfg}/user")).exists());
 }

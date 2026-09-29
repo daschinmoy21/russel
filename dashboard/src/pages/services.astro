@@ -2,6 +2,7 @@
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import OfflineState from '../components/OfflineState.astro';
+import DestroyDialog from '../components/DestroyDialog.astro';
 
 // Static shell only — no build-time control-plane fetch (#306).
 // Client hydrate() fills the table from the browser.
@@ -12,7 +13,6 @@ import OfflineState from '../components/OfflineState.astro';
     <Header
       title="Services"
       subtitle="Manage your microVM and container deployments."
-      connection="loading"
     />
     <div class="header-buttons">
       <button id="btnRefresh" class="btn btn-secondary" title="Refresh service list">
@@ -54,12 +54,15 @@ import OfflineState from '../components/OfflineState.astro';
     </div>
     <noscript><OfflineState /></noscript>
   </section>
+
+  <DestroyDialog />
 </Layout>
 
 <script>
   import { api, escapeHtml, getApiBase, isDemoMode, isServiceRunning } from '../lib/api';
   import { renderOfflineState, renderUnauthorizedState, renderEmptyState } from '../lib/offline_state';
   import { renderPortCell } from '../lib/ports';
+  import { confirmDestroy } from '../lib/destroy_dialog';
   import type { ConnectionState, ServiceVM } from '../lib/api';
 
   const tableWrapper = document.getElementById('servicesTableWrapper');
@@ -129,7 +132,7 @@ import OfflineState from '../components/OfflineState.astro';
         result = await api.stopService(id);
         break;
       case 'destroy':
-        if (!confirm(`Destroy service ${id}? This action cannot be undone.`)) return;
+        if (!(await confirmDestroy(id))) return;
         result = await api.destroyService(id);
         break;
       default:
@@ -226,8 +229,8 @@ import OfflineState from '../components/OfflineState.astro';
     justify-content: space-between;
     align-items: center;
     gap: 1rem;
-    padding: 0.75rem 1.1rem;
-    margin-bottom: 1.5rem;
+    padding: 0;
+    margin-bottom: 2.25rem;
     flex-wrap: wrap;
   }
 
@@ -235,10 +238,10 @@ import OfflineState from '../components/OfflineState.astro';
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    background-color: var(--bg-input);
-    border: 1px solid var(--border-card);
-    border-radius: var(--radius-md);
-    padding: 0.45rem 0.75rem;
+    background-color: transparent;
+    border: none;
+    border-bottom: 1px solid var(--border-input);
+    padding: 0.45rem 0;
     flex: 1;
     min-width: 240px;
     max-width: 440px;
@@ -261,19 +264,17 @@ import OfflineState from '../components/OfflineState.astro';
 
   .filter-pills {
     display: flex;
-    gap: 0.25rem;
-    background-color: var(--bg-input);
-    padding: 0.2rem;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-card);
+    gap: 1.75rem;
   }
 
   .pill-btn {
     background: none;
     border: none;
     color: var(--text-muted);
-    padding: 0.3rem 0.7rem;
-    font-size: 0.78rem;
+    padding: 0.3rem 0;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
     font-weight: 500;
     border-radius: var(--radius-sm);
     cursor: pointer;
@@ -286,9 +287,8 @@ import OfflineState from '../components/OfflineState.astro';
   }
 
   .pill-btn.active {
-    background-color: var(--bg-card);
     color: var(--text-primary);
-    box-shadow: var(--shadow-card);
+    font-weight: 700;
   }
 
   .services-list-area {

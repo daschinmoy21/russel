@@ -83,12 +83,20 @@ pub struct ContainerStartSpec {
     pub host_port: u16,
     pub guest_port: u16,
     pub memory_mb: u16,
+    /// `service.cpus` as `podman run --cpus`; `None` sets no CPU limit.
+    pub cpus: Option<u8>,
     pub env: Vec<(String, String)>,
-    /// Validated extra `podman run` arguments (inserted before entrypoint).
-    pub extra_args: Vec<String>,
+    /// Values resolved from `secret://` refs. Delivered as Podman secrets
+    /// (`--secret NAME,type=env`) so they stay out of argv and inspect (#457).
+    pub secret_env: Vec<(String, String)>,
+    /// Operator `podman run` flags from `--podman-arg` / API `podman_args`
+    /// (validated, inserted before `--rootfs`). Never reach the process.
+    pub podman_args: Vec<String>,
     pub volumes: Vec<russel_core::volumes::ResolvedVolume>,
     pub extra_ports: Vec<(u16, u16)>,
-    pub args: Vec<String>,
+    /// Russelfile `service.args`: process argv after the entrypoint.
+    pub service_args: Vec<String>,
+    /// Run the app unprivileged as the Podman user (`service.user` omitted).
     pub userns_keep_id: bool,
     pub restart: Option<String>,
 }
@@ -112,6 +120,11 @@ impl ContainerRunner {
 
     /// Fail if `podman info` does not indicate rootless.
     pub async fn ensure_rootless() -> anyhow::Result<()> {
+        Self::rootless_info().await.map(|_| ())
+    }
+
+    /// `podman info` JSON, after checking that Podman is rootless.
+    async fn rootless_info() -> anyhow::Result<String> {
         sanitize_podman_user_runtime_dir().await?;
         let output = podman_command()
             .await
@@ -127,9 +140,9 @@ impl ContainerRunner {
             );
         }
 
-        let info = String::from_utf8_lossy(&output.stdout);
+        let info = String::from_utf8_lossy(&output.stdout).into_owned();
         match parse_podman_rootless(&info) {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(info),
             Ok(false) => anyhow::bail!(rootless_required_error("false")),
             Err(_) => anyhow::bail!(rootless_required_error("not found")),
         }
@@ -140,12 +153,27 @@ impl ContainerRunner {
     }
 
     pub async fn start(&self, spec: &ContainerStartSpec) -> anyhow::Result<RunningContainer> {
-        crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
+        russel_core::ids::validate_service_id(&spec.service_id)?;
 
         // Validate args + rootless BEFORE stopping old container (#115).
         let log_path = container_log_path(&spec.service_id);
-        let args = build_run_args(spec, &log_path)?;
-        Self::ensure_rootless().await?;
+        let mut args = build_run_args(spec, &log_path)?;
+        let info = Self::rootless_info().await?;
+        // Rootless `--cpus` needs the cpu controller delegated to the podman
+        // user; without it `podman run` refuses to start. Run unlimited and
+        // say so rather than fail every deploy (cpus defaults to 1).
+        if spec.cpus.is_some() && !podman_has_cgroup_controller(&info, "cpu") {
+            tracing::warn!(
+                service_id = %spec.service_id,
+                "service.cpus not applied: the cpu cgroup controller is not delegated to the \
+                 podman user (see service.cpus in docs/reference/russelfile.md)"
+            );
+            let unlimited = ContainerStartSpec {
+                cpus: None,
+                ..spec.clone()
+            };
+            args = build_run_args(&unlimited, &log_path)?;
+        }
 
         let name = Self::container_name(&spec.service_id);
         stop_and_remove_container(&name).await?;
@@ -167,8 +195,14 @@ impl ContainerRunner {
                 &russel_core::volumes::extra_port_key(&spec.service_id, i),
             ));
         }
+        if let Err(e) = create_podman_secrets(&name, &spec.secret_env).await {
+            // Do not leave the keys created before the failing one behind.
+            remove_podman_secrets(&name).await;
+            return Err(e);
+        }
         let output = run_podman(&args).await?;
         if !output.status.success() {
+            remove_podman_secrets(&name).await;
             anyhow::bail!(
                 "podman run failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -190,13 +224,6 @@ impl ContainerRunner {
             );
         }
 
-        // Container env values are visible via `podman inspect`; prefer microvm
-        // for secret-heavy workloads (its deploy.env is 0600 in a 0700 dir).
-        tracing::info!(
-            service_id = %spec.service_id,
-            "note: container env values are visible via podman inspect; \
-             prefer microvm runtime for secret-heavy workloads"
-        );
         tracing::info!(
             service_id = %spec.service_id,
             container_name = %name,
@@ -215,7 +242,7 @@ impl ContainerRunner {
     }
 
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
-        crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
+        russel_core::ids::validate_service_id(service_id)?;
         let name = resolve_container_name(service_id);
         stop_container(&name).await?;
         // The container is already stopped. A metadata write failure must not
@@ -244,7 +271,7 @@ impl ContainerRunner {
         service_id: &str,
         policy: russel_core::VolumeDestroyPolicy,
     ) -> anyhow::Result<()> {
-        crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
+        russel_core::ids::validate_service_id(service_id)?;
         let name = resolve_container_name(service_id);
         stop_container(&name).await?;
         remove_container(&name).await?;
@@ -273,7 +300,7 @@ pub async fn destroy_with_policy_for(
 /// Redeploy and failed-deploy cleanup use this. `keep` applies to operator
 /// destroy, not to replacing a running generation that is still using the data.
 pub async fn destroy_preserving_volumes(service_id: &str) -> anyhow::Result<()> {
-    crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
+    russel_core::ids::validate_service_id(service_id)?;
     let name = resolve_container_name(service_id);
     stop_container(&name).await?;
     remove_container(&name).await?;
@@ -406,7 +433,7 @@ pub async fn restore_backed_up_service_dir(live: &Path, backup: &Path) -> anyhow
         if !already_parked {
             detach_managed_volumes(live).await?;
         }
-        tokio::fs::remove_dir_all(live).await.map_err(|e| {
+        remove_tree(live).await.map_err(|e| {
             anyhow::anyhow!(
                 "failed to remove partial service dir {}: {e}",
                 live.display()
@@ -451,7 +478,68 @@ pub fn dir_is_kept_volumes_only(path: &Path) -> bool {
     saw_volumes
 }
 
-async fn remove_service_payload_keep_volumes(base: &Path) -> anyhow::Result<()> {
+/// `remove_dir_all` for trees a rootless container has written to.
+///
+/// Podman creates mount points and bind targets inside `--rootfs` (and an
+/// app may create files in a volume) as the container's user namespace. With
+/// `userns = "keep-id"` the container root maps to a subordinate uid, so a
+/// non-root ctrl cannot unlink those entries (#464). On EACCES, retry inside
+/// `podman unshare`, where the ctrl user is root over its subuids. A root
+/// ctrl never needs the fallback.
+pub(crate) async fn remove_tree(path: &Path) -> std::io::Result<()> {
+    remove_tree_with(path, podman_unshare_rm).await
+}
+
+pub(super) async fn remove_tree_with<F, Fut>(path: &Path, fallback: F) -> std::io::Result<()>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::fs::remove_dir_all(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::info!(
+                path = %path.display(),
+                "removing subordinate-uid files via podman unshare"
+            );
+            fallback(path.to_path_buf()).await?;
+            // An error checking counts as still present: fail closed.
+            if tokio::fs::try_exists(path).await.unwrap_or(true) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is still present after podman unshare rm",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+async fn podman_unshare_rm(path: PathBuf) -> std::io::Result<()> {
+    let output = podman_command()
+        .await
+        .args(["unshare", "rm", "-rf", "--"])
+        .arg(&path)
+        .output()
+        .await
+        // Not the spawn error's own kind: a missing podman binary would read
+        // as NotFound, which callers take to mean the tree is already gone.
+        .map_err(|e| std::io::Error::other(format!("podman unshare rm: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "podman unshare rm -rf {} failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+/// Delete everything in `base` except a `volumes/` directory.
+pub(crate) async fn remove_service_payload_keep_volumes(base: &Path) -> anyhow::Result<()> {
     if !base.exists() {
         return Ok(());
     }
@@ -462,7 +550,7 @@ async fn remove_service_payload_keep_volumes(base: &Path) -> anyhow::Result<()> 
             continue;
         }
         if path.is_dir() {
-            tokio::fs::remove_dir_all(&path).await?;
+            remove_tree(&path).await?;
         } else {
             tokio::fs::remove_file(&path).await?;
         }
@@ -473,7 +561,7 @@ async fn remove_service_payload_keep_volumes(base: &Path) -> anyhow::Result<()> 
 impl ContainerRunner {
     /// Inspect a running Russel container (used by e2e tests and future status API).
     pub async fn inspect(&self, service_id: &str) -> anyhow::Result<Option<RunningContainer>> {
-        crate::microvm::MicrovmRunner::validate_service_id(service_id)?;
+        russel_core::ids::validate_service_id(service_id)?;
         let name = Self::container_name(service_id);
         let output = podman_command()
             .await
@@ -544,14 +632,30 @@ pub fn parse_podman_rootless(info_json: &str) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("podman info missing .host.security.rootless"))
 }
 
+/// Whether `podman info` lists `controller` under `host.cgroupControllers`.
+/// A missing list (older Podman) counts as available and leaves the decision
+/// to `podman run`.
+pub(crate) fn podman_has_cgroup_controller(info_json: &str, controller: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(info_json) else {
+        return true;
+    };
+    match value
+        .pointer("/host/cgroupControllers")
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(list) => list.iter().any(|c| c.as_str() == Some(controller)),
+        None => true,
+    }
+}
+
 /// Build `podman run` arguments for unit testing and runtime use.
 ///
-/// **Security note:** Environment variables (including values resolved from
-/// `secret://` references) are passed via `-e KEY=value` and are visible to
-/// anyone who can run `podman inspect` on the host. Prefer the microvm runtime
-/// for secret-heavy workloads; its deploy.env is written to a 0700 directory.
+/// **Security note:** plain env goes on `-e KEY=value` and is visible in
+/// `podman inspect`. Values from `secret://` refs (`spec.secret_env`) only
+/// appear as `--secret NAME,type=env,target=KEY`; the value itself goes to
+/// `podman secret create` over stdin (#457).
 pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Result<Vec<String>> {
-    crate::microvm::MicrovmRunner::validate_service_id(&spec.service_id)?;
+    russel_core::ids::validate_service_id(&spec.service_id)?;
 
     let name = ContainerRunner::container_name(&spec.service_id);
     let bind = crate::network::publish_bind_addr();
@@ -606,6 +710,11 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "/run".to_string(),
     ];
 
+    if let Some(cpus) = spec.cpus {
+        args.push("--cpus".to_string());
+        args.push(cpus.to_string());
+    }
+
     for vol in &spec.volumes {
         let source = vol.host_path.to_str().ok_or_else(|| {
             anyhow::anyhow!("non-UTF-8 volume host path {}", vol.host_path.display())
@@ -636,17 +745,21 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     }
 
     if spec.userns_keep_id {
+        // Unprivileged app (#466): run as the Podman user, who owns the
+        // volumes, and let it bind ports below 1024 inside its own netns.
         args.push("--userns".to_string());
         args.push("keep-id".to_string());
+        args.push("--sysctl".to_string());
+        args.push("net.ipv4.ip_unprivileged_port_start=0".to_string());
     }
     if let Some(restart) = spec.restart.as_deref() {
         args.push("--restart".to_string());
         args.push(restart.to_string());
     }
 
-    if !spec.extra_args.is_empty() {
-        validate_podman_passthrough_args(&spec.extra_args)?;
-        args.extend(spec.extra_args.clone());
+    if !spec.podman_args.is_empty() {
+        validate_podman_passthrough_args(&spec.podman_args)?;
+        args.extend(spec.podman_args.clone());
     }
 
     // Re-assert isolation after extras: podman last-wins for boolean flags and
@@ -663,14 +776,26 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         args.push(format!("{key}={value}"));
     }
 
+    let container = ContainerRunner::container_name(&spec.service_id);
+    for (key, _) in &spec.secret_env {
+        // The key lands in a comma-separated option; core already enforces
+        // [A-Za-z_][A-Za-z0-9_]*, so this only guards other callers.
+        russel_core::validate_env_key(key)?;
+        args.push("--secret".to_string());
+        args.push(format!(
+            "{},type=env,target={key}",
+            podman_secret_name(&container, key)
+        ));
+    }
+
     args.push("--rootfs".to_string());
     args.push(spec.rootfs.rootfs_path.display().to_string());
     args.push(spec.rootfs.entrypoint.display().to_string());
-    args.extend(spec.args.iter().cloned());
+    args.extend(spec.service_args.iter().cloned());
     Ok(args)
 }
 
-pub(super) async fn prepare_managed_volume_dirs(
+pub(crate) async fn prepare_managed_volume_dirs(
     volumes: &[russel_core::volumes::ResolvedVolume],
 ) -> anyhow::Result<()> {
     for vol in volumes {
@@ -727,7 +852,7 @@ pub async fn cleanup_service_dir_in(
         if matches!(policy, russel_core::VolumeDestroyPolicy::DeleteAll) {
             // Wipe the whole managed tree so stale dirs from removed volume
             // names go too (not only currently recorded paths).
-            tokio::fs::remove_dir_all(&volumes_root).await?;
+            remove_tree(&volumes_root).await?;
         } else if !volumes.is_empty() {
             let volumes_root_canon = volumes_root.canonicalize().map_err(|e| {
                 anyhow::anyhow!(
@@ -758,7 +883,7 @@ pub async fn cleanup_service_dir_in(
                         volumes_root.display()
                     );
                 }
-                tokio::fs::remove_dir_all(&host_canon).await.map_err(|e| {
+                remove_tree(&host_canon).await.map_err(|e| {
                     anyhow::anyhow!(
                         "failed to delete managed volume {}: {e}",
                         vol.host_path.display()
@@ -781,7 +906,7 @@ pub async fn cleanup_service_dir_in(
             continue;
         }
         if path.is_dir() {
-            tokio::fs::remove_dir_all(&path).await?;
+            remove_tree(&path).await?;
         } else {
             tokio::fs::remove_file(&path).await?;
         }
@@ -797,7 +922,7 @@ async fn dir_is_empty(path: &Path) -> anyhow::Result<bool> {
     Ok(rd.next_entry().await?.is_none())
 }
 
-fn volumes_recorded_for(service_id: &str) -> Vec<russel_core::volumes::ResolvedVolume> {
+pub(crate) fn volumes_recorded_for(service_id: &str) -> Vec<russel_core::volumes::ResolvedVolume> {
     let path = default_base_dir(service_id).join("metadata.json");
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -912,6 +1037,9 @@ async fn remove_container(name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to run podman rm: {e}"))?;
 
     if output.status.success() || is_missing_container(&output) {
+        // Secrets go with the container that references them: removing one
+        // a container still uses breaks that container's next restart.
+        remove_podman_secrets(name).await;
         return Ok(());
     }
 
@@ -919,6 +1047,106 @@ async fn remove_container(name: &str) -> anyhow::Result<()> {
         "podman rm failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     )
+}
+
+/// Podman secret holding one `secret://` env value of `container`:
+/// `{container}.{KEY}`. Service ids and env keys contain no dot, so the
+/// prefix `{container}.` names exactly this container's secrets.
+pub(crate) fn podman_secret_name(container: &str, key: &str) -> String {
+    format!("{container}.{key}")
+}
+
+/// Create the Podman secrets for `container`. Values go over stdin, never
+/// argv. Leftovers from an earlier run of the same container name are removed
+/// first instead of using `--replace`, which needs Podman 4.7 (Debian 12 ships
+/// 4.3).
+async fn create_podman_secrets(
+    container: &str,
+    secret_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if secret_env.is_empty() {
+        return Ok(());
+    }
+    remove_podman_secrets(container).await;
+    for (key, value) in secret_env {
+        let name = podman_secret_name(container, key);
+        let mut child = podman_command()
+            .await
+            .args(["secret", "create", &name, "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to run podman secret create: {e}"))?;
+        // Reap the child before reporting a failed write so it is not left
+        // behind; a short write must still fail even if podman exits 0.
+        let written = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(value.as_bytes()).await,
+            None => Ok(()),
+        };
+        let output = child.wait_with_output().await?;
+        written.map_err(|e| anyhow::anyhow!("failed to write podman secret {name}: {e}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "podman secret create {name} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort removal of every Podman secret created for `container`.
+async fn remove_podman_secrets(container: &str) {
+    let listed = match run_podman(&[
+        "secret".to_string(),
+        "ls".to_string(),
+        "--format".to_string(),
+        "{{.Name}}".to_string(),
+    ])
+    .await
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::warn!(
+                container,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "podman secret ls failed; container secrets may be left behind"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(container, error = %e, "podman secret ls failed");
+            return;
+        }
+    };
+    let names = secrets_for_container(&String::from_utf8_lossy(&listed.stdout), container);
+    if names.is_empty() {
+        return;
+    }
+    let mut args = vec!["secret".to_string(), "rm".to_string()];
+    args.extend(names);
+    match run_podman(&args).await {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::warn!(
+            container,
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "podman secret rm failed"
+        ),
+        Err(e) => tracing::warn!(container, error = %e, "podman secret rm failed"),
+    }
+}
+
+/// Names from `podman secret ls` output that belong to `container`.
+pub(crate) fn secrets_for_container(ls_output: &str, container: &str) -> Vec<String> {
+    let prefix = format!("{container}.");
+    ls_output
+        .lines()
+        .map(str::trim)
+        .filter(|n| n.starts_with(&prefix))
+        .map(str::to_string)
+        .collect()
 }
 
 fn is_missing_container(output: &std::process::Output) -> bool {

@@ -1,0 +1,130 @@
+name: Examples
+
+# Deploy every example on each runtime against a real, non-root russel-ctrl
+# and check that the app answers (#474, #470).
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/ctrl/**"
+      - "crates/core/**"
+      - "crates/cli/**"
+      - "examples/**"
+      - "contrib/tests/deploy_examples.sh"
+      - ".github/workflows/examples.yml"
+      - "nix/**"
+      - "flake.nix"
+      - "flake.lock"
+  push:
+    branches: [main]
+    paths:
+      - "crates/ctrl/**"
+      - "crates/core/**"
+      - "crates/cli/**"
+      - "examples/**"
+      - "contrib/tests/deploy_examples.sh"
+      - ".github/workflows/examples.yml"
+      - "nix/**"
+      - "flake.nix"
+      - "flake.lock"
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  containers:
+    name: Deploy container examples
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build russel and russel-ctrl
+        run: cargo build --release -p russel-ctrl -p russel-cli
+      - name: Rootless Podman with a user session
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman passt uidmap jq
+          # A lingering user manager gives rootless Podman the systemd cgroup
+          # manager and delegated memory/cpu controllers, as on a real host.
+          sudo loginctl enable-linger "$(id -un)"
+          uid=$(id -u)
+          for _ in $(seq 1 20); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$uid" >>"$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >>"$GITHUB_ENV"
+      - name: Podman info
+        run: podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupManager}} {{json .Host.CgroupControllers}} {{.Host.NetworkBackend}}'
+      - name: Deploy, probe, and destroy every example as a container
+        run: contrib/tests/deploy_examples.sh
+        env:
+          RUNTIME: container
+
+  microvms:
+    name: Deploy every example as a microVM
+    runs-on: ubuntu-24.04
+    # Manual only: a kernel cache miss builds Linux from source, which takes
+    # hours on hosted runners. Run the microVM sweep locally instead
+    # (RUNTIME=microvm contrib/tests/deploy_examples.sh).
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          # ctrl builds the guest busybox from <nixpkgs>.
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build russel and russel-ctrl
+        run: cargo build --release -p russel-ctrl -p russel-cli
+      - name: KVM and user namespaces for the runner user
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # Ubuntu 24.04 denies unprivileged user namespaces to binaries
+          # without an AppArmor profile. virtiofsd's namespace sandbox and
+          # passt both need them, as on the NixOS hosts Russel targets.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get install -y -qq jq
+          ls -l /dev/kvm
+      - name: Restore the microVM kernel
+        id: kernel
+        uses: actions/cache@v4
+        with:
+          path: .ci/microvm-kernel
+          key: microvm-kernel-${{ runner.arch }}-${{ hashFiles('flake.lock', 'nix/microvm-kernel.nix') }}
+      - name: Build the microVM kernel
+        if: steps.kernel.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          out=$(nix build --no-link --print-out-paths .#microvm-kernel)
+          mkdir -p .ci/microvm-kernel
+          cp "$out/bzImage" .ci/microvm-kernel/bzImage
+      - name: Deploy, probe, and destroy every example as a microVM
+        # The dev shell provides cloud-hypervisor, virtiofsd, and passt.
+        run: nix develop -c contrib/tests/deploy_examples.sh
+        env:
+          RUNTIME: microvm
+          RUSSEL_KERNEL_PATH: ${{ github.workspace }}/.ci/microvm-kernel/bzImage

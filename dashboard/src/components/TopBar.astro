@@ -1,0 +1,305 @@
+---
+import { headerBadgeMeta, resolveHeaderConnection } from '../lib/api';
+
+interface Props {
+  activePath: string;
+}
+
+const { activePath } = Astro.props;
+
+const tabs = [
+  { key: '1', href: '/', label: 'Overview', active: activePath === '/' },
+  { key: '2', href: '/services', label: 'Services', active: activePath.startsWith('/services'), countId: 'tabCountServices' },
+  { key: '3', href: '/deploy', label: 'Deploy', active: activePath === '/deploy' },
+  { key: '4', href: '/settings', label: 'Settings', active: activePath.startsWith('/settings') },
+];
+
+// Static shells never claim LIVE before the browser probe (#306).
+const initial = headerBadgeMeta(resolveHeaderConnection());
+---
+
+<header class="topbar">
+  <div class="brand-row">
+    <div class="brand">
+      <a href="/" class="brand-name">russel</a>
+    </div>
+    <div class="conn" id="connStatus" title={initial.title}>
+      <span class={`conn-mark ${initial.className}`} id="connMark"></span>
+      <span class="conn-label" id="connLabel">Checking</span>
+      <span class="conn-time" id="connTime"></span>
+    </div>
+  </div>
+
+  <nav class="tabs" aria-label="Views">
+    {tabs.map((tab) => (
+      <a
+        href={tab.href}
+        class={`tab${tab.active ? ' active' : ''}`}
+        aria-current={tab.active ? 'page' : undefined}
+        data-key={tab.key}
+      >
+        <span class="tab-key">{tab.key}</span>
+        <span class="tab-label">{tab.label}</span>
+        {tab.countId && <span class="tab-count" id={tab.countId}></span>}
+      </a>
+    ))}
+  </nav>
+</header>
+
+<footer class="keybar">
+  <span>Press 1&ndash;4 to switch views</span>
+  <span class="keybar-right">
+    <span class="keybar-api" id="footerApiBase">/api</span>
+    <button id="themeToggle" class="keybar-btn" type="button" aria-label="Toggle color theme">
+      <span class="tab-key">t</span> theme
+    </button>
+    <a class="keybar-btn" href="https://github.com/daschinmoy21/russel/blob/main/docs/install.md" target="_blank" rel="noreferrer">docs &nearr;</a>
+  </span>
+</footer>
+
+<script>
+  import { api, getApiBase, headerBadgeMeta, isDemoMode } from '../lib/api';
+  import type { ConnectionState } from '../lib/api';
+
+  const PROBE_INTERVAL_MS = 10_000;
+
+  const mark = document.getElementById('connMark');
+  const label = document.getElementById('connLabel');
+  const time = document.getElementById('connTime');
+  const box = document.getElementById('connStatus');
+  const count = document.getElementById('tabCountServices');
+  const apiEl = document.getElementById('footerApiBase');
+
+  if (apiEl) apiEl.textContent = getApiBase() || '/';
+
+  function stamp(): string {
+    return new Date().toISOString().slice(11, 19) + 'Z';
+  }
+
+  // Plain online/offline words for the indicator; the tooltip keeps the detail.
+  const STATUS_WORD: Partial<Record<ConnectionState, string>> = {
+    live: 'Online',
+    offline: 'Offline',
+  };
+
+  function tick() {
+    if (time) time.textContent = stamp();
+  }
+  tick();
+  setInterval(tick, 1000);
+
+  function apply(state: ConnectionState, total?: number) {
+    const meta = headerBadgeMeta(state, getApiBase(), window.location.origin);
+    if (mark) mark.className = `conn-mark ${meta.className}`;
+    if (label) label.textContent = STATUS_WORD[state] ?? meta.label;
+    if (box) box.title = meta.title;
+    if (count) count.textContent = typeof total === 'number' ? String(total) : '';
+  }
+
+  async function probe() {
+    try {
+      // Runs every 10s on every view: one /vms call, not the per-service fan-out.
+      const { connection, total } = await api.probeConnection();
+      apply(connection, total);
+    } catch {
+      apply(isDemoMode() ? 'demo' : 'offline');
+    }
+  }
+
+  probe();
+  setInterval(probe, PROBE_INTERVAL_MS);
+
+  // Theme toggle (button or `t`)
+  const html = document.documentElement;
+  function setTheme(theme: string) {
+    html.setAttribute('data-theme', theme);
+    try { localStorage.setItem('russel-theme', theme); } catch { /* private mode */ }
+  }
+  function toggleTheme() {
+    setTheme(html.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
+  }
+  document.getElementById('themeToggle')?.addEventListener('click', toggleTheme);
+
+  // Number keys switch views; ignore while typing or with modifiers.
+  const routes: Record<string, string> = { '1': '/', '2': '/services', '3': '/deploy', '4': '/settings' };
+  document.addEventListener('keydown', (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey || e.defaultPrevented) return;
+    const t = e.target as HTMLElement | null;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (e.key === 't') {
+      toggleTheme();
+      return;
+    }
+    const dest = routes[e.key];
+    if (dest && dest !== window.location.pathname) window.location.href = dest;
+  });
+</script>
+
+<style>
+  .topbar {
+    padding: 2.75rem 3.5rem 0;
+    max-width: 1320px;
+    width: 100%;
+  }
+
+  .brand-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .brand-name {
+    display: inline-block;
+    font-size: 2.6rem;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    line-height: 1;
+    color: var(--text-primary);
+    text-decoration: none;
+  }
+
+  .conn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.9rem;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.26em;
+    padding-bottom: 0.2rem;
+  }
+
+  .conn-label,
+  .conn-time {
+    color: var(--text-secondary);
+  }
+
+  .conn-mark {
+    width: 0.6rem;
+    height: 0.6rem;
+    background: currentColor;
+    color: var(--text-muted);
+  }
+
+  .conn-mark.badge-online { color: var(--accent-green); }
+  .conn-mark.badge-offline { color: var(--accent-red); }
+  .conn-mark.badge-demo,
+  .conn-mark.badge-warning { color: var(--accent-amber); }
+
+  .tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 3rem;
+    margin: 3.25rem 0 3rem;
+  }
+
+  .tab {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.9rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    text-transform: uppercase;
+    letter-spacing: 0.24em;
+    font-size: 0.88rem;
+  }
+
+  .tab:hover .tab-label {
+    color: var(--text-primary);
+  }
+
+  .tab-key {
+    color: var(--text-muted);
+    opacity: 0.6;
+    letter-spacing: 0;
+  }
+
+  .tab-label {
+    color: var(--text-secondary);
+  }
+
+  .tab.active .tab-label {
+    color: var(--text-primary);
+    font-weight: 700;
+  }
+
+  .tab-count {
+    color: var(--text-secondary);
+  }
+
+  .tab-count:empty {
+    display: none;
+  }
+
+  .keybar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 1.1rem 3.5rem;
+    background: var(--bg-app);
+    border-top: 1px solid var(--border-app);
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.26em;
+  }
+
+  .keybar-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 2rem;
+  }
+
+  .keybar-api {
+    text-transform: none;
+    letter-spacing: 0.04em;
+  }
+
+  .keybar-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--text-muted);
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .keybar-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .keybar-btn .tab-key {
+    margin-right: 0.5rem;
+  }
+
+  @media (max-width: 720px) {
+    .topbar {
+      padding: 1.75rem 1rem 0;
+    }
+
+    .tabs {
+      gap: 0.5rem 1.5rem;
+      margin: 2rem 0 2rem;
+    }
+
+    .keybar {
+      padding: 0.9rem 1rem;
+      letter-spacing: 0.12em;
+    }
+
+    .keybar-api {
+      display: none;
+    }
+  }
+</style>

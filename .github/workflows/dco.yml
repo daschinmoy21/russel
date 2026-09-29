@@ -1,0 +1,37 @@
+name: DCO
+
+# Every commit in an outside pull request needs a `Signed-off-by` trailer
+# matching its author (Developer Certificate of Origin, see CONTRIBUTING.md).
+# The repository owner's PRs are exempt: the owner is the copyright holder.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: DCO sign-off
+    if: github.event.pull_request.author_association != 'OWNER'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Run the validator from the base commit, never the PR's copy: a PR
+      # that edits contrib/check-dco.sh must not decide its own result.
+      - name: Check Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git show "${BASE_SHA}:contrib/check-dco.sh" >"${RUNNER_TEMP}/check-dco.sh"
+          bash "${RUNNER_TEMP}/check-dco.sh" "${BASE_SHA}..${HEAD_SHA}"

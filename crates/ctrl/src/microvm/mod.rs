@@ -1,15 +1,21 @@
 //! Cloud Hypervisor microVM runtime: VmSpec, runner lifecycle, agent initramfs.
 
 mod agent;
+pub(crate) mod preflight;
 mod process;
 mod runner;
 mod spec;
 
 // Stable crate::microvm::* surface (pre-split public API).
-pub use process::BootOutput;
+pub use process::{
+    BootOutput, cloud_hypervisor_cmdline_matches, cloud_hypervisor_cmdline_matches_under,
+};
 pub use runner::MicrovmRunner;
-pub use spec::{FsMount, KernelInfo, VmSpec};
-pub(crate) use spec::{ensure_private_dir, service_fs_mounts};
+pub use spec::{FsCache, FsMount, KernelInfo, VmSpec};
+pub(crate) use spec::{
+    check_volume_guest_paths, ensure_private_dir, render_guest_mounts, service_fs_mounts,
+    volume_fs_mounts,
+};
 
 /// Shared runner singleton used by deploy and warm_pool.
 pub(crate) use runner::shared_runner;

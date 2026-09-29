@@ -264,19 +264,12 @@ fn port_allocator_rejects_privileged_ports_with_ingress_message() {
     );
 }
 
-/// Fixed ports in 40xx — outside the typical ephemeral bind(0) range used by
-/// other unit tests (agent mock servers, etc.), and serialized via port_test_lock.
-const HOLD_TEST_PORT: u16 = 4010;
-const RELEASE_HOLD_TEST_PORT: u16 = 4011;
-const CLAIM_HOLD_TEST_PORT: u16 = 4012;
-
 #[test]
 fn port_allocator_hold_blocks_external_bind() {
     let _g = super::port_test_lock();
     PortAllocator::release("hold-svc");
     PortAllocator::release("other-hold-svc");
-    let port = HOLD_TEST_PORT;
-    PortAllocator::reserve("hold-svc", port).unwrap();
+    let port = super::reserve_test_port("hold-svc");
     assert!(PortAllocator::has_hold("hold-svc"));
     let bind = publish_bind_addr();
     let second = std::net::TcpListener::bind((bind.as_str(), port));
@@ -303,8 +296,7 @@ fn port_allocator_hold_blocks_external_bind() {
 fn port_allocator_release_drops_hold() {
     let _g = super::port_test_lock();
     PortAllocator::release("release-hold-svc");
-    let port = RELEASE_HOLD_TEST_PORT;
-    PortAllocator::reserve("release-hold-svc", port).unwrap();
+    let port = super::reserve_test_port("release-hold-svc");
     assert!(PortAllocator::has_hold("release-hold-svc"));
     assert_eq!(
         PortAllocator::allocated_port("release-hold-svc"),
@@ -336,8 +328,7 @@ fn claim_existing_same_port_drops_residual_hold() {
     // reserve holds a TcpListener; claim_existing means the live publisher
     // already owns the port, so any residual hold must be released.
     PortAllocator::release("claim-hold-svc");
-    let port = CLAIM_HOLD_TEST_PORT;
-    PortAllocator::reserve("claim-hold-svc", port).unwrap();
+    let port = super::reserve_test_port("claim-hold-svc");
     assert!(PortAllocator::has_hold("claim-hold-svc"));
     let bind = publish_bind_addr();
     assert!(
@@ -431,14 +422,14 @@ fn pkill_socat_pattern_anchored() {
 #[test]
 fn pkill_virtiofsd_pattern_no_prefix_collision() {
     // virtiofsd stop uses the service dir with a trailing slash as a boundary.
-    let pat_needle = format!("{}/", russel_core::paths::service_dir("foo").display());
+    let pat_needle = format!("{}/", crate::paths::service_dir("foo").display());
     let cmdline_foo = format!(
         "{}/virtiofs.sock",
-        russel_core::paths::service_dir("foo").display()
+        crate::paths::service_dir("foo").display()
     );
     let cmdline_foobar = format!(
         "{}/virtiofs.sock",
-        russel_core::paths::service_dir("foobar").display()
+        crate::paths::service_dir("foobar").display()
     );
     assert!(cmdline_foo.contains(&pat_needle), "foo should match itself");
     assert!(

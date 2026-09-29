@@ -17,7 +17,10 @@ use crate::{
         build_container_metadata, build_microvm_metadata, prior_runtime_from_disk, write_metadata,
     },
     microvm::{BootOutput, MicrovmRunner},
-    network::{PortAllocator, SubnetAllocation, TapForwarder, subnet_for},
+    network::{
+        MICROVM_READY_TIMEOUT, MicrovmNet, MicrovmNetMode, PortAllocator, SubnetAllocation,
+        TapForwarder, subnet_for,
+    },
     state::AppState,
     warm_pool::shared_warm_pool,
 };
@@ -86,14 +89,15 @@ pub(crate) async fn resolve_prior_runtime(service_id: &str) -> anyhow::Result<Op
     // assume legacy Microvm so teardown can proceed correctly.
     // A destroy that kept volumes leaves only `volumes/` and no metadata.
     // That is not a VM; microVM destroy would remove_dir_all the data.
-    let russel_dir = russel_core::paths::service_dir(service_id)
-        .display()
-        .to_string();
-    let microvms_dir = format!("/var/lib/microvms/{}", service_id);
+    let russel_dir = crate::paths::service_dir(service_id).display().to_string();
+    let microvms_dir = crate::paths::microvm_dir(service_id).display().to_string();
     let russel_path = Path::new(&russel_dir);
     let microvms_path = Path::new(&microvms_dir);
     if russel_path.exists() || microvms_path.exists() {
-        if !microvms_path.exists() && crate::container::dir_is_kept_volumes_only(russel_path) {
+        // `RUSSEL_DATA_DIR=/var/lib/microvms` makes the marker dir the
+        // service dir itself; it existing then says nothing about a VM.
+        let separate_marker = microvms_path.exists() && microvms_path != russel_path;
+        if !separate_marker && crate::container::dir_is_kept_volumes_only(russel_path) {
             tracing::info!(
                 service_id,
                 "service dir has only kept volumes; not treating it as a microvm"
@@ -201,72 +205,7 @@ pub(crate) async fn attempt_microvm_rollback(
     let old_metadata_bak_path = format!("{}/metadata.json", russel_bak);
     let content = std::fs::read_to_string(&old_metadata_bak_path)?;
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
-
-    let host_port = u16::try_from(
-        old_meta["host_port"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("missing host_port"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("host_port out of u16 range"))?;
-    let guest_port = u16::try_from(
-        old_meta["guest_port"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("missing guest_port"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("guest_port out of u16 range"))?;
-
-    let kernel_path_str = old_meta["kernel_path"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing kernel_path"))?;
-    let kernel_path = PathBuf::from(kernel_path_str);
-    if !kernel_path.exists() {
-        anyhow::bail!("kernel_path does not exist: {}", kernel_path.display());
-    }
-
-    let mem_mb = u16::try_from(
-        old_meta["mem_mb"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("missing mem_mb"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("mem_mb out of u16 range"))?;
-
-    let bin_name = old_meta["bin_name"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing bin_name"))?
-        .to_string();
-
-    // Resolve app/store paths. Prefer explicit fields; support legacy metadata
-    // that stored the Nix store directory in `app_path` and omitted `store_path`.
-    let (app_path, store_path) = resolve_rollback_app_paths(
-        old_meta["app_path"].as_str(),
-        old_meta["store_path"].as_str(),
-        &bin_name,
-    )?;
-    if !Path::new(&app_path).exists() {
-        anyhow::bail!("app_path does not exist: {app_path}");
-    }
-
-    // Require initramfs key; rebuild only when the recorded path is gone on disk.
-    let initramfs_recorded = old_meta["initramfs"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing initramfs"))?;
-    let initramfs_path = {
-        let recorded = PathBuf::from(initramfs_recorded);
-        if recorded.exists() {
-            recorded
-        } else {
-            tracing::warn!(
-                service_id,
-                path = %recorded.display(),
-                "recorded initramfs missing on disk — rebuilding agent initramfs"
-            );
-            runner.build_agent_initramfs().await?
-        }
-    };
-    // Extract desired_state user env for deploy.env restoration (F-04).
-    let user_env: HashMap<String, String> = desired_state_env(&old_meta);
-    // Resolve secret:// refs in restored env
-    let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
+    let recorded = RecordedMicrovm::from_metadata(service_id, old_meta, runner).await?;
 
     // All validations passed — now rename safely.
     // 1. Restore backup dirs, putting stashed volumes back on the live path.
@@ -276,136 +215,378 @@ pub(crate) async fn attempt_microvm_rollback(
         tokio::fs::rename(microvms_bak, microvms_dir).await?;
     }
 
-    // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick.
-    //    Include user env from desired_state (F-04: env restored on rollback).
-    // Fail closed: never persist preferred_subnet (unregistered) identities that
-    // may collide with another service after probe exhaustion.
-    let alloc = subnet_for(service_id)?;
-    let cfg_dir = format!("{}/cfg", russel_dir);
-    super::write_deploy_env(
-        &cfg_dir,
-        &alloc.vm_ip,
-        &alloc.host_ip,
-        guest_port,
-        &app_path,
-        &user_env,
-    )?;
+    recorded
+        .launch(service_id, russel_dir, runner, state, FailedLaunch::Destroy)
+        .await
+}
 
-    // 4. Reserve port
-    PortAllocator::reserve(service_id, host_port)?;
+/// What a failed [`RecordedMicrovm::launch`] leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailedLaunch {
+    /// Remove the service dir and release its ports (rollback).
+    Destroy,
+    /// Stop the processes but keep the dir, recorded metadata, and ports, so
+    /// a later relaunch can retry (restart-on-exit).
+    Keep,
+}
 
-    // Helper: tear down anything acquired after port reservation.
-    async fn cleanup_rollback_resources(
+/// A microVM generation recorded in `metadata.json`, validated and ready to
+/// boot again: by rollback from its backup, or in place by restart-on-exit.
+pub(crate) struct RecordedMicrovm {
+    meta: serde_json::Value,
+    host_port: u16,
+    guest_port: u16,
+    kernel_path: PathBuf,
+    mem_mb: u16,
+    bin_name: String,
+    app_path: String,
+    store_path: String,
+    initramfs_path: PathBuf,
+    user_env: HashMap<String, String>,
+    run_as: super::RunAs,
+}
+
+impl RecordedMicrovm {
+    /// Validate everything a boot needs before anything on disk changes.
+    pub(crate) async fn from_metadata(
         service_id: &str,
-        alloc: &SubnetAllocation,
+        meta: serde_json::Value,
         runner: &MicrovmRunner,
-        vm_child: Option<tokio::process::Child>,
-        aux: Option<Vec<tokio::process::Child>>,
-    ) {
-        drop(vm_child);
-        drop(aux);
-        if let Err(e) = runner.destroy(service_id).await {
-            tracing::warn!(service_id, error = %e, "failed to destroy partial rollback microVM");
+    ) -> anyhow::Result<Self> {
+        let host_port = u16::try_from(
+            meta["host_port"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("missing host_port"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("host_port out of u16 range"))?;
+        let guest_port = u16::try_from(
+            meta["guest_port"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("missing guest_port"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("guest_port out of u16 range"))?;
+
+        let kernel_path = PathBuf::from(
+            meta["kernel_path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing kernel_path"))?,
+        );
+        if !kernel_path.exists() {
+            anyhow::bail!("kernel_path does not exist: {}", kernel_path.display());
         }
-        let _ = TapForwarder::teardown(alloc).await;
-        PortAllocator::release_service(service_id);
+
+        let mem_mb = u16::try_from(
+            meta["mem_mb"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("missing mem_mb"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("mem_mb out of u16 range"))?;
+
+        let bin_name = meta["bin_name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing bin_name"))?
+            .to_string();
+
+        // Resolve app/store paths. Prefer explicit fields; support legacy metadata
+        // that stored the Nix store directory in `app_path` and omitted `store_path`.
+        let (app_path, store_path) = resolve_rollback_app_paths(
+            meta["app_path"].as_str(),
+            meta["store_path"].as_str(),
+            &bin_name,
+        )?;
+        if !Path::new(&app_path).exists() {
+            anyhow::bail!("app_path does not exist: {app_path}");
+        }
+
+        // Require initramfs key; rebuild only when the recorded path is gone on disk.
+        let initramfs_recorded = meta["initramfs"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing initramfs"))?;
+        let initramfs_path = {
+            let recorded = PathBuf::from(initramfs_recorded);
+            if recorded.exists() {
+                recorded
+            } else {
+                tracing::warn!(
+                    service_id,
+                    path = %recorded.display(),
+                    "recorded initramfs missing on disk — rebuilding agent initramfs"
+                );
+                runner.build_agent_initramfs().await?
+            }
+        };
+        // Extract desired_state user env for deploy.env restoration (F-04).
+        let user_env: HashMap<String, String> = desired_state_env(&meta);
+        // Resolve secret:// refs in restored env
+        let mut user_env = crate::secrets::resolve_env_secrets(&user_env)?;
+        let run_as = super::RunAs::from_desired_state(meta.get("desired_state"));
+        run_as.apply_env_defaults(&mut user_env);
+
+        Ok(Self {
+            meta,
+            host_port,
+            guest_port,
+            kernel_path,
+            mem_mb,
+            bin_name,
+            app_path,
+            store_path,
+            initramfs_path,
+            user_env,
+            run_as,
+        })
     }
 
-    let rollback_cpus: u8 = old_meta["cpus"]
-        .as_u64()
-        .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(1)
-        .clamp(1, 32);
+    /// Boot this generation from `russel_dir`: rewrite deploy.env, reserve
+    /// ports, set up networking, boot, and wait for readiness. Only then write
+    /// metadata and hand the processes to `state`.
+    pub(crate) async fn launch(
+        self,
+        service_id: &str,
+        russel_dir: &str,
+        runner: &MicrovmRunner,
+        state: &AppState,
+        on_failure: FailedLaunch,
+    ) -> anyhow::Result<()> {
+        let Self {
+            meta: old_meta,
+            host_port,
+            guest_port,
+            kernel_path,
+            mem_mb,
+            bin_name,
+            app_path,
+            store_path,
+            initramfs_path,
+            user_env,
+            run_as,
+        } = self;
 
-    // 5–6. Network + boot; clean up on any failure after reservation
-    let cfg_dir_path = PathBuf::from(&cfg_dir);
-    let boot_result: anyhow::Result<(
-        tokio::process::Child,
-        Vec<tokio::process::Child>,
-        tokio::process::Child,
-    )> = async {
-        let socat_child = TapForwarder::setup(service_id, &alloc, host_port, guest_port).await?;
-        let pool = shared_warm_pool();
-        let BootOutput {
-            vm_child,
-            virtiofsd_children,
-        } = pool
-            .restore_or_boot(
+        // 3. Always rewrite deploy.env so legacy/stale APP values cannot stick.
+        //    Include user env from desired_state (F-04: env restored on rollback).
+        // Fail closed: never persist preferred_subnet (unregistered) identities that
+        // may collide with another service after probe exhaustion.
+        let alloc = subnet_for(service_id)?;
+        let cfg_dir = format!("{}/cfg", russel_dir);
+        let recorded_args: Vec<String> = old_meta
+            .pointer("/desired_state/args")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let recorded_volumes: Vec<russel_core::volumes::ResolvedVolume> = old_meta
+            .pointer("/desired_state/volumes")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let recorded_extra_ports: Vec<(u16, u16)> = old_meta
+            .pointer("/desired_state/extra_ports")
+            .and_then(|v| {
+                serde_json::from_value::<Vec<russel_core::volumes::ExtraPortSpec>>(v.clone()).ok()
+            })
+            .unwrap_or_default()
+            .iter()
+            .map(|p| (p.host, p.guest))
+            .collect();
+        super::write_deploy_env(
+            &cfg_dir,
+            &alloc.vm_ip,
+            &alloc.host_ip,
+            guest_port,
+            &app_path,
+            &user_env,
+            &recorded_args,
+            &recorded_volumes,
+            run_as,
+        )?;
+        super::chown_managed_volumes_for_app(&recorded_volumes, run_as)?;
+
+        // 4. Reserve port
+        PortAllocator::reserve(service_id, host_port)?;
+        for (i, (host, _)) in recorded_extra_ports.iter().enumerate() {
+            if let Err(e) = PortAllocator::reserve(&extra_port_key(service_id, i), *host) {
+                if on_failure == FailedLaunch::Destroy {
+                    PortAllocator::release_service(service_id);
+                }
+                return Err(e);
+            }
+        }
+
+        // Helper: tear down anything acquired after port reservation.
+        async fn cleanup_launch_resources(
+            service_id: &str,
+            alloc: &SubnetAllocation,
+            net_mode: MicrovmNetMode,
+            runner: &MicrovmRunner,
+            on_failure: FailedLaunch,
+            vm_child: Option<tokio::process::Child>,
+            aux: Option<Vec<tokio::process::Child>>,
+        ) {
+            match on_failure {
+                FailedLaunch::Destroy => {
+                    drop(vm_child);
+                    drop(aux);
+                    if let Err(e) = runner.destroy(service_id).await {
+                        tracing::warn!(service_id, error = %e, "failed to destroy partially booted microVM");
+                    }
+                }
+                FailedLaunch::Keep => {
+                    for mut child in vm_child.into_iter().chain(aux.into_iter().flatten()) {
+                        let _ = child.kill().await;
+                    }
+                    if let Err(e) = runner.stop(service_id).await {
+                        tracing::warn!(service_id, error = %e, "failed to stop partially booted microVM");
+                    }
+                }
+            }
+            let _ = MicrovmNet::teardown(net_mode, alloc).await;
+            if on_failure == FailedLaunch::Destroy {
+                PortAllocator::release_service(service_id);
+            }
+        }
+
+        let cpus: u8 = old_meta["cpus"]
+            .as_u64()
+            .and_then(|n| u8::try_from(n).ok())
+            .unwrap_or(1)
+            .clamp(1, 32);
+
+        // 5–6. Network + boot; clean up on any failure after reservation
+        let net_mode = MicrovmNetMode::for_host()?;
+        let cfg_dir_path = PathBuf::from(&cfg_dir);
+        let boot_result: anyhow::Result<(
+            tokio::process::Child,
+            Vec<tokio::process::Child>,
+            MicrovmNet,
+        )> = async {
+            let net = MicrovmNet::setup(
+                net_mode,
                 service_id,
-                &kernel_path,
-                &initramfs_path,
                 &alloc,
-                mem_mb,
-                rollback_cpus,
-                &cfg_dir_path,
+                host_port,
+                guest_port,
+                &recorded_extra_ports,
             )
             .await?;
-        Ok((vm_child, virtiofsd_children, socat_child))
-    }
-    .await;
-
-    let (vm_child, virtiofsd_children, socat_child) = match boot_result {
-        Ok(v) => v,
-        Err(e) => {
-            cleanup_rollback_resources(service_id, &alloc, runner, None, None).await;
-            return Err(e.context("microVM rollback boot failed"));
+            let volume_fs =
+                crate::microvm::volume_fs_mounts(Path::new(russel_dir), &recorded_volumes);
+            let pool = shared_warm_pool();
+            let BootOutput {
+                vm_child,
+                virtiofsd_children,
+            } = pool
+                .restore_or_boot(
+                    service_id,
+                    &kernel_path,
+                    &initramfs_path,
+                    &alloc,
+                    &net.attach,
+                    &volume_fs,
+                    mem_mb,
+                    cpus,
+                    &cfg_dir_path,
+                )
+                .await?;
+            Ok((vm_child, virtiofsd_children, net))
         }
-    };
+        .await;
 
-    let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
+        let (vm_child, virtiofsd_children, net) = match boot_result {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_launch_resources(
+                    service_id, &alloc, net_mode, runner, on_failure, None, None,
+                )
+                .await;
+                return Err(e.context("recorded microVM boot failed"));
+            }
+        };
 
-    // 7. Readiness BEFORE marking deployed / writing durable success metadata
-    let ready =
-        TapForwarder::wait_for_vm_port(&alloc.vm_ip, guest_port, Duration::from_secs(10)).await;
-    if !ready {
-        // Tear down partial restore; do not report rolled_back for a dead service.
-        let mut aux = vec![socat_child];
-        aux.extend(virtiofsd_children);
-        cleanup_rollback_resources(service_id, &alloc, runner, Some(vm_child), Some(aux)).await;
-        anyhow::bail!(
-            "rolled-back microVM not reachable on {}:{guest_port} within 10s",
-            alloc.vm_ip
+        let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
+
+        // 7. Readiness BEFORE marking deployed / writing durable success metadata
+        let ready = MicrovmNet::wait_ready(
+            net_mode,
+            service_id,
+            &alloc,
+            host_port,
+            guest_port,
+            MICROVM_READY_TIMEOUT,
+        )
+        .await;
+        if !ready {
+            // Tear down the partial boot; do not report success for a dead service.
+            let mut aux = vec![net.forwarder];
+            aux.extend(net.extra_forwarders);
+            aux.extend(virtiofsd_children);
+            cleanup_launch_resources(
+                service_id,
+                &alloc,
+                net_mode,
+                runner,
+                on_failure,
+                Some(vm_child),
+                Some(aux),
+            )
+            .await;
+            anyhow::bail!(
+                "recorded microVM not reachable on {}:{guest_port} within {}s",
+                alloc.vm_ip,
+                MICROVM_READY_TIMEOUT.as_secs()
+            );
+        }
+
+        // 8. Write metadata + mark deployed only after readiness
+        let mut meta = build_microvm_metadata(
+            service_id,
+            host_port,
+            guest_port,
+            &alloc.vm_ip,
+            &alloc.host_ip,
+            vm_child.id(),
+            &v_pids,
+            net.socat_pid(),
+            &kernel_path.display().to_string(),
+            &store_path,
+            mem_mb,
+            cpus,
+            Some(&app_path),
+            Some(&bin_name),
+            Some(&initramfs_path.display().to_string()),
         );
-    }
+        net.record(&mut meta);
 
-    // 8. Write metadata + mark deployed only after readiness
-    let mut meta = build_microvm_metadata(
-        service_id,
-        host_port,
-        guest_port,
-        &alloc.vm_ip,
-        &alloc.host_ip,
-        vm_child.id(),
-        &v_pids,
-        socat_child.id(),
-        kernel_path_str,
-        &store_path,
-        mem_mb,
-        rollback_cpus,
-        Some(&app_path),
-        Some(&bin_name),
-        Some(&initramfs_path.display().to_string()),
-    );
+        // Keep the recorded generation's identity and desired_state (F-04) so
+        // later rollbacks, updates, and restarts see the same deploy.
+        if let Some(obj) = meta.as_object_mut() {
+            for key in ["desired_state", "generation_id", "repo_url", "config_path"] {
+                if let Some(value) = old_meta.get(key) {
+                    obj.insert(key.into(), value.clone());
+                }
+            }
+        }
+        let metadata_path = format!("{}/metadata.json", russel_dir);
+        if let Err(e) = write_metadata(&metadata_path, &meta) {
+            let mut aux = vec![net.forwarder];
+            aux.extend(net.extra_forwarders);
+            aux.extend(virtiofsd_children);
+            cleanup_launch_resources(
+                service_id,
+                &alloc,
+                net_mode,
+                runner,
+                on_failure,
+                Some(vm_child),
+                Some(aux),
+            )
+            .await;
+            return Err(e.context("recorded microVM metadata write failed"));
+        }
 
-    // Preserve desired_state from old metadata for future rollbacks (F-04).
-    if let Some(ds) = old_meta.get("desired_state")
-        && let Some(obj) = meta.as_object_mut()
-    {
-        obj.insert("desired_state".into(), ds.clone());
-    }
-    let metadata_path = format!("{}/metadata.json", russel_dir);
-    if let Err(e) = write_metadata(&metadata_path, &meta) {
-        let mut aux = vec![socat_child];
+        let mut aux = vec![net.forwarder];
+        aux.extend(net.extra_forwarders);
         aux.extend(virtiofsd_children);
-        cleanup_rollback_resources(service_id, &alloc, runner, Some(vm_child), Some(aux)).await;
-        return Err(e.context("microVM rollback metadata write failed"));
+        state.mark_deployed_with_aux(service_id, vm_child, aux, Some(host_port), Some(guest_port));
+
+        Ok(())
     }
-
-    let mut aux = vec![socat_child];
-    aux.extend(virtiofsd_children);
-    state.mark_deployed_with_aux(service_id, vm_child, aux, Some(host_port), Some(guest_port));
-
-    Ok(())
 }
 
 /// Resolve `app_path` / `store_path` for rollback.
@@ -472,6 +653,12 @@ pub(crate) async fn attempt_container_rollback(
     let old_rootfs_path = old_meta["rootfs_path"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing rootfs_path in container metadata"))?;
+    // Fail before renaming anything if the previous generation was collected.
+    if !Path::new(old_rootfs_path).exists() {
+        anyhow::bail!(
+            "previous rootfs_path no longer exists (garbage-collected?): {old_rootfs_path}"
+        );
+    }
 
     // F-04: restore podman_args from desired_state when present, falling back
     // to the legacy top-level "podman_args" field for older metadata.
@@ -508,10 +695,11 @@ pub(crate) async fn attempt_container_rollback(
         old_podman_args.clear();
     }
 
-    // F-04: restore user env from desired_state (resolved secrets).
-    let user_env: HashMap<String, String> = desired_state_env(&old_meta);
-    // Resolve secret:// refs
-    let user_env = crate::secrets::resolve_env_secrets(&user_env)?;
+    // F-04: restore user env from desired_state and re-resolve secret:// refs.
+    let declared_env: HashMap<String, String> = desired_state_env(&old_meta);
+    let mut user_env = crate::secrets::resolve_env_secrets(&declared_env)?;
+    let run_as = super::RunAs::from_desired_state(old_meta.get("desired_state"));
+    run_as.apply_env_defaults(&mut user_env);
 
     // All validations passed — rename safely, preserving managed volumes.
     crate::container::restore_backed_up_service_dir(Path::new(russel_dir), Path::new(russel_bak))
@@ -533,13 +721,10 @@ pub(crate) async fn attempt_container_rollback(
         }
     }
 
-    // Build container env: PORT first, then user env (PORT filtered out).
-    let mut env: Vec<(String, String)> = vec![("PORT".to_string(), old_guest_port.to_string())];
-    for (key, value) in &user_env {
-        if key != "PORT" {
-            env.push((key.clone(), value.clone()));
-        }
-    }
+    let (env, secret_env) = super::env::split_secret_env(
+        super::env::build_container_env(old_guest_port, &user_env),
+        &declared_env,
+    );
 
     let start_spec = ContainerStartSpec {
         service_id: service_id.to_string(),
@@ -550,23 +735,22 @@ pub(crate) async fn attempt_container_rollback(
         host_port: old_host_port,
         guest_port: old_guest_port,
         memory_mb: old_mem_mb,
+        cpus: old_meta["cpus"].as_u64().and_then(|n| u8::try_from(n).ok()),
         env,
-        extra_args: old_podman_args.clone(),
+        secret_env,
+        podman_args: old_podman_args.clone(),
         volumes: old_meta
             .get("desired_state")
             .and_then(|ds| ds.get("volumes"))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default(),
         extra_ports: old_extra_ports.iter().map(|p| (p.host, p.guest)).collect(),
-        args: old_meta
+        service_args: old_meta
             .get("desired_state")
             .and_then(|ds| ds.get("args"))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default(),
-        userns_keep_id: old_meta
-            .pointer("/desired_state/userns")
-            .and_then(|v| v.as_str())
-            == Some("keep-id"),
+        userns_keep_id: run_as == super::RunAs::App,
         restart: old_meta
             .pointer("/desired_state/restart")
             .and_then(|v| v.as_str())
@@ -613,6 +797,9 @@ pub(crate) async fn attempt_container_rollback(
         &old_podman_args,
     );
 
+    if let Some(cpus) = start_spec.cpus {
+        new_metadata["cpus"] = serde_json::json!(cpus);
+    }
     // Preserve desired_state from old metadata for future rollbacks (F-04).
     if let Some(ds) = old_meta.get("desired_state")
         && let Some(obj) = new_metadata.as_object_mut()

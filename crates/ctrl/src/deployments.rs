@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use russel_core::api::{DeploymentRecord, DeploymentsResponse};
+use russel_core::api::{DeployRequest, DeploymentRecord, DeploymentsResponse};
 use russel_core::config::RuntimeKind;
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +58,7 @@ const STATUS_ROLLED_BACK: &str = "rolled_back";
 
 /// On-disk path for a service's deployments journal.
 pub fn deployments_path(service_id: &str) -> PathBuf {
-    russel_core::paths::service_dir(service_id).join("deployments.json")
+    crate::paths::service_dir(service_id).join("deployments.json")
 }
 
 /// Journal path under an arbitrary base dir (tests).
@@ -87,6 +87,13 @@ pub struct DesiredStateSnapshot {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub podman_args: Vec<String>,
+    /// Commit this generation was built from (#448).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// The deployed tree had changes `rev` does not contain, so rebuilding
+    /// `rev` does not reproduce it exactly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dirty: bool,
 }
 
 /// Custom `Deserialize` so both on-disk shapes of `desired_state` decode:
@@ -120,6 +127,10 @@ impl<'de> Deserialize<'de> for DesiredStateSnapshot {
             env: std::collections::HashMap<String, String>,
             #[serde(default)]
             podman_args: Vec<String>,
+            #[serde(default)]
+            rev: Option<String>,
+            #[serde(default)]
+            dirty: bool,
         }
 
         #[derive(Deserialize)]
@@ -140,6 +151,8 @@ impl<'de> Deserialize<'de> for DesiredStateSnapshot {
             ingress_host: raw.ingress_host,
             env: raw.env,
             podman_args: raw.podman_args,
+            rev: raw.rev,
+            dirty: raw.dirty,
         };
         if let Some(port) = raw.port {
             if snap.host_port.is_none() {
@@ -187,10 +200,60 @@ impl DesiredStateSnapshot {
             .unwrap_or_default()
     }
 
+    /// `desired_state` of a `metadata.json` document, with the legacy
+    /// top-level `repo_url` / `config_path` / ports / `runtime` filling gaps.
+    ///
+    /// The one reader for "what did the last deploy run with", shared by
+    /// update and health restart. A legacy port that would fill a gap but is
+    /// out of `u16` range is an error: dropping it would silently turn a
+    /// recorded host:guest mapping into a freshly allocated host port.
+    pub fn from_metadata_with_legacy(meta: &serde_json::Value) -> anyhow::Result<Self> {
+        let str_field = |key: &str| meta.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        let port_field = |key: &str| -> anyhow::Result<Option<u16>> {
+            meta.get(key)
+                .and_then(|v| v.as_u64())
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("invalid {key} in metadata: {e}"))
+        };
+        let mut snap = Self::from_metadata_desired_state(meta);
+        snap.repo_url = snap.repo_url.or_else(|| str_field("repo_url"));
+        snap.config_path = snap.config_path.or_else(|| str_field("config_path"));
+        if snap.host_port.is_none() {
+            snap.host_port = port_field("host_port")?;
+        }
+        if snap.guest_port.is_none() {
+            snap.guest_port = port_field("guest_port")?;
+        }
+        snap.runtime = snap
+            .runtime
+            .or_else(|| str_field("runtime").and_then(|s| s.parse().ok()));
+        Ok(snap)
+    }
+
     pub fn is_rollback_ready(&self) -> bool {
         self.repo_url
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty())
+    }
+
+    /// Rebuild the deploy request for update, rollback, and health restart:
+    /// the recorded source only, never values resolved from the previous
+    /// Russelfile or allocation (#445), pinned to the recorded commit (#448)
+    /// and forced, since these redeploy on purpose. A dirty generation is not
+    /// pinned: its commit may lack the Russelfile or the changes it ran with,
+    /// so it rebuilds what the source holds now, as before #448. The id is a
+    /// check against the file's `service.name`. `None` without a non-blank
+    /// `repo_url`.
+    pub fn redeploy_request(self, service_id: &str) -> Option<DeployRequest> {
+        let repo_url = self.repo_url.filter(|url| !url.trim().is_empty())?;
+        Some(DeployRequest {
+            repo_url,
+            config_path: self.config_path.unwrap_or_else(|| "Russelfile.toml".into()),
+            vm_id: Some(service_id.to_string()),
+            rev: self.rev.filter(|_| !self.dirty),
+            force: true,
+        })
     }
 }
 
@@ -223,6 +286,18 @@ pub struct JournalEntry {
 }
 
 impl JournalEntry {
+    /// The entry's `desired_state`, with the entry's top-level source fields
+    /// filling gaps (rows written before `desired_state` existed).
+    pub fn recorded_source(&self) -> DesiredStateSnapshot {
+        let mut snap = self.desired_state.clone().unwrap_or_default();
+        snap.repo_url = snap.repo_url.or_else(|| self.repo_url.clone());
+        snap.config_path = snap.config_path.or_else(|| self.config_path.clone());
+        snap.runtime = snap.runtime.or(self.runtime);
+        snap.host_port = snap.host_port.or(self.host_port);
+        snap.guest_port = snap.guest_port.or(self.guest_port);
+        snap
+    }
+
     pub fn to_record(&self) -> DeploymentRecord {
         DeploymentRecord {
             version: self.version,
@@ -349,6 +424,21 @@ fn recompute_rollback_ready(entry: &mut JournalEntry) {
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty());
     entry.rollback_ready = ready && entry.status != STATUS_ACTIVE;
+}
+
+/// Store paths of the journal's `active` and `previous` generations: the
+/// retention window that [`crate::gcroots`] keeps rooted.
+pub fn retained_store_paths(service_id: &str) -> anyhow::Result<Vec<String>> {
+    retained_store_paths_at(&deployments_path(service_id))
+}
+
+pub fn retained_store_paths_at(path: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(load_journal(path)?
+        .entries
+        .into_iter()
+        .filter(|e| e.status == STATUS_ACTIVE || e.status == STATUS_PREVIOUS)
+        .filter_map(|e| e.store_path)
+        .collect())
 }
 
 /// Append a successful deployment to the journal under the default base path.
@@ -577,6 +667,7 @@ mod tests {
             ingress_host: Some("app.example.com".into()),
             env: Default::default(),
             podman_args: vec![],
+            ..Default::default()
         }
     }
 
@@ -618,6 +709,23 @@ mod tests {
         assert!(list.deployments[1].rollback_ready);
         assert_eq!(list.deployments[2].status, "superseded");
         assert_eq!(list.deployments[2].version, 1);
+    }
+
+    #[test]
+    fn retained_store_paths_are_active_and_previous_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        assert!(retained_store_paths_at(&path).unwrap().is_empty());
+
+        append(&path, "https://example.com/r1.git", "aaaa1111");
+        append(&path, "https://example.com/r2.git", "bbbb2222");
+        append(&path, "https://example.com/r3.git", "cccc3333");
+
+        // v1 is superseded: it leaves the retention window and loses its root.
+        assert_eq!(
+            retained_store_paths_at(&path).unwrap(),
+            ["/nix/store/cccc3333", "/nix/store/bbbb2222"]
+        );
     }
 
     #[test]
@@ -775,6 +883,155 @@ mod tests {
         assert_eq!(snap.ingress_host.as_deref(), Some("abc.com"));
         assert_eq!(snap.env.get("LOG_LEVEL").map(String::as_str), Some("info"));
         assert_eq!(snap.podman_args, vec!["--network", "bridge"]);
+    }
+
+    #[test]
+    fn metadata_with_legacy_prefers_desired_state() {
+        let meta = serde_json::json!({
+            "repo_url": "https://example.com/legacy.git",
+            "config_path": "legacy/Russelfile.toml",
+            "runtime": "microvm",
+            "host_port": 7000,
+            "guest_port": 7001,
+            "desired_state": {
+                "repo_url": "https://example.com/app.git",
+                "runtime": "container",
+                "port": {"host": 9000, "guest": 4000}
+            }
+        });
+        let snap = DesiredStateSnapshot::from_metadata_with_legacy(&meta).unwrap();
+        assert_eq!(
+            snap.repo_url.as_deref(),
+            Some("https://example.com/app.git")
+        );
+        // Gap in desired_state: legacy value fills it.
+        assert_eq!(snap.config_path.as_deref(), Some("legacy/Russelfile.toml"));
+        assert_eq!(snap.runtime, Some(RuntimeKind::Container));
+        assert_eq!((snap.host_port, snap.guest_port), (Some(9000), Some(4000)));
+    }
+
+    #[test]
+    fn metadata_with_legacy_reads_top_level_only_metadata() {
+        let meta = serde_json::json!({
+            "repo_url": "https://example.com/app.git",
+            "runtime": "container",
+            "host_port": 8080,
+            "guest_port": 4000
+        });
+        let snap = DesiredStateSnapshot::from_metadata_with_legacy(&meta).unwrap();
+        assert_eq!(
+            snap.repo_url.as_deref(),
+            Some("https://example.com/app.git")
+        );
+        assert_eq!(snap.runtime, Some(RuntimeKind::Container));
+        assert_eq!((snap.host_port, snap.guest_port), (Some(8080), Some(4000)));
+    }
+
+    #[test]
+    fn metadata_with_legacy_rejects_out_of_range_port() {
+        // Dropping 70000 would redeploy without the recorded mapping and move
+        // the service to a newly allocated host port.
+        let meta = serde_json::json!({
+            "repo_url": "https://example.com/app.git",
+            "host_port": 8080,
+            "guest_port": 70000
+        });
+        let err = DesiredStateSnapshot::from_metadata_with_legacy(&meta).unwrap_err();
+        assert!(err.to_string().contains("guest_port"), "{err}");
+
+        // A bad legacy value that desired_state already covers is never read.
+        let meta = serde_json::json!({
+            "repo_url": "https://example.com/app.git",
+            "host_port": 8080,
+            "guest_port": 70000,
+            "desired_state": {"port": {"host": 8080, "guest": 4000}}
+        });
+        let snap = DesiredStateSnapshot::from_metadata_with_legacy(&meta).unwrap();
+        assert_eq!(snap.guest_port, Some(4000));
+    }
+
+    /// #445: update/rollback re-read the Russelfile; recorded env, ports,
+    /// host, runtime, and podman args from the last deploy are not replayed.
+    #[test]
+    fn redeploy_request_carries_only_the_recorded_source() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("LOG_LEVEL".to_string(), "debug".to_string());
+        let snap = DesiredStateSnapshot {
+            repo_url: Some("https://example.com/app.git".into()),
+            config_path: Some("svc/Russelfile.toml".into()),
+            runtime: Some(RuntimeKind::Container),
+            host_port: Some(8080),
+            guest_port: Some(3000),
+            ingress_host: Some("abc.com".into()),
+            env,
+            podman_args: vec!["--network".into(), "bridge".into()],
+            rev: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            dirty: false,
+        };
+        let req = snap.redeploy_request("api").unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "repo_url": "https://example.com/app.git",
+                "config_path": "svc/Russelfile.toml",
+                "vm_id": "api",
+                "rev": "0123456789abcdef0123456789abcdef01234567",
+                "force": true,
+            })
+        );
+    }
+
+    /// A dirty generation's commit may not hold its Russelfile (untracked) or
+    /// its changes, so update and health restart must not pin to it.
+    #[test]
+    fn redeploy_request_does_not_pin_a_dirty_generation() {
+        let snap = DesiredStateSnapshot {
+            repo_url: Some("/srv/app".into()),
+            rev: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            dirty: true,
+            ..Default::default()
+        };
+        let req = snap.redeploy_request("api").unwrap();
+        assert_eq!(req.rev, None);
+        assert!(req.force);
+    }
+
+    #[test]
+    fn redeploy_request_requires_repo_url() {
+        assert!(
+            DesiredStateSnapshot::default()
+                .redeploy_request("api")
+                .is_none()
+        );
+        let blank = DesiredStateSnapshot {
+            repo_url: Some("  ".into()),
+            ..Default::default()
+        };
+        assert!(blank.redeploy_request("api").is_none());
+    }
+
+    #[test]
+    fn journal_recorded_source_falls_back_to_top_level() {
+        let entry = JournalEntry {
+            version: 1,
+            generation_id: None,
+            status: "previous".into(),
+            runtime: Some(RuntimeKind::Container),
+            deployed_at: "2026-07-28T09:00:00Z".into(),
+            store_path: None,
+            repo_url: Some("https://example.com/app.git".into()),
+            config_path: Some("svc/Russelfile.toml".into()),
+            host_port: Some(8080),
+            guest_port: None,
+            message: None,
+            rollback_ready: true,
+            desired_state: None,
+        };
+        let req = entry.recorded_source().redeploy_request("api").unwrap();
+        assert_eq!(req.repo_url, "https://example.com/app.git");
+        assert_eq!(req.config_path, "svc/Russelfile.toml");
+        assert_eq!(req.vm_id.as_deref(), Some("api"));
     }
 
     #[test]

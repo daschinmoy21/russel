@@ -19,7 +19,7 @@ use russel_core::api::{AgentLifecycleResponse, AgentStatusResponse};
 use russel_core::config::RuntimeKind;
 use russel_ctrl::container::{ContainerRunner, is_trusted_container_name};
 use russel_ctrl::metadata::load_service_disk_record_from;
-use russel_ctrl::microvm::MicrovmRunner;
+use russel_ctrl::microvm::cloud_hypervisor_cmdline_matches;
 use russel_ctrl::runtime::in_process_lifecycle;
 
 /// Error carrying an HTTP status for route mapping.
@@ -127,7 +127,7 @@ async fn run_lifecycle_op(
     operation: &str,
     status: &str,
 ) -> Result<AgentLifecycleResponse, LifecycleError> {
-    MicrovmRunner::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
+    russel_core::ids::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
     let resolved = resolve_service(data_root, service_id)?;
     let runtime = resolved.runtime;
     let result = match operation {
@@ -156,7 +156,7 @@ pub async fn status(
     data_root: &Path,
     service_id: &str,
 ) -> Result<AgentStatusResponse, LifecycleError> {
-    MicrovmRunner::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
+    russel_core::ids::validate_service_id(service_id).map_err(LifecycleError::bad_request)?;
     let resolved = resolve_service(data_root, service_id)?;
     let runtime = resolved.runtime;
     let (running, uptime) = probe_runtime(&resolved.record, runtime, service_id).await;
@@ -260,27 +260,6 @@ fn microvm_pid_is_alive(pid: u32, service_id: &str) -> bool {
     };
     let cmdline = String::from_utf8_lossy(&bytes).replace('\0', " ");
     cloud_hypervisor_cmdline_matches(&cmdline, service_id)
-}
-
-/// Pure identity check for unit tests (no /proc).
-///
-/// Requires `cloud-hypervisor` **and** the service data dir
-/// (`{data_root}/{service_id}/`) in the command line. A bare
-/// `cmdline.contains(service_id)` is too weak: service id `api` matches
-/// `--api-socket`. TAP needles are optional (agent status does not always
-/// have the TAP key).
-pub fn cloud_hypervisor_cmdline_matches(cmdline: &str, service_id: &str) -> bool {
-    if !cmdline.contains("cloud-hypervisor") {
-        return false;
-    }
-    if service_id.is_empty() {
-        return false;
-    }
-    // Service-scoped paths used at boot (API sock, cfg under the service dir).
-    cmdline.contains(&format!(
-        "{}/",
-        russel_core::paths::service_dir(service_id).display()
-    ))
 }
 
 /// Wall-clock seconds a process has been running, from `/proc`:
@@ -536,37 +515,6 @@ mod tests {
         let uptime = uptime_seconds_from_pid(std::process::id());
         // Fresh processes can report 0s; parse success is the contract.
         assert!(uptime.is_some());
-    }
-
-    #[test]
-    fn cloud_hypervisor_identity_requires_ch_and_service_dir() {
-        let api_sock = format!(
-            "{}/cloud-hypervisor.sock",
-            russel_core::paths::service_dir("api").display()
-        );
-        let other_sock = format!(
-            "{}/cloud-hypervisor.sock",
-            russel_core::paths::service_dir("other").display()
-        );
-        assert!(cloud_hypervisor_cmdline_matches(
-            &format!("cloud-hypervisor --api-socket {api_sock}"),
-            "api"
-        ));
-        // Unrelated process with reused PID shape.
-        assert!(!cloud_hypervisor_cmdline_matches(
-            "/usr/bin/sleep 999",
-            "api"
-        ));
-        // CH for a different service — must not match "api" via --api-socket.
-        assert!(!cloud_hypervisor_cmdline_matches(
-            &format!("cloud-hypervisor --api-socket {other_sock}"),
-            "api"
-        ));
-        assert!(!cloud_hypervisor_cmdline_matches(
-            "cloud-hypervisor --api-socket /tmp/x.sock",
-            "api"
-        ));
-        assert!(!cloud_hypervisor_cmdline_matches("cloud-hypervisor", ""));
     }
 
     #[test]

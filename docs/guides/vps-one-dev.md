@@ -1,203 +1,112 @@
 ---
 title: Single-VPS checklist
-description: Run russel-ctrl on one VPS as a single trusted operator — containers only.
+description: Run Russel on one VPS as its only operator, deploy apps from your laptop, and put them on the internet.
 sidebar_position: 1
 keywords: [vps, checklist, single operator, containers, host, connect, status]
 ---
 
-# Single-VPS one-developer checklist
+# Single-VPS checklist
 
-**Audience:** one trusted operator running `russel-ctrl` on a Linux VPS or home server, deploying with `russel` from a client.
+This is the path Russel v0.1 is built for: **one person, one Linux VPS**, apps running as rootless containers, deployed from a laptop over SSH. Tick the boxes as you go.
 
-**Scope:** container runtime on typical no-KVM VPS images. MicroVMs need `/dev/kvm` and are optional on bare metal or nested virt.
+Russel trusts whoever holds the API token completely. It is not built for sharing a server between people or teams.
 
-**Related:** [TLS reverse proxy](tls-reverse-proxy.md) · [Traefik ingress](traefik-ingress.md) · [App packaging](../concepts/builds.md)
+## 1. The server
 
-## Readiness summary
+- [ ] Linux x86_64 with systemd; Debian 12 or Ubuntu 22.04+ is easiest. No KVM needed.
+- [ ] We suggest 2 GB of RAM and 20 GB of disk or more. Nix builds and the Nix store take most of the disk.
+- [ ] An ordinary login user with `sudo`. The installer adds a separate `russel` account that runs everything; your user only needs `sudo` to install.
+- [ ] Firewall: allow SSH, plus 80 and 443 if you'll serve web apps. **Never open 7878**, the control plane port.
 
-| Area | Ready for one-dev VPS? | Notes |
-|---|---|---|
-| Core loop | **Yes** | CLI → HTTP API → Nix build → rootless Podman |
-| Auth | **Yes** | `RUSSEL_API_TOKEN` ≥32 chars, `RUSSEL_REQUIRE_AUTH=1` |
-| Control-plane transport | **Yes** | Loopback, `install.sh connect`, or HTTPS proxy |
-| Typical cheap VPS | **Containers only** | `type = "container"` in every `Russelfile.toml` |
-| NixOS host | **Yes** | `services.russel` |
-| Other Linux host | **Yes** | `./contrib/install.sh host` + user-systemd |
-| Dashboard | **Yes** | Vite `/api` for A/B, same-origin HTTPS for C |
-| Multi-tenant / multi-user | **No** | Single trusted operator model |
-| Managed databases | **No** | `[database.*]` is a placeholder |
+## 2. Install
 
-## Operator checklist
+- [ ] Follow [Installation](../getting-started/installation.md) steps 1 and 2 on the server: Podman, Nix, `install.sh check`, then `sudo install.sh host`.
+- [ ] Log out and back in, so your user's new `russel` group membership applies.
+- [ ] Check it's running:
 
-Copy into a runbook and tick as you go.
+  ```bash
+  systemctl status russel-ctrl
+  ```
 
-### A. Host prerequisites
+## 3. Connect from your laptop
 
-- [ ] Linux x86_64 or aarch64 matching the app flake `system`
-- [ ] Nix with flakes enabled
-- [ ] Rootless Podman: `podman info` reports rootless
-- [ ] Persistent user manager: `loginctl enable-linger "$(id -un)"`
-- [ ] Writable state dir: `/var/lib/russel`, mode `0700`, owned by the control-plane user
-- [ ] Firewall allows SSH + 443 (+80 for ACME); **do not expose 7878**
-- [ ] Disk for the Nix store and builds
-- [ ] No-KVM path: containers only, skip microVM deps
-- [ ] KVM path (if needed): `/dev/kvm`, TAP, `cloud-hypervisor`, `virtiofsd`, `socat`, `ip`, `iptables`
+- [ ] Install the CLI on the laptop, copy the token, and open the tunnel:
 
-### B. Install the control plane and client
+  ```bash
+  umask 077 && mkdir -p ~/.config/russel
+  scp user@vps:/etc/russel/env ~/.config/russel/env
+  ./contrib/install.sh connect user@vps
+  russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
+  russel ps
+  ```
 
-Produce the release once per machine from the public mirror (see [Installation](../getting-started/installation.md)), then install it — no dev setup, no debug builds:
+- [ ] Open `http://127.0.0.1:7878/` on the laptop for the dashboard, and paste the token into Settings.
 
-```bash
-git clone https://github.com/daschinmoy21/russel
-cd russel
-cargo build --release -p russel-cli -p russel-ctrl
-./contrib/install.sh host
-./contrib/install.sh status
-```
+Rather use HTTPS than a tunnel? See [TLS reverse proxy](tls-reverse-proxy.md).
 
-`host` installs `/usr/local/bin/russel-ctrl` + `contrib/russel-ctrl.service` as a systemd user unit and creates `~/.config/russel/env` (mode `0600`) when missing. A new `/var/lib/russel` is created with mode `0700`; an existing operator-owned directory keeps its current mode. It refuses NixOS, root, and system-managed units. NixOS uses `services.russel` instead:
+## 4. Deploy from git
 
-```nix
-{
-  services.russel.enable = true;
-  services.russel.bin = "/usr/local/bin/russel-ctrl";
-  services.russel.environmentFile = "/etc/russel/env"; # 0600, RUSSEL_API_TOKEN=
-}
-```
-
-Client on the laptop or same-host client:
+A remote control plane can't see your laptop's files, so deploy from a git URL. The server clones and builds it:
 
 ```bash
-./contrib/install.sh cli
-```
-
-### C. Select a control-plane topology
-
-#### A. Same host
-
-```bash
-russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
-russel origin
+russel apply https://github.com/you/app.git
 russel ps
+russel logs app
 ```
 
-Dashboard on that host: `http://127.0.0.1:7878/`, Settings `/api`.
+These commands assume the app's Russelfile says `name = "app"`. For a private repo, use an `ssh://` or `git@host:path` URL, and put a read-only deploy key for it in `/var/lib/russel/.ssh/` (owned by `russel`, mode `0600`). That is the home directory of the account that clones.
 
-#### B. Split + SSH tunnel
+Leave `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY` off on a VPS you deploy to remotely.
 
-On the laptop, copy the host env privately, then open the installer-managed forward:
+## 5. Put apps on the internet
+
+Russel publishes each app on a `127.0.0.1` port on the server, so nothing is public until you choose. Pick one:
+
+- [ ] **Traefik (recommended for web apps).** Russel writes a Traefik route for each service, so `app.example.com` reaches the right app. Traefik can also get TLS certificates from Let's Encrypt. See [Traefik ingress](traefik-ingress.md).
+- [ ] **Your own reverse proxy.** Pin the port with `[ingress]` and `port = 8080` in the Russelfile, and point Caddy or nginx at `127.0.0.1:8080`.
+
+## 6. Secrets and data
+
+- [ ] Store secrets on the server, never in the repo:
+
+  ```bash
+  printf '%s' "$DB_PASSWORD" | russel secrets set DB_PASSWORD
+  ```
+
+  Then reference them in the Russelfile as `DB_PASSWORD = "secret://DB_PASSWORD"` under `[service.env]`. See [Env + secrets](env-secrets.md).
+- [ ] Keep app data in `[[volumes]]` so it survives redeploys. See the [Russelfile reference](../reference/russelfile.md).
+
+## 7. Backups and upgrades
+
+- [ ] Back up `/etc/russel/env` (your token) and `/var/lib/russel` (secrets, volumes, deployment history). Both need `sudo` to read.
+- [ ] Upgrade by re-running the installer with a new `RUSSEL_VERSION`. See [Installation: Upgrade](../getting-started/installation.md#upgrade) and [Upgrades + backups](../operations/upgrades-backup.md).
+
+## Good first apps
+
+Every example except `microvm-http` runs as a container on a no-KVM VPS. Russel builds from the **root** of a git repo, so to deploy an example from git, copy its folder into a repo of its own first:
 
 ```bash
-umask 077 && mkdir -p ~/.config/russel
-scp user@host:~/.config/russel/env ~/.config/russel/env
-chmod 600 ~/.config/russel/env
-./contrib/install.sh connect user@host
-russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
-russel origin
-russel ps
+cp -r russel/examples/hello-rust hello-rust && cd hello-rust
+git init && git add . && git commit -m "hello-rust"
+git remote add origin git@github.com:you/hello-rust.git && git push -u origin HEAD
+russel apply https://github.com/you/hello-rust.git
 ```
 
-Anchored to `127.0.0.1:7878:127.0.0.1:7878` (`BatchMode`, `ExitOnForwardFailure`). Keep it up for CLI/dashboard. Dashboard Settings `/api`.
-
-#### C. Split + HTTPS
-
-Keep `russel-ctrl` on `127.0.0.1:7878`; terminate TLS in Caddy/nginx; forward `/` and `/api/` to loopback ctrl (or serve `dist/` yourself and strip `/api`); keep NDJSON unbuffered. See [TLS reverse proxy](tls-reverse-proxy.md).
-
-```bash
-umask 077 && mkdir -p ~/.config/russel
-scp user@host:~/.config/russel/env ~/.config/russel/env
-chmod 600 ~/.config/russel/env
-russel login https://russel.example.com --token-file ~/.config/russel/env
-russel origin
-russel ps
-```
-
-Dashboard Settings `/api`; token in `sessionStorage`; CLI login does not fill it.
-
-### D. First deploy
-
-Git URL for remote control planes (laptop paths are not uploaded; absolute local paths resolve on the **ctrl host** and need the opt-in):
-
-```bash
-russel deploy https://github.com/your-account/app.git --vm-id demo -p 8080:3000 --runtime container
-russel status demo
-russel logs demo
-russel destroy demo
-```
-
-Keep `--config` repository-relative. Every VPS Russelfile sets `type = "container"` (`russel init --type container`).
-
-### E. App reachability
-
-Choose app ingress separately from the control plane:
-
-- [ ] Publish selected app ports with `-p HOST:GUEST`, firewall only those ports
-- [ ] Or use Traefik for HTTP routes and keep ctrl on loopback — see [Traefik ingress](traefik-ingress.md)
-
-Never bind the control-plane port to a public/private network address.
-
-### F. Operations and upgrades
-
-- [ ] Keep `~/.config/russel/env` private (mode `0600`)
-- [ ] Back up `~/.config/russel/env` + `/var/lib/russel` for token/metadata/secrets/history recovery
-- [ ] Inspect with `./contrib/install.sh status`
-- [ ] Keep local-path deploys disabled on a remote ctrl
-
-Upgrade (other Linux) — rebuild the release from an updated checkout, then reinstall:
-
-```bash
-cd russel && git pull
-cargo build --release -p russel-cli -p russel-ctrl
-./contrib/install.sh host
-./contrib/install.sh status
-```
-
-Direct replacement:
-
-```bash
-sudo install -Dm755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
-systemctl --user restart russel-ctrl
-./contrib/install.sh status
-```
-
-Never delete env or state on upgrade. NixOS uses normal module activation. Full runbook: [Upgrades + backups](../operations/upgrades-backup.md).
-
-## Code / product checklist (maintainers)
-
-What must be true in-tree for the operator path above. Tick when verifying a release.
-
-### P0 for one-dev remote use
-
-- [x] Reserved `service_id` rejected on deploy/destroy
-- [x] Non-loopback bind requires `RUSSEL_API_TOKEN`; min length ≥32 + header-safe charset
-- [x] `RUSSEL_REQUIRE_AUTH` fail-closed on loopback
-- [x] CLI refuses cleartext Bearer to non-loopback; TLS proxy docs
-- [x] Local absolute path deploy gated (`RUSSEL_ALLOW_LOCAL_PATH_DEPLOY`)
-- [x] Container path (rootless Podman) works without KVM
-- [x] Secrets API + host store
-- [x] Dashboard does not bake public API tokens; default bind localhost
-- [x] Operator docs: this file + installation + TLS runbook
-- [x] NixOS module + systemd user unit with loopback / token / `0700` defaults
-- [x] `russel login` / config file (`~/.config/russel/config.toml`, `0600`)
-
-### Still DIY / later
-
-- [ ] deb/OCI packages
-- [ ] Native TLS in `russel-ctrl` (proxy is enough for one-dev)
-- [ ] Fresh-VPS e2e automated in CI
-- [ ] Multi-tenant isolation, horizontal scale, managed DBs
-
-## Example services for VPS smoke tests
-
-Use examples with `type = "container"`:
-
-| Example | Notes |
+| Example | What it is |
 |---|---|
-| `examples/basic-http` | Go `/health` + static assets |
-| `examples/hello-rust` | Minimal Rust HTTP |
-| `examples/static-test` | Static files |
-| `examples/shortlink` | In-memory shortener |
-| `examples/env-config` | Env + `secret://` |
-| `examples/microvm-http` | **microVM only** — needs KVM |
+| `hello-rust` | Minimal Rust HTTP server |
+| `basic-http` | Go server with `/health` and static files |
+| `shortlink` | In-memory URL shortener |
+| `env-config` | Shows env vars and `secret://` |
+| `redis`, `postgres` | Databases from nixpkgs, with a data volume |
+| `vaultwarden`, `navidrome` | Real self-hosted apps from nixpkgs |
 
-See [Examples](../reference/examples.md).
+All of them: [Examples](../reference/examples.md).
+
+## What v0.1 doesn't do
+
+- Several users or teams on one server
+- More than one server
+- Managed databases: run Postgres or Redis as ordinary services instead
+- TLS in the control plane itself: use SSH or a reverse proxy
+- Guaranteed restart after a server reboot. The control plane comes back by itself, but containers may not. Check `russel ps` after a reboot, and run `russel apply --force` for anything that is down. This is tracked in #450.

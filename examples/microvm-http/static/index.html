@@ -119,7 +119,7 @@
             </article>
             <article class="card card-compact">
               <h3>Traefik</h3>
-              <p>File provider: <code>&lt;vm-id&gt;.russel.local</code> → published host port.</p>
+              <p>File provider: <code>&lt;service.name&gt;.russel.local</code> → published host port.</p>
             </article>
             <article class="card card-compact">
               <h3>Package</h3>
@@ -137,13 +137,12 @@
 ./target/debug/russel-ctrl
 
 # deploy this example
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id basic
-curl http://127.0.0.1:8080/health
-# Traefik: http://basic.russel.local</code></pre>
+./target/debug/russel deploy examples/microvm-http
+# Traefik: http://microvm-http.russel.local</code></pre>
         </section>
 
         <footer class="page-foot">
-          <span>basic-http · Go stdlib + embed</span>
+          <span>microvm-http · Go stdlib + embed</span>
           <span class="muted">Russel dual-runtime demo</span>
         </footer>
       </main>

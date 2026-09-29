@@ -7,5 +7,7 @@ name = "microvm-http"
 source = "."
 port = 3000
 memory = "256mb"
+# More than one vCPU: guards against the Cloud Hypervisor boot hang (#510).
+cpus = 2
 type = "microvm"
 bin = "basic-http"

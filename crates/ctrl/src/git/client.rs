@@ -94,7 +94,7 @@ impl GitClient {
         validate_remote_host(&host)?;
         validate_remote_host_dns(&host).await?;
 
-        let checkout_root = PathBuf::from("/tmp/russel/checkouts");
+        let checkout_root = checkout_root();
         fs::create_dir_all(&checkout_root).context("failed to create checkout directory")?;
 
         // Best-effort GC of old checkouts (age-based) before clone.
@@ -237,6 +237,13 @@ pub(super) fn unique_checkout_dir_name_with(repo: &str, nanos: u128, sequence: u
 /// Atomically reserve an empty destination directory for a clone. The empty
 /// directory is accepted by `git clone`; `create_dir` makes name collisions
 /// observable and allows a retry without deleting another deployment's tree.
+/// Where remote clones and pinned checkouts live: under ctrl's own data root,
+/// so a shared /tmp path created by another user (or an earlier root ctrl)
+/// cannot block every clone with EACCES.
+pub(super) fn checkout_root() -> PathBuf {
+    crate::paths::data_root().join("_checkouts")
+}
+
 pub(super) fn reserve_checkout_dir(checkout_root: &Path, repo: &str) -> anyhow::Result<PathBuf> {
     for _ in 0..1024 {
         let checkout = checkout_root.join(unique_checkout_dir_name(repo));

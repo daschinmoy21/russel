@@ -43,8 +43,9 @@ function streamFromChunks(chunks: string[]): ReadableStream<Uint8Array> {
 }
 
 describe("isDeployStatusSuccess", () => {
-	test("only exact deployed is success", () => {
+	test("deployed and unchanged are success", () => {
 		expect(isDeployStatusSuccess("deployed")).toBe(true);
+		expect(isDeployStatusSuccess("unchanged")).toBe(true);
 		expect(isDeployStatusSuccess("failed")).toBe(false);
 		expect(isDeployStatusSuccess("Deployed")).toBe(false);
 		expect(isDeployStatusSuccess("")).toBe(false);

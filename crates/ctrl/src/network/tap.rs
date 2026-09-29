@@ -119,14 +119,25 @@ impl TapForwarder {
         wait_for_tcp_addr(&format!("{vm_ip}:{guest_port}"), timeout).await
     }
 
-    /// Poll until a TCP connect to the configured publish bind address succeeds.
+    /// Poll until the app behind the published host port accepts a
+    /// connection. A bare connect is not enough: the port forwarder (pasta,
+    /// rootlessport, socat) accepts whether or not the app listens (#462).
     pub async fn wait_for_host_port(host_port: u16, timeout: Duration) -> bool {
+        let addr = Self::host_port_addr(host_port);
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if super::app_accepts(&addr).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Loopback (or bind-IP) dial address for a published host port.
+    pub fn host_port_addr(host_port: u16) -> String {
         let bind = publish_bind_addr();
-        wait_for_tcp_addr(
-            &tcp_dial_addr(host_port_probe_host(&bind), host_port),
-            timeout,
-        )
-        .await
+        tcp_dial_addr(host_port_probe_host(&bind), host_port)
     }
 }
 

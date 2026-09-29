@@ -2,6 +2,7 @@
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import OfflineState from '../components/OfflineState.astro';
+import DestroyDialog from '../components/DestroyDialog.astro';
 
 // Static shell only — no build-time control-plane fetch (#306).
 // Query ?id= is client-only on static builds; loadDetail() hydrates live data.
@@ -9,14 +10,13 @@ import OfflineState from '../components/OfflineState.astro';
 
 <Layout title="Service Detail" activePath="/services">
   <div class="breadcrumb">
-    <a href="/services" class="back-link">← Back to Services</a>
+    <a href="/services" class="back-link">← services</a>
   </div>
 
   <div id="detailRoot">
     <Header
       title="Loading…"
       subtitle="Service details load in the browser."
-      connection="loading"
     />
 
     <div class="detail-grid">
@@ -60,7 +60,7 @@ import OfflineState from '../components/OfflineState.astro';
             </svg>
             Stop Service
           </button>
-          <button id="btnUpdate" class="btn btn-secondary">
+          <button id="btnUpdate" class="btn btn-secondary" title="Rebuild from the recorded repo and apply its current Russelfile">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
             </svg>
@@ -74,6 +74,7 @@ import OfflineState from '../components/OfflineState.astro';
           </button>
         </div>
 
+        <p class="action-hint">Update rebuilds from the recorded repo and applies its current Russelfile; nothing from the previous deploy is replayed.</p>
         <div id="actionFeedback" class="action-feedback hidden"></div>
       </div>
 
@@ -99,7 +100,7 @@ import OfflineState from '../components/OfflineState.astro';
   </div>
 
   <!-- Deployment History Card -->
-  <div class="card-panel" id="deployHistoryCard" style="margin-top: 1rem;">
+  <div class="card-panel" id="deployHistoryCard" style="margin-top: 3rem;">
     <div class="panel-header-row">
       <h2 class="section-title">Generations</h2>
       <p style="color: var(--text-muted); font-size: 0.85rem; margin: -0.75rem 0 0.5rem 0;">Deploy history — <strong>current</strong> is the desired generation (not process liveness). Use Overview above for running/stopped.</p>
@@ -115,7 +116,7 @@ import OfflineState from '../components/OfflineState.astro';
       <h3 class="modal-title" style="color: var(--accent-amber);">Confirm Rollback</h3>
       <p class="modal-description">
         <span id="rollbackMsg"></span>
-        Zero-downtime cutover: traffic will swap to the selected generation via ingress re-point. If that generation is no longer live, it will redeploy from recorded config.
+        Rollback redeploys the selected generation's recorded repo and config path through the normal pipeline. Commits are not recorded yet, so it builds what that source points to now.
       </p>
       <div class="modal-actions">
         <button id="btnCancelRollback" class="btn btn-secondary">Cancel</button>
@@ -124,25 +125,13 @@ import OfflineState from '../components/OfflineState.astro';
     </div>
   </div>
 
-  <!-- Destroy Confirmation Modal -->
-  <div id="destroyModal" class="modal-overlay hidden">
-    <div class="modal-content card-panel">
-      <h3 class="modal-title">Confirm Destruction</h3>
-      <p class="modal-description">
-        Are you sure you want to destroy <strong id="destroyServiceName">this service</strong>?
-        This will terminate the microVM/container instance and purge network interfaces. This action cannot be undone.
-      </p>
-      <div class="modal-actions">
-        <button id="btnCancelDestroy" class="btn btn-secondary">Cancel</button>
-        <button id="btnConfirmDestroy" class="btn btn-danger">Confirm Destroy</button>
-      </div>
-    </div>
-  </div>
+  <DestroyDialog />
 </Layout>
 
 <script>
   import { api, escapeHtml, formatUptime, getApiBase, isServiceRunning } from '../lib/api';
   import { renderOfflineState, renderUnauthorizedState } from '../lib/offline_state';
+  import { confirmDestroy } from '../lib/destroy_dialog';
 
   const params = new URLSearchParams(window.location.search);
   const serviceId = params.get('id');
@@ -158,9 +147,8 @@ import OfflineState from '../components/OfflineState.astro';
   const btnClearLogs = document.getElementById('btnClearLogs');
   const logConsole = document.getElementById('logConsole');
   const actionFeedback = document.getElementById('actionFeedback');
-  const destroyModal = document.getElementById('destroyModal');
-  const btnCancelDestroy = document.getElementById('btnCancelDestroy');
-  const btnConfirmDestroy = document.getElementById('btnConfirmDestroy');
+  /** Display name for the destroy dialog, set once the detail loads. */
+  let serviceLabel: string | undefined;
 
   function showFeedback(msg: string, isError = false) {
     if (!actionFeedback) return;
@@ -199,22 +187,7 @@ import OfflineState from '../components/OfflineState.astro';
     if (statRoute) statRoute.textContent = service.route_host || '—';
     if (statVmState) statVmState.textContent = service.vm_state || 'unknown';
     if (statUptime) statUptime.textContent = formatUptime(service.uptime_seconds);
-    // Update header badge via connection (Header's client probe handles this, but update inline too)
-    const connBadge = document.getElementById('connBadge');
-    if (connBadge) {
-      const map: Record<string, { cls: string; label: string; title: string }> = {
-        demo: { cls: 'badge badge-demo', label: 'DEMO', title: 'Demo mode — mock data (Settings)' },
-        live: { cls: 'badge badge-online', label: 'LIVE', title: 'Connected to russel-ctrl' },
-        offline: { cls: 'badge badge-offline', label: 'OFFLINE', title: 'Control plane unreachable — start russel-ctrl or enable Demo mode' },
-        unauthorized: { cls: 'badge badge-warning', label: 'UNAUTHORIZED', title: 'API token missing or wrong — open Settings' },
-      };
-      const b = map[connection] || map.live;
-      connBadge.className = b.cls;
-      connBadge.innerHTML = `<span class="badge-dot"></span>${b.label}`;
-      connBadge.title = b.title;
-    }
-    const modalName = document.getElementById('destroyServiceName');
-    if (modalName) modalName.textContent = service.name || service.id;
+    serviceLabel = service.name || service.id;
   }
 
   if (serviceId) {
@@ -238,17 +211,9 @@ import OfflineState from '../components/OfflineState.astro';
     btnUpdate.removeAttribute('disabled');
   });
 
-  btnDestroy?.addEventListener('click', () => {
-    destroyModal?.classList.remove('hidden');
-  });
-
-  btnCancelDestroy?.addEventListener('click', () => {
-    destroyModal?.classList.add('hidden');
-  });
-
-  btnConfirmDestroy?.addEventListener('click', async () => {
+  btnDestroy?.addEventListener('click', async () => {
     if (!serviceId) return;
-    destroyModal?.classList.add('hidden');
+    if (!(await confirmDestroy(serviceLabel ?? serviceId))) return;
     const res = await api.destroyService(serviceId);
     showFeedback(res.message, !res.success);
     if (res.success) {
@@ -317,6 +282,7 @@ import OfflineState from '../components/OfflineState.astro';
               <th>Version</th>
               <th>Status</th>
               <th>Runtime</th>
+              <th>Source</th>
               <th>Deployed</th>
               <th>Actions</th>
             </tr>
@@ -328,11 +294,17 @@ import OfflineState from '../components/OfflineState.astro';
                 const verSafe = Number.isFinite(ver) ? String(ver) : '0';
                 const runtime = escapeHtml(String(d.runtime || '\u2014'));
                 const deployed = escapeHtml(formatDeployDate(String(d.deployed_at || '')));
+                const source = d.repo_url
+                  ? `<span class="mono-text">${escapeHtml(String(d.repo_url))}</span>${
+                      d.config_path ? ` <span style="color: var(--text-muted);">${escapeHtml(String(d.config_path))}</span>` : ''
+                    }`
+                  : '\u2014';
                 return `
               <tr>
                 <td><strong>v${verSafe}</strong></td>
                 <td>${deploymentStatusBadge(String(d.status || ''))}</td>
                 <td>${runtime}</td>
+                <td>${source}</td>
                 <td>${deployed}</td>
                 <td>${
                   d.rollback_ready && d.status !== 'active'
@@ -422,7 +394,7 @@ import OfflineState from '../components/OfflineState.astro';
   .detail-grid {
     display: flex;
     flex-direction: column;
-    gap: 1.5rem;
+    gap: 3rem;
   }
 
   .panel-header-row {
@@ -449,7 +421,7 @@ import OfflineState from '../components/OfflineState.astro';
     font-size: 0.72rem;
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.18em;
     font-weight: 500;
   }
 
@@ -457,6 +429,12 @@ import OfflineState from '../components/OfflineState.astro';
     font-size: 0.92rem;
     font-weight: 500;
     color: var(--text-primary);
+  }
+
+  .action-hint {
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    margin-top: 0.5rem;
   }
 
   .stat-value.mono {
@@ -482,59 +460,17 @@ import OfflineState from '../components/OfflineState.astro';
   .action-feedback.success {
     background-color: var(--bg-badge-success);
     color: var(--accent-green);
-    border: 1px solid rgba(16, 185, 129, 0.25);
+    border-left: 1px solid currentColor;
   }
 
   .action-feedback.error {
     background-color: var(--bg-badge-danger);
     color: var(--accent-red);
-    border: 1px solid rgba(239, 68, 68, 0.25);
+    border-left: 1px solid currentColor;
   }
 
   .log-actions {
     display: flex;
     gap: 0.5rem;
-  }
-
-  /* Modal */
-  .modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-color: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(4px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-
-  .modal-content {
-    max-width: 460px;
-    width: 90%;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-  }
-
-  .modal-title {
-    font-size: 1.25rem;
-    font-weight: 700;
-    color: var(--accent-red);
-  }
-
-  .modal-description {
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    line-height: 1.5;
-  }
-
-  .modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.65rem;
-    margin-top: 0.5rem;
   }
 </style>

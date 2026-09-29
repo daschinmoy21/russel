@@ -12,16 +12,23 @@ use russel_core::{
 };
 
 use crate::{
-    container::{ContainerStartSpec, RootfsSpec, default_base_dir},
+    container::{
+        CONTAINER_READY_TIMEOUT, ContainerStartSpec, LOG_TAIL_LINES, ReadyOutcome, RootfsSpec,
+        container_log_path, default_base_dir, inspect_state, log_tail, not_ready_error,
+        wait_until_ready,
+    },
     metadata::{
         build_container_metadata_with_gen, build_microvm_metadata_with_gen, write_metadata,
     },
     microvm::{BootOutput, KernelInfo},
-    network::{SubnetAllocation, TapForwarder, subnet_for},
+    network::{
+        MICROVM_READY_TIMEOUT, MicrovmNet, MicrovmNetMode, SubnetAllocation, TapForwarder,
+        subnet_for,
+    },
     warm_pool::shared_warm_pool,
 };
 
-use super::env::{build_container_env, validate_bin_name};
+use super::env::{build_container_env, split_secret_env, validate_bin_name};
 use super::pipeline::{DeployPipeline, DeployWorkload};
 
 impl DeployPipeline {
@@ -36,8 +43,11 @@ impl DeployPipeline {
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
         generation_id: Option<&str>,
         desired_state: Option<&serde_json::Value>,
+        volumes: &[russel_core::volumes::ResolvedVolume],
         using_package: bool,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
+        crate::microvm::check_volume_guest_paths(volumes)?;
+        let run_as = super::RunAs::from_user(config.service.user.as_deref());
         let alloc: SubnetAllocation = subnet_for(service_id)?;
         tracing::info!(
             service_id,
@@ -60,7 +70,7 @@ impl DeployPipeline {
             })
             .await;
 
-        let cfg_dir = russel_core::paths::service_dir(service_id)
+        let cfg_dir = crate::paths::service_dir(service_id)
             .join("cfg")
             .display()
             .to_string();
@@ -71,7 +81,12 @@ impl DeployPipeline {
             port.guest,
             &app_path,
             env,
+            &config.service.args,
+            volumes,
+            run_as,
         )?;
+        crate::container::prepare_managed_volume_dirs(volumes).await?;
+        super::chown_managed_volumes_for_app(volumes, run_as)?;
 
         // Agent initramfs is cached after first use — no app baked in.
         let initramfs_path = self.runner.build_agent_initramfs().await?;
@@ -89,10 +104,26 @@ impl DeployPipeline {
                 description: "Setting up network + booting/restoring VM".into(),
             })
             .await;
-        tracing::info!(service_id, "setting up TAP + socat + booting VM");
+        let net_mode = MicrovmNetMode::for_host()?;
+        tracing::info!(
+            service_id,
+            net = net_mode.as_str(),
+            "setting up network + booting VM"
+        );
 
         let t_net = Instant::now();
-        let socat_child = TapForwarder::setup(service_id, &alloc, port.host, port.guest).await?;
+        let extra_ports: Vec<(u16, u16)> = config.ports.iter().map(|p| (p.host, p.guest)).collect();
+        let net = MicrovmNet::setup(
+            net_mode,
+            service_id,
+            &alloc,
+            port.host,
+            port.guest,
+            &extra_ports,
+        )
+        .await?;
+        let volume_fs =
+            crate::microvm::volume_fs_mounts(&crate::paths::service_dir(service_id), volumes);
         let network_ms = t_net.elapsed().as_millis();
 
         let t_start = Instant::now();
@@ -107,6 +138,8 @@ impl DeployPipeline {
                 &kernel_info.path,
                 &initramfs_path,
                 &alloc,
+                &net.attach,
+                &volume_fs,
                 mem_mb,
                 config.service.cpus,
                 &cfg_dir_path,
@@ -125,7 +158,7 @@ impl DeployPipeline {
             &alloc.host_ip,
             vm_child.id(),
             &v_pids,
-            socat_child.id(),
+            net.socat_pid(),
             &kernel_info.path.display().to_string(),
             &store_path.display().to_string(),
             mem_mb,
@@ -134,8 +167,9 @@ impl DeployPipeline {
             Some(&bin_name),
             Some(&initramfs_path.display().to_string()),
             generation_id,
-            Some(&alloc.tap_id),
+            net.tap_id(&alloc),
         );
+        net.record(&mut meta);
 
         // Merge desired_state for rollback + health restart (F-04).
         if let Some(ds) = desired_state
@@ -145,11 +179,18 @@ impl DeployPipeline {
         }
         write_metadata(&metadata_path, &meta)?;
 
-        // Create marker directory for MicrovmRunner::list() discovery
-        let microvms_marker = format!("/var/lib/microvms/{}", service_id);
-        std::fs::create_dir_all(&microvms_marker).map_err(|e| {
-            anyhow::anyhow!("failed to create marker dir {}: {}", microvms_marker, e)
-        })?;
+        // Marker dir for legacy discovery. The service dir already lists the
+        // VM, so a root-owned /var/lib/microvms under an unprivileged ctrl
+        // must not fail the deploy (#413).
+        let microvms_marker = crate::paths::microvm_dir(service_id);
+        if let Err(e) = std::fs::create_dir_all(&microvms_marker) {
+            tracing::warn!(
+                service_id,
+                dir = %microvms_marker.display(),
+                error = %e,
+                "could not create microVM marker dir; set RUSSEL_MICROVMS_DIR or RUSSEL_DATA_DIR"
+            );
+        }
 
         let start_ms = t_start.elapsed().as_millis();
         tracing::info!(
@@ -172,16 +213,23 @@ impl DeployPipeline {
             guest_port = port.guest,
             "polling VM readiness"
         );
-        let up =
-            TapForwarder::wait_for_vm_port(&alloc.vm_ip, port.guest, Duration::from_secs(10)).await;
+        let up = MicrovmNet::wait_ready(
+            net.mode,
+            service_id,
+            &alloc,
+            port.host,
+            port.guest,
+            MICROVM_READY_TIMEOUT,
+        )
+        .await;
         let ready_ms = t.elapsed().as_millis();
         if !up {
-            let console_log = russel_core::paths::service_dir(service_id)
+            let console_log = crate::paths::service_dir(service_id)
                 .join("console.log")
                 .display()
                 .to_string();
             let cfg_env = format!("{cfg_dir}/deploy.env");
-            let mut detail = String::from("VM not reachable in 10s");
+            let mut detail = format!("VM not reachable in {}s", MICROVM_READY_TIMEOUT.as_secs());
             detail.push_str(&format!(
                 "\nvm_ip={}:{} deploy.env_exists={} console={}",
                 alloc.vm_ip,
@@ -212,7 +260,9 @@ impl DeployPipeline {
 
         // H5: Also verify the host-side published port (socat bind may have
         // failed even when the guest is listening).
-        let host_up = TapForwarder::wait_for_host_port(port.host, Duration::from_secs(2)).await;
+        // passt readiness already went through the host port.
+        let host_up = net.mode == MicrovmNetMode::Passt
+            || TapForwarder::wait_for_host_port(port.host, Duration::from_secs(2)).await;
         if !host_up {
             anyhow::bail!(
                 "microVM guest reachable ({}:{}) but host port {} is not bound — \
@@ -228,7 +278,9 @@ impl DeployPipeline {
                 alloc,
                 vm_child: Box::new(vm_child),
                 virtiofsd_children,
-                socat_child: Box::new(socat_child),
+                net_mode: net.mode,
+                socat_child: Box::new(net.forwarder),
+                extra_forwarders: net.extra_forwarders,
                 initramfs_path,
                 port: port.clone(),
             },
@@ -292,18 +344,23 @@ impl DeployPipeline {
             })
             .await;
         let t_start = Instant::now();
+        let (plain_env, secret_env) =
+            split_secret_env(build_container_env(port.guest, env), &config.service.env);
         let start_spec = ContainerStartSpec {
             service_id: service_id.to_string(),
             rootfs: prepared.clone(),
             host_port: port.host,
             guest_port: port.guest,
             memory_mb: mem_mb,
-            env: build_container_env(port.guest, env),
-            extra_args: podman_args.to_vec(),
+            cpus: Some(config.service.cpus),
+            env: plain_env,
+            secret_env,
+            podman_args: podman_args.to_vec(),
             volumes: volumes.to_vec(),
             extra_ports: config.ports.iter().map(|p| (p.host, p.guest)).collect(),
-            args: config.service.args.clone(),
-            userns_keep_id: config.service.userns.as_deref() == Some("keep-id"),
+            service_args: config.service.args.clone(),
+            userns_keep_id: super::RunAs::from_user(config.service.user.as_deref())
+                == super::RunAs::App,
             restart: config.service.restart.clone(),
         };
         let running = self.containers.start(&start_spec).await?;
@@ -326,6 +383,8 @@ impl DeployPipeline {
             generation_id,
         );
 
+        metadata["cpus"] = serde_json::json!(config.service.cpus);
+
         // Merge desired_state for rollback + health restart (F-04).
         if let Some(ds) = desired_state
             && let Some(obj) = metadata.as_object_mut()
@@ -338,7 +397,7 @@ impl DeployPipeline {
         let _ = tx
             .send(DeployEvent::Progress {
                 phase: "ready".into(),
-                description: "Waiting for container service to be reachable".into(),
+                description: "Waiting for the app to accept connections".into(),
             })
             .await;
         tracing::info!(
@@ -346,12 +405,36 @@ impl DeployPipeline {
             host_port = port.host,
             "polling container readiness"
         );
-        let up = TapForwarder::wait_for_host_port(port.host, Duration::from_secs(10)).await;
+        // The forwarder accepts on the host port whether or not the app is up,
+        // so probe for the app and watch the container for an early exit (#462).
+        let addr = TapForwarder::host_port_addr(port.host);
+        let outcome = wait_until_ready(
+            || crate::network::app_accepts(&addr),
+            || inspect_state(&running.container_name),
+            CONTAINER_READY_TIMEOUT,
+        )
+        .await;
         let ready_ms = t.elapsed().as_millis();
-        if !up {
-            anyhow::bail!("container not reachable on 127.0.0.1:{} in 10s", port.host);
+        if outcome != ReadyOutcome::Ready {
+            let tail = log_tail(&container_log_path(service_id), LOG_TAIL_LINES);
+            tracing::warn!(
+                service_id,
+                ?outcome,
+                ready_ms,
+                "container did not become ready"
+            );
+            anyhow::bail!(
+                "{}",
+                not_ready_error(
+                    &outcome,
+                    port.host,
+                    port.guest,
+                    CONTAINER_READY_TIMEOUT,
+                    &tail
+                )
+            );
         }
-        tracing::info!(service_id, ready_ms, "container service reachable");
+        tracing::info!(service_id, ready_ms, "container app accepting connections");
 
         Ok((
             DeployWorkload::Container {

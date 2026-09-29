@@ -7,8 +7,8 @@
 #   virtualisation.podman.enable default on).
 #
 # DynamicUser is not used. Rootless Podman needs a real lingering account;
-# microVMs need /dev/kvm and TAP. For a container-only VPS, set `user` to your
-# lingering login user and skip KVM/TAP/cloud-hypervisor.
+# microVMs (experimental, `microvms.enable`) need /dev/kvm and passt. For a
+# container-only VPS, set `user` to your lingering login user.
 #
 # TLS is not implemented in ctrl. Put Caddy, nginx, or Traefik in front.
 # See docs/security-tls.md and docs/traefik.md.
@@ -120,7 +120,7 @@ in
         puts /run/wrappers on PATH, and defaults
         virtualisation.podman.enable on.
         False only keeps NoNewPrivileges=true. It does not configure
-        microVMs (KVM, TAP, cloud-hypervisor). Use that only when this
+        microVMs (see `microvms.enable`). Use that only when this
         unit never starts Podman.
       '';
     };
@@ -144,6 +144,26 @@ in
         Use mode 0600, readable by the service user. Typed as string so
         Nix does not copy the secret into the store.
       '';
+    };
+
+    microvms = {
+      enable = mkEnableOption ''
+        experimental microVMs (`service.type = "microvm"`). The unit joins
+        the `kvm` group and gets cloud-hypervisor, virtiofsd, and passt on
+        PATH. ctrl stays unprivileged: passt is the VM NIC and publishes
+        its port, as pasta does for rootless Podman (#461)
+      '';
+
+      kernel = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        example = lib.literalExpression ''"''${inputs.russel.packages.''${pkgs.system}.microvm-kernel}/bzImage"'';
+        description = ''
+          Guest kernel (`RUSSEL_KERNEL_PATH`). Must be Russel's microVM
+          kernel (virtio and fuse built in). Null leaves ctrl's own lookup:
+          `/var/lib/russel/_pool/kernel/bzImage`.
+        '';
+      };
     };
 
     extraEnvironment = mkOption {
@@ -216,13 +236,26 @@ in
         nix
         openssh
       ])
-      ++ [ config.virtualisation.podman.package ];
+      ++ [ config.virtualisation.podman.package ]
+      ++ lib.optionals cfg.microvms.enable (
+        with pkgs;
+        [
+          cloud-hypervisor
+          passt
+          virtiofsd
+        ]
+      );
       environment = {
         RUSSEL_CTRL_ADDR = cfg.bindAddress;
         RUSSEL_REQUIRE_AUTH = "1";
         HOME = "/var/lib/russel";
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        # Keeps every root under /var/lib/russel (microVM markers included).
+        RUSSEL_DATA_DIR = "/var/lib/russel";
+      }
+      // lib.optionalAttrs (cfg.microvms.enable && cfg.microvms.kernel != null) {
+        RUSSEL_KERNEL_PATH = toString cfg.microvms.kernel;
       }
       // cfg.extraEnvironment
       // {
@@ -258,6 +291,10 @@ in
       }
       // lib.optionalAttrs (resolvedGroup != null) {
         Group = resolvedGroup;
+      }
+      // lib.optionalAttrs cfg.microvms.enable {
+        # /dev/kvm only; no capabilities (passt networking, #461).
+        SupplementaryGroups = [ "kvm" ];
       };
     };
   };

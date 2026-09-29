@@ -31,7 +31,6 @@ use crate::{
     deployments,
     ingress::default_ingress,
     metadata::{load_metadata_from_disk, prior_runtime_from_disk, resolve_lifecycle_runtime},
-    microvm::MicrovmRunner,
     network::{PortAllocator, release_subnet},
     runtime::{self, RuntimeLifecycle},
     state::{AppState, LifecycleClaim},
@@ -171,18 +170,17 @@ fn spawn_deploy_stream(
     let deploy_tx = tx.clone();
     let monitor_state = state.clone();
     let deploy_guard = state.begin_deploy();
-    let sid = service_id;
-    let sid2 = sid.clone();
+    let pipeline = DeployPipeline::new(state);
+    let claimed_id = pipeline.claimed_service_id();
 
     let deploy_handle = tokio::spawn(async move {
         let _permit = permit;
         let _guard = deploy_guard;
-        let pipeline = DeployPipeline::new(state);
         let response = pipeline.deploy(request, deploy_tx.clone()).await;
         let status = response.status.clone();
         let elapsed_ms = response.elapsed_ms;
         tracing::info!(
-            service_id = %sid,
+            service_id = %response.service_id,
             status = %status,
             elapsed_ms = elapsed_ms,
             "{task_label} deploy finished"
@@ -203,11 +201,15 @@ fn spawn_deploy_stream(
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| format!("{task_label} deploy task panicked"));
             tracing::error!(
-                service_id = %sid2,
+                service_id = %service_id,
                 panic = %detail,
                 "{task_label} deploy task panicked"
             );
-            monitor_state.mark_failed(&sid2, detail);
+            // Only a claimed service is marked failed: the id comes from the
+            // Russelfile, and a panic before `mark_building` touched nothing.
+            if let Some(id) = claimed_id.get() {
+                monitor_state.mark_failed(id, detail);
+            }
             let _ = tx
                 .send(DeployEvent::Error(format!(
                     "{task_label} deploy task failed"
@@ -223,34 +225,16 @@ async fn deploy(
     State(state): State<AppState>,
     Json(request): Json<DeployRequest>,
 ) -> axum::response::Response {
-    if let Some(err) = request.port.as_ref().and_then(|p| p.validate().err()) {
-        return text_response(StatusCode::BAD_REQUEST, err);
-    }
-
-    // #300: never default to shared "api" — concurrent deploys would collide.
-    let service_id = match request
-        .vm_id
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        Some(id) => id.to_string(),
-        None => {
-            return text_response(
-                StatusCode::BAD_REQUEST,
-                "vm_id is required (e.g. \"my-service\"); shared default \"api\" was removed",
-            );
-        }
-    };
-
+    // The service id is the Russelfile `service.name`; the pipeline reads it
+    // after fetching the source. `vm_id`, when sent, is only a check (#446).
+    let requested_id = request.vm_id.clone().unwrap_or_default();
     tracing::info!(
         repo = %crate::git::redact_repo_url(&request.repo_url),
-        service_id = %service_id,
-        port = ?request.port.as_ref().map(|p| format!("{}:{}", p.host, p.guest)),
+        requested_id = %requested_id,
         "POST /deploy"
     );
 
-    match spawn_deploy_stream(state, request, service_id, "deploy") {
+    match spawn_deploy_stream(state, request, requested_id, "deploy") {
         Ok(response) => response,
         Err((status, message)) => text_response(status, message),
     }
@@ -260,7 +244,7 @@ async fn vm_status(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/status", service_id);
 
@@ -284,6 +268,7 @@ async fn vm_status(
             host_port: agent_status.host_port,
             guest_port: agent_status.guest_port,
             route_host: None,
+            restarts: None,
         }));
     }
 
@@ -297,7 +282,7 @@ async fn vm_logs(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<LogsResponse>, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/logs", service_id);
     let mut resp = state.logs(&service_id).ok_or((
@@ -404,10 +389,7 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
         .collect();
     let mut seen: std::collections::HashSet<String> = vms.iter().cloned().collect();
 
-    let bases = [
-        russel_core::paths::data_root(),
-        PathBuf::from("/var/lib/microvms"),
-    ];
+    let bases = [crate::paths::data_root(), crate::paths::microvms_root()];
     for base in &bases {
         let Ok(mut entries) = tokio::fs::read_dir(base).await else {
             continue;
@@ -423,6 +405,12 @@ async fn vms_list(State(state): State<AppState>) -> Json<VmsResponse> {
                 continue;
             };
             if is_reserved_service_dir(&name) {
+                continue;
+            }
+            // `destroy` with `keep = true` leaves only `volumes/`. That is
+            // data, not a service. Listing it re-created a stopped entry that
+            // a second destroy would then treat as a microVM.
+            if crate::container::dir_is_kept_volumes_only(&entry.path()) {
                 continue;
             }
             if seen.insert(name.clone()) {
@@ -561,7 +549,7 @@ async fn vm_stop(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
@@ -578,6 +566,11 @@ async fn vm_stop(
                 && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
             {
                 reap_children(vm, aux).await;
+            }
+            // restart = "unless-stopped" must leave an operator stop alone,
+            // including across a ctrl restart.
+            if handle.runtime == RuntimeKind::Microvm {
+                crate::restart::note_user_stop(&service_id);
             }
             // Deregister from ingress so the proxy stops routing to this backend.
             let ingress = default_ingress();
@@ -614,13 +607,16 @@ struct UpdateBody {
     repo_url: Option<String>,
     #[serde(default)]
     config_path: Option<String>,
+    /// Build the source's current HEAD instead of the recorded commit.
+    #[serde(default)]
+    refresh: bool,
 }
 
 /// `GET /vm/{service_id}/deployments` — deployment history journal (newest first).
 async fn vm_deployments(
     Path(service_id): Path<String>,
 ) -> Result<Json<DeploymentsResponse>, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!(service_id = %service_id, "GET /vm/{}/deployments", service_id);
     deployments::list(&service_id)
@@ -638,7 +634,7 @@ async fn vm_rollback(
     Path(service_id): Path<String>,
     body: Option<Json<RollbackRequest>>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let body = body.map(|j| j.0).unwrap_or_default();
@@ -658,12 +654,9 @@ async fn vm_rollback(
         (status, e.to_string())
     })?;
 
-    // Build DeployRequest from journal desired_state / top-level source fields.
-    let ds = target.desired_state.as_ref();
-    let repo_url = ds
-        .and_then(|d| d.repo_url.clone())
-        .or_else(|| target.repo_url.clone())
-        .filter(|u| !u.trim().is_empty())
+    let request = target
+        .recorded_source()
+        .redeploy_request(&service_id)
         .ok_or_else(|| {
             (
                 StatusCode::CONFLICT,
@@ -671,33 +664,6 @@ async fn vm_rollback(
                     .to_string(),
             )
         })?;
-    let config_path = ds
-        .and_then(|d| d.config_path.clone())
-        .or_else(|| target.config_path.clone())
-        .unwrap_or_else(|| "Russelfile.toml".into());
-    let runtime = ds.and_then(|d| d.runtime).or(target.runtime);
-    let host_port = ds.and_then(|d| d.host_port).or(target.host_port);
-    let guest_port = ds
-        .and_then(|d| d.guest_port)
-        .or(target.guest_port)
-        .unwrap_or(3000);
-    let ingress_host = ds.and_then(|d| d.ingress_host.clone());
-    let env = ds.map(|d| d.env.clone()).unwrap_or_default();
-    let podman_args = ds.map(|d| d.podman_args.clone()).unwrap_or_default();
-
-    let request = DeployRequest {
-        repo_url,
-        config_path,
-        vm_id: Some(service_id.clone()),
-        port: host_port.map(|host| russel_core::api::PortMapping {
-            host,
-            guest: guest_port,
-        }),
-        host: ingress_host,
-        runtime,
-        env,
-        podman_args,
-    };
 
     // On the next successful deploy append, demote current active → rolled_back.
     // Marker is only consumed after success so a failed rollback redeploy leaves
@@ -729,7 +695,7 @@ async fn vm_update(
     Path(service_id): Path<String>,
     body: Option<Json<UpdateBody>>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let body = body.map(|j| j.0).unwrap_or_default();
@@ -752,83 +718,23 @@ async fn vm_update(
         }
     };
 
-    let top_repo_url = meta
-        .get("repo_url")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let top_config_path = meta
-        .get("config_path")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let top_host_port: Option<u16> = meta
-        .get("host_port")
-        .and_then(|v| v.as_u64())
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid host_port in metadata: {e}"),
-            )
-        })?;
-    let top_guest_port: Option<u16> = meta
-        .get("guest_port")
-        .and_then(|v| v.as_u64())
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid guest_port in metadata: {e}"),
-            )
-        })?;
-    let top_runtime: Option<RuntimeKind> = meta
-        .get("runtime")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
-
-    //
-    // Typed via DesiredStateSnapshot (serde(default)); when absent/malformed we
-    // fall back to the legacy top-level metadata. The writer persists the user's
-    // original (pre-secret resolution) env plus podman_args / runtime / port that
-    // the deploy ran with, so a later update can reproduce the request verbatim.
-    let ds = deployments::DesiredStateSnapshot::from_metadata_desired_state(&meta);
-
     // Precedence: request body > desired_state > legacy top-level.
-    let repo_url = body
-        .repo_url
-        .or(ds.repo_url.clone())
-        .or(top_repo_url)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "no repo_url in request or metadata; pass {\"repo_url\":\"...\"} or redeploy once first".into(),
-            )
-        })?;
-    let config_path = body
-        .config_path
-        .or(ds.config_path.clone())
-        .or(top_config_path)
-        .unwrap_or_else(|| "Russelfile.toml".into());
-
-    let host_port = ds.host_port.or(top_host_port);
-    let guest_port = ds.guest_port.or(top_guest_port).unwrap_or(3000);
-    let ingress_host = ds.ingress_host;
-    let runtime = ds.runtime.or(top_runtime);
-
-    let request = DeployRequest {
-        repo_url,
-        config_path,
-        vm_id: Some(service_id.clone()),
-        port: host_port.map(|host| russel_core::api::PortMapping {
-            host,
-            guest: guest_port,
-        }),
-        host: ingress_host,
-        runtime,
-        env: ds.env,
-        podman_args: ds.podman_args,
-    };
+    let mut source = deployments::DesiredStateSnapshot::from_metadata_with_legacy(&meta)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    // Update rebuilds the recorded commit (#448). A new source or config
+    // path, or --refresh, builds whatever that source points at now.
+    if body.refresh || body.repo_url.is_some() || body.config_path.is_some() {
+        source.rev = None;
+    }
+    source.repo_url = body.repo_url.or(source.repo_url);
+    source.config_path = body.config_path.or(source.config_path);
+    let request = source.redeploy_request(&service_id).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "no repo_url in request or metadata; pass {\"repo_url\":\"...\"} or redeploy once first"
+                .to_string(),
+        )
+    })?;
 
     tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);
 
@@ -846,7 +752,7 @@ async fn vm_destroy(
     Path(service_id): Path<String>,
     Query(query): Query<DestroyQuery>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    MicrovmRunner::validate_service_id(&service_id)
+    russel_core::ids::validate_service_id(&service_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let policy = russel_core::VolumeDestroyPolicy::from_keep_override(query.keep_volumes);
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
@@ -854,15 +760,12 @@ async fn vm_destroy(
     // Resolve runtime and reject unsupported query params BEFORE claiming
     // Destroying. Returning Err after claim leaves status stuck.
     // Unreadable metadata is 500 — assuming microVM would destroy a container.
-    let runtime = require_lifecycle_runtime(&state, &service_id)?;
-    // Container service-dir cleanup is owned by destroy_with_policy
+    require_lifecycle_runtime(&state, &service_id)?;
+    // Service-dir cleanup is owned by destroy_with_policy on both runtimes
     // (FollowFile / KeepAll / DeleteAll). The agent RPC path has no policy
     // slot yet, so an explicit keep_volumes query against agent mode is
     // rejected instead of silently following the file.
-    if runtime == RuntimeKind::Container
-        && crate::agent_client::agent_mode_enabled()
-        && query.keep_volumes.is_some()
-    {
+    if crate::agent_client::agent_mode_enabled() && query.keep_volumes.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
             "keep_volumes is not supported in agent mode (unset RUSSEL_AGENT_URL or omit the query)"
@@ -872,12 +775,18 @@ async fn vm_destroy(
 
     let (runtime, handle) =
         claim_lifecycle_operation(&state, &service_id, ServiceStatus::Destroying)?;
-    let result = if runtime == RuntimeKind::Container && !crate::agent_client::agent_mode_enabled()
-    {
-        crate::container::destroy_with_policy_for(&service_id, policy).await
-    } else {
-        // MicroVM destroy ignores the keep_volumes query.
-        handle.lifecycle.destroy(&service_id).await
+    let result = match runtime {
+        _ if crate::agent_client::agent_mode_enabled() => {
+            handle.lifecycle.destroy(&service_id).await
+        }
+        RuntimeKind::Container => {
+            crate::container::destroy_with_policy_for(&service_id, policy).await
+        }
+        RuntimeKind::Microvm => {
+            crate::microvm::shared_runner()
+                .destroy_with_policy(&service_id, policy)
+                .await
+        }
     };
 
     let label = runtime_label(runtime);
@@ -907,6 +816,10 @@ async fn vm_destroy(
             let ingress = default_ingress();
             if let Err(e) = ingress.deregister(&service_id).await {
                 tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during destroy");
+            }
+            // Kept volumes are not Nix paths; every generation root goes.
+            if let Err(e) = crate::gcroots::remove(&service_id) {
+                tracing::warn!(service_id = %service_id, error = %e, "failed to remove gcroots during destroy");
             }
             tracing::info!(service_id = %service_id, runtime = %label, "destroyed service");
             state.remove_service(&service_id);

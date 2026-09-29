@@ -41,7 +41,7 @@ traefik --configFile=traefik.yml
 
 | Variable | Default | Description |
 |---|---|---|
-| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `/var/lib/russel/traefik/dynamic` | Must match `providers.file.directory` |
+| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `$RUSSEL_DATA_DIR/traefik/dynamic` (`/var/lib/russel/traefik/dynamic`) | Must match `providers.file.directory` |
 | `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Default suffix for `Host()` rules when `[ingress].host` is omitted (validated as a DNS name) |
 | `RUSSEL_TRAEFIK_BACKEND` | publish bind (`RUSSEL_PUBLISH_BIND`) | Host Traefik dials for a published backend port. Set it when Traefik runs in a different netns than the backend — e.g. rootless Podman Traefik reaching a host-published port via `10.89.0.1`. Leave unset when Traefik shares the backend's netns (wildcard binds map to loopback). |
 | `RUSSEL_TRAEFIK_TLS` | off | `1` adds `websecure` + `tls.certResolver` to each router |
@@ -81,7 +81,7 @@ the operator's job.
 
 ## How it works
 
-1. **Deploy**: `russel deploy` → ctrl writes `/var/lib/russel/traefik/dynamic/<service_id>.json` (atomic temp + rename).
+1. **Deploy**: `russel apply` → ctrl writes `/var/lib/russel/traefik/dynamic/<service_id>.json` (atomic temp + rename).
 2. **Traefik picks up** the router + service (file watch, sub-second).
 3. **Access**: `curl http://<service-host>`.
 4. **Stop/destroy**: ctrl removes the file → Traefik stops routing. Redeploy re-registers the new backend port.
@@ -164,7 +164,7 @@ uniqueness scan and the file update. Two concurrent deploys cannot both pass
 the scan.
 
 To drop a custom name, delete the `[ingress]` table from the Russelfile and run
-`russel deploy .`; the next write returns the service to the configured default
+`russel apply .`; the next write returns the service to the configured default
 suffix.
 
 App tunnels are not configured in the Russelfile yet; putting host-wide

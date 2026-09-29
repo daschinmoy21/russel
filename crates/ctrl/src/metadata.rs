@@ -38,7 +38,7 @@ pub const NODE_ID_ENV: &str = "RUSSEL_NODE_ID";
 
 /// On-disk path for a service's metadata.json.
 pub fn metadata_path(service_id: &str) -> PathBuf {
-    russel_core::paths::service_dir(service_id).join("metadata.json")
+    crate::paths::service_dir(service_id).join("metadata.json")
 }
 
 /// Resolve the node id written into service `metadata.json`.
@@ -322,7 +322,7 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
 /// Atomic write of the control plane catalog JSON to `/var/lib/russel/ctrl-catalog.json`.
 pub fn write_ctrl_catalog(catalog: &serde_json::Value) -> anyhow::Result<()> {
     write_ctrl_catalog_to(
-        &russel_core::paths::data_root().join("ctrl-catalog.json"),
+        &crate::paths::data_root().join("ctrl-catalog.json"),
         catalog,
     )
 }

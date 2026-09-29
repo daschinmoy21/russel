@@ -18,6 +18,13 @@ package = "vaultwarden"
 
 [service.env]
 DATA_FOLDER = "/data"
+# The nixpkgs package has no web vault (that is vaultwarden.webvault), and
+# vaultwarden exits when it cannot find one. Serve the API only; Bitwarden
+# clients talk to the API.
+WEB_VAULT_ENABLED = "false"
+# Rocket binds 127.0.0.1 by default; Podman port forwarding targets the
+# container IP, so listen on all interfaces.
+ROCKET_ADDRESS = "0.0.0.0"
 
 [[volumes]]
 name = "data"

@@ -22,7 +22,6 @@ const FLAKE_NAME: &str = "flake.nix";
 const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_MEMORY: &str = "256mb";
 const FALLBACK_NAME: &str = "app";
-const RESERVED_NAMES: &[&str] = &["secrets", "traefik", "_pool"];
 
 /// Create a starter `Russelfile.toml` (and optionally `flake.nix`).
 #[derive(Debug, Clone, Args)]
@@ -43,12 +42,13 @@ pub struct InitArgs {
     #[arg(long, default_value = DEFAULT_MEMORY)]
     pub memory: String,
 
-    /// Runtime kind written to `service.type`.
+    /// Runtime kind written to `service.type`: `container` (default) or
+    /// `microvm` (experimental; needs /dev/kvm and passt on the ctrl host).
     #[arg(long = "type", visible_alias = "runtime", value_name = "RUNTIME")]
     pub runtime: Option<RuntimeKind>,
 
-    /// nixpkgs attribute for container services without a flake
-    /// (e.g. `--package navidrome`). Implies `--type container`.
+    /// nixpkgs attribute for services without a flake
+    /// (e.g. `--package navidrome`). Works with either `--type`.
     #[arg(long, value_name = "ATTR")]
     pub package: Option<String>,
 
@@ -154,17 +154,9 @@ pub fn run(args: InitArgs) -> Result<()> {
     let keep_russelfile = russelfile_existed && !args.force;
     let mut port = args.port;
     let mut memory = args.memory.clone();
-    // --package implies container; an explicit --type still applies.
-    let mut runtime = args.runtime.unwrap_or_else(|| {
-        if package.is_some() {
-            RuntimeKind::Container
-        } else {
-            RuntimeKind::Microvm
-        }
-    });
-    if package.is_some() && runtime != RuntimeKind::Container {
-        bail!("--package requires --type container (package auto-flake is container-only)");
-    }
+    // Container is the default; an explicit --type still applies. The
+    // package auto-flake builds for either runtime.
+    let mut runtime = args.runtime.unwrap_or_default();
     let mut keep_package: Option<String> = package.map(str::to_string);
     if keep_russelfile {
         let existing = Russelfile::load(&russelfile_path)
@@ -456,58 +448,16 @@ fn resolve_bin(explicit: Option<&str>, name: &str) -> Result<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(name);
-    validate_bin_name(bin)?;
+    russel_core::ids::validate_bin_name(bin)?;
     Ok(bin.to_string())
 }
 
+/// `--name` follows the same rule `Russelfile::load` applies to
+/// `service.name`: the service id rule in `russel_core::ids`.
 fn validate_service_name(name: &str) -> Result<&str> {
-    if name.is_empty() {
-        bail!("service name must not be empty");
-    }
-    if name.len() > 128 {
-        bail!("service name too long (max 128 characters)");
-    }
-    if name == "." || name == ".." || name.contains("..") {
-        bail!("service name cannot contain path traversal components");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        bail!("service name can only contain ASCII letters, digits, dashes, and underscores");
-    }
+    russel_core::ids::validate_service_id(name)
+        .map_err(|e| anyhow!("invalid service name {name:?}: {e}"))?;
     Ok(name)
-}
-
-fn validate_bin_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("bin name must not be empty");
-    }
-    if name.len() > 256 {
-        bail!("bin name too long (max 256 characters)");
-    }
-    if name == "." || name == ".." {
-        bail!("bin name must not be '.' or '..'");
-    }
-    if name.bytes().all(|c| c == b'.') {
-        bail!("bin name must not consist entirely of dots");
-    }
-    let mut has_alnum = false;
-    let valid = name.bytes().all(|c| {
-        if c.is_ascii_alphanumeric() {
-            has_alnum = true;
-            true
-        } else {
-            c == b'.' || c == b'_' || c == b'+' || c == b'-'
-        }
-    });
-    if !valid {
-        bail!("bin name '{name}' contains invalid characters (only A-Za-z0-9._+- allowed)");
-    }
-    if !has_alnum {
-        bail!("bin name must contain at least one alphanumeric character");
-    }
-    Ok(())
 }
 
 fn validate_port(port: u16) -> Result<()> {
@@ -554,7 +504,7 @@ fn sanitize_ident(raw: &str) -> String {
 }
 
 fn avoid_reserved(name: String) -> String {
-    if RESERVED_NAMES.contains(&name.as_str()) || name.ends_with(".bak") {
+    if russel_core::reserved::is_reserved_service_dir(&name) {
         format!("{name}-svc")
     } else {
         name
@@ -586,18 +536,15 @@ fn render_russelfile(
 #   --name NAME              service.name   (default: Cargo.toml / go.mod / directory)
 #   --port PORT              service.port   (default: 3000, must not be 0)
 #   --memory SIZE            service.memory (default: 256mb; suffix mb or mib, min 16mb)
-#   --type / --runtime KIND  service.type   (microvm | container, default: microvm)
+#   --type / --runtime KIND  service.type   (container | microvm, default: container)
 #   --bin BIN                service.bin    (default: service.name, or package last part)
-#   --package ATTR           nixpkgs attr for containers (implies --type container)
+#   --package ATTR           nixpkgs attr to wrap when there is no flake.nix
 #   --with-flake             also write flake.nix (Rust / Go / static)
 #   --force                  overwrite existing Russelfile.toml / flake.nix
 #
 # Deploy / operate:
-#   russel deploy . -p HOST:{port}          # publish host:guest (guest is service.port)
-#   russel deploy . --vm-id {name}          # stable service id (else derived from the repo)
-#   russel deploy . --runtime {runtime}     # must match service.type if passed
 #   russel deploy . --config Russelfile.toml
-#   russel deploy . --env KEY=VALUE --env-file .env
+#   (service id, env, ingress, and podman flags all come from this file)
 #   printf '%s' \"$VAL\" | russel secrets set NAME
 #   russel secrets list
 #   russel status {name}
@@ -608,7 +555,8 @@ fn render_russelfile(
 #   russel destroy {name} --delete-volumes  # delete managed [[volumes]] dirs
 
 [service]
-# Unique service name. Hint for --vm-id. Default binary name if `bin` is omitted.
+# Unique service name and service id. Default binary name if `bin` is omitted.
+# Same rule as a service id: A-Za-z0-9_- (max 128), not secrets/traefik/_pool.
 name = \"{name}\"
 
 # Source directory relative to the repo root. \".\" is this project.
@@ -616,16 +564,17 @@ name = \"{name}\"
 source = \".\"
 
 # Guest listen port. The process should bind this (Russel also sets PORT).
-# Must not be 0. Publish with: russel deploy . -p HOST:{port}
+# Must not be 0. Set [ingress].port to pin a host-side backend port.
 port = {port}
 
 # Memory limit (microVM RAM / container --memory). Suffix mb or mib. Minimum 16mb.
-# Recommended: 256mb for Go/Rust, 512mb–1gb for heavier runtimes.
+# Recommended: 256mb for Go/Rust, 512mb–1024mb for heavier runtimes. No gb suffix.
 memory = \"{memory}\"
 
-# Runtime source of truth. CLI --runtime must match if provided.
-#   microvm    — KVM / Cloud Hypervisor (needs /dev/kvm, TAP)
-#   container  — rootless Podman --rootfs (typical VPS / no KVM)
+# Runtime source of truth.
+#   container  — rootless Podman --rootfs (default; typical VPS / no KVM)
+#   microvm    — KVM / Cloud Hypervisor, experimental: needs /dev/kvm and
+#                passt on the ctrl host (no root)
 type = \"{runtime}\"
 {package_line}
 # Guest userspace. Orthogonal to type (isolation). Default busybox.
@@ -636,7 +585,7 @@ type = \"{runtime}\"
 # Defaults to `name` when omitted. Allowed: A-Za-z0-9._+- (max 256).
 bin = \"{bin}\"
 {volumes_block}
-# Guest vCPUs for microVM (1..=32, default 1). Ignored for containers.
+# CPUs (1..=32, default 1): microVM vCPUs, container --cpus limit.
 # cpus = 1
 
 # Container-only: include bash, curl, and /usr/bin/env in the rootfs.
@@ -644,26 +593,20 @@ bin = \"{bin}\"
 # Required if the entrypoint is a `#!/usr/bin/env bash` script.
 # debug = false
 
-# Deploy-time environment (also settable with --env / --env-file).
+# Deploy-time environment.
 # Keys: ^[A-Za-z_][A-Za-z0-9_]*$. Max 64 keys, 4096 bytes per value.
 # Reserved (cannot set): PORT, VM_IP, HOST_IP, APP, IFS, PATH, LD_PRELOAD,
-# LD_LIBRARY_PATH, BASH_ENV, ENV, SHELL.
+# LD_AUDIT, LD_LIBRARY_PATH, BASH_ENV, ENV, SHELL. Checked when the file loads.
 # Values: plain text, or secret://NAME from `russel secrets set NAME`.
 # [service.env]
 # LOG_LEVEL = \"info\"
 # FEATURE_X = \"1\"
 # DATABASE_URL = \"secret://DATABASE_URL\"
 
-# Database provisioning is not implemented. Do not set enabled = true.
-# [database.postgres]
-# enabled = false
-# [database.redis]
-# enabled = false
-
 # Optional HTTP ingress. Omit for Host(<service_id>.<RUSSEL_TRAEFIK_DOMAIN>)
 # and an allocated backend port.
 # host is the exact Traefik Host() value (apex or subdomain), not a suffix.
-# port is the host-side backend (like -p HOST:guest), not service.port.
+# port is the host-side backend, not service.port.
 # [ingress]
 # host = \"abc.com\"
 # port = 4000
@@ -930,14 +873,14 @@ fn print_summary(
     }
     println!();
     println!("  \x1b[1mNext:\x1b[0m");
-    println!("    russel deploy . -p 8080:{port}");
+    println!("    russel deploy .");
     match runtime {
         RuntimeKind::Container => {
             println!("    \x1b[2m(container runtime — needs rootless Podman)\x1b[0m");
         }
         RuntimeKind::Microvm => {
             println!(
-                "    \x1b[2m(microVM default — pass --type container if the host has no KVM)\x1b[0m"
+                "    \x1b[2m(microVM runtime is experimental — needs /dev/kvm and passt on the ctrl host)\x1b[0m"
             );
         }
     }
@@ -1122,7 +1065,6 @@ version = "0.1.0"
         assert!(!cfg.service.debug);
         assert_eq!(cfg.service.cpus, 1);
         assert!(cfg.service.env.is_empty());
-        assert!(cfg.database.is_none());
     }
 
     #[test]
@@ -1149,13 +1091,10 @@ version = "0.1.0"
             "# [service.env]",
             "# LOG_LEVEL = \"info\"",
             "secret://DATABASE_URL",
-            "# [database.postgres]",
-            "# [database.redis]",
-            "# enabled = false",
             "# Optional HTTP ingress. Omit for Host(<service_id>.<RUSSEL_TRAEFIK_DOMAIN>)",
             "# and an allocated backend port.",
             "# host is the exact Traefik Host() value (apex or subdomain), not a suffix.",
-            "# port is the host-side backend (like -p HOST:guest), not service.port.",
+            "# port is the host-side backend, not service.port.",
             "# [ingress]",
             "# host = \"abc.com\"",
             "# port = 4000",
@@ -1166,24 +1105,28 @@ version = "0.1.0"
             "--bin BIN",
             "--with-flake",
             "--force",
-            "russel deploy . -p HOST:8080",
-            "--vm-id my-app",
-            "--runtime container",
+            "russel deploy .",
             "--config Russelfile.toml",
-            "--env KEY=VALUE",
-            "--env-file .env",
             "russel secrets set NAME",
             "russel status my-app",
             "russel logs my-app",
             "russel stop my-app",
             "russel destroy my-app",
             "PORT, VM_IP, HOST_IP, APP",
+            "LD_AUDIT",
+            "A-Za-z0-9_- (max 128)",
+            "512mb–1024mb",
         ] {
             assert!(
                 body.contains(needle),
                 "generated Russelfile missing {needle:?}\n{body}"
             );
         }
+        // Only mb / mib parse; a gb hint would recommend an invalid value.
+        assert!(
+            !body.contains("1gb"),
+            "template must not suggest gb:\n{body}"
+        );
     }
 
     #[test]
@@ -1645,6 +1588,25 @@ version = "0.1.0"
     }
 
     #[test]
+    fn runtime_defaults_to_container() {
+        let dir = tempfile::tempdir().unwrap();
+        run(InitArgs {
+            path: dir.path().to_path_buf(),
+            name: Some("demo".into()),
+            port: 3000,
+            memory: "256mb".into(),
+            runtime: None,
+            bin: None,
+            package: None,
+            with_flake: false,
+            force: false,
+        })
+        .unwrap();
+        let cfg = Russelfile::load(&dir.path().join(RUSSELFILE_NAME)).unwrap();
+        assert_eq!(cfg.service.runtime, RuntimeKind::Container);
+    }
+
+    #[test]
     fn package_implies_container_runtime() {
         let dir = tempfile::tempdir().unwrap();
         run(InitArgs {
@@ -1666,9 +1628,9 @@ version = "0.1.0"
     }
 
     #[test]
-    fn package_rejects_explicit_microvm() {
+    fn package_works_with_explicit_microvm() {
         let dir = tempfile::tempdir().unwrap();
-        let err = run(InitArgs {
+        run(InitArgs {
             path: dir.path().to_path_buf(),
             name: Some("demo".into()),
             port: 3000,
@@ -1679,13 +1641,10 @@ version = "0.1.0"
             with_flake: false,
             force: false,
         })
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("--package requires --type container"),
-            "unexpected err: {err}"
-        );
-        assert!(!dir.path().join(RUSSELFILE_NAME).exists());
+        .unwrap();
+        let cfg = Russelfile::load(&dir.path().join(RUSSELFILE_NAME)).unwrap();
+        assert_eq!(cfg.service.runtime, RuntimeKind::Microvm);
+        assert_eq!(cfg.service.package.as_deref(), Some("navidrome"));
     }
 
     #[test]

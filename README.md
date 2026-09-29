@@ -18,9 +18,9 @@ Russel is split into four crates:
 1. **Resolve** — Clone (or use local) repo and parse `Russelfile.toml` (including `service.type`).
 2. **Build** — Auto-generate `flake.nix` if missing (Rust/Go/static detection), then run `nix build` to produce a store path.
 3. **Branch on runtime**
-   - **microvm (default):** minimal initramfs → TAP + socat + virtiofsd → Cloud Hypervisor → guest runs app from virtiofs `/nix/store`.
-   - **container:** prepare Docker-like rootfs → rootless Podman `--rootfs` + `/nix/store:ro` bind → publish `-p HOST:GUEST`.
-4. **Ready** — TCP readiness on guest (microVM) or published host port (container); metadata written under `/var/lib/russel/<id>/`. Register with the `Ingress` trait (default: `TraefikFileIngress` writes Traefik dynamic config) so the reverse proxy can route traffic to the new backend.
+   - **microvm (experimental; KVM + root ctrl):** minimal initramfs → TAP + socat + virtiofsd → Cloud Hypervisor → guest runs app from virtiofs `/nix/store`.
+   - **container (default):** prepare Docker-like rootfs → rootless Podman `--rootfs` + `/nix/store:ro` bind → publish on `[ingress].port` or an allocated host port.
+4. **Ready** — the app accepts connections on the guest (microVM) or through the published host port while the container stays up (container); metadata written under `/var/lib/russel/<id>/`. Register with the `Ingress` trait (default: `TraefikFileIngress` writes Traefik dynamic config) so the reverse proxy can route traffic to the new backend.
 
 ## Quick Start
 
@@ -45,7 +45,7 @@ export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
 # override bind: RUSSEL_CTRL_ADDR=127.0.0.1:7878
 
 # 5. Deploy example (terminal 2, from repo root)
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id test-api
+./target/debug/russel deploy examples/basic-http
 # CLI target: RUSSEL_CONTROL_PLANE=http://127.0.0.1:7878 (default)
 # Prefer a git URL for remote/shared control planes (local paths default OFF).
 
@@ -53,20 +53,21 @@ export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
 curl http://127.0.0.1:8080/health
 # → ok
 
-./target/debug/russel status test-api
+./target/debug/russel status api
 ./target/debug/russel ps
-./target/debug/russel logs test-api
+./target/debug/russel logs api
 
 # 7. Tear down
-./target/debug/russel stop test-api
-./target/debug/russel destroy test-api
+./target/debug/russel stop api
+./target/debug/russel destroy api
 ```
 
-Put `russel` on PATH with [docs/getting-started/installation.md](docs/getting-started/installation.md) (`./contrib/install.sh cli`). For the non-NixOS user-systemd path, the short remote flow is:
+Put `russel` on PATH with [docs/getting-started/installation.md](docs/getting-started/installation.md) (`./contrib/install.sh cli`). For the non-NixOS path, the short remote flow is:
 
 ```bash
-# On the control-plane host:
-./contrib/install.sh host
+# On the control-plane host (runs russel-ctrl as a dedicated `russel` account):
+./contrib/install.sh check
+sudo ./contrib/install.sh host
 
 # On the laptop, with the token file copied privately:
 ./contrib/install.sh connect user@host
@@ -75,16 +76,15 @@ russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
 
 Use `services.russel` on NixOS. The full topology guide is in [docs/getting-started/installation.md](docs/getting-started/installation.md).
 
-**Without `-p`:** Traefik is the primary HTTP ingress. Omit publish and open `http://<service_id>.russel.local` once Traefik watches `/var/lib/russel/traefik/dynamic` (see [docs/guides/traefik-ingress.md](docs/guides/traefik-ingress.md)).
+**Traefik ingress:** Open `http://<service.name>.russel.local` once Traefik watches `/var/lib/russel/traefik/dynamic` (see [docs/guides/traefik-ingress.md](docs/guides/traefik-ingress.md)).
 
-**Container runtime:** `examples/basic-http` sets `type = "container"`. Pass `--runtime container` only if it matches. Needs **rootless** Podman.
+**Container runtime:** `examples/basic-http` sets `type = "container"`. It needs **rootless** Podman.
 
-If ctrl runs under `sudo` for microVMs, container deploys use rootless podman as `RUSSEL_PODMAN_USER` or `SUDO_USER` (not root). That user needs `podman info` → rootless true and `/run/user/$(id -u)` (try `loginctl enable-linger $USER` on headless hosts).
+If ctrl runs under `sudo` (for microVM TAP networking), container deploys use rootless podman as `RUSSEL_PODMAN_USER` or `SUDO_USER` (not root). That user needs `podman info` → rootless true and `/run/user/$(id -u)` (try `loginctl enable-linger $USER` on headless hosts).
 
 ```bash
 # Container path (examples/basic-http already sets type = "container")
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id test-api \
-  --runtime container
+./target/debug/russel deploy examples/basic-http
 ```
 
 **Secrets** (host store under `/var/lib/russel/secrets/`, mode `0600`):
@@ -92,13 +92,13 @@ If ctrl runs under `sudo` for microVMs, container deploys use rootless podman as
 ```bash
 printf '%s' "$DB_PASSWORD" | ./target/debug/russel secrets set DB_PASSWORD
 ./target/debug/russel secrets list
-# Reference in Russelfile or --env as secret://DB_PASSWORD
+# Reference in the Russelfile as secret://DB_PASSWORD
 ```
 
 **Update** a running service from its last deploy source:
 
 ```bash
-./target/debug/russel update test-api
+./target/debug/russel update api
 # optional overrides: --repo PATH_OR_URL --config Russelfile.toml
 ```
 
@@ -115,7 +115,7 @@ unless you have nested virt or bare metal.
 | Yes | CLI → remote `russel-ctrl` → git deploy → status / logs / destroy |
 | Yes | Bearer auth (`RUSSEL_API_TOKEN` ≥32 chars); non-loopback requires token |
 | Yes | TLS via reverse proxy (Caddy/nginx) in front of loopback ctrl |
-| Containers only | Typical no-KVM VPS: set `type = "container"` in every Russelfile |
+| Containers | The default `service.type`; microVMs are experimental (KVM + root ctrl) |
 | Yes | Install: NixOS module (`nixosModules.russel`) or `contrib/russel-ctrl.service` |
 | No | Multi-tenant isolation, managed DBs, native ctrl TLS |
 
@@ -139,17 +139,18 @@ KVM and TAP are optional on a container-only VPS.
 }
 ```
 
-On other Linux, run `./contrib/install.sh host` from the repository root after
-building the release binaries. It installs the user unit, creates
-`~/.config/russel/env` if needed, and keeps existing `~/.config/russel/env` and
-`/var/lib/russel` contents on upgrades. The unit binds loopback and uses
-`RUSSEL_REQUIRE_AUTH=1`.
+On other Linux, run `./contrib/install.sh check`, then `sudo ./contrib/install.sh host`
+from the repository root after building the release binaries. It creates an
+unprivileged `russel` account that runs russel-ctrl and every workload, installs
+the system unit, creates `/etc/russel/env` (readable by the `russel` group, which
+you join) if needed, and keeps existing `/etc/russel/env` and `/var/lib/russel`
+contents on upgrades. The unit binds loopback and uses `RUSSEL_REQUIRE_AUTH=1`.
 
 Choose one control-plane topology:
 
 | Topology | Client connection | Dashboard |
 |----------|-------------------|-----------|
-| A. Same host | `russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env` | `http://127.0.0.1:7878/`, Settings `/api` |
+| A. Same host | `russel login http://127.0.0.1:7878 --token-file /etc/russel/env` | `http://127.0.0.1:7878/`, Settings `/api` |
 | B. Split plus SSH | `./contrib/install.sh connect user@host`, then the same loopback login | same URL through the tunnel, Settings `/api` |
 | C. Split plus HTTPS | `russel login https://russel.example.com --token-file ~/.config/russel/env` | same HTTPS origin; proxy can forward `/` and `/api/` to loopback ctrl |
 
@@ -237,9 +238,7 @@ russel ps
 russel login [<url>] [--token-file PATH]   # token from file, env, or stdin
 russel logout
 russel origin                              # which ctrl this CLI will hit
-russel deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID] \
-  [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH] \
-  [-- <podman-run-args...>]          # container only, after --
+russel deploy <REPO> [--config PATH]
 russel status [<service_id>]
 russel logs [<service_id>]
 russel ps                                  # aliases: list, vms
@@ -251,26 +250,23 @@ russel secrets list
 russel secrets delete <name>
 ```
 
-- **`--env KEY=VALUE`** (repeatable): Set an environment variable for the deployed service. Overrides `[service.env]` from the Russelfile.
-- **`--env-file PATH`**: Load `KEY=VALUE` pairs from a file (`#` comments, blank lines skipped). Merged with `[service.env]` and `--env` (later wins).
 - Reserved keys (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are rejected for user-defined env vars.
 - **Secrets** (host store, not committed): `printf '%s' "$VAL" | russel secrets set NAME`, `list`, `delete` (value from stdin, never argv). In env maps use `secret://NAME` — the control plane resolves the value at deploy time from `/var/lib/russel/secrets/` (mode `0600`). HTTP: `GET /secrets`, `POST /secrets/{name}`, `DELETE /secrets/{name}` (Bearer auth when configured).
 
-- **`--runtime`** is **not** an override. If set, it must match `service.type` in the Russelfile (or the default `microvm` when omitted). Mismatch → hard error.
-- Ports today: **`-p HOST:GUEST`** (published binds). Traefik is the primary HTTP gateway; `-p` is optional for HTTP services.
+- `service.type` selects the runtime; `[ingress].port` pins the host side of the service port. Traefik is the primary HTTP gateway.
 - **Remote deploys** accept `https://`, `http://`, `ssh://`, and `git@host:path` only. Link-local / private / metadata hosts (e.g. `169.254.169.254`, RFC1918) are blocked on the control plane.
 - **Local absolute path deploys** are **disabled by default**. Set `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` on the control plane only for single-tenant trusted hosts (local dev). Paths are resolved on the **control-plane host**, not the CLI client — do not enable this on a shared/remote ctrl. Relative paths are always rejected; prefer a git URL when the control plane is remote.
 
 ### Config Path & Bin Name
 
 - `--config` must be a **relative** path under the repository root. The control plane opens it via `openat` with `O_NOFOLLOW` (symlinks rejected) and enforces a 1 MiB size cap.
-- The binary name (from `Russelfile.toml` `bin` or `name`) must match `[A-Za-z0-9._+-]` (max 256 chars). It is injected into the guest via a shell-quoted `deploy.env` file.
+- `service.name` follows the service id rule (`[A-Za-z0-9_-]`, max 128). The binary name (`bin`, else `name`) must match `[A-Za-z0-9._+-]` (max 256 chars). Both are checked when the Russelfile loads. It is injected into the guest via a shell-quoted `deploy.env` file.
 
 ### Redeploy / update
 
 Redeploying an existing service kills and waits for old processes before reusing ports. If a new deploy fails after a prior successful deployment, Russel attempts automatic **rollback** to the previous running service. A successful rollback reports status `rolled_back`; the CLI exit code is non-zero so CI pipelines can detect the failure.
 
-**`russel update <id>`** re-applies desired state from the `repo_url` / `config_path` recorded in metadata at the last successful deploy (override with `--repo` / `--config`).
+**`russel update <id>`** rebuilds from the recorded repo and config path, then applies the current Russelfile. Changes to `[service.env]`, `service.port`, and `[ingress]` take effect; values from the previous deploy are not replayed. The Russelfile `service.name` must equal `<id>`. `--repo` / `--config` can select a source and config path.
 
 ### Health
 
@@ -283,9 +279,9 @@ A repository you want to deploy needs a `Russelfile.toml` in its root. Scaffold 
 ```bash
 cd my-app
 russel init                       # writes Russelfile.toml
-russel init --type container      # no KVM / typical VPS
+russel init --type microvm        # experimental: KVM host + passt
 russel init --with-flake          # also writes flake.nix
-# then: russel deploy . -p 8080:3000
+# then: russel deploy .
 ```
 
 ```toml
@@ -295,7 +291,7 @@ source = "."
 port = 3000
 memory = "256mb"
 bin = "api"    # optional — defaults to name
-type = "microvm"  # optional: "microvm" (default) or "container"
+type = "container"  # optional: "container" (default) or "microvm" (experimental)
 guest = "busybox" # optional: "busybox" (default). "linux" is rejected until implemented
 
 [service.env]    # optional — user-defined environment variables
@@ -307,8 +303,8 @@ FEATURE_X = "1"
 
 | `service.type` | Isolation | Host needs |
 |----------------|-----------|------------|
-| `microvm` (default) | KVM / Cloud Hypervisor | KVM, TAP, virtiofsd, socat |
-| `container` | Rootless Podman `--rootfs` | Rootless Podman |
+| `container` (default) | Rootless Podman `--rootfs` | Rootless Podman |
+| `microvm` (experimental) | KVM / Cloud Hypervisor | KVM, virtiofsd, passt (no root; a root ctrl uses TAP + socat) |
 
 `type` is isolation. `guest` is the userspace inside that isolation.
 
@@ -320,32 +316,28 @@ FEATURE_X = "1"
 **Russel containers** prepare a rootfs under `/var/lib/russel/<id>/rootfs` and bind-mount the host `/nix/store` read-only. By default (`debug = false`) the rootfs is **read-only** (tmpfs `/tmp` and `/run` only) with no bash, curl, or `/usr/bin/env` — entrypoints must be statically linked or use an absolute `/nix/store/…` interpreter. Set `debug = true` in your Russelfile to include shell debugging tools. Do **not** pass a bare Nix package path as `--rootfs` yourself — use `russel deploy`.
 
 ```bash
-# MicroVM (default)
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id api
+# The example Russelfile sets name = "api" and type = "container".
+./target/debug/russel deploy examples/basic-http
 
-# Container — Russelfile must have type = "container", and --runtime must match if passed
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id api \
-  --runtime container
-
-# Container with extra podman run flags (after --)
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --runtime container \
-  -- -v /data:/data:ro --network bridge
+# Optional container Podman flags belong in the Russelfile:
+# [service]
+# podman_args = ["-v", "/data:/data:ro", "--network", "bridge"]
 ```
 
-Russel checks readiness by TCP-connecting to the published host port (container) or guest port via TAP (microVM). For application-level health monitoring, expose a `/health` endpoint on `PORT` as a convention (Traefik is already the ingress).
+Russel checks readiness by connecting to the guest port via TAP (microVM) or to the published host port (container). For containers, a bare connect is not enough, because the rootless port forwarder accepts even when the app is down: the connection must stay open for 200 ms (or the app must send data), and the container must not exit or restart. A container that exits during startup fails the deploy at once with its exit code and the last 40 lines of its output. Otherwise the app has 30 s to answer. For application-level health monitoring, expose a `/health` endpoint on `PORT` as a convention (Traefik is already the ingress).
 
 ## Networking Model
 
 - **MicroVM:** Each VM gets a deterministic `/30` subnet from `service_id` (FNV-1a), host TAP `rsl-<hex>`, `socat` host→guest port forward. Guest L3 isolation uses a dedicated `RUSSEL-FORWARD` iptables chain (default-deny for `rsl-*`); set `RUSSEL_FORWARD=allow` only for single-tenant debugging (guests can otherwise pivot via host routing when `ip_forward=1`).
-- **Container:** Rootless Podman publishes `-p HOST:GUEST` (from CLI `-p` / allocator).
+- **Container:** Rootless Podman publishes the host port configured by `[ingress].port` or selected by the allocator.
 
 ### Port Publishing (today)
 
-`-p HOST:GUEST` publishes a host port via `socat` (microVM) or Podman port mapping (container). Both paths go through the port allocator so host ports never collide across services.
+`[ingress].port` pins a host port; otherwise Russel allocates one. The port is published via `socat` (microVM) or Podman port mapping (container), through the port allocator so host ports do not collide across services.
 
 ### Traefik Gateway
 
-Traefik is the **primary HTTP ingress gateway**. Russel writes dynamic configuration files into `/var/lib/russel/traefik/dynamic/` (override with `RUSSEL_TRAEFIK_DYNAMIC_DIR`). Each deployed service gets a Host rule: `<service_id>.<domain>` (domain defaults to `russel.local`, override with `RUSSEL_TRAEFIK_DOMAIN`).
+Traefik is the **primary HTTP ingress gateway**. Russel writes dynamic configuration files into `/var/lib/russel/traefik/dynamic/` (override with `RUSSEL_TRAEFIK_DYNAMIC_DIR`). Each deployed service gets a Host rule: `<service.name>.<domain>` (domain defaults to `russel.local`, override with `RUSSEL_TRAEFIK_DOMAIN`).
 
 ```yaml
 # Static Traefik config snippet (traefik.yml)
@@ -358,7 +350,7 @@ providers:
     watch: true
 ```
 
-With Traefik running, access your service at `http://<service_id>.russel.local` (requires DNS or `/etc/hosts` entry pointing to Traefik's IP). The host port is auto-allocated as a private backend — no user `-p` required for normal HTTP apps. `-p` remains available as an escape hatch for direct host publishing.
+With Traefik running, access your service at `http://<service.name>.russel.local` (requires DNS or `/etc/hosts` entry pointing to Traefik's IP). The host port is auto-allocated as a private backend unless `[ingress].port` pins it.
 
 On destroy/stop, Russel removes the dynamic config file so Traefik stops routing to the dead backend. Redeploy re-registers with the new backend port.
 
@@ -374,7 +366,7 @@ Stopping the control plane (`SIGINT`/`SIGTERM`) **does not** destroy running wor
 
 ### Container Lifecycle
 
-Containers are started only after podman arguments are fully validated and rootless mode is confirmed. For redeploys, the old container is stopped only after validation succeeds (fail-closed). Readiness is confirmed by TCP-polling the published host port.
+Containers are started only after podman arguments are fully validated and rootless mode is confirmed. For redeploys, the old container is stopped only after validation succeeds (fail-closed). Readiness requires the app to accept connections through the published host port while the container stays up (see above).
 
 ## Boot & Network Timing Optimization (Under 2s Boot)
 
@@ -382,7 +374,7 @@ To optimize boot time from 40s+ to under 2s, we transitioned from a heavy guest-
 
 - **Minimal Initramfs**: Dropped the Nix OS closure from guest RAM. The initramfs is only 2-3MB, consisting of BusyBox and necessary drivers.
 - **Virtiofs /nix/store Share**: The host `/nix/store` is mounted directly inside the guest using `virtiofsd` and the `virtiofs` filesystem driver, allowing instant access to the application closure without packaging it in the initrd.
-- **Kernel Module Bootstrapping**: Since standard nixpkgs kernels compile VirtIO networking (`virtio_net`) and VirtIO filesystem (`virtiofs`) as modules (`=m`), our `/init` script dynamically extracts and loads the VirtIO dependency chain (e.g. `virtio_ring`, `virtio.ko`, `virtio_pci_*`, `virtio_net`, `fuse`, `virtiofs`) via `insmod` before mounting the store or bringing up `eth0`.
+- **Drivers Built In**: Russel's kernel (`.#microvm-kernel`) compiles VirtIO networking and virtiofs in (`=y`), so the initramfs carries no kernel modules. Ctrl does not fall back to a stock nixpkgs kernel, which builds them as modules. Kernels supplied through `RUSSEL_KERNEL_PATH` or the kernel pool must also have these drivers built in.
 - **Direct App Execution**: Bypasses systemd in the guest. The `/init` script executes the application binary directly, reducing guest-side lifecycle overhead to virtually zero.
 
 ## System Requirements
@@ -391,8 +383,8 @@ Russel currently runs the control plane on **Linux only**. The `russel-ctrl` bin
 
 | Dependency | Used for | Required when |
 |------------|----------|----------------|
-| Nix with flakes enabled | Building application closures, the kernel, BusyBox, and kernel modules | Always |
-| `cloud-hypervisor` | Booting the microVM | MicroVM deploy |
+| Nix with flakes enabled | Building application closures, the kernel, and BusyBox | Always |
+| `cloud-hypervisor` (v52 or newer for `cpus` > 1 with passt) | Booting the microVM | MicroVM deploy |
 | `virtiofsd` | Sharing the host `/nix/store` with the guest | MicroVM deploy |
 | `socat` | Forwarding the host port to the guest | MicroVM deploy |
 | `iproute2` (`ip`) | Creating and configuring TAP interfaces | MicroVM / ctrl networking |
@@ -441,7 +433,8 @@ On a non-Nix host, install the equivalent packages with your distribution's pack
 │   ├── russelfile.md      # Russelfile reference / design
 │   ├── security-tls.md    # TLS reverse-proxy runbook
 │   ├── traefik.md         # Traefik ingress setup
-│   └── vps-one-dev.md     # Single-VPS one-dev checklist
+│   ├── vps-one-dev.md     # Single-VPS one-dev checklist
+│   └── plans/             # MVP / scaling plans
 ├── flake.nix         # development shell
 └── README.md
 ```
@@ -544,10 +537,13 @@ custom kernel, microVM races are skipped.
 
 - **Subnet collision detection** — 16-bit FNV-1a space, <2% collision at 50 services. Add when scale demands it.
 - **virtiofsd --readonly** — `/nix/store` and the per-service `cfg/` dir (host-written `deploy.env`) are read-only from the guest. Guest writes `.agent_ready` to a separate `scratch/` share (`/run/russel` in the guest). Scratch has no quota; disk-fill is bounded to that directory.
-- **Database stubs** — `[database.*]` in Russelfile is still a placeholder; health probes + optional restart are implemented (`RUSSEL_HEALTH_*`).
 - **No integration/e2e tests** — requires KVM + root. Marked `#[ignore]` candidate for a future e2e crate.
 - **Auth optional on loopback** — dev mode warns but does not enforce. Production should always set `RUSSEL_API_TOKEN`.
 - **Nix builds trust the source repo** — a malicious `flake.nix` runs as the build user. Multi-tenant: only deploy trusted repos. Opt-in `RUSSEL_NIX_RESTRICTED=1` forces sandboxed `nix build` and disables auto-flake. Full threat model: [docs/security/nix-builds.md](docs/security/nix-builds.md).
+
+## Security
+
+Report vulnerabilities privately, not in public issues. See [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
@@ -555,4 +551,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, coding standards, and the mand
 
 ## License
 
-Apache-2.0
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

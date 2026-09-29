@@ -30,14 +30,16 @@ shellcheck -x contrib/install.sh contrib/tests/install_test.sh   # installer cha
 cd dashboard && bun test && bun run build                        # dashboard changes
 ```
 
+`cargo test` never uses the real `/var/lib/russel` or `/var/lib/microvms`. ctrl code resolves them through `crate::paths`, which pins a per-process temp dir in unit tests; integration tests call `russel_core::paths::pin_temp_roots()`. Do not set `RUSSEL_DATA_DIR` from a test: parallel tests would race on it.
+
 CI enforces concurrency + cancel-in-progress, Rust caching, timeouts, installer tests + `systemd-analyze verify`, dashboard `bun test` before build, and shellcheck. Manual deploy smoke (for deploy-path changes):
 
 ```bash
 cargo build
 ./target/debug/russel-ctrl &
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id contrib-smoke --runtime container
+./target/debug/russel deploy examples/basic-http
 curl -sf http://127.0.0.1:8080/health
-./target/debug/russel destroy contrib-smoke
+./target/debug/russel destroy api
 ```
 
 Needs writable `/var/lib/russel` + rootless Podman (containers) or KVM (microVMs).

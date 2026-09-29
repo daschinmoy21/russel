@@ -8,13 +8,12 @@ keywords: [russel, nix, microvm, cloud-hypervisor, podman, self-hosted, deployme
 
 # Russel documentation
 
-Russel is a self-hosted platform for deploying Nix-built services as **microVMs** (Cloud Hypervisor + KVM) or **Russel containers** (rootless Podman `--rootfs`). You push a repo with a `Russelfile.toml`; Russel builds it with Nix and runs the resulting `/nix/store` closure. No registries, no image builds, no YAML DSL.
+Russel is a self-hosted platform for deploying Nix-built services as **Russel containers** (rootless Podman `--rootfs`, the default) or, experimentally, **microVMs** (Cloud Hypervisor + KVM). You push a repo with a `Russelfile.toml`; Russel builds it with Nix and runs the resulting `/nix/store` closure. No registries, no image builds, no YAML DSL.
 
 ```bash
-russel init --type container
-russel deploy . -p 8080:3000 --vm-id api
-curl http://127.0.0.1:8080/health
-# → ok
+russel init       # write a Russelfile.toml for this project
+russel apply .    # build it with Nix and run it
+russel ps         # see it running, and on which port
 ```
 
 ## When to use Russel
@@ -31,9 +30,9 @@ curl http://127.0.0.1:8080/health
 1. **Resolve** — Clone the repo (or use a trusted local path) and load `Russelfile.toml`.
 2. **Build** — `nix build` the flake's `packages.<system>.default` output. Missing `flake.nix` is auto-generated (Rust / Go / static).
 3. **Run** — Branch on `service.type`:
-   - `microvm` (default): minimal initramfs → TAP + `socat` + `virtiofsd` → Cloud Hypervisor → app execs from virtiofs `/nix/store`.
-   - `container`: minimal rootfs → rootless `podman --rootfs` + `/nix/store:ro` bind → `-p HOST:GUEST`.
-4. **Route** — Register with the `Ingress` trait. Default `TraefikFileIngress` writes a dynamic file; Traefik routes `Host(<id>.<domain>)` to the backend. `-p` is an escape hatch.
+   - `microvm` (experimental; needs `/dev/kvm`, no root): minimal initramfs → `passt` networking + `virtiofsd` → Cloud Hypervisor → app execs from virtiofs `/nix/store`. A ctrl running as root uses TAP + `socat` instead of `passt`.
+   - `container` (default): minimal rootfs → rootless `podman --rootfs` + `/nix/store:ro` bind → `[ingress].port` or an allocated `127.0.0.1` host port.
+4. **Route** — Register with the `Ingress` trait. Default `TraefikFileIngress` writes a dynamic file; Traefik routes `Host(<service.name>.<domain>)` to the backend.
 
 See [Concepts: Architecture](concepts/architecture.md) for the full pipeline, [Concepts: Runtimes](concepts/runtimes.md) for the isolation tradeoff, and [Concepts: Networking](concepts/networking.md) for TAP/subnet/ports.
 

@@ -673,7 +673,7 @@ fn clone_failure_message_redacts_userinfo_when_host_case_differs() {
 #[test]
 fn clone_failure_cleanup_path_omits_userinfo() {
     let repo = "https://user:s3cret@github.com/org/repo.git";
-    let checkout = std::path::PathBuf::from("/tmp/russel/checkouts")
+    let checkout = std::path::PathBuf::from("/var/lib/russel/_checkouts")
         .join(unique_checkout_dir_name_with(repo, 1, 1));
     let cleanup_err = std::io::Error::other("permission denied");
     let msg = clone_failure_message(
@@ -684,4 +684,97 @@ fn clone_failure_cleanup_path_omits_userinfo() {
     assert!(!msg.contains("s3cret"), "{msg}");
     assert!(!msg.contains("user"), "{msg}");
     assert!(msg.contains("https://github.com/org/repo.git"), "{msg}");
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A repo with the app in `app/`: one commit per Russelfile body.
+fn repo_with_app_commits(bodies: &[&str]) -> (TempDir, Vec<String>) {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    fs::create_dir(repo.path().join("app")).unwrap();
+    let revs = bodies
+        .iter()
+        .map(|body| {
+            fs::write(repo.path().join("app/Russelfile.toml"), body).unwrap();
+            git(repo.path(), &["add", "-A"]);
+            git(repo.path(), &["commit", "-qm", body]);
+            git(repo.path(), &["rev-parse", "HEAD"])
+        })
+        .collect();
+    (repo, revs)
+}
+
+#[test]
+fn commit_ids_are_full_lowercase_hex() {
+    use super::is_commit_id;
+    assert!(is_commit_id("0123456789abcdef0123456789abcdef01234567"));
+    assert!(!is_commit_id("0123456789ABCDEF0123456789abcdef01234567"));
+    assert!(!is_commit_id("0123456"));
+    assert!(!is_commit_id("--upload-pack=x0123456789abcdef0123456789"));
+}
+
+#[tokio::test]
+async fn source_rev_tracks_commit_and_dirtiness_of_the_deployed_dir() {
+    use super::source_rev;
+    let (repo, revs) = repo_with_app_commits(&["one"]);
+    let app = repo.path().join("app");
+
+    let clean = source_rev(&app, "Russelfile.toml").await.unwrap();
+    assert_eq!((clean.rev.as_str(), clean.dirty), (revs[0].as_str(), false));
+
+    // Changes outside the deployed dir do not make it dirty.
+    fs::write(repo.path().join("README"), "x").unwrap();
+    git(repo.path(), &["add", "README"]);
+    assert!(!source_rev(&app, "Russelfile.toml").await.unwrap().dirty);
+
+    fs::write(app.join("Russelfile.toml"), "edited").unwrap();
+    assert!(source_rev(&app, "Russelfile.toml").await.unwrap().dirty);
+
+    // An untracked Russelfile is not part of any commit.
+    git(repo.path(), &["checkout", "-q", "--", "app"]);
+    fs::write(app.join("Other.toml"), "x").unwrap();
+    assert!(source_rev(&app, "Other.toml").await.unwrap().dirty);
+
+    let plain = TempDir::new().unwrap();
+    assert!(source_rev(plain.path(), "Russelfile.toml").await.is_none());
+}
+
+#[test]
+fn checkout_rev_rebuilds_an_older_commit_of_a_local_subdir() {
+    let (repo, revs) = repo_with_app_commits(&["one", "two"]);
+    let app = repo.path().join("app");
+    let app_url = app.to_str().unwrap().to_string();
+    with_local_path_deploy_env(Some("1"), || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (dir, _lease) = GitClient.checkout_rev(&app_url, &revs[0]).await.unwrap();
+            assert!(dir.ends_with("app"), "{}", dir.display());
+            assert_eq!(
+                fs::read_to_string(dir.join("Russelfile.toml")).unwrap(),
+                "one"
+            );
+            let pinned = super::source_rev(&dir, "Russelfile.toml").await.unwrap();
+            assert_eq!(pinned.rev, revs[0]);
+
+            let missing = "0".repeat(40);
+            assert!(GitClient.checkout_rev(&app_url, &missing).await.is_err());
+            assert!(GitClient.checkout_rev(&app_url, "HEAD").await.is_err());
+        });
+    });
+    // The operator's working tree is untouched.
+    assert_eq!(
+        fs::read_to_string(app.join("Russelfile.toml")).unwrap(),
+        "two"
+    );
 }

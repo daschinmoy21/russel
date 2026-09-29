@@ -85,6 +85,10 @@ pub(crate) struct ServiceState {
     pub(crate) prebuild_vm_state: Option<VmState>,
     /// Bumped when process ownership changes so the matching supervisor exits.
     pub(crate) process_generation: u64,
+    /// Relaunches under `restart = "unless-stopped"` since the last deploy.
+    pub(crate) restarts: u32,
+    /// Consecutive relaunches that did not stay up; drives crash-loop backoff.
+    pub(crate) restart_streak: u32,
 }
 
 impl Default for ServiceState {
@@ -105,6 +109,8 @@ impl Default for ServiceState {
             prebuild_status: None,
             prebuild_vm_state: None,
             process_generation: 0,
+            restarts: 0,
+            restart_streak: 0,
         }
     }
 }
@@ -118,6 +124,30 @@ pub(super) enum SupervisePoll {
     Stopped,
     /// A supervised child exited or could not be polled.
     Exited(String),
+}
+
+/// Which liveness supervisor fits the workload a service currently owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Supervision {
+    /// Owned `Child` handles from a cold boot: poll `try_wait`.
+    Process,
+    /// Podman container: poll `podman inspect` by id.
+    Container(String),
+    /// Adopted microVM with a known PID and no `Child`: poll `/proc`.
+    Pid,
+}
+
+impl Supervision {
+    /// `None` when the service owns nothing a supervisor could watch.
+    pub(crate) fn for_service(s: &ServiceState) -> Option<Self> {
+        if s.vm_process.is_some() {
+            return Some(Self::Process);
+        }
+        if s.runtime == Some(RuntimeKind::Container) {
+            return s.container_id.clone().map(Self::Container);
+        }
+        s.vm_pid.map(|_| Self::Pid)
+    }
 }
 
 impl Default for AppState {

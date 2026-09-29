@@ -1,0 +1,7 @@
+# Route host state paths through `crate::paths` so unit tests get a temp root
+# instead of the real /var/lib/russel (#412).
+disallowed-methods = [
+    { path = "russel_core::paths::data_root", reason = "use crate::paths::data_root (unit tests get a temp root)" },
+    { path = "russel_core::paths::service_dir", reason = "use crate::paths::service_dir (unit tests get a temp root)" },
+    { path = "russel_core::paths::microvms_root", reason = "use crate::paths::microvms_root (unit tests get a temp root)" },
+]

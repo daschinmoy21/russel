@@ -8,6 +8,7 @@ use russel_core::config::RuntimeKind;
 use russel_core::reserved::is_reserved_service_dir;
 
 use crate::metadata::{self, ServiceDiskRecord};
+use crate::microvm::cloud_hypervisor_cmdline_matches_under;
 use crate::network::PortAllocator;
 use crate::state::{AppState, ContainerProbe, probe_container};
 
@@ -39,7 +40,13 @@ pub struct ReconcileReport {
 
 /// Reconcile all services under `/var/lib/russel`.
 pub async fn reconcile_startup(state: &AppState) -> ReconcileReport {
-    reconcile_startup_in(state, &russel_core::paths::data_root()).await
+    let report = reconcile_startup_in(state, &crate::paths::data_root()).await;
+    // Services deployed before gcroots existed, or whose roots were lost,
+    // get them back on the next ctrl start (#411).
+    for service_id in state.list_services() {
+        crate::gcroots::sync_logged(&service_id).await;
+    }
+    report
 }
 
 /// Reconcile all services under an arbitrary base directory (for tests).
@@ -211,10 +218,9 @@ fn probe_microvm_alive(record: &ServiceDiskRecord, tap_id: Option<&str>) -> bool
 /// Identity check for cloud-hypervisor PIDs.
 ///
 /// Requires `cloud-hypervisor` in the cmdline and either the service
-/// directory `/var/lib/russel/{service_id}/` or the exact TAP needle
-/// `tap={tap}` (F-06). A bare `contains(service_id)` is not used:
-/// `--api-socket` matches service id `api`, and `api` is a prefix of
-/// `api-gateway`.
+/// directory under the data root or the exact TAP needle `tap={tap}`
+/// (F-06). A bare `contains(service_id)` is not used: `--api-socket`
+/// matches service id `api`, and `api` is a prefix of `api-gateway`.
 fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
     if pid == 0 {
         return false;
@@ -231,19 +237,20 @@ fn ch_pid_matches(pid: u32, service_id: &str, tap_id: Option<&str>) -> bool {
 
 /// Pure cmdline identity check (no `/proc`).
 fn ch_cmdline_matches(cmdline: &str, service_id: &str, tap_id: Option<&str>) -> bool {
-    if !cmdline.contains("cloud-hypervisor") {
-        return false;
-    }
-    if !service_id.is_empty() && cmdline.contains(&format!("/var/lib/russel/{service_id}/")) {
+    ch_cmdline_matches_under(&crate::paths::data_root(), cmdline, service_id, tap_id)
+}
+
+fn ch_cmdline_matches_under(
+    data_root: &std::path::Path,
+    cmdline: &str,
+    service_id: &str,
+    tap_id: Option<&str>,
+) -> bool {
+    if cloud_hypervisor_cmdline_matches_under(data_root, cmdline, service_id) {
         return true;
     }
-    if let Some(tap) = tap_id
-        && !tap.is_empty()
-        && cmdline.contains(&format!("tap={tap}"))
-    {
-        return true;
-    }
-    false
+    cmdline.contains("cloud-hypervisor")
+        && tap_id.is_some_and(|tap| !tap.is_empty() && cmdline.contains(&format!("tap={tap}")))
 }
 
 /// Combine an id probe with the `russel-{service_id}` name fallback.
@@ -379,8 +386,8 @@ mod tests {
     }
 
     /// Spawn a long-lived shell whose argv contains `cloud-hypervisor` and
-    /// `/var/lib/russel/{service_id}/`, mimicking a cloud-hypervisor process
-    /// for F-06 identity checks.
+    /// the service dir, mimicking a cloud-hypervisor process for F-06
+    /// identity checks.
     fn spawn_fake_cloud_hypervisor(service_id: &str) -> std::process::Child {
         let mut command = std::process::Command::new("/bin/sh");
         #[cfg(unix)]
@@ -388,7 +395,7 @@ mod tests {
             use std::os::unix::process::CommandExt;
             command.arg0(format!("cloud-hypervisor-{service_id}"));
         }
-        let service_dir = format!("/var/lib/russel/{service_id}/");
+        let service_dir = format!("{}/", crate::paths::service_dir(service_id).display());
         let child = command
             .args(["-c", "sleep 30; wait"])
             .arg(&service_dir)
@@ -688,6 +695,13 @@ mod tests {
         let _ = fake.wait();
     }
 
+    fn api_socket_cmdline(service_id: &str) -> String {
+        format!(
+            "cloud-hypervisor --api-socket {}/cloud-hypervisor.sock",
+            crate::paths::service_dir(service_id).display()
+        )
+    }
+
     #[test]
     fn ch_cmdline_matches_rejects_api_socket_without_service_dir() {
         assert!(!ch_cmdline_matches(
@@ -697,19 +711,51 @@ mod tests {
         ));
         // `api` must not match as a prefix of `api-gateway`.
         assert!(!ch_cmdline_matches(
-            "cloud-hypervisor --api-socket /var/lib/russel/api-gateway/cloud-hypervisor.sock",
+            &api_socket_cmdline("api-gateway"),
             "api",
             None
         ));
-        assert!(ch_cmdline_matches(
-            "cloud-hypervisor --api-socket /var/lib/russel/api/cloud-hypervisor.sock",
+        assert!(ch_cmdline_matches(&api_socket_cmdline("api"), "api", None));
+        assert!(!ch_cmdline_matches(&api_socket_cmdline("api"), "", None));
+    }
+
+    #[test]
+    fn ch_cmdline_matches_uses_configured_data_root() {
+        // #396 moved service dirs under RUSSEL_DATA_DIR. The old literal
+        // `/var/lib/russel/{id}/` needle missed VMs under any other root.
+        let root = russel_core::paths::data_root_from(Some("/srv/russel"));
+        let default_root = russel_core::paths::data_root_from(None);
+        let cmdline = format!(
+            "cloud-hypervisor --api-socket {}/cloud-hypervisor.sock",
+            root.join("api").display()
+        );
+        assert!(!cmdline.contains("/var/lib/russel/"));
+        assert!(ch_cmdline_matches_under(&root, &cmdline, "api", None));
+        // Same cmdline is not this service's VM under a different root.
+        assert!(!ch_cmdline_matches_under(
+            &default_root,
+            &cmdline,
             "api",
             None
         ));
-        assert!(!ch_cmdline_matches(
-            "cloud-hypervisor --api-socket /var/lib/russel/api/cloud-hypervisor.sock",
-            "",
+        assert!(!ch_cmdline_matches_under(
+            &root,
+            &cmdline,
+            "api-gateway",
             None
+        ));
+        // TAP fallback still identifies the VM regardless of root.
+        assert!(ch_cmdline_matches_under(
+            &default_root,
+            &format!("{cmdline} --net tap=rsl-abc123,mac=aa"),
+            "api",
+            Some("rsl-abc123")
+        ));
+        assert!(!ch_cmdline_matches_under(
+            &default_root,
+            "sleep --net tap=rsl-abc123",
+            "api",
+            Some("rsl-abc123")
         ));
     }
 

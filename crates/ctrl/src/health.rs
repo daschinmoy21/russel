@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use russel_core::api::{DeployRequest, PortMapping, ServiceStatus, VmState};
+use russel_core::api::{DeployRequest, ServiceStatus, VmState};
 
 use crate::api::deploy_semaphore;
 use crate::deploy::DeployPipeline;
@@ -11,7 +11,8 @@ use crate::metadata::load_metadata_from_disk;
 use crate::network::publish_bind_addr;
 use crate::state::AppState;
 
-/// Check whether a service is reachable at a socket address or HTTP URL.
+/// Check whether the app at a socket address or HTTP URL accepts connections.
+/// A bare connect is not enough: a port forwarder accepts for a dead app (#462).
 pub async fn check(addr: &str) -> bool {
     let addr = addr
         .trim_start_matches("http://")
@@ -19,9 +20,7 @@ pub async fn check(addr: &str) -> bool {
         .split('/')
         .next()
         .unwrap_or(addr);
-    tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
-        .await
-        .is_ok_and(|result| result.is_ok())
+    crate::network::app_accepts(addr).await
 }
 
 /// Whether auto-restart is enabled (`RUSSEL_HEALTH_RESTART=1`).
@@ -72,17 +71,6 @@ fn resolve_probe_target(
     let guest = guest_port.filter(|p| *p > 0)?;
     let ip = vm_ip.filter(|s| !s.is_empty())?;
     Some(health_probe_addr(ip, guest))
-}
-
-/// Build a `PortMapping` for restart, rejecting zero ports.
-///
-/// `host` of `None` or zero means "let the pipeline allocate". Guest must also
-/// be present and non-zero — a missing guest is not port 3000, and restarting
-/// against 3000 sends traffic at a service that listens elsewhere.
-fn restart_port_mapping(host: Option<u16>, guest: Option<u16>) -> Option<PortMapping> {
-    let host = host.filter(|p| *p > 0)?;
-    let guest = guest.filter(|p| *p > 0)?;
-    Some(PortMapping { host, guest })
 }
 
 /// Pure decision for how `try_auto_restart` should treat a deploy response.
@@ -227,7 +215,7 @@ enum RestartOutcome {
 }
 
 async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome {
-    let Some(meta) = load_source_from_metadata(service_id) else {
+    let Some(request) = load_restart_request(service_id).await else {
         tracing::warn!(
             service_id,
             "health restart skipped — no repo_url in metadata (redeploy once to record source)"
@@ -249,20 +237,10 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
 
     tracing::info!(
         service_id,
-        repo = %crate::git::redact_repo_url(&meta.repo_url),
+        repo = %crate::git::redact_repo_url(&request.repo_url),
         "health restart: redeploying from recorded source"
     );
     let pipeline = DeployPipeline::new(state.clone());
-    let request = DeployRequest {
-        repo_url: meta.repo_url,
-        config_path: meta.config_path,
-        vm_id: Some(service_id.to_string()),
-        port: restart_port_mapping(meta.host_port, meta.guest_port),
-        host: meta.ingress_host,
-        runtime: meta.runtime,
-        env: meta.env,
-        podman_args: meta.podman_args,
-    };
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     // Drain events so the channel never fills.
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -309,63 +287,20 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
     }
 }
 
-struct SourceMeta {
-    repo_url: String,
-    config_path: String,
-    host_port: Option<u16>,
-    guest_port: Option<u16>,
-    ingress_host: Option<String>,
-    runtime: Option<russel_core::config::RuntimeKind>,
-    env: HashMap<String, String>,
-    podman_args: Vec<String>,
-}
-
-fn load_source_from_metadata(service_id: &str) -> Option<SourceMeta> {
+/// Redeploy request from the last deploy's recorded source, or `None` when
+/// metadata is missing, unparseable, has an invalid recorded port, or has no
+/// `repo_url`.
+async fn load_restart_request(service_id: &str) -> Option<DeployRequest> {
     let path = crate::metadata::metadata_path(service_id);
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = tokio::fs::read_to_string(path).await.ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    // Legacy top-level fields (fallback).
-    let top_repo_url = value
-        .get("repo_url")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let top_config_path = value
-        .get("config_path")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let top_host_port: Option<u16> = value
-        .get("host_port")
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok());
-    let top_guest_port: Option<u16> = value
-        .get("guest_port")
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok());
-    let top_runtime: Option<russel_core::config::RuntimeKind> = value
-        .get("runtime")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
-
-    // desired_state block — typed via DesiredStateSnapshot (serde(default)).
-    let ds = crate::deployments::DesiredStateSnapshot::from_metadata_desired_state(&value);
-
-    // Precedence: desired_state > legacy top-level.
-    let repo_url = ds.repo_url.or(top_repo_url)?;
-
-    Some(SourceMeta {
-        repo_url,
-        config_path: ds
-            .config_path
-            .or(top_config_path)
-            .unwrap_or_else(|| "Russelfile.toml".into()),
-        host_port: ds.host_port.or(top_host_port),
-        guest_port: ds.guest_port.or(top_guest_port),
-        ingress_host: ds.ingress_host,
-        runtime: ds.runtime.or(top_runtime),
-        env: ds.env,
-        podman_args: ds.podman_args,
-    })
+    match crate::deployments::DesiredStateSnapshot::from_metadata_with_legacy(&value) {
+        Ok(source) => source.redeploy_request(service_id),
+        Err(e) => {
+            tracing::warn!(service_id, error = %e, "health restart: unusable recorded source");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,9 +314,13 @@ mod tests {
         assert!(!check("127.0.0.1:1").await);
     }
 
-    #[test]
-    fn load_source_missing_is_none() {
-        assert!(load_source_from_metadata("definitely-missing-svc-xyz").is_none());
+    #[tokio::test]
+    async fn load_restart_request_missing_is_none() {
+        assert!(
+            load_restart_request("definitely-missing-svc-xyz")
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -488,17 +427,5 @@ mod tests {
                 assert!(!restart_enabled(), "expected falsy for {falsy:?}");
             });
         }
-    }
-
-    #[test]
-    fn restart_port_mapping_rejects_zero_host_and_guest() {
-        assert!(restart_port_mapping(None, Some(3000)).is_none());
-        assert!(restart_port_mapping(Some(0), Some(3000)).is_none());
-        assert!(restart_port_mapping(Some(8080), Some(0)).is_none());
-        assert!(restart_port_mapping(Some(9000), None).is_none());
-        assert!(restart_port_mapping(None, None).is_none());
-        let m = restart_port_mapping(Some(9000), Some(4000)).unwrap();
-        assert_eq!(m.host, 9000);
-        assert_eq!(m.guest, 4000);
     }
 }

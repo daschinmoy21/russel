@@ -106,18 +106,22 @@ new_case() {
   : >"$MOCK_CURL_MODE_FILE"
   MOCK_CURL_MODE=unreachable
   export MOCK_CURL_MODE
-  FAKE_USER=alice
-  FAKE_GROUP=users
-  FAKE_UID=1000
-  FAKE_GID=1000
+  # `host` runs as root through sudo; alice is the operator who ran it.
+  FAKE_USER=root
+  FAKE_GROUP=root
+  FAKE_UID=0
+  FAKE_GID=0
+  SUDO_USER=alice
+  export SUDO_USER
   FAKE_OS=Linux
   FAKE_NIXOS_MARKER=0
   FAKE_NIXOS_RELEASE=0
   SYSTEM_UNIT_ACTIVE=0
   SYSTEM_FRAGMENT=
   SYSTEM_FRAGMENT_UNIT=
-  USER_MANAGER_OK=1
-  USER_UNIT_EXISTS=1
+  SYSTEM_ACTIVE=0
+  SYSTEM_UNIT_INSTALLED=0
+  USER_UNIT_EXISTS=0
   USER_ACTIVE=0
   ENABLE_RESULT=0
   RESTART_FAIL_FIRST=0
@@ -128,7 +132,26 @@ new_case() {
   MOCK_SS_AVAILABLE=1
   MOCK_LSOF_AVAILABLE=0
   MOCK_SYSTEMCTL_AVAILABLE=1
-  FAKE_STATE_OWNER=1000:1000
+  # The russel account gets uid/gid 990 from the useradd mock.
+  FAKE_STATE_OWNER=990:990
+  FAKE_ENV_OWNER=0:990
+  # Prerequisite probes all pass unless a case breaks one.
+  FAKE_MISSING=
+  FAKE_CGROUP_V2=1
+  FAKE_USER_DBUS=1
+  FAKE_NIX=1
+  FAKE_NIX_DAEMON=1
+  FAKE_FLAKES=1
+  FAKE_PODMAN_MAJOR=5
+  FAKE_DISK_GIB=100
+  FAKE_CH_MAJOR=53
+  FAKE_MICROVM_MISSING=
+  FAKE_KVM_GROUP=1
+  mkdir -p "$CASE_ROOT/etc/systemd/system" "$CASE_ROOT/home-alice"
+  printf '%s\n' "alice:x:1000:1000:Alice:${CASE_ROOT}/home-alice:/bin/bash" >"$CASE_ROOT/passwd"
+  printf '%s\n' 'alice:x:1000:' 'users:x:100:' >"$CASE_ROOT/group"
+  printf '%s\n' 'alice:100000:65536' >"$CASE_ROOT/etc/subuid"
+  printf '%s\n' 'alice:100000:65536' >"$CASE_ROOT/etc/subgid"
   unset RUSSEL_CTRL_DEST
   RUSSEL_DASHBOARD_DEST="${CASE_ROOT}/share/russel/dashboard"
   export RUSSEL_DASHBOARD_DEST
@@ -139,9 +162,12 @@ new_case() {
   FAKE_KVM=0
   unset RUSSEL_VERSION MOCK_RELEASE_DIR
   rm -f "${CASE_ROOT}/ssh-args"
-  rm -f "${CASE_ROOT}/systemctl-user.log" "${CASE_ROOT}/loginctl.log" "${CASE_ROOT}/sudo.log"
+  rm -f "${CASE_ROOT}/systemctl-user.log" "${CASE_ROOT}/systemctl-system.log"
+  rm -f "${CASE_ROOT}/loginctl.log" "${CASE_ROOT}/sudo.log" "${CASE_ROOT}/usermod.log"
   rm -f "${CASE_ROOT}/chown.log"
 }
+
+UNIT_FILE_REL=etc/systemd/system/russel-ctrl.service
 
 set_curl_mode() {
   MOCK_CURL_MODE=$1
@@ -198,7 +224,7 @@ drop_checksum() {
 
 assert_output_contains() {
   local text=$1
-  grep -Fq -- "$text" <<<"$LAST_OUTPUT" || die "output does not contain expected text"
+  grep -Fq -- "$text" <<<"$LAST_OUTPUT" || { printf '%s\n' "$LAST_OUTPUT" >&2; die "output does not contain: $text"; }
 }
 
 assert_output_lacks() {
@@ -230,7 +256,10 @@ expect_main_rc() {
   LAST_OUTPUT=$(main "$@" 2>&1)
   actual=$?
   set -e
-  [[ "$actual" == "$expected" ]] || die "unexpected rc $actual, expected $expected"
+  if [[ "$actual" != "$expected" ]]; then
+    printf '%s\n' "$LAST_OUTPUT" >&2
+    die "unexpected rc $actual, expected $expected (args: $*)"
+  fi
 }
 
 call_count() {
@@ -250,7 +279,17 @@ nixos_marker_present() { [[ "$FAKE_NIXOS_MARKER" == 1 ]]; }
 os_release_is_nixos() { [[ "$FAKE_NIXOS_RELEASE" == 1 ]]; }
 host_binary_path() { printf '%s\n' "$CASE_DEST"; }
 state_dir_path() { printf '%s\n' "$CASE_STATE"; }
-path_owner() { printf '%s\n' "$FAKE_STATE_OWNER"; }
+system_unit_path() { printf '%s\n' "${CASE_ROOT}/${UNIT_FILE_REL}"; }
+env_dir_path() { printf '%s\n' "${CASE_ROOT}/etc/russel"; }
+subuid_file_path() { printf '%s\n' "${CASE_ROOT}/etc/subuid"; }
+subgid_file_path() { printf '%s\n' "${CASE_ROOT}/etc/subgid"; }
+path_owner() {
+  if [[ "$1" == "$(env_file_path)" ]]; then
+    printf '%s\n' "$FAKE_ENV_OWNER"
+  else
+    printf '%s\n' "$FAKE_STATE_OWNER"
+  fi
+}
 run_chown() { printf '%s\n' "$*" >>"${CASE_ROOT}/chown.log"; }
 run_sudo() {
   printf '%s\n' "$*" >>"${CASE_ROOT}/sudo.log"
@@ -261,24 +300,100 @@ run_sudo() {
   esac
 }
 command_available() {
+  case " $FAKE_MISSING " in
+    *" $1 "*) return 1 ;;
+  esac
   case "$1" in
     ss) [[ "$MOCK_SS_AVAILABLE" == 1 ]] ;;
     lsof) [[ "$MOCK_LSOF_AVAILABLE" == 1 ]] ;;
     systemctl) [[ "$MOCK_SYSTEMCTL_AVAILABLE" == 1 ]] ;;
+    podman|newuidmap|newgidmap|git|getent|useradd|usermod|loginctl) return 0 ;;
     *) command -v "$1" >/dev/null 2>&1 ;;
   esac
 }
+
+# A file-backed passwd/group database, so accounts that useradd creates in one
+# `main` call (a subshell) are visible to the next.
+run_getent() {
+  local database=$1 key=$2
+  awk -F: -v key="$key" '$1 == key { print; found = 1; exit } END { exit !found }' \
+    "${CASE_ROOT}/${database}"
+}
+run_groupadd() {
+  printf 'groupadd %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
+  printf '%s\n' "${*: -1}:x:990:" >>"${CASE_ROOT}/group"
+}
+run_useradd() {
+  printf 'useradd %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
+  printf '%s\n' "${*: -1}:x:990:990::${CASE_STATE}:/usr/sbin/nologin" >>"${CASE_ROOT}/passwd"
+}
+run_usermod() {
+  printf 'usermod %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
+  local user=${*: -1}
+  case "$1" in
+    --add-subuids) printf '%s:%s:65536\n' "$user" "${2%%-*}" >>"$(subuid_file_path)" ;;
+    --add-subgids) printf '%s:%s:65536\n' "$user" "${2%%-*}" >>"$(subgid_file_path)" ;;
+  esac
+}
+
+# Prerequisite probes.
+cgroup_v2_available() { [[ "$FAKE_CGROUP_V2" == 1 ]]; }
+user_dbus_available() { [[ "$FAKE_USER_DBUS" == 1 ]]; }
+nix_command_path() {
+  [[ "$FAKE_NIX" == 1 ]] || return 1
+  printf '%s\n' /nix/var/nix/profiles/default/bin/nix
+}
+nix_daemon_active() { [[ "$FAKE_NIX_DAEMON" == 1 ]]; }
+nix_flakes_enabled() { [[ "$FAKE_FLAKES" == 1 ]]; }
+podman_major_version() { printf '%s\n' "$FAKE_PODMAN_MAJOR"; }
+run_podman() { printf 'podman version %s.0.0\n' "$FAKE_PODMAN_MAJOR"; }
+disk_free_gib() { printf '%s\n' "$FAKE_DISK_GIB"; }
+cloud_hypervisor_major_version() { printf '%s\n' "$FAKE_CH_MAJOR"; }
+microvm_missing_tools() { printf '%s' "$FAKE_MICROVM_MISSING"; }
+group_exists() {
+  if [[ "$1" == kvm ]]; then
+    [[ "$FAKE_KVM_GROUP" == 1 ]]
+    return
+  fi
+  run_getent group "$1" >/dev/null 2>&1
+}
+
 run_systemctl_system() {
   local operation=$1
   local unit=${*: -1}
+  printf '%s %s\n' "$operation" "$*" >>"${CASE_ROOT}/systemctl-system.log"
   case "$operation" in
-    is-active|is-enabled)
-      [[ "$SYSTEM_UNIT_ACTIVE" == 1 && "$unit" == russel.service ]] ||
-        [[ "$SYSTEM_UNIT_ACTIVE" == 1 && "$unit" == russel-ctrl.service ]]
+    is-active)
+      if [[ "$unit" == russel-ctrl ]]; then
+        if [[ "$SYSTEM_ACTIVE" == 1 ]]; then
+          [[ "$*" == *--quiet* ]] || printf '%s\n' active
+          return 0
+        fi
+        [[ "$*" == *--quiet* ]] || printf '%s\n' inactive
+        return 3
+      fi
+      [[ "$SYSTEM_UNIT_ACTIVE" == 1 && "$unit" == russel.service ]]
+      ;;
+    is-enabled)
+      [[ "$SYSTEM_UNIT_ACTIVE" == 1 && "$unit" == russel.service ]]
       ;;
     show)
       if [[ "$unit" == "$SYSTEM_FRAGMENT_UNIT" ]]; then
         printf '%s\n' "$SYSTEM_FRAGMENT"
+      fi
+      ;;
+    cat) [[ "$SYSTEM_UNIT_INSTALLED" == 1 ]] ;;
+    daemon-reload) : ;;
+    restart)
+      if [[ "$RESTART_FAIL_FIRST" == 1 && $(grep -c '^restart ' "${CASE_ROOT}/systemctl-system.log") == 1 ]]; then
+        printf '%s\n' 'original restart diagnostic' >&2
+        return 1
+      fi
+      ;;
+    enable)
+      if [[ "$ENABLE_RESULT" != 0 ]]; then
+        printf '%s\n' 'enable diagnostic' >&2
+        return "$ENABLE_RESULT"
       fi
       ;;
     *) return 1 ;;
@@ -288,9 +403,7 @@ run_systemctl_user() {
   local operation=$1
   printf '%s %s\n' "$operation" "$*" >>"${CASE_ROOT}/systemctl-user.log"
   case "$operation" in
-    status) [[ "$USER_MANAGER_OK" == 1 ]] ;;
     cat) [[ "$USER_UNIT_EXISTS" == 1 ]] ;;
-    daemon-reload) : ;;
     is-active)
       if [[ "$USER_ACTIVE" == 1 ]]; then
         [[ "$*" == *--quiet* ]] || printf '%s\n' active
@@ -298,20 +411,6 @@ run_systemctl_user() {
       fi
       [[ "$*" == *--quiet* ]] || printf '%s\n' inactive
       return 3
-      ;;
-    restart)
-      if [[ "$RESTART_FAIL_FIRST" == 1 && $(grep -c '^restart ' "${CASE_ROOT}/systemctl-user.log") == 1 ]]; then
-        printf '%s\n' 'original restart diagnostic' >&2
-        return 1
-      fi
-      USER_ACTIVE=1
-      ;;
-    enable)
-      if [[ "$ENABLE_RESULT" != 0 ]]; then
-        printf '%s\n' 'enable diagnostic' >&2
-        return "$ENABLE_RESULT"
-      fi
-      USER_ACTIVE=1
       ;;
     *) return 1 ;;
   esac
@@ -344,6 +443,11 @@ run_ssh() {
 }
 run_russel() { printf '%s\n' "${MOCK_ORIGIN:-https://remote.example.invalid}"; }
 
+# The unit `host` should install: the shipped one with russel's uid (990).
+expected_unit() {
+  sed 's/@RUSSEL_UID@/990/g' "${SCRIPT_DIR}/russel-ctrl.service"
+}
+
 # Parser and topology refusal coverage.
 new_case
 expect_main_rc 2 unknown
@@ -352,6 +456,9 @@ expect_main_rc 2 connect
 expect_main_rc 2 connect ""
 expect_main_rc 2 connect -host
 expect_main_rc 2 status extra
+expect_main_rc 2 check extra
+expect_main_rc 2 --skip-checks cli
+expect_main_rc 2 --skip-checks status
 pass "usage and argument validation"
 
 new_case
@@ -438,14 +545,14 @@ FAKE_KVM=1
 set_curl_mode 401
 expect_main_rc 0 host
 cmp -s "$CASE_DEST" <(printf '%s\n' ctrl-download) || die "downloaded ctrl binary was not installed"
-cmp -s "$HOME/.config/systemd/user/russel-ctrl.service" "${SCRIPT_DIR}/russel-ctrl.service" \
-  || die "downloaded unit was not installed"
+cmp -s "${CASE_ROOT}/${UNIT_FILE_REL}" <(expected_unit) || die "downloaded unit was not rendered and installed"
 [[ "$(<"$(kernel_pool_image_path)")" == 'kernel-download' ]] || die "kernel was not installed into the pool"
 assert_file_mode "$CASE_STATE/_pool/kernel" 700
 assert_file_mode "$CASE_STATE/_pool/kernel/bzImage" 644
-grep -Fq 'alice:users' "${CASE_ROOT}/chown.log" || die "kernel pool was not chowned to the operator"
+grep -Fq 'russel:russel' "${CASE_ROOT}/chown.log" || die "kernel pool was not chowned to the service account"
+grep -Fq 'usermod --append --groups kvm russel' "${CASE_ROOT}/usermod.log" || die "russel was not added to kvm"
 assert_output_contains 'installed microVM kernel'
-pass "host download mode fetches the KVM-gated kernel with operator ownership"
+pass "host download mode fetches the KVM-gated kernel owned by the service account"
 
 # A container-only host skips the kernel instead of failing.
 new_case
@@ -457,6 +564,9 @@ set_curl_mode 401
 expect_main_rc 0 host
 assert_output_contains 'containers only'
 [[ ! -e "$CASE_STATE/_pool/kernel/bzImage" ]] || die "kernel was fetched without /dev/kvm"
+if grep -q 'kvm' "${CASE_ROOT}/usermod.log"; then
+  die "russel joined kvm without /dev/kvm"
+fi
 pass "host skips the kernel on a container-only host"
 
 # A KVM host must have the kernel asset. Missing it is a failed install, not a skip.
@@ -487,9 +597,12 @@ expect_main_rc 0 all
 [[ ! -e "$CASE_STATE/_pool" ]] || die "all must not fetch the microVM kernel"
 pass "all installs binaries without the kernel"
 
+# Topology refusals: not root, not Linux, NixOS, a NixOS-module unit, a
+# Nix-store unit, and the old per-user install.
 new_case
-FAKE_USER=root
+FAKE_UID=1000
 expect_main_rc 2 host
+assert_output_contains 'host must run as root'
 new_case
 FAKE_OS=Darwin
 expect_main_rc 2 host
@@ -504,46 +617,162 @@ SYSTEM_UNIT_ACTIVE=1
 expect_main_rc 2 host
 new_case
 SYSTEM_FRAGMENT=/nix/store/russel-unit
-SYSTEM_FRAGMENT_UNIT=russel.service
+SYSTEM_FRAGMENT_UNIT=russel-ctrl.service
 expect_main_rc 2 host
-pass "root, OS, NixOS, system-unit, and Nix-store refusals"
+new_case
+make_host_binary legacy-binary
+mkdir -p "$CASE_ROOT/home-alice/.config/systemd/user"
+: >"$CASE_ROOT/home-alice/.config/systemd/user/russel-ctrl.service"
+expect_main_rc 2 host
+assert_output_contains 'found the old per-user install'
+assert_output_contains 'systemctl --user disable --now russel-ctrl'
+assert_output_contains '--take-state-ownership host'
+[[ ! -e "${CASE_ROOT}/usermod.log" ]] || die "legacy refusal changed accounts"
+pass "root, OS, NixOS, module-unit, Nix-store, and legacy per-user refusals"
 
-# First host install: the fake openssl token is captured into the env file,
-# and must never be emitted by the installer.
+# `check` reports every problem with a fix, and `host` stops on failures.
+new_case
+expect_main_rc 0 check
+assert_output_contains 'Ready.'
+new_case
+FAKE_MISSING='podman newuidmap'
+FAKE_FLAKES=0
+FAKE_USER_DBUS=0
+expect_main_rc 1 check
+assert_output_contains 'podman is not installed'
+assert_output_contains 'sudo apt install podman'
+assert_output_contains 'sudo apt install uidmap'
+assert_output_contains 'sudo apt install dbus-user-session'
+assert_output_contains "experimental-features = nix-command flakes"
+assert_output_contains '4 problem(s) must be fixed'
+new_case
+FAKE_NIX=0
+expect_main_rc 1 check
+assert_output_contains 'no multi-user Nix'
+assert_output_contains '--daemon'
+new_case
+FAKE_PODMAN_MAJOR=3
+FAKE_CGROUP_V2=0
+FAKE_NIX_DAEMON=0
+expect_main_rc 1 check
+assert_output_contains 'podman 4 or newer is required (found: 3)'
+assert_output_contains 'cgroup v2 is required'
+assert_output_contains 'nix-daemon is not running'
+new_case
+FAKE_KVM=1
+FAKE_CH_MAJOR=51
+FAKE_DISK_GIB=4
+expect_main_rc 0 check
+assert_output_contains 'cloud-hypervisor v51 hangs when cpus > 1'
+assert_output_contains 'only 4 GiB free for /nix'
+assert_output_contains 'Ready, with 3 warning(s).'
+new_case
+FAKE_KVM=1
+FAKE_MICROVM_MISSING='passt'
+expect_main_rc 0 check
+assert_output_contains 'microVMs (optional): missing passt'
+pass "check reports failures with fixes and optional microVM warnings"
+
+new_case
+make_host_binary checked-binary
+FAKE_FLAKES=0
+set_curl_mode 401
+expect_main_rc 1 host
+assert_output_contains 'fix the problems above'
+[[ ! -e "$CASE_DEST" ]] || die "host installed a binary despite failed checks"
+[[ ! -e "${CASE_ROOT}/usermod.log" ]] || die "host changed accounts despite failed checks"
+expect_main_rc 0 --skip-checks host
+assert_output_contains 'skipping host checks'
+[[ -e "$CASE_DEST" ]] || die "--skip-checks did not install"
+pass "host stops on failed checks unless --skip-checks"
+
+# First host install: the service account, its id ranges, linger, the operator
+# in the group, the token file, the rendered system unit, and the binary.
 new_case
 make_host_binary first-binary
 set_curl_mode 401
 expect_main_rc 0 host
-ENV_FILE="$HOME/.config/russel/env"
-UNIT_FILE="$HOME/.config/systemd/user/russel-ctrl.service"
+ENV_FILE="$(env_file_path)"
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
+assert_file_contains "${CASE_ROOT}/usermod.log" 'groupadd --system russel'
+assert_file_contains "${CASE_ROOT}/usermod.log" "useradd --system --gid russel --home-dir ${CASE_STATE} --no-create-home"
+assert_file_contains "${CASE_ROOT}/usermod.log" 'usermod --add-subuids 165536-231071 russel'
+assert_file_contains "${CASE_ROOT}/usermod.log" 'usermod --add-subgids 165536-231071 russel'
+assert_file_contains "${CASE_ROOT}/usermod.log" 'usermod --append --groups russel alice'
+assert_file_contains "${CASE_ROOT}/loginctl.log" 'enable-linger russel'
 [[ "$(<"$ENV_FILE")" == 'RUSSEL_API_TOKEN=known-fake-token' ]] || die "unexpected token file"
-assert_file_mode "$ENV_FILE" 600
-assert_file_mode "$HOME/.config/russel" 700
-assert_file_mode "$HOME/.config/systemd/user" 700
-cmp -s "$UNIT_FILE" "${SCRIPT_DIR}/russel-ctrl.service" || die "unit was not installed"
+assert_file_mode "$ENV_FILE" 640
+assert_file_mode "$(env_dir_path)" 750
+grep -Fq "root:russel -- $(env_dir_path)" "${CASE_ROOT}/chown.log" || die "env dir was not given to root:russel"
+assert_file_mode "$CASE_STATE" 700
+grep -Fq "russel:russel -- ${CASE_STATE}" "${CASE_ROOT}/chown.log" || die "state dir was not given to russel"
+cmp -s "$UNIT_FILE" <(expected_unit) || die "unit was not rendered with russel's uid"
+if grep -q '@RUSSEL_UID@' "$UNIT_FILE"; then
+  die "unit still has the uid placeholder"
+fi
 cmp -s "$CASE_DEST" "${RELEASE}/russel-ctrl" || die "host binary was not installed"
-[[ "$(call_count "${CASE_ROOT}/systemctl-user.log" enable)" == 1 ]] || die "first install enable call missing"
-[[ "$(call_count "${CASE_ROOT}/systemctl-user.log" daemon-reload)" == 1 ]] || die "first install daemon-reload call missing"
-[[ "$(wc -l <"${CASE_ROOT}/loginctl.log")" == 1 ]] || die "first install linger call missing"
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" enable)" == 1 ]] || die "first install enable call missing"
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" daemon-reload)" == 1 ]] || die "first install daemon-reload missing"
+[[ ! -e "${CASE_ROOT}/systemctl-user.log" ]] || die "host touched a user manager"
+assert_output_contains 'alice is now in the russel group'
+assert_output_contains "--token-file ${ENV_FILE}"
 assert_output_lacks known-fake-token
-pass "first host install, token permissions, unit, binary, enable, linger"
+pass "first host install: account, id ranges, linger, token, unit, binary, enable"
+
+# Re-running keeps the account and its id ranges instead of adding more.
+new_case
+make_host_binary rerun-binary
+set_curl_mode 401
+expect_main_rc 0 host
+SYSTEM_ACTIVE=1
+expect_main_rc 0 host
+[[ "$(grep -c '^useradd ' "${CASE_ROOT}/usermod.log")" == 1 ]] || die "rerun created the account again"
+[[ "$(grep -c -- '--add-subuids' "${CASE_ROOT}/usermod.log")" == 1 ]] || die "rerun added another subuid range"
+[[ "$(grep -c '^russel:' "${CASE_ROOT}/etc/subuid")" == 1 ]] || die "subuid file has a duplicate range"
+pass "rerun is idempotent for the service account"
+
+# Moving from the old per-user install keeps the operator's token.
+new_case
+make_host_binary migrated-binary
+mkdir -p "$CASE_ROOT/home-alice/.config/russel"
+printf '%s\n' 'RUSSEL_API_TOKEN=legacy-token-value' >"$CASE_ROOT/home-alice/.config/russel/env"
+set_curl_mode 401
+expect_main_rc 0 host
+[[ "$(<"$(env_file_path)")" == 'RUSSEL_API_TOKEN=legacy-token-value' ]] || die "legacy token was not carried over"
+assert_output_lacks legacy-token-value
+pass "legacy token carried into /etc/russel/env"
+
+# A token file anyone can read, or one not owned by root, is refused.
+new_case
+make_host_binary loose-binary
+mkdir -p "$(env_dir_path)"
+printf '%s\n' 'RUSSEL_API_TOKEN=loose-token' >"$(env_file_path)"
+chmod 644 "$(env_file_path)"
+set_curl_mode 401
+expect_main_rc 1 host
+assert_output_contains 'world-accessible'
+chmod 640 "$(env_file_path)"
+FAKE_ENV_OWNER=1000:990
+expect_main_rc 1 host
+assert_output_contains 'must be owned by root'
+pass "token file permission and ownership checks"
 
 # A differing but valid unit is preserved, along with the token and state.
 new_case
 make_host_binary old-binary
 set_curl_mode 401
 expect_main_rc 0 host
-ENV_FILE="$HOME/.config/russel/env"
-UNIT_FILE="$HOME/.config/systemd/user/russel-ctrl.service"
+ENV_FILE="$(env_file_path)"
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
 printf '%s\n' 'RUSSEL_API_TOKEN=preserved-token' >"$ENV_FILE"
-chmod 600 "$ENV_FILE"
+chmod 640 "$ENV_FILE"
 printf '%s\n' '# operator edit' >>"$UNIT_FILE"
 make_host_binary new-binary
-USER_ACTIVE=1
+SYSTEM_ACTIVE=1
 expect_main_rc 0 host
 [[ "$(<"$ENV_FILE")" == 'RUSSEL_API_TOKEN=preserved-token' ]] || die "existing token changed"
 grep -Fq '# operator edit' "$UNIT_FILE" || die "existing unit changed"
-[[ "$(call_count "${CASE_ROOT}/systemctl-user.log" restart)" == 1 ]] || die "active unit was not restarted"
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" restart)" == 1 ]] || die "active unit was not restarted"
 cmp -s "$CASE_DEST.previous" <(printf '%s\n' old-binary) || die "previous binary copy missing"
 assert_output_lacks preserved-token
 pass "existing token, unit, state, and binary backup preservation"
@@ -551,28 +780,41 @@ pass "existing token, unit, state, and binary backup preservation"
 # Force replaces a differing valid unit and reloads it.
 new_case
 make_host_binary force-binary
-mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/russel"
-cp "${SCRIPT_DIR}/russel-ctrl.service" "$HOME/.config/systemd/user/russel-ctrl.service"
-printf '%s\n' '# operator edit' >>"$HOME/.config/systemd/user/russel-ctrl.service"
-printf '%s\n' 'RUSSEL_API_TOKEN=preserved-token' >"$HOME/.config/russel/env"
-chmod 600 "$HOME/.config/russel/env"
 set_curl_mode 401
+expect_main_rc 0 host
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
+printf '%s\n' '# operator edit' >>"$UNIT_FILE"
+SYSTEM_ACTIVE=1
 expect_main_rc 0 --force-unit host
-cmp -s "$HOME/.config/systemd/user/russel-ctrl.service" "${SCRIPT_DIR}/russel-ctrl.service" || die "force did not replace unit"
-[[ "$(call_count "${CASE_ROOT}/systemctl-user.log" daemon-reload)" == 1 ]] || die "force did not daemon-reload"
+cmp -s "$UNIT_FILE" <(expected_unit) || die "force did not replace unit"
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" daemon-reload)" == 2 ]] || die "force did not daemon-reload"
 pass "force-unit replacement"
 
-# State ownership is refused unless explicitly taken.
+# A unit that no longer runs as russel is refused rather than started.
+new_case
+make_host_binary user-binary
+set_curl_mode 401
+expect_main_rc 0 host
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
+sed -i 's/^User=russel$/User=root/' "$UNIT_FILE"
+expect_main_rc 1 host
+assert_output_contains 'fails required User=russel'
+pass "unit validation requires User=russel"
+
+# State ownership is refused unless explicitly taken; taking it is recursive.
 new_case
 make_host_binary state-binary
 mkdir -p "$CASE_STATE"
-FAKE_STATE_OWNER=2000:2000
+FAKE_STATE_OWNER=1000:1000
 set_curl_mode 401
 expect_main_rc 1 host
-[[ ! -e "${CASE_ROOT}/sudo.log" || "$(grep -c '^chown ' "${CASE_ROOT}/sudo.log")" == 0 ]] || die "state refusal attempted chown"
+assert_output_contains 'use --take-state-ownership'
+if grep -Fq -- "-R russel:russel" "${CASE_ROOT}/chown.log" 2>/dev/null; then
+  die "state refusal chowned"
+fi
 expect_main_rc 0 --take-state-ownership host
-[[ "$(grep -c '^chown ' "${CASE_ROOT}/sudo.log" 2>/dev/null || true)" == 1 ]] || die "state ownership takeover did not chown"
-pass "state ownership refusal and takeover"
+grep -Fq -- "-R russel:russel -- ${CASE_STATE}" "${CASE_ROOT}/chown.log" || die "takeover did not chown recursively"
+pass "state ownership refusal and recursive takeover"
 
 # A failed active-unit restart restores the old binary and retries restart once.
 new_case
@@ -580,12 +822,12 @@ make_host_binary old-active-binary
 set_curl_mode 401
 expect_main_rc 0 host
 make_host_binary new-active-binary
-USER_ACTIVE=1
+SYSTEM_ACTIVE=1
 RESTART_FAIL_FIRST=1
 expect_main_rc 1 host
 [[ "$(<"$CASE_DEST")" == 'old-active-binary' ]] || die "binary rollback failed"
 [[ "$(<"$CASE_DEST.previous")" == 'old-active-binary' ]] || die "rollback backup changed"
-[[ "$(call_count "${CASE_ROOT}/systemctl-user.log" restart)" == 2 ]] || die "restoration restart was not attempted exactly once"
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" restart)" == 2 ]] || die "restoration restart was not attempted exactly once"
 assert_output_contains 'original restart diagnostic'
 pass "active restart rollback and restoration restart"
 
@@ -603,7 +845,7 @@ CASE_KERNEL="$(kernel_pool_image_path)"
 printf '%s\n' ctrl-download-v2 >"${RELEASE_ASSETS}/russel-ctrl-v1.2.3-x86_64"
 printf '%s\n' kernel-download-v2 >"${RELEASE_ASSETS}/russel-kernel-v1.2.3-x86_64.bzImage"
 ( cd "$RELEASE_ASSETS" && sha256sum russel-* >SHA256SUMS )
-USER_ACTIVE=1
+SYSTEM_ACTIVE=1
 RESTART_FAIL_FIRST=1
 expect_main_rc 1 host
 [[ "$(<"$CASE_DEST")" == 'ctrl-download' ]] || die "binary rollback failed"
@@ -612,15 +854,25 @@ expect_main_rc 1 host
 [[ "$(<"${CASE_KERNEL}.previous")" == 'kernel-download' ]] || die "kernel backup missing"
 pass "failed upgrade restores the previous pool kernel with the binary"
 
-# Linger failure is a warning after a healthy endpoint, not an install failure.
+# Linger is what gives the account /run/user and a user bus, so failing to
+# enable it fails the install before anything starts.
 new_case
 make_host_binary linger-binary
 set_curl_mode 200-valid
 LINGER_FAIL=1
-expect_main_rc 0 host
-assert_output_contains 'Host installation is ready.'
-assert_output_contains 'warning: could not enable login linger'
-pass "linger warning after usable install"
+expect_main_rc 1 host
+assert_output_contains 'cannot enable linger for russel'
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" enable)" == 0 ]] || die "unit started without linger"
+pass "linger failure stops the install"
+
+# Subuid allocation starts after every existing range, never below 100000.
+new_case
+printf '%s\n' 'alice:100000:65536' 'bob:165536:65536' 'odd:300000:10' >"$CASE_ROOT/etc/subuid"
+[[ "$(next_subid_start "$CASE_ROOT/etc/subuid")" == 300010 ]] || die "subuid start after ranges is wrong"
+: >"$CASE_ROOT/etc/subuid"
+[[ "$(next_subid_start "$CASE_ROOT/etc/subuid")" == 100000 ]] || die "subuid start for an empty file is wrong"
+[[ "$(next_subid_start "$CASE_ROOT/etc/missing")" == 100000 ]] || die "subuid start for a missing file is wrong"
+pass "subuid range allocation"
 
 # Probe classification: 401, valid 200 JSON, and invalid 200 JSON.
 new_case
@@ -730,5 +982,23 @@ expect_main_rc 0 status
 assert_output_contains 'russel origin: https://elsewhere.example.invalid'
 assert_output_contains 'API: unauthorized'
 pass "status API exit and independent origin reporting"
+
+new_case
+SYSTEM_UNIT_INSTALLED=1
+SYSTEM_ACTIVE=1
+set_curl_mode 401
+expect_main_rc 0 status
+assert_output_contains 'unit: russel-ctrl.service active'
+new_case
+USER_UNIT_EXISTS=1
+USER_ACTIVE=1
+set_curl_mode 401
+expect_main_rc 0 status
+assert_output_contains 'unit: old per-user russel-ctrl.service active'
+new_case
+set_curl_mode 401
+expect_main_rc 0 status
+assert_output_contains 'unit: not installed on this machine'
+pass "status reports the system unit and flags the old per-user unit"
 
 echo "all installer tests passed"

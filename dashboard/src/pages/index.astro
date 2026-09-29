@@ -1,66 +1,44 @@
 ---
 import Layout from '../layouts/Layout.astro';
-import Header from '../components/Header.astro';
-import MetricCard from '../components/MetricCard.astro';
 import ActivityChart from '../components/ActivityChart.astro';
 import OfflineState from '../components/OfflineState.astro';
-import { STATIC_FLEET_STATUS, type ServiceVM } from '../lib/api';
+import { STATIC_FLEET_STATUS, overviewMetricsForConnection, type ServiceVM } from '../lib/api';
 
 // Static shell only — no build-time control-plane fetch (#306).
 // Client hydrate() fills live metrics from the browser.
 const status = STATIC_FLEET_STATUS;
 const services: ServiceVM[] = [];
+const loadingMetrics = overviewMetricsForConnection('loading', status, services)!;
 ---
 
 <Layout title="Dashboard" activePath="/">
-  <Header
-    title="Overview"
-    subtitle="Self-hosted control plane for microVMs and container workloads."
-    connection="loading"
-  />
+  <section class="block">
+    <div class="block-head">
+      <h2 class="section-title">Fleet</h2>
+    </div>
+    <div class="rows" id="metricsGrid">
+      {loadingMetrics.map((m) => (
+        <div class="tree-row">
+          <span class="c-name">{m.title.toLowerCase()}</span>
+          <span class="c-count">{m.value}</span>
+          <span class="c-meta">{m.subtext.toLowerCase()}</span>
+        </div>
+      ))}
+    </div>
+  </section>
 
-  <div class="metrics-grid" id="metricsGrid">
-    <MetricCard
-      title="Fleet Health"
-      value="—"
-      subtext="Loading…"
-      accentColor="var(--accent-green)"
-    />
-    <MetricCard
-      title="Longest Uptime"
-      value="—"
-      subtext="Across all services"
-      accentColor="var(--accent-primary)"
-    />
-    <MetricCard
-      title="API Latency"
-      value="—"
-      subtext="Loading…"
-      accentColor="var(--accent-primary)"
-    />
-    <MetricCard
-      title="Services"
-      value="—"
-      subtext="Loading…"
-      accentColor="var(--accent-primary)"
-    />
-  </div>
-
-  <ActivityChart status={status} services={services} />
-
-  <section class="recent-services-section" id="servicesSection">
-    <div class="section-header">
-      <div>
-        <h2 class="section-title">Active Fleet Status</h2>
-        <p class="subtitle">Recently deployed services and their current state.</p>
-      </div>
-      <a href="/services" class="btn btn-secondary btn-sm">View all</a>
+  <section class="block" id="servicesSection">
+    <div class="block-head section-header">
+      <h2 class="section-title">Services</h2>
+      <a href="/services" class="btn btn-sm">view all</a>
     </div>
     <div class="card-panel empty-state">
-      <p>Loading…</p>
+      <p>loading…</p>
     </div>
     <noscript><OfflineState /></noscript>
   </section>
+
+  <ActivityChart status={status} services={services} />
 </Layout>
 
 <script>
@@ -68,6 +46,7 @@ const services: ServiceVM[] = [];
     api,
     escapeHtml,
     formatUptime,
+    plural,
     getApiBase,
     isApiBaseLoopback,
     isServiceRunning,
@@ -76,7 +55,7 @@ const services: ServiceVM[] = [];
     probeEndpointPort,
   } from '../lib/api';
   import { renderOfflineState, renderUnauthorizedState, renderEmptyState } from '../lib/offline_state';
-  import { renderPortCell } from '../lib/ports';
+  import { getHostPort } from '../lib/ports';
   import type { FleetStatus, ServiceVM } from '../lib/api';
 
   const SAMPLE_KEY = 'RUSSEL_FLEET_SAMPLES';
@@ -407,27 +386,32 @@ const services: ServiceVM[] = [];
 
   // ---- Bar updater ----
 
-  function updateBar(id: string, count: number, max: number): void {
+  function pctOf(count: number, of: number): number {
+    return of > 0 ? Math.round((count / of) * 100) : 0;
+  }
+
+  function updateBar(id: string, count: number, of: number): void {
     const barRow = document.getElementById(id);
     if (!barRow) return;
+    const p = pctOf(count, of);
     const fill = barRow.querySelector('.bar-fill') as HTMLElement | null;
     const countEl = barRow.querySelector('.bar-count');
-    if (fill) fill.style.width = `${Math.max(0, (count / Math.max(max, 1)) * 100)}%`;
+    if (fill) fill.style.width = `${p}%`;
     if (countEl) countEl.textContent = String(count);
+    barRow.classList.toggle('is-zero', count === 0);
   }
 
   function updateComposition(status: FleetStatus, services: ServiceVM[]): void {
     const microvmCount = services.filter((s) => s.runtime === 'microvm').length;
     const containerCount = services.filter((s) => s.runtime === 'container').length;
-    const barMax = Math.max(status.running_vms, status.stopped_vms, status.failed_vms, 1);
-    const runtimeMax = Math.max(microvmCount, containerCount, 1);
+    const total = Math.max(status.total_vms, services.length);
     const hasFleet = (status.total_vms ?? services.length) > 0;
 
-    updateBar('barRunning', status.running_vms, barMax);
-    updateBar('barStopped', status.stopped_vms, barMax);
-    updateBar('barFailed', status.failed_vms, barMax);
-    updateBar('barMicrovm', microvmCount, runtimeMax);
-    updateBar('barContainer', containerCount, runtimeMax);
+    updateBar('barRunning', status.running_vms, total);
+    updateBar('barStopped', status.stopped_vms, total);
+    updateBar('barFailed', status.failed_vms, total);
+    updateBar('barMicrovm', microvmCount, services.length);
+    updateBar('barContainer', containerCount, services.length);
 
     // Update fleet stats row values
     const byId = (id: string, v: string) => { const el = document.getElementById(id); if (el) el.textContent = v; };
@@ -436,6 +420,8 @@ const services: ServiceVM[] = [];
     byId('statFailed', String(status.failed_vms));
     byId('statMicrovm', String(microvmCount));
     byId('statContainer', String(containerCount));
+    byId('statMicrovmWord', plural(microvmCount, 'microVM'));
+    byId('statContainerWord', plural(containerCount, 'container'));
     byId('statMaxUptime', status.max_uptime_seconds > 0 ? formatUptime(status.max_uptime_seconds) : '\u2014');
 
     // Toggle empty callout + header CTA (bars stay mounted for live updates)
@@ -493,39 +479,50 @@ const services: ServiceVM[] = [];
           : 0;
       grid.innerHTML = cards
         .map((card, i) => {
-          const progress =
+          const meter =
             i === 0 && healthPct > 0
-              ? `<div class="metric-progress-track"><div class="metric-progress-fill" style="width:${healthPct}%;background-color:var(--accent-green)"></div></div>`
+              ? `<span class="hbar"><span class="hbar-fill" style="width:${healthPct}%"></span></span>`
               : '';
-          return `<div class="metric-card card-panel">
-          <span class="metric-title">${escapeHtml(card.title)}</span>
-          <div class="metric-value-row"><span class="metric-value">${escapeHtml(card.value)}</span></div>
-          <span class="metric-subtext">${escapeHtml(card.subtext)}</span>
-          ${progress}
+          return `<div class="tree-row">
+          <span class="c-name">${escapeHtml(card.title.toLowerCase())}</span>
+          <span class="c-count">${escapeHtml(card.value)}</span>
+          ${meter}
+          <span class="c-meta">${escapeHtml(card.subtext.toLowerCase())}</span>
         </div>`;
         })
         .join('');
     }
 
-    // Update services table
+    // Update services rows: uptime is drawn relative to the longest-running service.
     const section = document.getElementById('servicesSection');
     if (section) {
       const headerRow = section.querySelector('.section-header');
       if (services.length > 0) {
-        const rows = services.slice(0, 4).map((svc) => {
-          const statusClass = isServiceRunning(svc) ? 'badge-running' : 'badge-stopped';
+        const maxUptime = Math.max(...services.map((s) => s.uptime_seconds || 0), 1);
+        const loopback = isApiBaseLoopback();
+        const rows = services.slice(0, 6).map((svc) => {
+          const running = isServiceRunning(svc);
           const idAttr = encodeURIComponent(svc.id);
           const label = escapeHtml(svc.name || svc.id);
-          const secondaryId = (svc.name && svc.name !== svc.id) ? `<span class="service-id">${escapeHtml(svc.id)}</span>` : '';
-          return `<tr>
-            <td><div class="service-name-cell"><a href="/service-detail?id=${idAttr}" class="service-link">${label}</a>${secondaryId}</div></td>
-            <td><span class="runtime-tag ${escapeHtml(svc.runtime)}">${svc.runtime === 'microvm' ? 'MicroVM' : 'Container'}</span></td>
-            <td><span class="badge ${statusClass}"><span class="badge-dot"></span>${escapeHtml(svc.status)}</span></td>
-            <td>${renderPortCell(svc)}</td>
-            <td style="text-align:right"><a href="/service-detail?id=${idAttr}" class="btn btn-secondary btn-sm">Details</a></td>
-          </tr>`;
+          const uptime = svc.uptime_seconds || 0;
+          const pct = Math.round((uptime / maxUptime) * 100);
+          const hp = getHostPort(svc);
+          const port = hp == null
+            ? '<span class="muted">no port</span>'
+            : loopback
+              ? `<a class="port-link" href="http://localhost:${hp}" target="_blank" rel="noopener noreferrer">:${hp}</a>`
+              : `<span class="port-link" title="Host port is on the remote control-plane host">:${hp}</span>`;
+          return `<div class="tree-row">
+            <a href="/service-detail?id=${idAttr}" class="c-name">${label}</a>
+            <span class="c-wide">${escapeHtml(svc.id)}</span>
+            <span class="runtime-tag ${escapeHtml(svc.runtime)} c-rt">${svc.runtime === 'microvm' ? 'microvm' : 'container'}</span>
+            <span class="hbar"><span class="hbar-fill" style="width:${pct}%"></span></span>
+            <span class="c-up">up ${escapeHtml(uptime > 0 ? formatUptime(uptime) : '—')}</span>
+            <span class="c-port">${port}</span>
+            <span class="${running ? 'tone-ok' : 'tone-bad'}">${escapeHtml(svc.status)}</span>
+          </div>`;
         }).join('');
-        const tableHtml = `<div class="data-table-container"><table class="data-table"><thead><tr><th>Service / ID</th><th>Runtime</th><th>Status</th><th>Ports</th><th style="text-align:right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        const tableHtml = `<div class="rows data-table-container">${rows}</div>`;
         // Replace everything after the header row
         const afterHeader = section.querySelector('.data-table-container, .empty-state');
         if (afterHeader) afterHeader.remove();
@@ -552,26 +549,3 @@ const services: ServiceVM[] = [];
   hydrate();
   setInterval(hydrate, POLL_INTERVAL_MS);
 </script>
-
-<style>
-  .metrics-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 1rem;
-    margin-bottom: 0.5rem;
-  }
-
-  .recent-services-section {
-    margin-top: 2rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.85rem;
-  }
-
-  .section-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 1rem;
-  }
-</style>

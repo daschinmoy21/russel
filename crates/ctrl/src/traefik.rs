@@ -28,7 +28,7 @@ fn dir_write_lock(dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
 ///
 /// ## Environment
 /// - `RUSSEL_TRAEFIK_DYNAMIC_DIR` — directory for dynamic config files
-///   (default `/var/lib/russel/traefik/dynamic`)
+///   (default `$RUSSEL_DATA_DIR/traefik/dynamic`, i.e. `/var/lib/russel/traefik/dynamic`)
 /// - `RUSSEL_TRAEFIK_DOMAIN` — domain suffix for Host rules
 ///   (default `russel.local`)
 /// - `RUSSEL_TRAEFIK_TLS` — when `1`/`true`, attach TLS to routers (websecure)
@@ -52,7 +52,7 @@ impl TraefikFileIngress {
     pub fn from_env() -> Self {
         let dynamic_dir = std::env::var("RUSSEL_TRAEFIK_DYNAMIC_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/russel/traefik/dynamic"));
+            .unwrap_or_else(|_| crate::paths::data_root().join("traefik/dynamic"));
         let domain = std::env::var("RUSSEL_TRAEFIK_DOMAIN")
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| DEFAULT_DOMAIN.to_string());

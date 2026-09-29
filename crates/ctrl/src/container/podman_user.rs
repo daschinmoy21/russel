@@ -1,8 +1,26 @@
 //! Rootless podman identity when ctrl runs privileged for microVMs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tokio::process::Command;
+
+static PODMAN_PROGRAM: OnceLock<PathBuf> = OnceLock::new();
+
+/// Test support: run `program` instead of `podman` for the rest of the
+/// process. Integration tests point this at a missing binary so `/vms`
+/// discovery and teardown never see or touch the host's real containers.
+/// First call wins; returns the pinned program.
+#[doc(hidden)]
+pub fn pin_podman_program(program: impl Into<PathBuf>) -> &'static Path {
+    PODMAN_PROGRAM.get_or_init(|| program.into())
+}
+
+fn podman_program() -> &'static Path {
+    PODMAN_PROGRAM
+        .get()
+        .map_or(Path::new("podman"), PathBuf::as_path)
+}
 
 // microVMs need a privileged ctrl (TAP/KVM). Containers must stay rootless.
 // When ctrl is root, run podman as RUSSEL_PODMAN_USER or SUDO_USER.
@@ -198,14 +216,14 @@ pub(crate) async fn podman_command() -> Command {
         if let Some(ref dbus) = env.dbus {
             cmd.arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"));
         }
-        cmd.arg("podman");
+        cmd.arg(podman_program());
         cmd
     } else {
         // Ambient podman. If ctrl is root (no user wrap), strip session vars
         // that `sudo -E` may have preserved — otherwise rootful podman writes
         // crun state into the invoking user's /run/user/UID as root:root and
         // later rootless runs fail with Permission denied.
-        let mut cmd = Command::new("podman");
+        let mut cmd = Command::new(podman_program());
         if unsafe { libc::geteuid() } == 0 {
             cmd.env_remove("XDG_RUNTIME_DIR");
             cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
@@ -358,7 +376,7 @@ pub(super) async fn ensure_rootfs_readable_for_podman_user(rootfs: &Path) -> any
 
     // Best-effort: allow the podman user to traverse /var/lib/russel without
     // world a+rx. User execute-only ACL; skip on failure.
-    let russel_root = russel_core::paths::data_root();
+    let russel_root = crate::paths::data_root();
     if russel_root.exists() {
         let root_s = russel_root.display().to_string();
         let output = tokio::process::Command::new("setfacl")

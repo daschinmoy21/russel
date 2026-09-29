@@ -65,6 +65,14 @@ let
   extraWarm = evalHost [
     { services.russel.extraEnvironment.RUSSEL_WARM_POOL = "1"; }
   ];
+
+  microvms = evalHost [
+    {
+      services.russel.microvms.enable = true;
+      services.russel.microvms.kernel = "/srv/kernel/bzImage";
+    }
+  ];
+  microvmsSvc = microvms.config.systemd.services.russel;
 in
 assert failedAssertions default == [ ];
 assert defaultSc.User == "russel";
@@ -94,6 +102,17 @@ assert !noPodman.config.virtualisation.podman.enable;
 assert lib.any (a: lib.hasInfix "loopback" a.message) (failedAssertions badBind);
 
 assert extraWarm.config.systemd.services.russel.environment.RUSSEL_WARM_POOL == "0";
+
+assert !(defaultSc ? SupplementaryGroups);
+assert !(default.config.systemd.services.russel.environment ? RUSSEL_KERNEL_PATH);
+assert failedAssertions microvms == [ ];
+assert microvmsSvc.serviceConfig.SupplementaryGroups == [ "kvm" ];
+assert microvmsSvc.environment.RUSSEL_KERNEL_PATH == "/srv/kernel/bzImage";
+assert lib.hasInfix "passt" microvmsSvc.environment.PATH;
+assert lib.hasInfix "cloud-hypervisor" microvmsSvc.environment.PATH;
+# ctrl stays unprivileged: no capabilities, no root.
+assert !(microvmsSvc.serviceConfig ? AmbientCapabilities);
+assert microvmsSvc.serviceConfig.User == "russel";
 
 {
   ok = true;

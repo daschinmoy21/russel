@@ -57,8 +57,13 @@
 
       packages = forEachSupportedSystem (
         { pkgs }:
-        pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        pkgs.lib.optionalAttrs pkgs.stdenv.isLinux rec {
           microvm-kernel = pkgs.callPackage ./nix/microvm-kernel.nix { };
+          # GPL-2.0 corresponding source, released next to the bzImage.
+          microvm-kernel-source = pkgs.callPackage ./nix/microvm-kernel-source.nix {
+            kernel = microvm-kernel;
+            nixpkgsRev = nixpkgs.rev;
+          };
         }
       );
 
@@ -77,6 +82,9 @@
               # so it must be gated to Linux to avoid Darwin evaluation failures.
               ++ (lib.optionals stdenv.isLinux [
                 cloud-hypervisor
+                # Unprivileged microVM networking (vhost-user NIC + port publish).
+                passt
+                virtiofsd
                 # Rootless Podman for Russel containers (`service.type = "container"`).
                 podman
               ]);

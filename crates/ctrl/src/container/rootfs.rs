@@ -9,7 +9,7 @@ use tokio::process::Command;
 
 /// Default service state directory: `/var/lib/russel/<service_id>`.
 pub fn default_base_dir(service_id: &str) -> PathBuf {
-    russel_core::paths::service_dir(service_id)
+    crate::paths::service_dir(service_id)
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +176,7 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
 
     let rootfs_path = spec.base_dir.join("rootfs");
     if rootfs_path.exists() {
-        tokio::fs::remove_dir_all(&rootfs_path).await?;
+        super::runner::remove_tree(&rootfs_path).await?;
     }
     create_layout(&rootfs_path)?;
     write_etc_files(&rootfs_path)?;
@@ -195,7 +195,11 @@ pub async fn prepare_rootfs(spec: &RootfsSpec) -> anyhow::Result<PreparedRootfs>
         );
     }
 
-    let container_entrypoint = PathBuf::from(format!("/bin/{}", spec.bin_name));
+    // Exec the store path itself, not the /bin/<name> link: programs that
+    // locate their install from argv[0] without following symlinks
+    // (PostgreSQL 17+ looks for ../lib and ../share) need the real prefix.
+    // Not canonicalized, so multi-call binaries still see their own name.
+    let container_entrypoint = store_path_in_container(&entrypoint)?;
     tracing::info!(
         service_id = %spec.service_id,
         rootfs = %rootfs_path.display(),
@@ -410,9 +414,14 @@ fn store_bin_to_container_path(host_path: &Path) -> anyhow::Result<PathBuf> {
     let canonical = host_path
         .canonicalize()
         .unwrap_or_else(|_| host_path.to_path_buf());
-    let path_str = canonical
+    store_path_in_container(&canonical)
+}
+
+/// `/nix/store/...` suffix of a host store path, without resolving symlinks.
+fn store_path_in_container(host_path: &Path) -> anyhow::Result<PathBuf> {
+    let path_str = host_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 store path: {}", canonical.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 store path: {}", host_path.display()))?;
     let Some(idx) = path_str.find("/nix/store/") else {
         anyhow::bail!("expected path containing /nix/store/, got {path_str}");
     };

@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "Russel",
-  "description": "Self-hosted Nix deployment platform — microVMs or rootless containers.",
+  "description": "Self-hosted Nix deployment platform — rootless containers, with experimental microVMs.",
   "colors": {
     "primary": "#16a34a"
   },
@@ -34,7 +34,7 @@
       },
       {
         "group": "Project",
-        "pages": ["project/development", "project/releases"]
+        "pages": ["project/development", "project/releases", "project/features/v0.1"]
       }
     ]
   }

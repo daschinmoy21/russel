@@ -84,25 +84,12 @@ pub struct ResolvedVolume {
 
 /// Directory for a managed volume: `/var/lib/russel/<id>/volumes/<name>`.
 pub fn managed_volume_dir(service_id: &str, name: &str) -> anyhow::Result<PathBuf> {
-    validate_service_id_component(service_id)?;
+    crate::ids::validate_service_id(service_id)?;
     validate_volume_name(name)?;
     Ok(crate::paths::data_root()
         .join(service_id)
         .join("volumes")
         .join(name))
-}
-
-fn validate_service_id_component(service_id: &str) -> anyhow::Result<()> {
-    if service_id.is_empty() {
-        anyhow::bail!("service_id must not be empty");
-    }
-    if service_id.contains('\0') {
-        anyhow::bail!("service_id contains NUL");
-    }
-    if service_id.contains('/') || service_id.contains("..") {
-        anyhow::bail!("service_id must not contain '/' or '..'");
-    }
-    Ok(())
 }
 
 /// `RUSSEL_VOLUME_ROOTS` as colon-separated absolute prefixes. Empty if unset.
@@ -153,7 +140,11 @@ fn path_hits_denied_prefix(path: &str) -> Option<String> {
             return Some((*prefix).to_string());
         }
     }
-    for key in ["RUSSEL_DATA_DIR", "RUSSEL_SECRETS_DIR"] {
+    for key in [
+        "RUSSEL_DATA_DIR",
+        "RUSSEL_SECRETS_DIR",
+        "RUSSEL_MICROVMS_DIR",
+    ] {
         let Ok(raw) = std::env::var(key) else {
             continue;
         };
@@ -179,12 +170,9 @@ fn path_hits_denied_prefix(path: &str) -> Option<String> {
 }
 
 /// Structural checks at Russelfile load. Absolute-host allowlist is deploy-time.
-pub fn validate_volumes(volumes: &[VolumeSpec], runtime_is_container: bool) -> anyhow::Result<()> {
+pub fn validate_volumes(volumes: &[VolumeSpec]) -> anyhow::Result<()> {
     if volumes.is_empty() {
         return Ok(());
-    }
-    if !runtime_is_container {
-        anyhow::bail!("[[volumes]] requires service.type = \"container\"");
     }
     if volumes.len() > MAX_VOLUMES {
         anyhow::bail!(
@@ -301,15 +289,11 @@ fn validate_host_path_syntax(host: &str) -> anyhow::Result<()> {
 
 pub fn validate_extra_ports(
     ports: &[ExtraPortSpec],
-    runtime_is_container: bool,
     service_port: u16,
     ingress_port: Option<u16>,
 ) -> anyhow::Result<()> {
     if ports.is_empty() {
         return Ok(());
-    }
-    if !runtime_is_container {
-        anyhow::bail!("[[ports]] requires service.type = \"container\"");
     }
     if ports.len() > MAX_EXTRA_PORTS {
         anyhow::bail!(
@@ -324,23 +308,9 @@ pub fn validate_extra_ports(
         hosts.insert(p);
     }
     for p in ports {
-        if p.host == 0 {
-            anyhow::bail!("[[ports]] host must not be 0");
-        }
+        crate::config::validate_publish_host_port("[[ports]] host", p.host)?;
         if p.guest == 0 {
             anyhow::bail!("[[ports]] guest must not be 0");
-        }
-        if p.host < 1024 {
-            anyhow::bail!(
-                "[[ports]] host {} is privileged (< 1024); Traefik owns 80/443",
-                p.host
-            );
-        }
-        if p.host == 7878 || p.host == 7946 {
-            anyhow::bail!(
-                "[[ports]] host {} collides with the default ctrl (7878) or agent (7946) listen port",
-                p.host
-            );
         }
         if p.guest == service_port {
             anyhow::bail!(
@@ -418,41 +388,80 @@ fn is_nix_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// `service.args` is process argv after the entrypoint, on both runtimes: the
+/// container gets it after `--rootfs … <entrypoint>`, the microVM guest agent
+/// reads it one entry per line from `/config/argv` (#463). Entries can hold
+/// no newline, so that file needs no escaping.
 pub fn validate_service_args(args: &[String]) -> anyhow::Result<()> {
+    validate_token_list("service.args", args, true, "")
+}
+
+/// `service.podman_args` are extra `podman run` tokens, one per entry. Only
+/// the shape is checked here; the control plane rejects Russel-owned and
+/// isolation-weakening flags fail-closed at deploy.
+pub fn validate_podman_args(args: &[String], runtime_is_container: bool) -> anyhow::Result<()> {
+    validate_token_list(
+        "service.podman_args",
+        args,
+        runtime_is_container,
+        "they are `podman run` flags",
+    )
+}
+
+fn validate_token_list(
+    field: &str,
+    args: &[String],
+    runtime_is_container: bool,
+    container_only_reason: &str,
+) -> anyhow::Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    if !runtime_is_container {
+        anyhow::bail!("{field} requires service.type = \"container\" ({container_only_reason})");
+    }
     if args.len() > 32 {
-        anyhow::bail!("service.args: too many entries (max 32)");
+        anyhow::bail!("{field}: too many entries (max 32)");
     }
     for arg in args {
         if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
-            anyhow::bail!("service.args entry must not contain NUL or newlines");
+            anyhow::bail!("{field} entry must not contain NUL or newlines");
         }
         if arg.len() > 256 {
-            anyhow::bail!("service.args entry too long (max 256 bytes)");
+            anyhow::bail!("{field} entry too long (max 256 bytes)");
         }
     }
     Ok(())
 }
 
-pub fn validate_userns(userns: Option<&str>, runtime_is_container: bool) -> anyhow::Result<()> {
-    let Some(userns) = userns else {
-        return Ok(());
-    };
-    if !runtime_is_container {
-        anyhow::bail!("service.userns requires service.type = \"container\"");
+/// `service.user` (#466): omitted runs the app as an unprivileged user on
+/// both runtimes; `"root"` is the only value.
+pub fn validate_user(user: Option<&str>) -> anyhow::Result<()> {
+    match user {
+        None | Some("root") => Ok(()),
+        Some(other) => anyhow::bail!(
+            "service.user must be \"root\" or omitted (got {other:?}); omitted runs the app \
+             as an unprivileged user"
+        ),
     }
-    if userns != "keep-id" {
-        anyhow::bail!("service.userns must be \"keep-id\" (got {userns:?})");
+}
+
+/// `service.userns` was replaced by `service.user` (#466).
+pub fn reject_userns(userns: Option<&str>) -> anyhow::Result<()> {
+    if userns.is_some() {
+        anyhow::bail!(
+            "service.userns was removed: apps now run as an unprivileged user by default, \
+             which is what userns = \"keep-id\" did. Delete the line, or set \
+             service.user = \"root\" to run the app as root"
+        );
     }
     Ok(())
 }
 
-pub fn validate_restart(restart: Option<&str>, runtime_is_container: bool) -> anyhow::Result<()> {
+pub fn validate_restart(restart: Option<&str>) -> anyhow::Result<()> {
     let Some(restart) = restart else {
         return Ok(());
     };
-    if !runtime_is_container {
-        anyhow::bail!("service.restart requires service.type = \"container\"");
-    }
     if restart != "unless-stopped" {
         anyhow::bail!("service.restart must be \"unless-stopped\" (got {restart:?})");
     }
@@ -520,7 +529,7 @@ pub fn resolve_volumes(
     volumes: &[VolumeSpec],
     roots: &[PathBuf],
 ) -> anyhow::Result<Vec<ResolvedVolume>> {
-    validate_service_id_component(service_id)?;
+    crate::ids::validate_service_id(service_id)?;
     let mut out = Vec::with_capacity(volumes.len());
     for vol in volumes {
         if let Some(name) = vol.name.as_deref() {
@@ -567,7 +576,7 @@ keep = true
         assert!(v.host.is_none());
         assert!(v.rw);
         assert!(v.keep);
-        validate_volumes(&[v], true).unwrap();
+        validate_volumes(&[v]).unwrap();
     }
 
     #[test]
@@ -577,45 +586,44 @@ host = "/home/me/music"
 guest = "/music"
 keep = true
 "#);
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains("keep is only valid with name"));
     }
 
     #[test]
-    fn volumes_require_container() {
+    fn volumes_load_on_either_runtime() {
         let v = vol("name = \"data\"\nguest = \"/data\"\n");
-        let err = validate_volumes(&[v], false).unwrap_err();
-        assert!(err.to_string().contains("container"));
+        validate_volumes(&[v]).unwrap();
     }
 
     #[test]
     fn guest_must_be_absolute() {
         let v = vol("name = \"data\"\nguest = \"data\"\n");
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains("absolute"));
     }
 
     #[test]
     fn guest_rejects_root() {
         let v = vol("name = \"data\"\nguest = \"/\"\n");
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains("must not be \"/\""));
         let v = vol("name = \"data\"\nguest = \"///\"\n");
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains("must not be \"/\""));
     }
 
     #[test]
     fn guest_rejects_parent_dir() {
         let v = vol("name = \"data\"\nguest = \"/data/../etc\"\n");
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains(".."));
     }
 
     #[test]
     fn host_denied_etc() {
         let v = vol("host = \"/etc/shadow\"\nguest = \"/secret\"\n");
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains("denied"));
     }
 
@@ -627,7 +635,7 @@ keep = true
             "/var/lib/microvms/api",
         ] {
             let v = vol(&format!("host = {host:?}\nguest = \"/data\"\n"));
-            let err = validate_volumes(&[v], true).unwrap_err();
+            let err = validate_volumes(&[v]).unwrap_err();
             assert!(
                 err.to_string().contains("denied"),
                 "{host} should be denied, got {err}"
@@ -638,11 +646,11 @@ keep = true
     #[test]
     fn guest_and_host_reject_comma() {
         let guest = vol("name = \"data\"\nguest = \"/data,bind-propagation=rshared\"\n");
-        let err = validate_volumes(&[guest], true).unwrap_err();
+        let err = validate_volumes(&[guest]).unwrap_err();
         assert!(err.to_string().contains("commas"), "{err}");
 
         let host = vol("host = \"/srv/music,Z\"\nguest = \"/music\"\n");
-        let err = validate_volumes(&[host], true).unwrap_err();
+        let err = validate_volumes(&[host]).unwrap_err();
         assert!(err.to_string().contains("commas"), "{err}");
     }
 
@@ -654,7 +662,7 @@ keep = true
             "host = \"/srv/music\\nZ\"\nguest = \"/music\"\n",
             "host = \"/srv/music\\rZ\"\nguest = \"/music\"\n",
         ] {
-            let err = validate_volumes(&[vol(toml)], true).unwrap_err();
+            let err = validate_volumes(&[vol(toml)]).unwrap_err();
             assert!(
                 err.to_string().contains("newline") || err.to_string().contains("commas"),
                 "{err}"
@@ -699,7 +707,7 @@ keep = true
     #[test]
     fn name_or_host_required() {
         let v = vol("guest = \"/data\"\n");
-        let err = validate_volumes(&[v], true).unwrap_err();
+        let err = validate_volumes(&[v]).unwrap_err();
         assert!(err.to_string().contains("name = or host ="));
     }
 
@@ -710,7 +718,6 @@ keep = true
                 host: 50300,
                 guest: 3000,
             }],
-            true,
             3000,
             None,
         )
@@ -725,7 +732,6 @@ keep = true
                 host: 80,
                 guest: 8080,
             }],
-            true,
             3000,
             None,
         )
@@ -857,11 +863,14 @@ keep = true
     }
 
     #[test]
-    fn userns_and_restart_container_only() {
-        validate_userns(Some("keep-id"), true).unwrap();
-        assert!(validate_userns(Some("keep-id"), false).is_err());
-        assert!(validate_userns(Some("host"), true).is_err());
-        validate_restart(Some("unless-stopped"), true).unwrap();
-        assert!(validate_restart(Some("always"), true).is_err());
+    fn user_root_or_omitted_userns_removed_restart_either_runtime() {
+        validate_user(None).unwrap();
+        validate_user(Some("root")).unwrap();
+        assert!(validate_user(Some("1000")).is_err());
+        reject_userns(None).unwrap();
+        let err = reject_userns(Some("keep-id")).unwrap_err().to_string();
+        assert!(err.contains("service.user"), "{err}");
+        validate_restart(Some("unless-stopped")).unwrap();
+        assert!(validate_restart(Some("always")).is_err());
     }
 }

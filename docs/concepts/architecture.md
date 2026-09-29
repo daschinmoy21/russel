@@ -98,12 +98,12 @@ sequenceDiagram
     P->>P: merge env (file < request), resolve secret:// refs
     P->>B: nix build path:repo#packages.sys.default
     B-->>P: /nix/store/hash
-    alt microvm (default)
+    alt microvm (experimental)
         P->>R: TAP + socat + virtiofsd×2 + CH boot
         R-->>P: reachable (TCP poll guest 10s)
-    else container
+    else container (default)
         P->>R: prepare rootfs, podman run --rootfs
-        R-->>P: reachable (TCP poll host port 10s)
+        R-->>P: app answers via host port, container still up (30s)
     end
     P->>I: register or swap Host rule + 127.0.0.1 backend
     P->>P: write metadata.json + desired_state (ingress_host, pin)
@@ -159,7 +159,7 @@ Residual risks (DNS-rebinding around the SSRF guard, metadata-IP redirects durin
 
 ## What's intentionally not here
 
-- `[database.*]` is parsed then rejected when enabled — a vestigial stub, not a feature. Run databases as separate (user-managed) services.
+- There is no `[database]` section and no managed databases. Run Postgres or Redis as ordinary `service.package` services with kept `[[volumes]]` (`examples/postgres`, `examples/redis`).
 - Warm pool (`RUSSEL_WARM_POOL=1`) is experimental, off by default, with known races. Cold boot is already ~2 s via the agent initramfs.
 - Flat `/status` + `/logs` are single-service shims (`400` when >1 service exists). Prefer `/vm/{id}/…`.
 

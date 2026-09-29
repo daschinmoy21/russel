@@ -123,17 +123,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run installer tests
         run: bash contrib/tests/install_test.sh
-      - name: Verify systemd user unit
+      - name: Verify systemd system unit
         run: |
           set -euo pipefail
           cleanup() {
-            sudo rm -f /usr/local/bin/russel-ctrl
-            sudo rmdir /var/lib/russel 2>/dev/null || true
+            sudo rm -f /usr/local/bin/russel-ctrl /etc/russel/env
+            sudo rmdir /etc/russel /var/lib/russel 2>/dev/null || true
           }
           trap cleanup EXIT
-          mkdir -p "$HOME/.config/russel"
-          : >"$HOME/.config/russel/env"
-          chmod 600 "$HOME/.config/russel/env"
           sudo install -m 755 /bin/true /usr/local/bin/russel-ctrl
-          sudo mkdir -p /var/lib/russel
-          systemd-analyze verify contrib/russel-ctrl.service
+          sudo mkdir -p /var/lib/russel /etc/russel
+          sudo install -m 640 /dev/null /etc/russel/env
+          getent passwd russel >/dev/null || sudo useradd --system --no-create-home russel
+          # install.sh host fills in the service account's uid the same way.
+          unit_dir="$(mktemp -d)"
+          sed "s/@RUSSEL_UID@/$(id -u russel)/g" contrib/russel-ctrl.service >"${unit_dir}/russel-ctrl.service"
+          systemd-analyze verify "${unit_dir}/russel-ctrl.service"

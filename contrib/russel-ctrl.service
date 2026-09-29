@@ -1,52 +1,63 @@
-# systemd --user unit for russel-ctrl (non-NixOS).
+# systemd system unit for russel-ctrl (non-NixOS).
 #
-# Same defaults as nix/modules/russel-host.nix:
-#   127.0.0.1:7878, RUSSEL_REQUIRE_AUTH=1, warm pool off, /var/lib/russel 0700.
+# `sudo ./contrib/install.sh host` installs this at
+# /etc/systemd/system/russel-ctrl.service after replacing @RUSSEL_UID@ with the
+# uid of the `russel` service account it creates. Same model as
+# nix/modules/russel-host.nix: a dedicated, lingering, unprivileged account
+# with a subuid/subgid range for rootless Podman, and nothing else.
 #
-# Install:
-#   cargo build --release
-#   sudo install -m 755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
-#   mkdir -p ~/.config/systemd/user ~/.config/russel
-#   cp contrib/russel-ctrl.service ~/.config/systemd/user/
-#   umask 077
-#   printf 'RUSSEL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > ~/.config/russel/env
-#   sudo mkdir -p /var/lib/russel
-#   sudo chown "$(id -un):$(id -gn)" /var/lib/russel
-#   sudo chmod 700 /var/lib/russel
-#   loginctl enable-linger "$(id -un)"
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now russel-ctrl.service
+# Defaults: 127.0.0.1:7878, RUSSEL_REQUIRE_AUTH=1, warm pool off,
+# /var/lib/russel 0700 owned by russel. The token is in /etc/russel/env
+# (root:russel 0640), so members of the `russel` group can `russel login`.
 #
 # TLS: reverse proxy to 127.0.0.1:7878. Do not expose :7878.
-# See docs/security-tls.md and docs/traefik.md.
-# KVM/TAP/cloud-hypervisor are optional. Container-only VPS uses rootless Podman.
+# MicroVMs (experimental) are optional: the installer adds russel to the kvm
+# group when /dev/kvm exists; cloud-hypervisor, virtiofsd, and passt must be on
+# PATH. No root or capabilities.
 # Dashboard: GET / from the same process. Logs: /var/lib/russel/ctrl.log
 # (stderr is warnings unless you add --debug to ExecStart).
 
 [Unit]
 Description=Russel control plane
 Documentation=https://github.com/daschinmoy21/russel
-After=network.target
+After=network-online.target nix-daemon.service user@@RUSSEL_UID@.service
+Wants=network-online.target user@@RUSSEL_UID@.service
+# Rootless Podman keeps its runtime state here; the lingering user manager
+# creates it.
+RequiresMountsFor=/run/user/@RUSSEL_UID@
 
 [Service]
 Type=simple
+User=russel
+Group=russel
 ExecStart=/usr/local/bin/russel-ctrl
 WorkingDirectory=/var/lib/russel
 Environment=RUSSEL_CTRL_ADDR=127.0.0.1:7878
 Environment=RUSSEL_REQUIRE_AUTH=1
 Environment=RUSSEL_WARM_POOL=0
+Environment=RUSSEL_DATA_DIR=/var/lib/russel
 Environment=HOME=/var/lib/russel
-EnvironmentFile=%h/.config/russel/env
+# A system unit does not read /etc/profile.d, so name the Nix daemon profile
+# explicitly: builds run `nix` from here.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/nix/var/nix/profiles/default/bin
+# Rootless Podman finds its runtime dir and the user bus (systemd cgroup
+# manager) through these.
+Environment=XDG_RUNTIME_DIR=/run/user/@RUSSEL_UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@RUSSEL_UID@/bus
+EnvironmentFile=/etc/russel/env
 Restart=on-failure
 RestartSec=5s
-# Rootless Podman needs newuidmap (file caps). Matches
-# services.russel.rootlessPodman default true. Set yes if this unit
-# never starts containers.
+# Rootless Podman needs newuidmap (file caps or setuid).
 NoNewPrivileges=no
 ProtectSystem=strict
-# /run/user is the rootless Podman runtime. ProtectSystem=strict
-# would otherwise make it read-only.
-ReadWritePaths=/var/lib/russel /run/user
+# Absolute [[volumes]].host binds need their root here too, or containers see
+# it read-only. Add it with `sudo systemctl edit russel-ctrl`:
+#   [Service]
+#   ReadWritePaths=/srv/russel
+# and list it in RUSSEL_VOLUME_ROOTS in /etc/russel/env.
+ReadWritePaths=/var/lib/russel /run/user/@RUSSEL_UID@
+# read-only, not yes: yes hides /run/user, which rootless Podman needs.
+ProtectHome=read-only
 PrivateTmp=yes
 Delegate=yes
 # Workloads (pasta/conmon) are children of this unit. control-group would
@@ -54,4 +65,4 @@ Delegate=yes
 KillMode=process
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

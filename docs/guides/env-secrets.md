@@ -7,15 +7,16 @@ keywords: [env, secrets, secret store, env-file, reserved keys]
 
 # Env and secrets
 
-User config is layered: `Russelfile [service.env]` < `--env-file` < `--env`. Secrets are stored on the host and referenced as `secret://NAME`.
+Environment values are declared in the Russelfile under `[service.env]`. Secrets are stored on the host and referenced as `secret://NAME`.
 
 ## Env rules (enforced)
 
+Loading the Russelfile checks `[service.env]`, so a bad key fails before any build. The control plane re-checks the map after resolving secrets.
+
 - Key: `^[A-Za-z_][A-Za-z0-9_]*$`, max 64 keys.
-- Reserved keys rejected: `PORT`, `VM_IP`, `HOST_IP`, `APP`, `IFS`, `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELL`.
+- Reserved keys rejected: `PORT`, `VM_IP`, `HOST_IP`, `APP`, `IFS`, `PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELL`.
 - Value: no NUL / `\n` / `\r`, max 4096 B.
-- Binary name (`bin` or `name`) must match `[A-Za-z0-9._+-]`, max 256 chars; injected via shell-quoted `deploy.env`.
-- Merge order: Russelfile < env-file < `--env` (later wins). Env-file format is `KEY=VALUE` per line, `#` comments and blanks skipped.
+- `service.name` uses the service id rule (`[A-Za-z0-9_-]`, max 128). `service.bin` allows the wider `[A-Za-z0-9._+-]`, max 256; it is injected via shell-quoted `deploy.env`.
 
 ```toml
 [service.env]
@@ -24,8 +25,7 @@ FEATURE_X = "1"
 ```
 
 ```bash
-russel deploy . --vm-id api -p 8080:3000 --env LOG_LEVEL=debug --env FEATURE_X=1
-russel deploy . --vm-id api -p 8080:3000 --env-file ./prod.env
+russel apply .
 ```
 
 Injected runtime vars (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are set by Russel — do not define them.
@@ -56,7 +56,7 @@ The control plane resolves the value at deploy time and re-validates. Missing se
 | Runtime | Delivery | Visibility |
 |---|---|---|
 | microVM | `deploy.env` (`0600` in a `0700` dir) via read-only `russelcfg` virtiofs share | Host root + guest init only |
-| Container | `podman -e` | Visible via `podman inspect` — prefer microVMs for secret-heavy workloads |
+| Container | Plain values: `podman -e`. `secret://` values: a Podman secret `russel-<id>.<KEY>` (created over stdin, injected with `--secret ...,type=env`) | Plain values show in `podman inspect`; secret values do not, and never reach argv. Podman keeps them in its secret store (`0600`, podman user). Removed with the container. |
 
 `russel-agent` lifetime RPCs forward the same env contract; agent env passthrough is documented in the agent crate.
 
@@ -67,6 +67,7 @@ See `examples/env-config/Russelfile.toml`:
 ```toml
 [service]
 name = "env-config"
+source = "."
 port = 3000
 memory = "128mb"
 type = "container"
@@ -79,7 +80,7 @@ DEMO_SECRET = "secret://DEMO_SECRET"
 
 ```bash
 printf '%s' "bench-secret" | russel secrets set DEMO_SECRET
-russel deploy examples/env-config -p 8080:3000 --vm-id env-demo --runtime container
+russel apply examples/env-config
 curl http://127.0.0.1:8080/
 ```
 

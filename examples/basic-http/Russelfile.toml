@@ -1,6 +1,6 @@
 # basic-http — Go stdlib HTTP server with /health and embedded static assets.
 # Runtime: container (rootless Podman). For microVM, use examples/microvm-http
-# or set type = "microvm" and pass matching --runtime if you pass one.
+# or set type = "microvm" in this Russelfile.
 
 [service]
 name = "api"
@@ -17,8 +17,6 @@ type = "container"
 # LOG_LEVEL = "info"
 # API_TOKEN = "secret://API_TOKEN"
 
-[database.postgres]
-enabled = false
-
-[database.redis]
-enabled = false
+# Optional: pin a stable host-side port (the old `-p 8080:3000`).
+# [ingress]
+# port = 8080

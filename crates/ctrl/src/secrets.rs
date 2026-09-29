@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 fn default_secrets_dir() -> PathBuf {
-    russel_core::paths::data_root().join("secrets")
+    crate::paths::data_root().join("secrets")
 }
 
 /// Validate a secret name: alphanumeric, `_`, `-`, length 1..=64.
@@ -121,6 +121,11 @@ pub fn list_secrets() -> anyhow::Result<Vec<String>> {
 }
 
 const SECRET_REF_PREFIX: &str = "secret://";
+
+/// Whether an env value is a `secret://NAME` reference.
+pub fn is_secret_ref(value: &str) -> bool {
+    value.starts_with(SECRET_REF_PREFIX)
+}
 
 /// Resolve `secret://name` values in an env map. Non-ref values pass through.
 pub fn resolve_env_secrets(

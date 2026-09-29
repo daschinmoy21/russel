@@ -65,6 +65,9 @@ async fn main() -> Result<()> {
     // endpoints work without waiting for GET /vms lazy discovery.
     let report = russel_ctrl::reconcile::reconcile_startup(&state).await;
     tracing::info!(?report, "startup reconcile complete");
+    // Relaunch microVMs with restart = "unless-stopped" that reconcile found
+    // down (host reboot, or the VM died while ctrl was not running).
+    russel_ctrl::restart::relaunch_at_startup(&state);
 
     // Start warm pool prepare in the background so the first deploy after
     // ctrl restart can restore from a paused snapshot instead of cold booting.
@@ -246,7 +249,7 @@ async fn shutdown_signal() {
 /// `flock`. The returned fd must be held for the process lifetime; exiting
 /// releases the lock automatically, so no unlock path is needed.
 fn acquire_instance_lock() -> Result<std::os::fd::OwnedFd> {
-    acquire_instance_lock_at(&russel_core::paths::data_root().join("ctrl.lock"))
+    acquire_instance_lock_at(&russel_ctrl::paths::data_root().join("ctrl.lock"))
 }
 
 fn acquire_instance_lock_at(lock_path: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
@@ -278,8 +281,8 @@ fn acquire_instance_lock_at(lock_path: &std::path::Path) -> Result<std::os::fd::
                 "another russel-ctrl instance is running (lock: {})\n\
                  \n\
                  Check the controller service and port:\n\
-                   systemctl --user status russel-ctrl\n\
-                   systemctl status russel-ctrl  # system unit / NixOS (services.russel)\n\
+                   systemctl status russel-ctrl  # install.sh host\n\
+                   systemctl status russel       # NixOS (services.russel)\n\
                    ss -ltnp | grep {port}",
                 lock_path.display()
             );
@@ -399,7 +402,7 @@ fn live_service_tap_ids() -> std::collections::HashSet<String> {
     };
     let mut taps = std::collections::HashSet::new();
     let mut services = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(russel_core::paths::data_root()) {
+    if let Ok(entries) = std::fs::read_dir(russel_ctrl::paths::data_root()) {
         for entry in entries.flatten() {
             if let Ok(ft) = entry.file_type()
                 && ft.is_dir()
@@ -519,12 +522,15 @@ mod tests {
         );
         assert!(msg.contains(&lock_path.display().to_string()), "got: {msg}");
         assert!(
-            msg.contains("systemctl --user status russel-ctrl"),
+            msg.contains("systemctl status russel-ctrl  # install.sh host"),
             "got: {msg}"
         );
         assert!(msg.contains("ss -ltnp"), "got: {msg}");
         assert!(msg.contains("7878"), "got: {msg}");
-        assert!(msg.contains("systemctl status russel-ctrl"), "got: {msg}");
+        assert!(
+            msg.contains("systemctl status russel       # NixOS"),
+            "got: {msg}"
+        );
 
         drop(first);
         let _third = acquire_instance_lock_at(&lock_path).unwrap();

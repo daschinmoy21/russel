@@ -4,20 +4,14 @@ use std::{fmt, fs, path::Path, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 use crate::volumes::{
-    ExtraPortSpec, VolumeSpec, validate_extra_ports, validate_package_attr, validate_restart,
-    validate_service_args, validate_userns, validate_volumes,
+    ExtraPortSpec, VolumeSpec, reject_userns, validate_extra_ports, validate_package_attr,
+    validate_podman_args, validate_restart, validate_service_args, validate_user, validate_volumes,
 };
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Russelfile {
     pub service: ServiceConfig,
-    /// Database provisioning is not yet implemented.
-    /// When enabled = true, `load` returns an error telling the user
-    /// databases are not supported yet, rather than silently ignoring
-    /// their config.
-    #[serde(default)]
-    pub database: Option<DatabaseConfig>,
     #[serde(default)]
     pub ingress: Option<IngressConfig>,
     /// Bind mounts. Container runtime only. Rootfs stays read-only.
@@ -38,15 +32,14 @@ impl Russelfile {
     /// Parse from a string — shared by `load` and tests.
     pub fn load_from_str(contents: &str) -> anyhow::Result<Self> {
         let mut config: Self = toml::from_str(contents)?;
-        // Reject database config at parse time — it's not implemented yet.
-        if let Some(ref db) = config.database
-            && (db.postgres.as_ref().is_some_and(|p| p.enabled)
-                || db.redis.as_ref().is_some_and(|r| r.enabled))
-        {
-            anyhow::bail!(
-                "database provisioning is not yet supported (remove [database] from Russelfile)"
-            );
+        // One ASCII rule for `service.name` and the service id; the wider
+        // `[A-Za-z0-9._+-]` rule belongs to `bin` only.
+        crate::ids::validate_service_id(&config.service.name)
+            .map_err(|e| anyhow::anyhow!("service.name {:?}: {e}", config.service.name))?;
+        if let Some(bin) = config.service.bin.as_deref() {
+            crate::ids::validate_bin_name(bin).map_err(|e| anyhow::anyhow!("service.bin: {e}"))?;
         }
+        validate_env_map(&config.service.env).map_err(|e| anyhow::anyhow!("[service.env]: {e}"))?;
         if config.service.port == 0 {
             anyhow::bail!("service.port must not be 0");
         }
@@ -62,19 +55,7 @@ impl Russelfile {
                 *host = normalized;
             }
             if let Some(port) = ingress.port {
-                if port == 0 {
-                    anyhow::bail!("ingress.port must not be 0");
-                }
-                if port < 1024 {
-                    anyhow::bail!(
-                        "ingress.port {port} is privileged (< 1024); Traefik owns 80/443"
-                    );
-                }
-                if port == 7878 || port == 7946 {
-                    anyhow::bail!(
-                        "ingress.port {port} collides with the default ctrl (7878) or agent (7946) listen port"
-                    );
-                }
+                validate_publish_host_port("ingress.port", port)?;
             }
         }
         if config.service.cpus < 1 || config.service.cpus > 32 {
@@ -92,12 +73,13 @@ impl Russelfile {
             validate_package_attr(package)?;
         }
         validate_service_args(&config.service.args)?;
-        validate_userns(config.service.userns.as_deref(), is_container)?;
-        validate_restart(config.service.restart.as_deref(), is_container)?;
-        validate_volumes(&config.volumes, is_container)?;
+        validate_podman_args(&config.service.podman_args, is_container)?;
+        validate_user(config.service.user.as_deref())?;
+        reject_userns(config.service.userns.as_deref())?;
+        validate_restart(config.service.restart.as_deref())?;
+        validate_volumes(&config.volumes)?;
         validate_extra_ports(
             &config.ports,
-            is_container,
             config.service.port,
             config.ingress.as_ref().and_then(|i| i.port),
         )?;
@@ -159,8 +141,10 @@ pub fn validate_source_path(source: &str) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
-    #[default]
     Microvm,
+    /// Default when `service.type` is omitted: microVMs are experimental in
+    /// v0.1 and need a privileged ctrl (#473).
+    #[default]
     Container,
 }
 
@@ -222,39 +206,10 @@ impl FromStr for GuestKind {
     }
 }
 
-/// Resolve effective runtime: Russelfile `service.type` is source of truth.
-/// CLI `--runtime` must match when provided; otherwise the file value is used.
-pub fn resolve_runtime(file: RuntimeKind, cli: Option<RuntimeKind>) -> anyhow::Result<RuntimeKind> {
-    match cli {
-        None => Ok(file),
-        Some(cli_kind) if cli_kind == file => Ok(file),
-        Some(cli_kind) => anyhow::bail!(
-            "CLI --runtime {cli_kind} does not match Russelfile service.type ({file})"
-        ),
-    }
-}
-
-/// Resolve the effective ingress host. The Russelfile is the source of truth;
-/// a CLI host may only match it, case-insensitively and after trimming.
-/// Both sides are DNS-validated so a bad `Host()` value fails before Traefik.
-pub fn resolve_ingress_host(
-    file: Option<&str>,
-    cli: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let file = file.map(normalize_ingress_host).transpose()?;
-    let cli = cli.map(normalize_ingress_host).transpose()?;
-
-    match (file, cli) {
-        (Some(file), None) => Ok(Some(file)),
-        (Some(file), Some(cli)) if file == cli => Ok(Some(file)),
-        (Some(file), Some(cli)) => {
-            anyhow::bail!("CLI --host {cli} does not match Russelfile ingress.host ({file})")
-        }
-        (None, None) => Ok(None),
-        (None, Some(cli)) => {
-            anyhow::bail!("CLI --host {cli} does not match Russelfile (no [ingress].host)")
-        }
-    }
+/// Normalize and DNS-validate Russelfile `[ingress].host`, so a bad `Host()`
+/// value fails before Traefik.
+pub fn resolve_ingress_host(file: Option<&str>) -> anyhow::Result<Option<String>> {
+    file.map(normalize_ingress_host).transpose()
 }
 
 fn normalize_ingress_host(host: &str) -> anyhow::Result<String> {
@@ -272,40 +227,32 @@ fn normalize_ingress_host(host: &str) -> anyhow::Result<String> {
 /// 0, privileged (< 1024), and the default ctrl/agent binds as a hint.
 /// The live `RUSSEL_CTRL_ADDR` / `RUSSEL_AGENT_ADDR` collision check stays
 /// deploy-time in the pipeline, which sees the live process env.
-fn validate_ingress_port(port: u16) -> anyhow::Result<()> {
+/// The one host-side publish rule, shared by `[ingress].port` and
+/// `[[ports]]` hosts. `field` names the source in the error.
+pub fn validate_publish_host_port(field: &str, port: u16) -> anyhow::Result<()> {
     if port == 0 {
-        anyhow::bail!("ingress.port must not be 0");
+        anyhow::bail!("{field} must not be 0");
     }
     if port < 1024 {
-        anyhow::bail!("ingress.port {port} is privileged (< 1024); Traefik owns 80/443");
+        anyhow::bail!("{field} {port} is privileged (< 1024); Traefik owns 80/443");
     }
     if port == 7878 || port == 7946 {
         anyhow::bail!(
-            "ingress.port {port} collides with the default ctrl (7878) or agent (7946) listen port"
+            "{field} {port} collides with the default ctrl (7878) or agent (7946) listen port"
         );
     }
     Ok(())
 }
 
-/// Resolve the effective host-side ingress port. A CLI-only port remains a
-/// supported escape hatch; when both values exist they must match. The CLI
-/// side is validated here so `-p 80:guest` cannot bypass the file-pin checks.
-pub fn resolve_ingress_port(
-    file: Option<u16>,
-    cli_port: Option<u16>,
-) -> anyhow::Result<Option<u16>> {
-    match (file, cli_port) {
-        (Some(file), None) => Ok(Some(file)),
-        (Some(file), Some(cli)) if file == cli => Ok(Some(file)),
-        (Some(file), Some(cli)) => {
-            anyhow::bail!("CLI -p host {cli} does not match Russelfile ingress.port ({file})")
-        }
-        (None, Some(cli)) => {
-            validate_ingress_port(cli)?;
-            Ok(Some(cli))
-        }
-        (None, None) => Ok(None),
-    }
+/// The primary publish for a deploy: `service.port` is always the guest side
+/// (and `PORT`); `[ingress].port` only pins the host side. `[[ports]]` rows
+/// are additional listeners; load already rejects one reusing that host.
+pub fn resolve_primary_publish(config: &Russelfile) -> Option<crate::api::PortMapping> {
+    let host = config.ingress.as_ref().and_then(|i| i.port)?;
+    Some(crate::api::PortMapping {
+        host,
+        guest: config.service.port,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,20 +267,24 @@ pub struct IngressConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
+    /// Same rule as a service id ([`crate::ids::validate_service_id`]):
+    /// 1..=128 ASCII `[A-Za-z0-9_-]`, not a reserved data-root dir.
     pub name: String,
     pub source: String,
     pub port: u16,
     pub memory: Memory,
-    /// Runtime kind (`microvm` or `container`). TOML field is `type`.
+    /// Runtime kind (`container`, the default, or `microvm`). TOML field is `type`.
     #[serde(default, rename = "type")]
     pub runtime: RuntimeKind,
     /// Guest userspace (`busybox` or `linux`). Default busybox.
     #[serde(default)]
     pub guest: GuestKind,
     /// Name of the binary produced by the build.
-    /// Defaults to `name` if not specified.
+    /// Defaults to `name` if not specified. Wider charset than `name`:
+    /// [`crate::ids::validate_bin_name`] (`[A-Za-z0-9._+-]`, max 256).
     pub bin: Option<String>,
     /// User-defined environment variables injected at deploy time.
+    /// Checked at load with [`validate_env_map`].
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// When true, include bash + curl debug tools and a `/usr/bin/env` wrapper
@@ -344,7 +295,7 @@ pub struct ServiceConfig {
     /// interpreter path).
     #[serde(default)]
     pub debug: bool,
-    /// Guest vCPUs for microVM runtime (1..=32). Ignored for containers.
+    /// CPUs (1..=32): microVM vCPUs, or the container `--cpus` limit.
     /// Defaults to 1 when omitted.
     #[serde(default = "default_cpus")]
     pub cpus: u8,
@@ -352,13 +303,26 @@ pub struct ServiceConfig {
     /// (e.g. `"navidrome"`). A committed flake always wins.
     #[serde(default)]
     pub package: Option<String>,
-    /// Extra argv after the entrypoint binary.
+    /// Process argv after the entrypoint binary (`$out/bin/<bin> <args…>`),
+    /// on both runtimes. Not the same thing as the CLI's `--podman-arg`, which
+    /// adds flags to `podman run` and never reaches the process.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Container-only. Only `"keep-id"` is accepted.
+    /// Extra `podman run` tokens, one per entry (container only). Not
+    /// process argv: that is `args`. Validated fail-closed by the control plane.
+    #[serde(default)]
+    pub podman_args: Vec<String>,
+    /// Who the app runs as, on both runtimes (#466). Omitted: an unprivileged
+    /// user (the control plane's own uid, or `nobody` under a root ctrl).
+    /// `"root"` is the only value.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Removed (#466): loading a Russelfile that sets it fails with a pointer
+    /// to `user`. Kept only to give that message.
     #[serde(default)]
     pub userns: Option<String>,
-    /// Container-only. Only `"unless-stopped"` is accepted.
+    /// Only `"unless-stopped"` is accepted. Containers get Podman's restart
+    /// policy; microVMs are relaunched by ctrl.
     #[serde(default)]
     pub restart: Option<String>,
 }
@@ -455,34 +419,6 @@ pub fn validate_env_map(env: &std::collections::HashMap<String, String>) -> anyh
         }
     }
     Ok(())
-}
-
-/// Merge env maps: base first, then overlay (overlay wins on key conflict).
-pub fn merge_env_maps(
-    base: &std::collections::HashMap<String, String>,
-    overlay: &std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
-    let mut merged = base.clone();
-    for (k, v) in overlay {
-        merged.insert(k.clone(), v.clone());
-    }
-    merged
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DatabaseConfig {
-    pub postgres: Option<PostgresConfig>,
-    pub redis: Option<RedisConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PostgresConfig {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RedisConfig {
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -600,37 +536,21 @@ memory = "512gb"
     }
 
     #[test]
-    fn parse_database_config_disabled_ok() {
-        let toml = r#"
-[service]
-name = "db-app"
-source = "."
-port = 5432
-memory = "512mb"
-
-[database.postgres]
-enabled = false
-"#;
-        let config: Russelfile = toml::from_str(toml).unwrap();
-        let db = config.database.unwrap();
-        assert!(!db.postgres.unwrap().enabled);
-        assert!(db.redis.is_none());
-    }
-
-    #[test]
-    fn parse_database_enabled_rejected() {
-        let toml = r#"
-[service]
-name = "db-app"
-source = "."
-port = 5432
-memory = "512mb"
-
-[database.postgres]
-enabled = true
-"#;
-        let err = Russelfile::load_from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("not yet supported"));
+    fn database_table_is_not_part_of_the_schema() {
+        // Postgres / Redis are ordinary `service.package` apps with
+        // `[[volumes]]`. There is no `[database]` section, placeholder or not.
+        for table in [
+            "[database.postgres]\nenabled = false",
+            "[database.redis]\nenabled = false",
+            "[database.mysql]\nenabled = true",
+        ] {
+            let toml = format!("{}\n{table}\n", minimal_russelfile(None));
+            let err = Russelfile::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field `database`"),
+                "expected [database] to be rejected: {err}"
+            );
+        }
     }
 
     #[test]
@@ -648,7 +568,7 @@ typo_field = "oops"
     }
 
     #[test]
-    fn runtime_defaults_to_microvm_when_omitted() {
+    fn runtime_defaults_to_container_when_omitted() {
         let toml = r#"
 [service]
 name = "app"
@@ -657,7 +577,7 @@ port = 3000
 memory = "256mb"
 "#;
         let config: Russelfile = toml::from_str(toml).unwrap();
-        assert_eq!(config.service.runtime, RuntimeKind::Microvm);
+        assert_eq!(config.service.runtime, RuntimeKind::Container);
     }
 
     #[test]
@@ -748,27 +668,6 @@ guest = "ubuntu"
 "#;
         let err = toml::from_str::<Russelfile>(toml).unwrap_err();
         assert!(err.to_string().contains("ubuntu"));
-    }
-
-    #[test]
-    fn resolve_runtime_match_ok() {
-        let resolved =
-            resolve_runtime(RuntimeKind::Container, Some(RuntimeKind::Container)).unwrap();
-        assert_eq!(resolved, RuntimeKind::Container);
-    }
-
-    #[test]
-    fn resolve_runtime_mismatch_errors() {
-        let err = resolve_runtime(RuntimeKind::Microvm, Some(RuntimeKind::Container)).unwrap_err();
-        assert!(err.to_string().contains("does not match"));
-        assert!(err.to_string().contains("container"));
-        assert!(err.to_string().contains("microvm"));
-    }
-
-    #[test]
-    fn resolve_runtime_cli_omitted_uses_file() {
-        let resolved = resolve_runtime(RuntimeKind::Container, None).unwrap();
-        assert_eq!(resolved, RuntimeKind::Container);
     }
 
     #[test]
@@ -930,43 +829,18 @@ guest = "ubuntu"
     }
 
     #[test]
-    fn resolve_ingress_host_matches_the_file_or_omits_it() {
-        assert_eq!(resolve_ingress_host(None, None).unwrap(), None);
+    fn resolve_ingress_host_normalizes_and_validates_the_file_value() {
+        assert_eq!(resolve_ingress_host(None).unwrap(), None);
         assert_eq!(
-            resolve_ingress_host(Some("  ABC.com  "), None).unwrap(),
+            resolve_ingress_host(Some("  ABC.com  ")).unwrap(),
             Some("abc.com".to_string())
         );
-        assert_eq!(
-            resolve_ingress_host(Some("ABC.com"), Some(" abc.COM ")).unwrap(),
-            Some("abc.com".to_string())
-        );
-
-        let err = resolve_ingress_host(Some("abc.com"), Some("other.com")).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "CLI --host other.com does not match Russelfile ingress.host (abc.com)"
-        );
-
-        let err = resolve_ingress_host(None, Some("abc.com")).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "CLI --host abc.com does not match Russelfile (no [ingress].host)"
-        );
-
-        for value in [Some(""), Some("   ")] {
-            let err = resolve_ingress_host(value, None).unwrap_err();
+        for value in ["", "   "] {
+            let err = resolve_ingress_host(Some(value)).unwrap_err();
             assert_eq!(err.to_string(), "ingress.host must not be empty");
         }
-        let err = resolve_ingress_host(None, Some(" ")).unwrap_err();
-        assert_eq!(err.to_string(), "ingress.host must not be empty");
-
         for bad in ["bad`name", "not a host", "-lead.example.com", "a..b"] {
-            let err = resolve_ingress_host(Some(bad), None).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                format!("ingress.host {bad:?} is not a valid DNS name")
-            );
-            let err = resolve_ingress_host(None, Some(bad)).unwrap_err();
+            let err = resolve_ingress_host(Some(bad)).unwrap_err();
             assert_eq!(
                 err.to_string(),
                 format!("ingress.host {bad:?} is not a valid DNS name")
@@ -974,40 +848,53 @@ guest = "ubuntu"
         }
     }
 
+    fn publish_config(extra: &str) -> Russelfile {
+        Russelfile::load_from_str(&format!(
+            "[service]\nname = \"api\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\ntype = \"container\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn resolve_ingress_port_matches_or_allows_cli_only_pin() {
-        assert_eq!(resolve_ingress_port(None, None).unwrap(), None);
-        assert_eq!(resolve_ingress_port(Some(4000), None).unwrap(), Some(4000));
-        assert_eq!(resolve_ingress_port(None, Some(4000)).unwrap(), Some(4000));
-        assert_eq!(
-            resolve_ingress_port(Some(4000), Some(4000)).unwrap(),
-            Some(4000)
+    fn primary_publish_guest_is_always_service_port() {
+        assert!(resolve_primary_publish(&publish_config("")).is_none());
+        let p = resolve_primary_publish(&publish_config("[ingress]\nport = 8080\n")).unwrap();
+        assert_eq!((p.host, p.guest), (8080, 3000));
+    }
+
+    #[test]
+    fn primary_publish_host_cannot_reuse_a_ports_row() {
+        let err = Russelfile::load_from_str(
+            "[service]\nname = \"api\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n\
+             type = \"container\"\n[ingress]\nport = 8080\n[[ports]]\nhost = 8080\nguest = 9000\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("8080"), "{err}");
+    }
+
+    #[test]
+    fn podman_args_are_container_only_and_bounded() {
+        let config = publish_config("podman_args = [\"-v\", \"/data:/data:ro\"]\n");
+        assert_eq!(config.service.podman_args, vec!["-v", "/data:/data:ro"]);
+
+        let err = Russelfile::load_from_str(
+            "[service]\nname = \"api\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n\
+             type = \"microvm\"\npodman_args = [\"-v\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("service.podman_args requires service.type = \"container\""),
+            "{err}"
         );
 
-        let err = resolve_ingress_port(Some(4000), Some(5000)).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "CLI -p host 5000 does not match Russelfile ingress.port (4000)"
-        );
-
-        for (port, expected) in [
-            (0, "ingress.port must not be 0"),
-            (
-                80,
-                "ingress.port 80 is privileged (< 1024); Traefik owns 80/443",
-            ),
-            (
-                7878,
-                "ingress.port 7878 collides with the default ctrl (7878) or agent (7946) listen port",
-            ),
-            (
-                7946,
-                "ingress.port 7946 collides with the default ctrl (7878) or agent (7946) listen port",
-            ),
-        ] {
-            let err = resolve_ingress_port(None, Some(port)).unwrap_err();
-            assert_eq!(err.to_string(), expected);
-        }
+        let many = vec!["\"-q\""; 33].join(", ");
+        let err = Russelfile::load_from_str(&format!(
+            "[service]\nname = \"api\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n\
+             type = \"container\"\npodman_args = [{many}]\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("too many entries"), "{err}");
     }
 
     #[test]
@@ -1134,20 +1021,6 @@ FEATURE_X = "1"
         map.insert("FOO".to_string(), "a".repeat(4097));
         let err = validate_env_map(&map).unwrap_err();
         assert!(err.to_string().contains("too long"));
-    }
-
-    #[test]
-    fn merge_env_maps_overlay_wins() {
-        let mut base = HashMap::new();
-        base.insert("A".to_string(), "base".to_string());
-        base.insert("B".to_string(), "base_b".to_string());
-        let mut overlay = HashMap::new();
-        overlay.insert("A".to_string(), "overlay".to_string());
-        overlay.insert("C".to_string(), "overlay_c".to_string());
-        let merged = merge_env_maps(&base, &overlay);
-        assert_eq!(merged.get("A"), Some(&"overlay".to_string()));
-        assert_eq!(merged.get("B"), Some(&"base_b".to_string()));
-        assert_eq!(merged.get("C"), Some(&"overlay_c".to_string()));
     }
 
     #[test]
@@ -1301,7 +1174,7 @@ port = 4533
 memory = "512mb"
 type = "container"
 package = "navidrome"
-userns = "keep-id"
+user = "root"
 restart = "unless-stopped"
 args = ["--loglevel", "info"]
 
@@ -1321,6 +1194,21 @@ guest = 4534
         assert_eq!(config.volumes.len(), 1);
         assert!(config.volumes[0].keep);
         assert_eq!(config.ports[0].host, 4534);
+        assert_eq!(config.service.user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn userns_fails_load_with_a_pointer_to_user() {
+        let toml = r#"
+[service]
+name = "pg"
+source = "."
+port = 5432
+memory = "256mb"
+userns = "keep-id"
+"#;
+        let err = Russelfile::load_from_str(toml).unwrap_err().to_string();
+        assert!(err.contains("service.user"), "{err}");
     }
 
     #[test]
@@ -1372,20 +1260,158 @@ guest = 4534
     }
 
     #[test]
-    fn volumes_rejected_on_microvm() {
+    fn volumes_and_ports_load_on_microvm() {
         let toml = r#"
 [service]
 name = "app"
 source = "."
 port = 3000
 memory = "256mb"
+type = "microvm"
 
 [[volumes]]
 name = "data"
 guest = "/data"
+
+[[ports]]
+host = 50300
+guest = 50300
 "#;
-        let err = Russelfile::load_from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("container"));
+        let config = Russelfile::load_from_str(toml).unwrap();
+        assert_eq!(config.volumes.len(), 1);
+        assert_eq!(config.ports.len(), 1);
+    }
+
+    fn service_with(fields: &str) -> String {
+        format!("[service]\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n{fields}\n",)
+    }
+
+    #[test]
+    fn service_name_follows_the_service_id_rule_at_load() {
+        for name in ["app", "my-app", "svc_01", &"a".repeat(128)] {
+            Russelfile::load_from_str(&service_with(&format!("name = {name:?}"))).unwrap();
+        }
+        for name in [
+            "",
+            "my app",
+            "my.app",
+            "a/b",
+            "g++",
+            "сервис",
+            "café",
+            "secrets",
+            "_pool",
+            &"a".repeat(129),
+        ] {
+            let err = Russelfile::load_from_str(&service_with(&format!("name = {name:?}")))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("service.name"),
+                "expected {name:?} to be rejected as service.name: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_bin_keeps_the_wider_rule_at_load() {
+        for bin in ["my.app", "g++", "gcc-12.2", "a.out", &"b".repeat(256)] {
+            let toml = service_with(&format!("name = \"app\"\nbin = {bin:?}"));
+            let config = Russelfile::load_from_str(&toml).unwrap();
+            assert_eq!(config.service.bin_name(), bin);
+        }
+        for bin in ["", ".", "..", "a b", "a/b", "$(x)", &"b".repeat(257)] {
+            let toml = service_with(&format!("name = \"app\"\nbin = {bin:?}"));
+            let err = Russelfile::load_from_str(&toml).unwrap_err().to_string();
+            assert!(
+                err.starts_with("service.bin"),
+                "expected bin {bin:?} to be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_env_is_validated_at_load() {
+        let ok = service_with(
+            "name = \"app\"\n[service.env]\nLOG_LEVEL = \"info\"\nTOKEN = \"secret://TOKEN\"",
+        );
+        assert_eq!(Russelfile::load_from_str(&ok).unwrap().service.env.len(), 2);
+
+        for (entry, expected) in [
+            ("PORT = \"1\"", "reserved"),
+            ("LD_AUDIT = \"x\"", "reserved"),
+            ("\"1FOO\" = \"x\"", "must start with a letter"),
+            ("\"MY-VAR\" = \"x\"", "invalid characters"),
+            ("FOO = \"a\\nb\"", "newline"),
+        ] {
+            let toml = service_with(&format!("name = \"app\"\n[service.env]\n{entry}"));
+            let err = Russelfile::load_from_str(&toml).unwrap_err().to_string();
+            assert!(
+                err.starts_with("[service.env]") && err.contains(expected),
+                "expected {entry:?} to fail with {expected:?}: {err}"
+            );
+        }
+
+        let long = service_with(&format!(
+            "name = \"app\"\n[service.env]\nFOO = \"{}\"",
+            "a".repeat(4097)
+        ));
+        let err = Russelfile::load_from_str(&long).unwrap_err().to_string();
+        assert!(err.contains("too long"), "{err}");
+
+        let many: String = (0..65).map(|i| format!("K{i} = \"v\"\n")).collect();
+        let toml = service_with(&format!("name = \"app\"\n[service.env]\n{many}"));
+        let err = Russelfile::load_from_str(&toml).unwrap_err().to_string();
+        assert!(err.contains("too many env keys"), "{err}");
+    }
+
+    /// Every Russelfile shipped under `examples/` must load. CI runs this,
+    /// so an example that drifts from the schema fails the build.
+    #[test]
+    fn every_shipped_russelfile_loads() {
+        fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.file_name().and_then(|n| n.to_str()) == Some("Russelfile.toml") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        collect(&root.join("examples"), &mut files);
+        assert!(
+            files.len() >= 10,
+            "expected the shipped examples, found {files:?}"
+        );
+        for file in files {
+            if let Err(e) = Russelfile::load(&file) {
+                panic!("{} does not load: {e:#}", file.display());
+            }
+        }
+    }
+
+    #[test]
+    fn service_args_load_on_both_runtimes() {
+        let container =
+            service_with("name = \"redis\"\ntype = \"container\"\nargs = [\"--dir\", \"/data\"]");
+        let config = Russelfile::load_from_str(&container).unwrap();
+        assert_eq!(config.service.args, vec!["--dir", "/data"]);
+
+        // Omitted type is container, so args load.
+        let omitted = service_with("name = \"app\"\nargs = [\"--flag\"]");
+        Russelfile::load_from_str(&omitted).unwrap();
+
+        let toml = service_with("name = \"app\"\ntype = \"microvm\"\nargs = [\"--flag\"]");
+        let config = Russelfile::load_from_str(&toml).unwrap();
+        assert_eq!(config.service.args, vec!["--flag"]);
+        // Shape limits still apply on a microVM.
+        let newline = service_with("name = \"app\"\ntype = \"microvm\"\nargs = [\"a\\nb\"]");
+        assert!(Russelfile::load_from_str(&newline).is_err());
+        let empty = service_with("name = \"app\"\ntype = \"microvm\"\nargs = []");
+        Russelfile::load_from_str(&empty).unwrap();
     }
 
     #[test]

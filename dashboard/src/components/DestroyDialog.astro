@@ -1,0 +1,15 @@
+<!-- Destroy confirmation, shared by the services list and detail page.
+     Open it with confirmDestroy() from ../lib/destroy_dialog. -->
+<div id="destroyModal" class="modal-overlay hidden">
+  <div class="modal-content card-panel" role="alertdialog" aria-modal="true" aria-labelledby="destroyModalTitle">
+    <h3 id="destroyModalTitle" class="modal-title">Confirm Destruction</h3>
+    <p class="modal-description">
+      Are you sure you want to destroy <strong id="destroyServiceName">this service</strong>?
+      This will terminate the microVM/container instance and purge network interfaces. This action cannot be undone.
+    </p>
+    <div class="modal-actions">
+      <button id="btnCancelDestroy" class="btn btn-secondary">Cancel</button>
+      <button id="btnConfirmDestroy" class="btn btn-danger">Confirm Destroy</button>
+    </div>
+  </div>
+</div>

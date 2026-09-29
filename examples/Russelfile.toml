@@ -5,9 +5,3 @@ source = "."
 port = 3000
 memory = "256mb"
 type = "container"
-
-[database.postgres]
-enabled = false
-
-[database.redis]
-enabled = false

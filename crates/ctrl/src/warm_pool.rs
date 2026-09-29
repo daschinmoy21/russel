@@ -28,13 +28,15 @@ use std::{
 
 use crate::{
     ch_api,
-    microvm::{self, BootOutput, MicrovmRunner, VmSpec, ensure_private_dir, service_fs_mounts},
-    network::{self, SubnetAllocation, TapForwarder},
+    microvm::{
+        self, BootOutput, FsMount, MicrovmRunner, VmSpec, ensure_private_dir, service_fs_mounts,
+    },
+    network::{self, SubnetAllocation, TapForwarder, VmNet},
 };
 
 /// Pool state directories (under `/var/lib/russel/_pool/`).
 fn pool_base() -> std::path::PathBuf {
-    russel_core::paths::data_root().join("_pool")
+    crate::paths::data_root().join("_pool")
 }
 
 fn golden_dir() -> std::path::PathBuf {
@@ -167,7 +169,7 @@ impl WarmPool {
             cpus_max: env_cpu_max(),
             memory_mb: 256, // minimum viable; hotplug adds headroom
             memory_hotplug_mb: env_mem_hotplug_mb(),
-            tap: alloc.tap_id.clone(),
+            net: VmNet::Tap(alloc.tap_id.clone()),
             mac: alloc.mac.clone(),
             api_socket: api_socket.clone(),
             fs: service_fs_mounts(
@@ -271,18 +273,27 @@ impl WarmPool {
         kernel_path: &Path,
         initramfs_path: &Path,
         alloc: &SubnetAllocation,
+        net: &VmNet,
+        volume_fs: &[FsMount],
         memory_mb: u16,
         cpus_boot: u8,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
-        if !self.is_ready() {
-            tracing::info!(service_id, "warm pool not ready — cold booting");
+        // Golden snapshots are taken with a TAP NIC and the three base shares;
+        // passt VMs and VMs with [[volumes]] cold boot.
+        if !self.is_ready() || matches!(net, VmNet::VhostUser(_)) || !volume_fs.is_empty() {
+            tracing::info!(
+                service_id,
+                "warm pool not ready or not applicable — cold booting"
+            );
             return self
                 .cold_boot(
                     service_id,
                     kernel_path,
                     initramfs_path,
                     alloc,
+                    net,
+                    volume_fs,
                     memory_mb,
                     cpus_boot,
                     config_dir,
@@ -302,6 +313,8 @@ impl WarmPool {
                     kernel_path,
                     initramfs_path,
                     alloc,
+                    net,
+                    volume_fs,
                     memory_mb,
                     cpus_boot,
                     config_dir,
@@ -324,6 +337,8 @@ impl WarmPool {
                     kernel_path,
                     initramfs_path,
                     alloc,
+                    net,
+                    volume_fs,
                     memory_mb,
                     cpus_boot,
                     config_dir,
@@ -340,13 +355,13 @@ impl WarmPool {
         kernel_path: &Path,
         initramfs_path: &Path,
         alloc: &SubnetAllocation,
+        net: &VmNet,
+        volume_fs: &[FsMount],
         memory_mb: u16,
         cpus_boot: u8,
         config_dir: &Path,
     ) -> anyhow::Result<BootOutput> {
-        let sock_dir = russel_core::paths::service_dir(service_id)
-            .display()
-            .to_string();
+        let sock_dir = crate::paths::service_dir(service_id).display().to_string();
         std::fs::create_dir_all(&sock_dir)?;
         let scratch_dir = PathBuf::from(format!("{sock_dir}/scratch"));
         ensure_private_dir(&scratch_dir)?;
@@ -363,10 +378,13 @@ impl WarmPool {
             cpus_max,
             memory_mb,
             memory_hotplug_mb: env_mem_hotplug_mb(),
-            tap: alloc.tap_id.clone(),
+            net: net.clone(),
             mac: alloc.mac.clone(),
             api_socket,
-            fs: service_fs_mounts(Path::new(&sock_dir), config_dir, &scratch_dir),
+            fs: service_fs_mounts(Path::new(&sock_dir), config_dir, &scratch_dir)
+                .into_iter()
+                .chain(volume_fs.iter().cloned())
+                .collect(),
             console: "null".into(),
             restore_url: None,
         };
@@ -386,9 +404,7 @@ impl WarmPool {
         // (or another restore) cannot race the golden snapshot being read.
         let _lock = self.restore_mutex.lock().await;
 
-        let sock_dir = russel_core::paths::service_dir(service_id)
-            .display()
-            .to_string();
+        let sock_dir = crate::paths::service_dir(service_id).display().to_string();
         std::fs::create_dir_all(&sock_dir)?;
 
         let restore_dir = format!("{sock_dir}/restore");
@@ -447,7 +463,7 @@ impl WarmPool {
             cpus_max: env_cpu_max(),
             memory_mb: memory_mb.max(256),
             memory_hotplug_mb: env_mem_hotplug_mb(),
-            tap: alloc.tap_id.clone(),
+            net: VmNet::Tap(alloc.tap_id.clone()),
             mac: alloc.mac.clone(),
             api_socket: PathBuf::from(&api_socket_path),
             fs: service_fs_mounts(Path::new(&sock_dir), config_dir, &scratch_dir),

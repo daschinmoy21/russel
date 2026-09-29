@@ -1,14 +1,12 @@
 ---
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
-import { isDemoMode } from '../lib/api';
 ---
 
 <Layout title="Deploy Service" activePath="/deploy">
   <Header
     title="Deploy New Service"
     subtitle="Provision a fresh Cloud-Hypervisor microVM or Podman container workload."
-    isDemo={isDemoMode()}
   />
 
   <div class="deploy-grid">
@@ -29,44 +27,9 @@ import { isDemoMode } from '../lib/api';
           <span class="field-hint">Path to <code>Russelfile.toml</code> in the repository.</span>
         </div>
 
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label" for="runtime">Runtime Engine</label>
-            <select id="runtime" class="form-select">
-              <option value="">Auto-detect</option>
-              <option value="microvm">MicroVM (Cloud-Hypervisor)</option>
-              <option value="container">Container (Podman Rootless)</option>
-            </select>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label" for="vmId">VM / Instance ID (Optional)</label>
-            <input type="text" id="vmId" class="form-input" placeholder="Auto-generated if blank" />
-          </div>
-        </div>
-
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label" for="hostPort">Host Port</label>
-            <input type="number" id="hostPort" class="form-input" placeholder="e.g. 8080" min="1" max="65535" />
-            <span class="field-hint">Must match <code>[ingress].port</code> when the Russelfile pins one. Must be ≥1024 and not 7878/7946.</span>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label" for="guestPort">Guest Port</label>
-            <input type="number" id="guestPort" class="form-input" placeholder="e.g. 3000" min="1" max="65535" />
-          </div>
-        </div>
-
         <div class="form-group">
-          <label class="form-label" for="ingressHost">Ingress Host (optional)</label>
-          <input type="text" id="ingressHost" class="form-input" placeholder="e.g. abc.com" />
-          <span class="field-hint">Exact Traefik <code>Host()</code> value. Must match <code>[ingress].host</code> when the Russelfile sets one; omitted means <code>&lt;service&gt;.russel.local</code>.</span>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label" for="envVars">Environment Variables (KEY=VALUE per line)</label>
-          <textarea id="envVars" class="form-textarea" rows="3" placeholder="DATABASE_URL=postgres://...&#10;PORT=8080"></textarea>
+          <label class="form-label" for="vmId">Expected service name (optional, must match service.name)</label>
+          <input type="text" id="vmId" class="form-input" placeholder="service.name" />
         </div>
 
         <div class="form-actions">
@@ -78,6 +41,8 @@ import { isDemoMode } from '../lib/api';
           </button>
         </div>
       </form>
+      <p class="field-hint">The Russelfile is the whole desired state: its <code>service.name</code> is the service id, and runtime, ports, host, env, and podman flags all come from it.</p>
+      <p class="field-hint hidden" id="deployedLink"></p>
     </div>
 
     <!-- Deployment Terminal Console -->
@@ -102,6 +67,7 @@ import { isDemoMode } from '../lib/api';
   const deployConsole = document.getElementById('deployConsole');
   const streamStatus = document.getElementById('streamStatus');
   const btnSubmit = document.getElementById('btnSubmitDeploy');
+  const deployedLink = document.getElementById('deployedLink');
 
   form?.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -111,72 +77,12 @@ import { isDemoMode } from '../lib/api';
     streamStatus.textContent = 'Deploying...';
     streamStatus.className = 'badge badge-warning';
     deployConsole.textContent = '';
+    deployedLink?.classList.add('hidden');
+    let deployedId = '';
 
     const repo_url = (document.getElementById('repoUrl') as HTMLInputElement).value.trim();
     const config_path = (document.getElementById('configPath') as HTMLInputElement).value.trim() || 'Russelfile.toml';
     const vm_id = (document.getElementById('vmId') as HTMLInputElement).value.trim() || undefined;
-    const runtimeVal = (document.getElementById('runtime') as HTMLSelectElement).value;
-    const runtime = (runtimeVal === 'microvm' || runtimeVal === 'container') ? runtimeVal as 'microvm' | 'container' : undefined;
-    const hostPortStr = (document.getElementById('hostPort') as HTMLInputElement).value.trim();
-    const guestPortStr = (document.getElementById('guestPort') as HTMLInputElement).value.trim();
-    const ingressHostRaw = (document.getElementById('ingressHost') as HTMLInputElement).value.trim();
-    const envRaw = (document.getElementById('envVars') as HTMLTextAreaElement).value.trim();
-
-    /** Parse a port field: integer 1–65535, or null if empty/invalid. */
-    function parsePortField(raw: string): number | null {
-      if (!raw) return null;
-      if (!/^\d+$/.test(raw)) return null;
-      const n = Number(raw);
-      if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
-      return n;
-    }
-
-    // Port mapping: omit when both empty; both required (and valid) if either is set.
-    // Never coerce empty/invalid to 0 (see #285).
-    let port: { host: number; guest: number } | undefined;
-    if (hostPortStr || guestPortStr) {
-      if (!hostPortStr || !guestPortStr) {
-        deployConsole.textContent = '[Error] Both host and guest ports are required when either is set (valid range 1–65535).\n';
-        streamStatus.textContent = 'Failed';
-        streamStatus.className = 'badge badge-stopped';
-        btnSubmit.removeAttribute('disabled');
-        return;
-      }
-      const host = parsePortField(hostPortStr);
-      const guest = parsePortField(guestPortStr);
-      if (host == null || guest == null) {
-        deployConsole.textContent = '[Error] Ports must be integers in the range 1–65535.\n';
-        streamStatus.textContent = 'Failed';
-        streamStatus.className = 'badge badge-stopped';
-        btnSubmit.removeAttribute('disabled');
-        return;
-      }
-      port = { host, guest };
-    }
-
-    // Ingress host: exact Traefik Host() value; ctrl enforces match-or-omit
-    // against [ingress].host. Client-side guard for the reserved/port rules.
-    let host: string | undefined;
-    if (ingressHostRaw) {
-      if (ingressHostRaw.length > 253 || !/^[A-Za-z0-9.-]+$/.test(ingressHostRaw)) {
-        deployConsole.textContent = '[Error] Ingress host must be a valid DNS name (letters, digits, dots, hyphens, max 253 chars).\n';
-        streamStatus.textContent = 'Failed';
-        streamStatus.className = 'badge badge-stopped';
-        btnSubmit.removeAttribute('disabled');
-        return;
-      }
-      host = ingressHostRaw;
-    }
-
-    const env: Record<string, string> = {};
-    if (envRaw) {
-      for (const line of envRaw.split('\n')) {
-        const eq = line.indexOf('=');
-        if (eq > 0) {
-          env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
-        }
-      }
-    }
 
     const handleEvent = (ev: DeployEvent) => {
       const ts = new Date().toISOString().slice(11, 19);
@@ -185,17 +91,28 @@ import { isDemoMode } from '../lib/api';
       } else if (ev.type === 'Complete') {
         const p = ev.payload;
         deployConsole.textContent += `[${ts}] COMPLETE: ${p.message} (${p.elapsed_ms}ms, service_id=${p.service_id}, status=${p.status})\n`;
+        deployedId = p.service_id || '';
       } else if (ev.type === 'Error') {
         deployConsole.textContent += `[${ts}] ERROR: ${ev.payload}\n`;
       }
       deployConsole.scrollTop = deployConsole.scrollHeight;
     };
 
-    const result = await api.deployService({ repo_url, config_path, vm_id, port, host, runtime, env }, handleEvent);
+    const result = await api.deployService({ repo_url, config_path, vm_id }, handleEvent);
 
     streamStatus.textContent = result.success ? 'Complete' : 'Failed';
     streamStatus.className = result.success ? 'badge badge-running' : 'badge badge-stopped';
     btnSubmit.removeAttribute('disabled');
+
+    // The id comes from the Russelfile, so link to whatever the server deployed.
+    if (deployedLink && deployedId) {
+      deployedLink.replaceChildren('Service ');
+      const a = document.createElement('a');
+      a.href = `/service-detail?id=${encodeURIComponent(deployedId)}`;
+      a.textContent = deployedId;
+      deployedLink.append(a, ' (id from service.name)');
+      deployedLink.classList.remove('hidden');
+    }
   });
 </script>
 
@@ -203,13 +120,7 @@ import { isDemoMode } from '../lib/api';
   .deploy-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 1.5rem;
-  }
-
-  @media (max-width: 960px) {
-    .deploy-grid {
-      grid-template-columns: 1fr;
-    }
+    gap: 2.5rem;
   }
 
   .form-row {
@@ -225,35 +136,54 @@ import { isDemoMode } from '../lib/api';
   }
 
   .field-hint {
-    font-size: 0.76rem;
-    color: var(--text-muted);
-    margin-top: 0.15rem;
+    font-size: 0.85rem;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    margin-top: 0.25rem;
   }
 
   .field-hint code {
     font-family: var(--font-mono);
-    color: var(--accent-primary);
+    color: var(--text-primary);
+    font-weight: 600;
   }
 
+  /* The divider runs down the whole column so the header, subtitle, and
+     log text share one left edge. */
   .console-panel {
     display: flex;
     flex-direction: column;
+    border-left: 1px solid var(--border-card);
+    padding-left: 1.5rem;
   }
 
   .console-panel .subtitle code {
     font-family: var(--font-mono);
-    color: var(--accent-primary);
-    font-size: 0.8rem;
+    color: var(--text-primary);
+    font-weight: 600;
   }
 
   .panel-header-row {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: flex-start;
   }
 
   .log-console {
     flex: 1;
     min-height: 380px;
+    border-left: none;
+    padding-left: 0;
+  }
+
+  @media (max-width: 960px) {
+    .deploy-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .console-panel {
+      border-left: none;
+      padding-left: 0;
+    }
   }
 </style>

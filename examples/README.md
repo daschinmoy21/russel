@@ -18,7 +18,7 @@ Self-contained apps for trying **container** (default) and **microVM** deploys.
 | [caddy](caddy/) | container | nixpkgs `caddy` via `service.package` | 8080 | Stateless `file-server`; no volume |
 | [meilisearch](meilisearch/) | container | nixpkgs `meilisearch` via `service.package` | 7700 | Managed `data` volume; demo master key |
 
-The container examples with a committed `Dockerfile` (the Go, Rust, Python, and filebrowser set) can race Russel against raw podman/docker via `./bench.sh`. The `service.package` demos build from nixpkgs and ship no Dockerfile.
+Every example has a `Dockerfile`, used only as the raw podman/docker baseline in `./bench.sh`. For the `service.package` demos it is the upstream image at the version nixpkgs ships, so their baseline "build" is an image pull, not a compile.
 
 ## Prerequisites
 
@@ -36,11 +36,11 @@ Rootless Podman is required for `type = "container"`. See root [README](../READM
 ## Quick deploy
 
 ```bash
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id basic
+./target/debug/russel deploy examples/basic-http
 curl http://127.0.0.1:8080/health
-./target/debug/russel destroy basic
+./target/debug/russel destroy api
 ```
 
 ## Runtime switch (dual-live)
 
-Redeploy the same `--vm-id` with a different Russelfile `type` (and matching `--runtime` if set). Russel boots a candidate generation, **Traefik `Ingress::swap`**, then tears down the old runtime. Prefer `http://<id>.russel.local` over a fixed `-p` for stable URLs.
+Change `service.type` in the Russelfile and deploy again to switch runtime for that service. The `service.name` stays its id across deploys. Russel boots a candidate generation, **Traefik `Ingress::swap`**, then tears down the old runtime. Prefer `http://<service.name>.russel.local` for a stable URL.

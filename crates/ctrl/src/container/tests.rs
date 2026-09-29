@@ -1,9 +1,13 @@
-use super::passthrough::validate_nix_store_source;
+use super::passthrough::{
+    podman_passthrough_disabled_from, validate_nix_store_source,
+    validate_podman_passthrough_args_with,
+};
 use super::podman_user::{configured_podman_user, resolve_podman_user};
 use super::rootfs::select_nix_tool_store_path;
 use super::runner::{
-    NIX_STORE_MOUNT, is_trusted_container_name, prepare_managed_volume_dirs,
-    resolve_container_name, rootless_required_error,
+    NIX_STORE_MOUNT, is_trusted_container_name, podman_has_cgroup_controller, podman_secret_name,
+    prepare_managed_volume_dirs, remove_tree_with, resolve_container_name, rootless_required_error,
+    secrets_for_container,
 };
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -113,7 +117,13 @@ async fn prepare_rootfs_creates_layout_and_modes() {
         & 0o7777;
     assert_eq!(tmp_mode, 0o1777);
 
-    assert_eq!(prepared.entrypoint, PathBuf::from("/bin/app"));
+    // Exec the store path (PostgreSQL 17+ resolves ../lib from argv[0]);
+    // the /bin link stays for PATH lookups and debugging.
+    assert_eq!(
+        prepared.entrypoint,
+        PathBuf::from("/nix/store/fake-app-package/bin/app")
+    );
+    assert!(rootfs.join("bin/app").is_symlink());
 
     // debug: false — bash, curl, and env wrapper must be absent.
     assert!(
@@ -229,7 +239,7 @@ fn container_name_rejects_invalid_service_id_in_run_args() {
         guest_port: 3000,
         memory_mb: 256,
         env: vec![],
-        extra_args: vec![],
+        podman_args: vec![],
         ..Default::default()
     };
     let err = build_run_args(&spec, &container_log_path("evil")).unwrap_err();
@@ -251,7 +261,7 @@ fn build_run_args_includes_rootfs_mount_ports_memory_and_labels() {
             ("PORT".into(), "3000".into()),
             ("RUSSEL".into(), "1".into()),
         ],
-        extra_args: vec![],
+        podman_args: vec![],
         ..Default::default()
     };
     let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
@@ -420,7 +430,7 @@ fn managed_port_appears_after_passthrough_env() {
         guest_port: 3000,
         memory_mb: 512,
         env: vec![("PORT".into(), "3000".into())],
-        extra_args: vec!["-e".into(), "FOO=bar".into()],
+        podman_args: vec!["-e".into(), "FOO=bar".into()],
         ..Default::default()
     };
     let log_path = PathBuf::from("/var/lib/russel/api-1/container.log");
@@ -873,34 +883,15 @@ fn accept_network_allowed_modes() {
 }
 
 #[test]
-fn reject_userns_disallowed() {
-    for val in ["host", "auto", "nomap"] {
-        let err =
-            validate_podman_passthrough_args(&["--userns".into(), val.to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("only keep-id"),
-            "expected rejection for --userns {val}: {err}"
-        );
+fn reject_userns_in_favor_of_service_user() {
+    for args in [
+        vec!["--userns".to_string(), "keep-id".to_string()],
+        vec!["--userns=host".to_string()],
+        vec!["--userns".to_string()],
+    ] {
+        let err = validate_podman_passthrough_args(&args).unwrap_err();
+        assert!(err.to_string().contains("service.user"), "{args:?}: {err}");
     }
-    for eq in ["--userns=host", "--userns=auto"] {
-        let err = validate_podman_passthrough_args(&[eq.to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("only keep-id"),
-            "expected rejection for {eq}: {err}"
-        );
-    }
-}
-
-#[test]
-fn accept_userns_keep_id() {
-    validate_podman_passthrough_args(&["--userns".into(), "keep-id".into()]).unwrap();
-    validate_podman_passthrough_args(&["--userns=keep-id".into()]).unwrap();
-}
-
-#[test]
-fn reject_userns_no_value() {
-    let err = validate_podman_passthrough_args(&["--userns".into()]).unwrap_err();
-    assert!(err.to_string().contains("requires a value"), "{err}");
 }
 
 #[test]
@@ -911,7 +902,7 @@ fn accept_secret() {
 
 #[test]
 fn reject_unknown_passthrough_flags() {
-    with_allow_podman_args_env(None, || {
+    {
         for arg in [
             "--hooks-dir=/tmp/hooks",
             "--runtime=runc",
@@ -928,7 +919,7 @@ fn reject_unknown_passthrough_flags() {
             "--conmon-pidfile=/tmp/x",
             "--cidfile=/tmp/x",
         ] {
-            let err = validate_podman_passthrough_args(&[arg.to_string()]).unwrap_err();
+            let err = validate_podman_passthrough_args_with(&[arg.to_string()], false).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("not on the allowlist")
@@ -939,7 +930,7 @@ fn reject_unknown_passthrough_flags() {
                 "expected allowlist denial for {arg}: {err}"
             );
         }
-    });
+    }
 }
 
 #[test]
@@ -1040,63 +1031,35 @@ fn reject_tmpfs_non_absolute_destination() {
     );
 }
 
-static ALLOW_PODMAN_ARGS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_allow_podman_args_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-    let _guard = ALLOW_PODMAN_ARGS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let previous = std::env::var("RUSSEL_ALLOW_PODMAN_ARGS").ok();
-    // SAFETY: exclusive lock held for the duration of the mutation + assertion.
-    unsafe {
-        match value {
-            Some(v) => std::env::set_var("RUSSEL_ALLOW_PODMAN_ARGS", v),
-            None => std::env::remove_var("RUSSEL_ALLOW_PODMAN_ARGS"),
-        }
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    unsafe {
-        match previous {
-            Some(v) => std::env::set_var("RUSSEL_ALLOW_PODMAN_ARGS", v),
-            None => std::env::remove_var("RUSSEL_ALLOW_PODMAN_ARGS"),
-        }
-    }
-    match result {
-        Ok(v) => v,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
-}
-
+// The switch is tested through the pure functions: setting
+// RUSSEL_ALLOW_PODMAN_ARGS here would race every other passthrough test,
+// since cargo runs tests in parallel and they all read it.
 #[test]
 fn russel_allow_podman_args_zero_rejects_extras() {
     for falsy in ["0", "false", "no", "off", "disabled"] {
-        with_allow_podman_args_env(Some(falsy), || {
-            let err = validate_podman_passthrough_args(&["--network".into(), "bridge".into()])
-                .unwrap_err();
-            assert!(
-                err.to_string().contains("RUSSEL_ALLOW_PODMAN_ARGS"),
-                "expected disable message for {falsy:?}: {err}"
-            );
-            // Empty extras still ok.
-            validate_podman_passthrough_args(&[]).unwrap();
-        });
+        assert!(
+            podman_passthrough_disabled_from(Some(falsy)),
+            "{falsy:?} must disable passthrough"
+        );
     }
+    let err = validate_podman_passthrough_args_with(&["--network".into(), "bridge".into()], true)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("RUSSEL_ALLOW_PODMAN_ARGS"),
+        "expected disable message: {err}"
+    );
+    // Empty extras still ok.
+    validate_podman_passthrough_args_with(&[], true).unwrap();
 }
 
 #[test]
-fn russel_allow_podman_args_truthy_allows_allowlisted() {
-    for truthy in ["1", "true", "yes", "on"] {
-        with_allow_podman_args_env(Some(truthy), || {
-            validate_podman_passthrough_args(&["--network".into(), "bridge".into()]).unwrap();
-        });
+fn russel_allow_podman_args_truthy_or_unset_allows_allowlisted() {
+    for value in [None, Some("1"), Some("true"), Some("yes"), Some("on")] {
+        let disabled = podman_passthrough_disabled_from(value);
+        assert!(!disabled, "{value:?} must leave the allowlist in effect");
+        validate_podman_passthrough_args_with(&["--network".into(), "bridge".into()], disabled)
+            .unwrap();
     }
-}
-
-#[test]
-fn russel_allow_podman_args_unset_allows_allowlisted() {
-    with_allow_podman_args_env(None, || {
-        validate_podman_passthrough_args(&["--network".into(), "bridge".into()]).unwrap();
-    });
 }
 
 #[test]
@@ -1111,7 +1074,7 @@ fn build_run_args_reasserts_hardening_after_passthrough() {
         guest_port: 3000,
         memory_mb: 512,
         env: vec![("PORT".into(), "3000".into())],
-        extra_args: vec![
+        podman_args: vec![
             "--cap-drop".into(),
             "NET_RAW".into(),
             "--network".into(),
@@ -1343,7 +1306,7 @@ fn build_run_args_inserts_passthrough_before_entrypoint() {
         guest_port: 3000,
         memory_mb: 512,
         env: vec![("PORT".into(), "3000".into())],
-        extra_args: vec![
+        podman_args: vec![
             "-v".into(),
             "/nix/store/abc123:/dest:ro".into(),
             "--network".into(),
@@ -1365,7 +1328,7 @@ fn build_run_args_inserts_passthrough_before_entrypoint() {
 fn container_log_path_is_under_service_base_dir() {
     assert_eq!(
         container_log_path("demo"),
-        PathBuf::from("/var/lib/russel/demo/container.log")
+        crate::paths::service_dir("demo").join("container.log")
     );
 }
 
@@ -1442,7 +1405,7 @@ fn build_run_args_adds_rw_volume_and_keeps_rootfs_readonly() {
             name: Some("data".into()),
         }],
         extra_ports: vec![(50300, 50300)],
-        args: vec!["--loglevel".into(), "info".into()],
+        service_args: vec!["--loglevel".into(), "info".into()],
         userns_keep_id: true,
         restart: Some("unless-stopped".into()),
         ..Default::default()
@@ -1845,7 +1808,7 @@ async fn e2e_podman_container_lifecycle() {
         guest_port: 8080,
         memory_mb: 128,
         env: vec![("PORT".into(), "8080".into())],
-        extra_args: vec![],
+        podman_args: vec![],
         ..Default::default()
     };
 
@@ -1870,18 +1833,26 @@ fn with_russel_podman_user_env<T>(value: Option<&str>, f: impl FnOnce() -> T) ->
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let previous = std::env::var("RUSSEL_PODMAN_USER").ok();
+    // Under `sudo` (e.g. `sudo ./bench.sh`) euid is 0 and SUDO_USER is set,
+    // so configured_podman_user() would fall back to it. Clear it so these
+    // tests see only the RUSSEL_PODMAN_USER value they set.
+    let previous_sudo_user = std::env::var("SUDO_USER").ok();
     // SAFETY: exclusive lock held for the duration of the mutation + assertion.
     unsafe {
         match value {
             Some(v) => std::env::set_var("RUSSEL_PODMAN_USER", v),
             None => std::env::remove_var("RUSSEL_PODMAN_USER"),
         }
+        std::env::remove_var("SUDO_USER");
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     unsafe {
         match previous {
             Some(v) => std::env::set_var("RUSSEL_PODMAN_USER", v),
             None => std::env::remove_var("RUSSEL_PODMAN_USER"),
+        }
+        if let Some(v) = previous_sudo_user {
+            std::env::set_var("SUDO_USER", v);
         }
     }
     match result {
@@ -2004,5 +1975,173 @@ fn resolve_container_name_falls_back_when_metadata_missing() {
     assert_eq!(
         resolve_container_name("no-such-service-193-unit"),
         "russel-no-such-service-193-unit"
+    );
+}
+
+/// A tree with entries the test user cannot unlink, standing in for rootfs
+/// files a keep-id container created as a subordinate uid (#464). `None` as
+/// root, where a read-only parent does not produce EACCES.
+fn undeletable_tree(base: &Path) -> Option<(PathBuf, PathBuf)> {
+    // Safety: geteuid is a pure POSIX query of this process.
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
+    let tree = base.join("rootfs");
+    let locked = tree.join("nix");
+    std::fs::create_dir_all(locked.join("store")).unwrap();
+    std::fs::write(locked.join("mtab"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    Some((tree, locked))
+}
+
+#[tokio::test]
+async fn remove_tree_falls_back_on_eacces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((tree, locked)) = undeletable_tree(tmp.path()) else {
+        return;
+    };
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = called.clone();
+    remove_tree_with(&tree, |path| async move {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        // What `podman unshare rm -rf` achieves: removal regardless of owner.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::remove_dir_all(path)
+    })
+    .await
+    .unwrap();
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!tree.exists());
+}
+
+#[tokio::test]
+async fn remove_tree_errors_when_fallback_leaves_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((tree, locked)) = undeletable_tree(tmp.path()) else {
+        return;
+    };
+    let err = remove_tree_with(&tree, |_| async { Ok(()) })
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("still present"), "{err}");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn remove_tree_skips_fallback_for_other_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = remove_tree_with(&tmp.path().join("missing"), |_| async {
+        panic!("fallback must only run on EACCES")
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn remove_tree_plain_dir_needs_no_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = tmp.path().join("rootfs");
+    std::fs::create_dir_all(tree.join("etc")).unwrap();
+    std::fs::write(tree.join("etc/hostname"), b"x").unwrap();
+    remove_tree_with(&tree, |_| async { panic!("no EACCES, no fallback") })
+        .await
+        .unwrap();
+    assert!(!tree.exists());
+}
+
+fn cpus_spec(cpus: Option<u8>) -> ContainerStartSpec {
+    ContainerStartSpec {
+        service_id: "api".into(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from("/var/lib/russel/api/rootfs"),
+            entrypoint: PathBuf::from("/bin/api"),
+        },
+        host_port: 8080,
+        guest_port: 3000,
+        memory_mb: 256,
+        cpus,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn build_run_args_sets_cpus_before_rootfs() {
+    let args = build_run_args(&cpus_spec(Some(2)), &container_log_path("api")).unwrap();
+    let at = args.iter().position(|a| a == "--cpus").expect("--cpus");
+    assert_eq!(args[at + 1], "2");
+    let rootfs = args.iter().position(|a| a == "--rootfs").unwrap();
+    assert!(
+        at < rootfs,
+        "--cpus must be a podman flag, not process argv"
+    );
+}
+
+#[test]
+fn build_run_args_without_cpus_sets_no_limit() {
+    let args = build_run_args(&cpus_spec(None), &container_log_path("api")).unwrap();
+    assert!(!args.iter().any(|a| a == "--cpus"));
+}
+
+#[test]
+fn cgroup_controller_detection() {
+    let delegated = r#"{"host":{"cgroupControllers":["cpu","io","memory","pids"]}}"#;
+    assert!(podman_has_cgroup_controller(delegated, "cpu"));
+    let memory_only = r#"{"host":{"cgroupControllers":["memory","pids"]}}"#;
+    assert!(!podman_has_cgroup_controller(memory_only, "cpu"));
+    // Older Podman without the list: let `podman run` decide.
+    assert!(podman_has_cgroup_controller(r#"{"host":{}}"#, "cpu"));
+}
+fn secret_spec() -> ContainerStartSpec {
+    ContainerStartSpec {
+        service_id: "api".into(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from("/var/lib/russel/api/rootfs"),
+            entrypoint: PathBuf::from("/bin/api"),
+        },
+        host_port: 8080,
+        guest_port: 3000,
+        memory_mb: 256,
+        env: vec![("LOG_LEVEL".into(), "info".into())],
+        secret_env: vec![("DB_PASSWORD".into(), "hunter2-value-bytes".into())],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn build_run_args_keeps_secret_values_out_of_argv() {
+    let args = build_run_args(&secret_spec(), &container_log_path("api")).unwrap();
+    assert!(
+        !args.iter().any(|a| a.contains("hunter2")),
+        "secret value leaked into argv: {args:?}"
+    );
+    let at = args.iter().position(|a| a == "--secret").expect("--secret");
+    assert_eq!(
+        args[at + 1],
+        "russel-api.DB_PASSWORD,type=env,target=DB_PASSWORD"
+    );
+    assert!(at < args.iter().position(|a| a == "--rootfs").unwrap());
+    // Plain env still uses -e.
+    assert!(args.iter().any(|a| a == "LOG_LEVEL=info"));
+}
+
+#[test]
+fn build_run_args_rejects_secret_key_that_would_inject_options() {
+    let mut spec = secret_spec();
+    spec.secret_env = vec![("A,target=PATH".into(), "x".into())];
+    assert!(build_run_args(&spec, &container_log_path("api")).is_err());
+}
+
+#[test]
+fn secrets_for_container_matches_only_that_container() {
+    let ls = "russel-api.DB_PASSWORD\nrussel-api.TOKEN\nrussel-api_gdeadbeef.DB_PASSWORD\nrussel-apix.TOKEN\nunrelated\n";
+    assert_eq!(
+        secrets_for_container(ls, "russel-api"),
+        vec!["russel-api.DB_PASSWORD", "russel-api.TOKEN"]
+    );
+    assert_eq!(
+        secrets_for_container(ls, "russel-api_gdeadbeef"),
+        vec![podman_secret_name("russel-api_gdeadbeef", "DB_PASSWORD")]
     );
 }

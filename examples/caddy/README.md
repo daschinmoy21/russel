@@ -3,9 +3,16 @@
 Stateless `caddy file-server` demo on port 8080, built from nixpkgs with
 `service.package = "caddy"`.
 
+Add this to `examples/caddy/Russelfile.toml` to pin the direct host port used below:
+
+```toml
+[ingress]
+port = 8080
+```
+
 ```bash
 ./target/debug/russel-ctrl
-./target/debug/russel deploy examples/caddy -p 8080:8080 --vm-id caddy
+./target/debug/russel deploy examples/caddy
 curl http://127.0.0.1:8080/
 ./target/debug/russel destroy caddy
 ```

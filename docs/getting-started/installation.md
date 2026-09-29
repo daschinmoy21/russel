@@ -1,242 +1,242 @@
 ---
 title: Installation
-description: Install russel and russel-ctrl and pick a topology — same host, SSH tunnel, or HTTPS.
+description: Install the russel CLI and the russel-ctrl control plane on Linux, then connect to it from the same host or from your laptop.
 sidebar_position: 1
-keywords: [install, topology, ssh tunnel, https, caddy, nginx, nixos, systemd]
+keywords: [install, topology, ssh tunnel, https, caddy, nginx, nixos, systemd, check]
 ---
 
 # Installation
 
-You install two binaries. The release path downloads prebuilt x86_64 Linux binaries and needs no checkout and no compiler. `.deb`, OCI, and cross-architecture packages do not exist yet.
+Russel has two programs:
 
-| Binary | Where it runs | Job |
+| Program | Where it runs | What it does |
 |---|---|---|
-| `russel` | Laptop or same-host client (crate `russel-cli`) | Deploy, `ps`, logs, `login` |
-| `russel-ctrl` | Linux control-plane host | Build + run microVMs/containers, HTTP API |
+| `russel-ctrl` | Your Linux server (the **control plane**) | Builds apps with Nix and runs them. Serves the HTTP API and the dashboard on `127.0.0.1:7878`. |
+| `russel` | Your laptop, or the server itself | The CLI: `apply`, `ps`, `logs`, `rollback`, … |
 
-When you build from source, build each binary on the OS where it will run. A `russel-ctrl` linked against NixOS glibc will not start on Debian (`required file not found`). The published release binaries have the same constraint; see [glibc, NixOS, and other libc](#glibc-nixos-and-other-libc).
+This page gets both running. It takes about 15 minutes on a fresh server, most of it installing Nix and Podman.
 
-## What you'll need
+> **On NixOS?** Skip to [NixOS](#nixos). The rest of this page is for Debian, Ubuntu, and other systemd distributions.
 
-- Control-plane host: writable `/var/lib/russel` (mode `0700`), rootless Podman for containers; Nix with flakes, KVM + TAP + `cloud-hypervisor` + `virtiofsd` + `socat` + `ip` + `iptables` for microVMs.
-- A Rust toolchain only on machines where you build from source (rustup, or `nix develop` in the checkout).
-- A 32+ char `RUSSEL_API_TOKEN` for any non-loopback or production use (the host installer generates one for you).
+## How Russel runs
 
-## Get Russel
+The installer creates a dedicated system account called `russel`. The control plane and every app run as that account, never as root and never as your own login user. So an app that escaped its container would find no SSH keys, no `sudo`, and none of your files.
 
-Install the published release without a checkout or a compiler:
+You need `sudo` once, to install. After that, nothing runs as root.
+
+## 1. Prepare the server
+
+You need a Linux x86_64 server with systemd. A cheap VPS without KVM is fine: apps run as **rootless Podman containers** by default.
+
+**Install Podman** and the pieces rootless Podman needs (Debian 12, Ubuntu 22.04 or newer):
 
 ```bash
+sudo apt update
+sudo apt install -y podman uidmap dbus-user-session git
+```
+
+**Install Nix** with the multi-user (daemon) installer, and turn on flakes for everyone:
+
+```bash
+sh <(curl -L https://nixos.org/nix/install) --daemon
+echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
+sudo systemctl restart nix-daemon
+```
+
+> **Note:** use the daemon install. The `russel` account builds through the Nix daemon; a single-user Nix install belongs to one user and can't be shared with it.
+
+**Check the server.** The installer can tell you what's still missing, and how to fix it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | bash -s -- check
+```
+
+```text
+Checking this host for Russel:
+  ok    Linux with systemd
+  ok    cgroup v2
+  ok    podman 4.3.1
+  ok    newuidmap and newgidmap (rootless Podman)
+  FAIL  nix flakes are not enabled for all users
+        echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
+        sudo systemctl restart nix-daemon
+  ...
+1 problem(s) must be fixed before installing.
+```
+
+Fix anything marked `FAIL`. Lines marked `warn` are about optional features like microVMs. From a checkout, `./contrib/install.sh check` does the same.
+
+## 2. Install Russel on the server
+
+Pick **one** of these. Both run the same checks first and stop if something is missing.
+
+### Option A: download a release
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
+  | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
   | RUSSEL_VERSION=v0.1.0 bash -s -- cli
 ```
 
-Swap `cli` for `ctrl`, `all`, or `host`. The installer downloads `russel`, `russel-ctrl`, and the dashboard `dist` tarball, then checks every asset against the release `SHA256SUMS` before it installs anything. A missing `RUSSEL_VERSION` with no local build is an error, not a silent fallback to "latest". `RUSSEL_RELEASE_BASE` repoints the artifact base URL at a mirror or an internal file server; the default is `https://github.com/daschinmoy21/russel/releases/download`.
+The installer downloads the binaries and checks each one against the release `SHA256SUMS` before installing anything. You must name a version; there is no "latest".
 
-The same script is safe to run from a checkout. With a local `target/release` it copies the binaries instead of downloading, unless `RUSSEL_VERSION` is set.
+The release binaries need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+). On older distributions, on musl (Alpine), or on NixOS, build from source instead.
 
-### glibc, NixOS, and other libc
+### Option B: build from source
 
-The release binaries are linked against glibc 2.35 (Ubuntu 22.04 builders). They run on newer glibc (Ubuntu 24.04, Debian 12) and fail to start on older ones, on NixOS, and on musl.
-
-- **NixOS:** use `services.russel`, never the release binary and never `install.sh host`. The module builds the control plane from your pinned nixpkgs. For microVMs, put the release `bzImage` at `/var/lib/russel/_pool/kernel/bzImage` or set `RUSSEL_KERNEL_PATH`.
-- **Alpine or another musl distribution:** build from source on that machine.
-- **Older glibc than 2.35 (Ubuntu 20.04, Debian 11):** build from source on that machine.
-
-### Build from source
-
-Clone the public mirror and build once per machine that will run a binary:
+You need a Rust toolchain ([rustup](https://rustup.rs)).
 
 ```bash
 git clone https://github.com/daschinmoy21/russel
 cd russel
 cargo build --release -p russel-cli -p russel-ctrl
-# → target/release/russel
-# → target/release/russel-ctrl
-```
-
-Then install from that checkout (staying in the repo root):
-
-```bash
-./contrib/install.sh cli    # → ~/.local/bin/russel
-./contrib/install.sh ctrl   # → /usr/local/bin/russel-ctrl (sudo if needed)
-./contrib/install.sh all    # both
-```
-
-> **Note:** contributor setup (dev shell, debug builds, `cargo test`, lint) lives in [Contributing](../project/development.md). Everything below is the operator path.
-
-`install.sh` also manages the non-NixOS host lifecycle:
-
-```bash
-./contrib/install.sh [--force-unit] [--take-state-ownership] host   # user-systemd install (refuses NixOS/root)
-./contrib/install.sh connect user@host                              # anchored SSH forward
-./contrib/install.sh status                                         # endpoint, listener, unit, CLI origin
-```
-
-`host` installs `/usr/local/bin/russel-ctrl`, copies the dashboard dist to `/usr/local/share/russel/dashboard`, installs `contrib/russel-ctrl.service` as a user unit, and creates `~/.config/russel/env` (mode `0600`) when missing. A new `/var/lib/russel` is created with mode `0700`; an existing operator-owned directory keeps its current mode. `--take-state-ownership` takes a foreign-owned directory and sets mode `0700`. Restart failure restores the previous binary. Token values are never printed. `connect` opens the anchored forward `127.0.0.1:7878:127.0.0.1:7878` with `BatchMode` + `ExitOnForwardFailure`. `status` probes `/vms` with a bounded timeout. A Russel endpoint is HTTP 200 with a `vms` array, or HTTP 401 with `WWW-Authenticate: Bearer realm="russel-ctrl"`. A bare 401 from some other listener is not Russel.
-
-### microVM kernel
-
-`host` probes `/dev/kvm` before it touches the kernel pool. On a KVM host it downloads the release `russel-kernel-<version>-x86_64.bzImage` (a required release asset), verifies it against `SHA256SUMS`, and installs it at `/var/lib/russel/_pool/kernel/bzImage`. A missing kernel asset fails the install. The pool directories are chowned to the operator, the same account that owns `/var/lib/russel`, so ctrl reads and rewrites its own cache instead of inheriting root-owned `0700` directories. Private GitHub downloads can pass `RUSSEL_GITHUB_TOKEN` (or `GH_TOKEN` / `GITHUB_TOKEN`).
-
-Without `/dev/kvm` the install prints a containers-only skip and leaves the pool alone. `all` never fetches the kernel; only `host` does. To use a locally built kernel instead, `nix build .#microvm-kernel` and export `RUSSEL_KERNEL_PATH` to `result/bzImage` before starting ctrl.
-
-
-## Choose a topology
-
-| Topology | Control plane | Client and dashboard |
-|---|---|---|
-| **A. Same host** | `russel-ctrl` on loopback | `russel` on the same host; open `http://127.0.0.1:7878/`; Settings `/api` |
-| **B. Split + SSH** | `russel-ctrl` on loopback | Anchored SSH forward; CLI + browser on the laptop to `http://127.0.0.1:7878/`; Settings `/api` |
-| **C. Split + HTTPS** | `russel-ctrl` on loopback behind a TLS proxy | CLI + browser use the same HTTPS origin; Settings `/api` |
-
-Recommended transports are loopback HTTP (same host), the anchored SSH forward from `install.sh connect`, or HTTPS at the reverse proxy. **Do not bind the control plane to a public or private network address.**
-
-### Topology A — same host
-
-On the Linux host, from your checkout:
-
-```bash
+sudo ./contrib/install.sh host
 ./contrib/install.sh cli
-./contrib/install.sh host
-russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
+```
+
+Build on the machine that will run the binary. A binary built on NixOS will not start on Debian.
+
+### What `install.sh host` did
+
+- Created the `russel` system account: no login shell, no `sudo`, home `/var/lib/russel`. It gets its own range of sub-IDs for rootless Podman, and "linger", so it runs from boot without anyone logged in.
+- Created `/var/lib/russel` (mode `0700`, owned by `russel`). All Russel state lives here.
+- Generated an API token in `/etc/russel/env` (owner `root`, group `russel`, mode `0640`). The token is never printed.
+- Added **you** (the user who ran `sudo`) to the `russel` group, so you can read the token.
+- Installed `russel-ctrl` to `/usr/local/bin` and the dashboard to `/usr/local/share/russel/dashboard`.
+- Installed and started the system service `russel-ctrl`, running as `russel` and listening on `127.0.0.1:7878` only, with authentication required.
+
+`install.sh cli` installed `russel` to `~/.local/bin`. Make sure that directory is on your `PATH`.
+
+> **Log out and back in** (or run `newgrp russel`) before the next step. Group membership only applies to new logins.
+
+## 3. Connect the CLI
+
+The control plane only listens on `127.0.0.1`. **Never expose port 7878 to the network.** Reach it in one of three ways.
+
+### Same server
+
+```bash
+russel login http://127.0.0.1:7878 --token-file /etc/russel/env
 russel origin
 russel ps
 ```
 
-Dashboard on the same host: open `http://127.0.0.1:7878/` and set Settings to `/api`. `russel-ctrl` serves the UI itself. Paste the token from `~/.config/russel/env` into Settings.
+`russel origin` shows which control plane the CLI talks to and whether it is reachable. `russel ps` shows an empty table on a fresh install.
 
-### Topology B — split + SSH tunnel
+### From your laptop, over SSH (recommended)
 
-On the control-plane host:
-
-```bash
-./contrib/install.sh host
-```
-
-On the laptop, install the client and copy the env file privately:
+Install the CLI on the laptop (Option A with `cli`, or Option B's `install.sh cli`). Then copy the token and open a tunnel:
 
 ```bash
-./contrib/install.sh cli
 umask 077 && mkdir -p ~/.config/russel
-scp user@host:~/.config/russel/env ~/.config/russel/env
-chmod 600 ~/.config/russel/env
-./contrib/install.sh connect user@host
+scp user@server:/etc/russel/env ~/.config/russel/env
+./contrib/install.sh connect user@server
 russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
-russel origin
 russel ps
 ```
 
-Keep the background SSH forward up while using the CLI or dashboard. Do not replace it with a hand-rolled forward command. On the laptop open `http://127.0.0.1:7878/` (Settings `/api`); the tunnel carries both the UI and the API.
-
-Manual equivalent (must stay loopback-anchored and fail if the forward fails):
+`connect` starts a background SSH forward from the laptop's `127.0.0.1:7878` to the server's. It fails loudly if the forward cannot be set up. Keep it running while you use the CLI or dashboard. If you prefer to run it by hand:
 
 ```bash
 ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
-  -L 127.0.0.1:7878:127.0.0.1:7878 user@host
+  -L 127.0.0.1:7878:127.0.0.1:7878 user@server
 ```
 
-### Topology C — split + HTTPS
+### From anywhere, over HTTPS
 
-On the control-plane host, keep the unit on loopback (`./contrib/install.sh host`). Put Caddy or nginx in front of `127.0.0.1:7878`. The proxy must terminate TLS, strip `/api` before forwarding to the control plane, and leave deploy NDJSON unbuffered. Full configs: [TLS reverse proxy](../guides/tls-reverse-proxy.md).
-
-On the laptop:
+Put Caddy or nginx in front of `127.0.0.1:7878` on the server, then log in with the HTTPS URL:
 
 ```bash
-umask 077 && mkdir -p ~/.config/russel
-scp user@host:~/.config/russel/env ~/.config/russel/env
-chmod 600 ~/.config/russel/env
-./contrib/install.sh cli
 russel login https://russel.example.com --token-file ~/.config/russel/env
-russel origin
-russel ps
 ```
 
-The reverse proxy can forward `/` and `/api/` to loopback ctrl (ctrl serves the dashboard and nests the API under `/api`). Stripping `/api` and serving `dashboard/dist` yourself still works. In Settings use `/api`. Enter the dashboard token there; it stays in tab-scoped `sessionStorage`. CLI login does not populate the dashboard.
+The CLI refuses to send the token over plain `http://` to anything but loopback. Proxy configs: [TLS reverse proxy](../guides/tls-reverse-proxy.md).
 
-## Auth quick reference
+> **Fish shell:** don't `source` the env file; fish can't read `KEY=VALUE` files. `--token-file` works in every shell.
+
+## 4. Open the dashboard
+
+Open `http://127.0.0.1:7878/` (through the tunnel from a laptop, or your HTTPS URL). Paste the token from `/etc/russel/env` into **Settings**. The dashboard keeps it for that browser tab only; `russel login` does not fill it in. More: [Dashboard](dashboard.md).
+
+## 5. Check the install
+
+On the server:
 
 ```bash
-russel login [<url>] [--token-file PATH]   # token from file, env, or stdin
-russel logout
-russel origin                              # which ctrl this CLI will hit
+systemctl status russel-ctrl
+./contrib/install.sh status      # from a checkout, or pipe the script with `status`
 ```
 
-- `RUSSEL_API_TOKEN` (env) wins over `~/.config/russel/config.toml` (mode `0600`).
-- `login --token-file` accepts a bare token or a `RUSSEL_API_TOKEN=…` line.
-- **Fish:** Fish does not `export` `KEY=VALUE` files. Do not `source` an env file. Use `russel login … --token-file ~/.config/russel/env`.
+The control plane's log is `/var/lib/russel/ctrl.log`; reading it needs `sudo`, because only `russel` can open that directory. `journalctl -u russel-ctrl` shows start-up errors.
 
-- The CLI **refuses** to send the token over `http://` to a non-loopback host. Override only with `--insecure` / `RUSSEL_INSECURE_CLEARTEXT=1` (not recommended). Prefer HTTPS.
+You're ready: [Quickstart](../quickstart.md) deploys an example app in a few minutes.
+
+## Optional: microVMs (experimental)
+
+Containers are the default and what most servers should use. MicroVMs give each app its own kernel through Cloud Hypervisor. They need hardware virtualization, which most cheap VPSes don't expose.
+
+You need `cloud-hypervisor` **v52 or newer** (older versions hang when `cpus` > 1), `virtiofsd`, and `passt` on `PATH`. `install.sh check` warns about each missing one.
+
+When `/dev/kvm` exists, `install.sh host` adds `russel` to the `kvm` group and installs the release microVM kernel at `/var/lib/russel/_pool/kernel/bzImage`. Nothing else needs root. Without `/dev/kvm`, the installer prints "containers only" and moves on. To use your own kernel, build `nix build .#microvm-kernel` and set `RUSSEL_KERNEL_PATH` to `result/bzImage` in `/etc/russel/env`.
 
 ## NixOS
 
-NixOS hosts use `services.russel`, not `install.sh host`:
+Use the `services.russel` module, not `install.sh host` and not the release binaries. Build `russel-ctrl` from source on the NixOS machine (Option B, `cargo build` only), install it, and point the module at it:
 
 ```nix
 {
   services.russel.enable = true;
   services.russel.bin = "/usr/local/bin/russel-ctrl"; # or services.russel.package
-  services.russel.environmentFile = "/etc/russel/env"; # 0600, RUSSEL_API_TOKEN=
+  services.russel.environmentFile = "/etc/russel/env"; # mode 0600, contains RUSSEL_API_TOKEN=...
 }
 ```
 
-The module defaults to `127.0.0.1:7878`, `RUSSEL_REQUIRE_AUTH=1`, `/var/lib/russel` mode `0700`, warm pool off, and rootless-Podman integration on. Put a TLS proxy in front for split HTTPS access. Details: [Operations: systemd + NixOS](../operations/systemd-nixos.md).
+It works the same way as the installer: a dedicated `russel` account, `127.0.0.1:7878`, authentication required, `/var/lib/russel` at mode `0700`, rootless Podman. The service is `russel.service` (`systemctl status russel`). For microVMs add `services.russel.microvms.enable = true;`. Details: [systemd + NixOS](../operations/systemd-nixos.md).
 
-## Other Linux (systemd user unit)
+## Upgrade
 
-Copy `contrib/russel-ctrl.service` to `~/.config/systemd/user/`, write `~/.config/russel/env` (mode `0600`) with `RUSSEL_API_TOKEN`, `chown` `/var/lib/russel` to yourself (mode `0700`), then `systemctl --user enable --now russel-ctrl`. Or run `./contrib/install.sh host`, which does all of this.
-
-## Deploy from a remote client
-
-Use a git URL when the control plane is remote — a laptop filesystem path is **not** uploaded:
-
-```bash
-russel deploy https://github.com/your-account/app.git --vm-id app -p 8080:3000 --runtime container
-```
-
-A local absolute path is resolved on the **control-plane host** (must already exist there) and only when the control plane sets `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1`. Keep `--config` repository-relative. See [First deploy](first-deploy.md).
-
-## Upgrade and inspect
-
-Other Linux, release download (the installer keeps env + state and restarts the user unit):
+Run the same install command with the new version. Your token and `/var/lib/russel` are kept, and the service restarts:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | RUSSEL_VERSION=v0.2.0 bash -s -- host
-./contrib/install.sh status
+  | sudo RUSSEL_VERSION=v0.2.0 bash -s -- host
 ```
 
-Pinned versions matter here. Re-running with the same `RUSSEL_VERSION` is a no-op; a new tag replaces the binary and leaves the token and `/var/lib/russel` in place.
+From source: `git pull`, rebuild, and run `sudo ./contrib/install.sh host` again. If the new binary fails to start, the installer puts the old one back.
 
-Other Linux, from an updated checkout:
+Never delete `/etc/russel/env` or `/var/lib/russel` when upgrading. Backups: [Upgrades + backups](../operations/upgrades-backup.md).
 
-```bash
-cd russel && git pull
-cargo build --release -p russel-cli -p russel-ctrl
-./contrib/install.sh host
-./contrib/install.sh status
-```
+### Moving from an older per-user install
 
-Direct binary replacement:
+Earlier builds of `install.sh host` ran russel-ctrl as your own user, from `~/.config/systemd/user`. The new installer finds that setup and stops with the steps to move over:
 
-```bash
-sudo install -Dm755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
-systemctl --user restart russel-ctrl
-./contrib/install.sh status
-```
+1. `russel ps`, then `russel destroy` each service. The new `russel` account can't take over containers that your own Podman started.
+2. `systemctl --user disable --now russel-ctrl`, then delete `~/.config/systemd/user/russel-ctrl.service`.
+3. `sudo ./contrib/install.sh --take-state-ownership host`. This gives `/var/lib/russel` (secrets, history, volumes) to `russel`, and keeps the token from `~/.config/russel/env`, so your existing `russel login` keeps working.
 
-Never delete `~/.config/russel/env` or `/var/lib/russel` on upgrade. NixOS upgrades use normal module activation. Full runbook: [Upgrades + backups](../operations/upgrades-backup.md).
+Then `russel apply` your services again.
 
-## Verify
+## Installer reference
 
-```bash
-russel origin   # url, auth, reachable
-russel ps       # list workloads (aliases: list, vms)
-./contrib/install.sh status
-```
+| Command | What it does |
+|---|---|
+| `install.sh check` | Lists what the server is missing, with a fix for each. Changes nothing; no `sudo` needed. |
+| `sudo install.sh host` | Server install described above. Runs `check` first. Refuses NixOS. |
+| `install.sh cli` | Installs `russel` to `~/.local/bin`. |
+| `install.sh ctrl` | Installs only the `russel-ctrl` binary, no service. |
+| `install.sh all` | `cli` + `ctrl`. |
+| `install.sh connect user@server` | Opens the SSH forward to the server's control plane. |
+| `install.sh status` | Shows the endpoint, the listener, the service, and the CLI's origin. |
 
-Typical VPS has no KVM — set `type = "container"` in every Russelfile (`russel init --type container`). Next: [First deploy](first-deploy.md) · [Single-VPS checklist](../guides/vps-one-dev.md).
+| Flag or variable | Meaning |
+|---|---|
+| `RUSSEL_VERSION` | Release to download, such as `v0.1.0`. Required unless you run the script from a checkout with a `target/release` build. |
+| `RUSSEL_RELEASE_BASE` | Download from a mirror instead of GitHub Releases. |
+| `--take-state-ownership` | Give an existing `/var/lib/russel` owned by another user (and everything in it) to `russel`. |
+| `--force-unit` | Replace an existing `/etc/systemd/system/russel-ctrl.service` that differs from the shipped one. Review your changes first. |
+| `--skip-checks` | Install even when `check` reports problems. |
 
 ## Related
 
-- [First deploy](first-deploy.md) · [Dashboard](dashboard.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [systemd + NixOS](../operations/systemd-nixos.md) · [CLI reference](../reference/cli.md)
+- [Quickstart](../quickstart.md) · [First deploy](first-deploy.md) · [Single-VPS checklist](../guides/vps-one-dev.md) · [Troubleshooting](../guides/troubleshooting.md) · [CLI reference](../reference/cli.md)

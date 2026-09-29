@@ -6,13 +6,13 @@ sidebar_position: 100
 
 # Docs folder
 
-Website-ready, Tailscale/Cloudflare-style. `index.md` is the landing page; `mint.json` is the Mintlify nav; `sidebar.ts` is the Starlight/Docusaurus nav snippet; `_category_.json` files label each section for Docusaurus.
+Website-ready, Tailscale/Cloudflare-style. `index.md` is the landing page; `docs.json` is the Mintlify nav; `sidebar.ts` is the Starlight/Docusaurus nav snippet; `_category_.json` files label each section for Docusaurus.
 
 ## Consume it
 
 | Target | File |
 |---|---|
-| Mintlify | `docs/mint.json` (nav) + `*.md` (content) |
+| Mintlify | `docs/docs.json` (nav) + `*.md` (content) |
 | Docusaurus | `*.md` frontmatter (`title`, `description`, `sidebar_position`) + `*/_category_.json` |
 | Astro Starlight | Import `docs/sidebar.ts` (`sidebar` export) into `astro.config.mjs` |
 

@@ -35,6 +35,40 @@ pub fn port_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Ports for tests that drop a hold and later expect to re-bind the same port.
+///
+/// Such tests race anything else that binds the port in between, so the range
+/// avoids both busy sources: 3100+ is the allocator's own range (a dev ctrl,
+/// rootless Podman publishes, and in-process `next` calls all land there), and
+/// the kernel hands out `bind(0)` / `connect()` ports from its ephemeral range
+/// (32768–60999 on Linux). Only fixed-port listeners live here, and the probe
+/// in [`reserve_test_port`] skips those.
+#[cfg(test)]
+const TEST_PORTS: std::ops::Range<u16> = 20000..30000;
+
+/// Reserve a free port from [`TEST_PORTS`] for `service_id` (with a hold).
+///
+/// The probe start is spread by pid and a per-process counter so concurrent
+/// `cargo test` runs and successive tests do not reuse the same ports.
+#[cfg(test)]
+pub fn reserve_test_port(service_id: &str) -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let len = u32::from(TEST_PORTS.end - TEST_PORTS.start);
+    let start = std::process::id()
+        .wrapping_mul(7919)
+        .wrapping_add(NEXT.fetch_add(101, Ordering::Relaxed));
+    let mut last_err = None;
+    for i in 0..len {
+        let port = TEST_PORTS.start + (start.wrapping_add(i) % len) as u16;
+        match PortAllocator::reserve(service_id, port) {
+            Ok(()) => return port,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    panic!("no free test port in {TEST_PORTS:?} for {service_id}: {last_err:?}");
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PortAllocator;
 

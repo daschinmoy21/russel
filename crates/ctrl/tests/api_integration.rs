@@ -29,11 +29,41 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+/// Missing on purpose: `podman` calls fail as on a host without Podman.
+const NO_PODMAN: &str = "/nonexistent/russel-test-podman";
+
+/// Serializes every test in this binary and hands each one empty host roots.
+///
+/// The data and microVM roots are pinned once per process to a temp dir
+/// (never `/var/lib/russel`), and Podman to a missing binary so `/vms` does
+/// not list the host's real containers. Because the lock serializes tests,
+/// clearing the roots here gives each test a clean slate.
 fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|p| p.into_inner());
+    russel_core::paths::pin_temp_roots();
+    russel_ctrl::container::pin_podman_program(NO_PODMAN);
+    for root in [
+        russel_ctrl::paths::data_root(),
+        russel_ctrl::paths::microvms_root(),
+    ] {
+        clear_dir(&root);
+    }
+    guard
+}
+
+fn clear_dir(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir).expect("read test root").flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(&path).expect("clear test root");
+        } else {
+            std::fs::remove_file(&path).expect("clear test root");
+        }
+    }
 }
 
 /// Holds the env lock and restores `RUSSEL_API_TOKEN` (+ optional secrets dir)
@@ -233,6 +263,35 @@ async fn vms_list_empty_when_no_services() {
 }
 
 #[tokio::test]
+async fn state_writes_stay_in_temp_data_root() {
+    let _env = EnvGuard::open_auth();
+    let root = russel_ctrl::paths::data_root();
+    assert!(
+        root.starts_with(std::env::temp_dir()),
+        "test data root must be a temp dir, got {}",
+        root.display()
+    );
+    assert!(russel_ctrl::paths::microvms_root().starts_with(std::env::temp_dir()));
+
+    let state = AppState::default();
+    seed_service(&state, "catalog-probe");
+    state.write_catalog().expect("write catalog");
+    let catalog = std::fs::read_to_string(root.join("ctrl-catalog.json")).expect("catalog");
+    assert!(catalog.contains("catalog-probe"), "catalog={catalog}");
+}
+
+#[tokio::test]
+async fn vms_list_includes_microvm_marker_dirs_from_test_root() {
+    let _env = EnvGuard::open_auth();
+    std::fs::create_dir_all(russel_ctrl::paths::microvm_dir("marker-vm")).unwrap();
+
+    let res = get(app(AppState::default()), "/vms").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert_eq!(body["vms"], json!(["marker-vm"]));
+}
+
+#[tokio::test]
 async fn vms_list_includes_seeded_service() {
     let _env = EnvGuard::open_auth();
     let state = AppState::default();
@@ -246,6 +305,40 @@ async fn vms_list_includes_seeded_service() {
         vms.iter().any(|v| v.as_str() == Some("demo-svc")),
         "expected demo-svc in {vms:?}"
     );
+}
+
+#[tokio::test]
+async fn vms_list_skips_dir_with_only_kept_volumes() {
+    let _env = EnvGuard::open_auth();
+    // What `destroy` leaves behind for a `keep = true` volume.
+    let kept = russel_ctrl::paths::service_dir("kept-svc").join("volumes/data");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join("db.sqlite"), b"data").unwrap();
+
+    let state = AppState::default();
+    let res = get(app(state.clone()), "/vms").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    let vms = body["vms"].as_array().expect("vms array");
+    assert!(
+        !vms.iter().any(|v| v.as_str() == Some("kept-svc")),
+        "kept volumes listed as a service: {vms:?}"
+    );
+    assert!(state.status("kept-svc").is_none());
+
+    // No state entry, so a follow-up destroy is a 404 and the data stays.
+    let res = app(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/vm/kept-svc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(kept.join("db.sqlite").is_file());
 }
 
 #[tokio::test]
@@ -540,8 +633,7 @@ async fn deploy_with_auth_accepts_request_and_streams_ndjson() {
         &json!({
             "repo_url": "https://127.0.0.1/does-not-exist.git",
             "config_path": "Russelfile.toml",
-            "vm_id": "integ-deploy",
-            "runtime": "container"
+            "vm_id": "integ-deploy"
         }),
         STRONG_TOKEN,
     )

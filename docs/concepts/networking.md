@@ -31,7 +31,17 @@ flowchart LR
 - Startup removes only **orphan** `rsl-*` TAPs with no live service directory. Host iptables/Docker/VPN chains are never flushed.
 - Guest L3 isolation uses a dedicated **`RUSSEL-FORWARD`** chain jumped from built-in `FORWARD` for `-i rsl-+` / `-o rsl-+` with a terminal **DROP**, installed **before** `ip_forward=1` so there is no window without the filter. Default-denies guest→guest and guest→off-host pivot via host routing without breaking `socat` publish. Rules are removed when the last `rsl-*` TAP goes away (same lifecycle as restoring `ip_forward`).
 - Escape hatch (single-tenant debug only): `RUSSEL_FORWARD=allow` or `RUSSEL_DISABLE_FORWARD_FILTER=1` skips the filter and best-effort removes previously installed Russel-owned rules. With `ip_forward=1` and no filter a compromised guest can route via the host — prefer the secure default.
-- If `iptables` is missing or the process lacks `CAP_NET_ADMIN`, filter install fails soft with a warning (boot continues). Production microVM hosts should run privileged so isolation applies.
+- If `iptables` is missing or the process lacks `CAP_NET_ADMIN`, filter install fails soft with a warning (boot continues).
+
+### Unprivileged microVM networking (passt)
+
+A ctrl without `CAP_NET_ADMIN` (every supported install) cannot create TAPs, so each VM gets a `passt --vhost-user` process instead (`RUSSEL_MICROVM_NET=passt`; `tap` forces the root path). passt is the NIC backend and publishes `bind:host_port` → `guest_port` itself, the way pasta does for rootless Podman. There is no TAP, socat, or iptables.
+
+- The guest keeps the same `/30` addressing (`passt --address VM_IP --gateway HOST_IP`), but the VM IP is not routable from the host, so readiness probes the published port.
+- `--no-map-gw` stops the gateway address from reaching host loopback (and so ctrl's API). Guests get outbound NAT through passt, like rootless containers.
+- The passt pid and `net = "passt"` go into metadata so stop and destroy tear down the right thing.
+- virtiofsd runs with `--sandbox=namespace` when ctrl is not root (`chroot` needs root).
+
 
 ## Container networking
 

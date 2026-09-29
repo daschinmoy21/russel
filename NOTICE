@@ -1,0 +1,16 @@
+Russel
+Copyright 2026 Chinmoy Das
+
+This product includes software developed by Chinmoy Das
+(https://github.com/daschinmoy21/russel).
+
+Release artifacts include a Linux kernel image (russel-kernel-*.bzImage),
+which is licensed separately under the GNU General Public License v2.0.
+Its complete corresponding source is published in the same release as
+russel-kernel-<tag>-source.tar: the upstream kernel tarball, the applied
+patches, the kernel .config, and the Nix expressions and nixpkgs revision
+used to build it.
+
+The dashboard bundle (russel-dashboard-*.tar.gz) is built with third-party
+npm packages under their own licenses (MIT, ISC, BSD, Apache-2.0 and
+others). Their notices are in THIRD-PARTY-LICENSES.txt inside that bundle.

@@ -10,12 +10,16 @@
 /// - `traefik` — ingress dynamic config root
 /// - `secrets` — host secrets store
 /// - `_pool` — warm-pool snapshot state
+/// - `_checkouts` — git clones that deploys build from
+/// - `_microvms` — microVM marker dirs under a relocated data root
 pub fn is_reserved_service_dir(name: &str) -> bool {
     name.ends_with(".bak")
         || name.ends_with(".volumes-stash")
         || name == "traefik"
         || name == "secrets"
         || name == "_pool"
+        || name == "_checkouts"
+        || name == crate::paths::MICROVMS_SUBDIR
 }
 
 #[cfg(test)]
@@ -28,6 +32,8 @@ mod tests {
             "traefik",
             "secrets",
             "_pool",
+            "_checkouts",
+            "_microvms",
             "api.bak",
             "svc.bak",
             "api.volumes-stash",

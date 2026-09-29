@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 /// passthrough extras are rejected. Unset or any other value leaves the
 /// allowlist in effect.
 fn podman_passthrough_disabled() -> bool {
-    russel_core::env_util::env_bool(std::env::var("RUSSEL_ALLOW_PODMAN_ARGS").ok().as_deref())
+    podman_passthrough_disabled_from(std::env::var("RUSSEL_ALLOW_PODMAN_ARGS").ok().as_deref())
+}
+
+/// Pure form of [`podman_passthrough_disabled`] for a given env value.
+pub(super) fn podman_passthrough_disabled_from(value: Option<&str>) -> bool {
+    russel_core::env_util::env_bool(value)
         .map(|b| !b)
         .unwrap_or(false)
 }
@@ -39,16 +44,6 @@ fn validate_passthrough_network_mode(flag: &str, val: &str) -> anyhow::Result<()
         anyhow::bail!(
             "podman passthrough arg denied for security: {flag} {val} \
              (only bridge, none, slirp4netns, pasta are permitted)"
-        );
-    }
-    Ok(())
-}
-
-fn validate_passthrough_userns(val: &str) -> anyhow::Result<()> {
-    if val != "keep-id" {
-        anyhow::bail!(
-            "podman passthrough arg denied for security: --userns {val} \
-             (only keep-id is permitted)"
         );
     }
     Ok(())
@@ -103,6 +98,12 @@ fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
     if arg == "--user" || arg == "-u" || arg.starts_with("--user=") || arg.starts_with("-u=") {
         anyhow::bail!("podman passthrough arg denied for security: --user/-u");
     }
+    if arg == "--userns" || arg.starts_with("--userns=") {
+        anyhow::bail!(
+            "podman passthrough arg denied: --userns; the app runs unprivileged by default, \
+             set service.user = \"root\" to run it as root"
+        );
+    }
     if arg == "--entrypoint" || arg.starts_with("--entrypoint=") {
         anyhow::bail!("podman passthrough arg denied for security: --entrypoint");
     }
@@ -151,7 +152,6 @@ fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
 ///
 /// Allowed (with value constraints where noted):
 /// - `--network` / `--net` / `-net` — bridge | none | slirp4netns | pasta
-/// - `--userns=keep-id` only
 /// - `--cap-drop`, `--secret`, `-e`/`--env` (non-PORT), `--label`/`-l`,
 ///   `--annotation`, memory/cpu limits, `--tmpfs`, `--shm-size`, `--hostname`,
 ///   `--ulimit`
@@ -159,7 +159,16 @@ fn deny_known_unsafe_passthrough(arg: &str) -> anyhow::Result<()> {
 ///
 /// Set `RUSSEL_ALLOW_PODMAN_ARGS=0` to reject any non-empty extras.
 pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
-    if !args.is_empty() && podman_passthrough_disabled() {
+    validate_podman_passthrough_args_with(args, podman_passthrough_disabled())
+}
+
+/// [`validate_podman_passthrough_args`] with the `RUSSEL_ALLOW_PODMAN_ARGS`
+/// switch passed in, so tests need not mutate the process env.
+pub(super) fn validate_podman_passthrough_args_with(
+    args: &[String],
+    disabled: bool,
+) -> anyhow::Result<()> {
+    if !args.is_empty() && disabled {
         anyhow::bail!(
             "podman passthrough args disabled (RUSSEL_ALLOW_PODMAN_ARGS=0); \
              unset or set to 1 to allow allowlisted extras"
@@ -194,24 +203,6 @@ pub fn validate_podman_passthrough_args(args: &[String]) -> anyhow::Result<()> {
         }
         if let Some(val) = arg.strip_prefix("--net=") {
             validate_passthrough_network_mode("--net=", val)?;
-            i += 1;
-            continue;
-        }
-
-        if arg == "--userns" {
-            let val = require_passthrough_value(arg, next)?;
-            validate_passthrough_userns(val)?;
-            i += 2;
-            continue;
-        }
-        if let Some(val) = arg.strip_prefix("--userns=") {
-            // Preserve "userns=…" wording for disallowed values.
-            if val != "keep-id" {
-                anyhow::bail!(
-                    "podman passthrough arg denied for security: --userns={val} \
-                     (only keep-id is permitted)"
-                );
-            }
             i += 1;
             continue;
         }

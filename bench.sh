@@ -12,7 +12,12 @@ set -euo pipefail
 #   3. Raw podman/docker — Dockerfile build + run (baseline; skipped if no Dockerfile)
 #
 # All examples/*/Russelfile.toml are raced. Temp Russelfiles inject type for the
-# race (file type is ignored for fairness). Apps without Dockerfile skip path 3.
+# race (file type is ignored for fairness). Container-only apps (service.args,
+# podman_args, [[volumes]]) skip path 1, and apps with a host-path volume skip
+# both Russel paths, except postgres, whose PGDATA the bench prepares. Apps
+# without a Dockerfile skip path 3.
+#
+# Stop any running russel-ctrl first: the bench starts its own on :7878.
 #
 # Run from repo root after `nix develop` or with Rust toolchain on PATH.
 # Use --cold to force cold builds (no layer/nix cache); default is --warm.
@@ -98,6 +103,10 @@ cleanup() {
 			fi
 		fi
 	done
+	# Remove the bench secret while the ctrl that stored it is still up
+	if [ "${BENCH_SECRET_SET:-0}" -eq 1 ] && command -v russel &>/dev/null; then
+		russel secrets delete DEMO_SECRET &>/dev/null || warn "failed to delete DEMO_SECRET"
+	fi
 	# Kill control plane
 	if [ -n "$CTRL_PID" ] && kill -0 "$CTRL_PID" 2>/dev/null; then
 		info "shutting down russel-ctrl (pid $CTRL_PID)"
@@ -108,10 +117,6 @@ cleanup() {
 	bench_restore_var_lib
 	# Remove temp files
 	bench_cleanup_tmp_paths
-	# Remove the bench secret if this run set it (best effort)
-	if [ "${BENCH_SECRET_SET:-0}" -eq 1 ] && command -v russel &>/dev/null; then
-		russel secrets delete DEMO_SECRET &>/dev/null || warn "failed to delete DEMO_SECRET"
-	fi
 }
 trap cleanup EXIT
 
@@ -132,6 +137,15 @@ LAST_RUSSEL_RUNTIME=""
 
 # ── 0. Dependency check ─────────────────────────────────────────────────────
 header "Dependency Check"
+
+# The bench starts its own russel-ctrl on 127.0.0.1:7878 over a scratch
+# /var/lib/russel. A ctrl already on that port would take every race, and its
+# state would be swapped out from under it, so refuse instead.
+if (exec 3<>/dev/tcp/127.0.0.1/7878) 2>/dev/null; then
+	fail "127.0.0.1:7878 is already in use (a running russel-ctrl?). Stop it first: the bench starts its own."
+	exit 1
+fi
+
 RUNTIME=""
 if command -v podman &>/dev/null; then
 	RUNTIME="podman"
@@ -209,6 +223,7 @@ if [ "$test_status" -eq 0 ]; then
 	pass "tests: ${test_passed} passed, ${test_failed} failed in ${test_ms}ms"
 else
 	warn "tests failed (exit ${test_status}): ${test_passed} passed, ${test_failed} failed in ${test_ms}ms"
+	echo "$test_out" | grep -E '^test .* FAILED$' | sed 's/^/    /' || true
 fi
 
 # ── 5. Release build ──────────────────────────────────────────────────────────
@@ -336,9 +351,50 @@ else
 
 	get_ready_path() {
 		case "$1" in
-		basic-http | hello-rust | env-config | shortlink | microvm-http) echo "/health" ;;
+		basic-http | hello-rust | env-config | shortlink | microvm-http | meilisearch) echo "/health" ;;
 		*) echo "/" ;;
 		esac
+	}
+
+	# Readiness means the app itself answers. Rootless port forwarding accepts
+	# TCP before the app listens, so a bare connect proves nothing: redis and
+	# postgres must send a protocol reply, and HTTP apps probed at "/" may
+	# answer with any status (caddy's file-server 404s, auth-gated apps 401).
+	probe_ready() {
+		local port="$1" example="$2" path="$3" reply code
+		case "$example" in
+		redis)
+			# Any RESP reply: +PONG, or -NOAUTH when requirepass is set.
+			reply=$(timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; printf 'PING\r\n' >&3; head -c1 <&3" 2>/dev/null)
+			[ "$reply" = "+" ] || [ "$reply" = "-" ]
+			;;
+		postgres)
+			# SSLRequest; the server answers N (no TLS) or S.
+			reply=$(timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; printf '\x00\x00\x00\x08\x04\xd2\x16\x2f' >&3; head -c1 <&3" 2>/dev/null)
+			[ "$reply" = "N" ] || [ "$reply" = "S" ]
+			;;
+		*)
+			if [ "$path" = "/" ]; then
+				code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$port$path" 2>/dev/null)
+				[ -n "$code" ] && [ "$code" != "000" ]
+			else
+				curl -sf --max-time 1 "http://127.0.0.1:$port$path" >/dev/null 2>&1
+			fi
+			;;
+		esac
+	}
+
+	# Why an example cannot be raced on a runtime, or empty when it can.
+	race_skip_reason() {
+		local runtime="$1" file="$2" example
+		example=$(basename "$(dirname "$file")")
+		if grep -qE '^[[:space:]]*host[[:space:]]*=[[:space:]]*"/' "$file" &&
+			! { [ "$example" = "postgres" ] && [ -n "${BENCH_PGDATA:-}" ]; }; then
+			echo "host-path volume needs prepared host data"
+		elif [ "$runtime" = "microvm" ] &&
+			grep -qE '^[[:space:]]*podman_args[[:space:]]*=' "$file"; then
+			echo "container-only (podman_args)"
+		fi
 	}
 
 	# Ensure env-config can resolve secret://DEMO_SECRET at deploy time.
@@ -388,26 +444,61 @@ else
 			fi
 		fi
 
-		# Inject type under [service] so each race path is forced (microvm|container),
-		# independent of the example's committed type default.
+		# The Russelfile is the whole desired state, so each race gets its own
+		# copy: type (microvm|container), service.name (the service id), and
+		# [ingress].port (the host port curl probes) replace the committed values.
 		local cfg_name="Russelfile.bench-${runtime_kind}.toml"
 		local cfg_path="$repo_path/$cfg_name"
-		awk -v rt="$runtime_kind" '
-			BEGIN { in_service=0; injected=0 }
-			/^type[[:space:]]*=/ { next }
-			/^\[service\]/ {
+		# `bin` defaults to service.name, so renaming the service would move
+		# the entrypoint. Pin it to the committed name when the file omits it.
+		local pin_bin=""
+		pin_bin=$(awk '
+			/^[[:space:]]*\[/ { in_svc = ($0 ~ /^[[:space:]]*\[service\][[:space:]]*(#.*)?$/) }
+			in_svc && /^[[:space:]]*bin[[:space:]]*=/ { has_bin = 1 }
+			in_svc && /^[[:space:]]*name[[:space:]]*=/ && match($0, /"[^"]*"/) { name = substr($0, RSTART + 1, RLENGTH - 2) }
+			END { if (!has_bin) print name }
+		' "$repo_path/Russelfile.toml")
+		# postgres races against the PGDATA prepared at ctrl start.
+		local host_vol=""
+		[ "$example" = "postgres" ] && host_vol="${BENCH_PGDATA:-}"
+		awk -v rt="$runtime_kind" -v id="$vm_id" -v hp="$host_port" -v bin="$pin_bin" -v hostvol="$host_vol" '
+			BEGIN { section=""; injected=0; ingress=0 }
+			# Headers may carry trailing whitespace or a comment; tables like
+			# [service.env] are not [service].
+			/^[[:space:]]*\[/ {
+				section = ""
+				if ($0 ~ /^[[:space:]]*\[service\][[:space:]]*(#.*)?$/) section = "service"
+				else if ($0 ~ /^[[:space:]]*\[ingress\][[:space:]]*(#.*)?$/) section = "ingress"
+				else if ($0 ~ /^[[:space:]]*\[\[volumes\]\]/) section = "volumes"
+			}
+			section == "service" && /^[[:space:]]*(name|type)[[:space:]]*=/ { next }
+			section == "ingress" && /^[[:space:]]*port[[:space:]]*=/ { next }
+			section == "volumes" && hostvol != "" && /^[[:space:]]*host[[:space:]]*=/ { print "host = \"" hostvol "\""; next }
+			section == "service" && /^[[:space:]]*\[/ {
 				print
+				print "name = \"" id "\""
 				print "type = \"" rt "\""
-				in_service=1
+				if (bin != "") print "bin = \"" bin "\""
 				injected=1
 				next
 			}
-			/^\[/ { in_service=0 }
+			section == "ingress" && /^[[:space:]]*\[/ {
+				print
+				print "port = " hp
+				ingress=1
+				next
+			}
 			{ print }
 			END {
 				if (!injected) {
 					print "[service]"
+					print "name = \"" id "\""
 					print "type = \"" rt "\""
+				}
+				if (!ingress) {
+					print ""
+					print "[ingress]"
+					print "port = " hp
 				}
 			}
 		' "$repo_path/Russelfile.toml" >"$cfg_path"
@@ -418,10 +509,7 @@ else
 			-d "{
 				\"repo_url\": \"$repo_path\",
 				\"config_path\": \"$cfg_name\",
-				\"vm_id\": \"$vm_id\",
-				\"port\": {\"host\": $host_port, \"guest\": $guest_port},
-				\"runtime\": \"$runtime_kind\",
-				\"podman_args\": []
+				\"vm_id\": \"$vm_id\"
 			}" 2>&1)
 		rm -f "$cfg_path"
 
@@ -441,7 +529,7 @@ else
 			curl_start=$(date +%s%N)
 			curl_ok=0
 			for _ in $(seq 1 100); do
-				if curl -sf "http://127.0.0.1:$host_port$ready_path" >/dev/null 2>&1; then
+				if probe_ready "$host_port" "$example" "$ready_path"; then
 					curl_ok=1
 					break
 				fi
@@ -542,12 +630,41 @@ else
 
 		RUSSEL_STATE_DIR=$(mktemp -d /tmp/russel-bench-XXXXXX)
 		export RUSSEL_CTRL_ADDR="127.0.0.1:7878"
+		# Races deploy examples/<app> by absolute path. That is gated off by
+		# default (#196); the bench ctrl is single-tenant and short-lived.
+		export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
 
 		mkdir -p "$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
 		# mktemp is 0700 root-owned; rootless podman (SUDO_USER) must traverse
 		# /var/lib/russel → this tree to faccessat the prepared rootfs.
 		chmod 755 "$RUSSEL_STATE_DIR" "$RUSSEL_STATE_DIR/lib" \
 			"$RUSSEL_STATE_DIR/lib/russel" "$RUSSEL_STATE_DIR/lib/microvms"
+
+		# postgres needs an initialized PGDATA on a host path, which Russel does
+		# not create. Prepare one here the way examples/postgres documents it,
+		# as the podman user (apps run as that uid by default, #466), under
+		# a volume root that only this run allows. This must follow the chmod
+		# above: initdb as SUDO_USER cannot traverse the 0700 mktemp dir.
+		BENCH_VOLUME_ROOT="$RUSSEL_STATE_DIR/volumes"
+		export RUSSEL_VOLUME_ROOTS="$BENCH_VOLUME_ROOT"
+		mkdir -p "$BENCH_VOLUME_ROOT"
+		[ -n "$RUSSEL_PODMAN_USER" ] && chown "$RUSSEL_PODMAN_USER" "$BENCH_VOLUME_ROOT"
+		BENCH_PGDATA=""
+		if [ -f examples/postgres/Russelfile.toml ]; then
+			pg_out=$(nix build --no-link --print-out-paths \
+				'github:NixOS/nixpkgs/nixos-unstable#postgresql^out' 2>/dev/null || true)
+			pgdata="$BENCH_VOLUME_ROOT/postgres"
+			if [ -x "$pg_out/bin/initdb" ] &&
+				as_deploy_user "$pg_out/bin/initdb" -D "$pgdata" -U postgres \
+					--no-locale -E UTF8 --auth=trust >/dev/null 2>&1 &&
+				as_deploy_user sh -c "printf \"listen_addresses = '*'\nunix_socket_directories = '/tmp'\n\" >>'$pgdata/postgresql.conf' &&
+					echo 'host all all 0.0.0.0/0 trust' >>'$pgdata/pg_hba.conf'"; then
+				BENCH_PGDATA="$pgdata"
+				pass "postgres: PGDATA prepared ($(basename "$pg_out"))"
+			else
+				warn "postgres: could not prepare PGDATA; its race will be skipped"
+			fi
+		fi
 		# ponytail: redirect /var/lib/{russel,microvms} to temp dir (requires root)
 		# Consumed by bench_restore_var_lib in the EXIT trap (bench-common.sh).
 		# shellcheck disable=SC2034
@@ -573,6 +690,12 @@ else
 		info "waiting for control plane on $RUSSEL_CTRL_ADDR ..."
 		ctrl_ready=0
 		for i in $(seq 1 30); do
+			# Only our ctrl counts: if it exited (e.g. the port was taken
+			# after the preflight), stop instead of racing someone else's.
+			if ! kill -0 "$CTRL_PID" 2>/dev/null; then
+				warn "russel-ctrl exited during startup: $(tail -1 "$RUSSEL_LOG")"
+				break
+			fi
 			if curl -sf "http://${RUSSEL_CTRL_ADDR}/vms" >/dev/null 2>&1; then
 				ctrl_ready=1
 				break
@@ -684,7 +807,11 @@ else
 		EXAMPLES+=("$example")
 
 		# ── Russel microVM ──────────────────────────────────────────────────
-		if [ "$RUSSEL_MICROVM_SKIPPED" -eq 0 ]; then
+		mvm_skip=$(race_skip_reason microvm "examples/$example/Russelfile.toml")
+		if [ -n "$mvm_skip" ] && [ "$RUSSEL_MICROVM_SKIPPED" -eq 0 ]; then
+			info "russel microVM: skipped ($mvm_skip)"
+		fi
+		if [ "$RUSSEL_MICROVM_SKIPPED" -eq 0 ] && [ -z "$mvm_skip" ]; then
 			host_port=$PORT_BASE
 			PORT_BASE=$((PORT_BASE + 1))
 			vm_id="bench-mvm-${example}"
@@ -727,7 +854,11 @@ else
 		fi
 
 		# ── Russel container (rootless podman) ──────────────────────────────
-		if [ "$RUSSEL_CONTAINER_SKIPPED" -eq 0 ]; then
+		ctr_skip=$(race_skip_reason container "examples/$example/Russelfile.toml")
+		if [ -n "$ctr_skip" ] && [ "$RUSSEL_CONTAINER_SKIPPED" -eq 0 ]; then
+			info "russel container: skipped ($ctr_skip)"
+		fi
+		if [ "$RUSSEL_CONTAINER_SKIPPED" -eq 0 ] && [ -z "$ctr_skip" ]; then
 			host_port=$PORT_BASE
 			PORT_BASE=$((PORT_BASE + 1))
 			vm_id="bench-ctr-${example}"
@@ -811,7 +942,7 @@ else
 					else
 						boot_ok=0
 						for _ in $(seq 1 100); do
-							if curl -sf "http://127.0.0.1:$dhp$ready_path" >/dev/null 2>&1; then
+							if probe_ready "$dhp" "$example" "$ready_path"; then
 								boot_ok=1
 								break
 							fi
@@ -911,7 +1042,7 @@ else
 		echo -e "  ${DIM}  Russel microVM:  nix build → initramfs → TAP/socat → cloud-hypervisor → curl${NC}"
 		echo -e "  ${DIM}  Russel container: nix build → rootfs adapter → rootless podman --rootfs → curl${NC}"
 		echo -e "  ${DIM}  ${runtime_label} baseline: Dockerfile build + run → curl (not Russel; skipped if no Dockerfile)${NC}"
-		echo -e "  ${DIM}  Russel deploy API sets runtime=microvm|container; ports via -p style host/guest.${NC}"
+		echo -e "  ${DIM}  Russel deploy API reads runtime and ports from the Russelfile.${NC}"
 		echo -e "  ${DIM}  Warm runs reuse nix/store and image layers; use --cold for cold builds.${NC}"
 		echo -e "  ${DIM}  Examples raced: all examples/*/Russelfile.toml (new apps included).${NC}"
 		echo ""

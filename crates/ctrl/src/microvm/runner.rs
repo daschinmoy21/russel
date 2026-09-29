@@ -13,9 +13,10 @@ use crate::ch_api;
 use super::agent::{AGENT_BUSYBOX_APPLETS, AGENT_INIT_SCRIPT, AGENT_INITRAMFS_BASENAME};
 use super::process::{
     BootOutput, cloud_hypervisor_stop_pattern, escape_pkill_literal, network_alloc_for_service,
-    read_metadata, stop_tap_identity, terminate_owned_process, wait_for_process_exit,
+    read_metadata, stop_tap_identity, terminate_owned_process, virtiofsd_stop_pattern,
+    wait_for_process_exit,
 };
-use super::spec::{KernelInfo, VmSpec};
+use super::spec::{FsMount, KernelInfo, VmSpec};
 
 /// Shared runner singleton — kernel/busybox/modules caches live across deploys.
 pub(crate) fn shared_runner() -> MicrovmRunner {
@@ -24,21 +25,28 @@ pub(crate) fn shared_runner() -> MicrovmRunner {
     RUNNER.clone()
 }
 
-/// virtiofsd sandbox mode from RUSSEL_VIRTIOFS_SANDBOX (default: chroot).
-/// Set RUSSEL_VIRTIOFS_SANDBOX=none for escape hatch.
+/// virtiofsd sandbox mode from RUSSEL_VIRTIOFS_SANDBOX. Default: chroot as
+/// root, namespace otherwise (chroot needs root; namespace uses an
+/// unprivileged user namespace). Set RUSSEL_VIRTIOFS_SANDBOX=none for escape hatch.
 pub(crate) fn virtiofsd_sandbox() -> String {
     std::env::var("RUSSEL_VIRTIOFS_SANDBOX")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "chroot".to_string())
+        .unwrap_or_else(|| {
+            // Safety: geteuid is a pure POSIX query of this process.
+            if unsafe { libc::geteuid() } == 0 {
+                "chroot".to_string()
+            } else {
+                "namespace".to_string()
+            }
+        })
 }
 
 #[derive(Debug, Clone)]
 pub struct MicrovmRunner {
     kernel_cache: Arc<Mutex<Option<KernelInfo>>>,
     busybox_cache: Arc<Mutex<Option<PathBuf>>>,
-    modules_cache: Arc<Mutex<Option<PathBuf>>>,
     agent_initramfs_cache: Arc<Mutex<Option<PathBuf>>>,
     /// Serializes agent initramfs builds so concurrent cold deploys
     /// don't race on the shared work directory (F-18).
@@ -50,7 +58,6 @@ impl Default for MicrovmRunner {
         Self {
             kernel_cache: Arc::new(Mutex::new(None)),
             busybox_cache: Arc::new(Mutex::new(None)),
-            modules_cache: Arc::new(Mutex::new(None)),
             agent_initramfs_cache: Arc::new(Mutex::new(None)),
             build_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -66,9 +73,8 @@ impl MicrovmRunner {
     ///
     /// Resolution order:
     ///   1. In-memory cache
-    ///   2. `RUSSEL_KERNEL_PATH` env var → drivers_builtin=true
+    ///   2. `RUSSEL_KERNEL_PATH` env var
     ///   3. `RUSSEL_KERNEL_POOL` env var, else `/var/lib/russel/_pool/kernel/bzImage`
-    ///      → drivers_builtin=true
     ///   4. `nix build .#microvm-kernel` (flake attr, detected via flake.nix)
     ///   5. Hard error naming the pool path, `RUSSEL_KERNEL_PATH`, and
     ///      `nix build .#microvm-kernel` — never falls back to the stock
@@ -83,15 +89,12 @@ impl MicrovmRunner {
         if let Ok(env_path) = std::env::var("RUSSEL_KERNEL_PATH") {
             let p = PathBuf::from(&env_path);
             if p.exists() {
-                let info = KernelInfo {
-                    path: p,
-                    drivers_builtin: true,
-                };
+                let info = KernelInfo { path: p };
                 self.store_kernel_cache(info.clone());
                 tracing::info!(
                     kernel = %info.path.display(),
                     source = "RUSSEL_KERNEL_PATH",
-                    "kernel cached (drivers built-in)"
+                    "kernel cached"
                 );
                 return Ok(info);
             }
@@ -100,18 +103,15 @@ impl MicrovmRunner {
 
         let pool = match std::env::var("RUSSEL_KERNEL_POOL") {
             Ok(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
-            _ => russel_core::paths::data_root().join("_pool/kernel/bzImage"),
+            _ => crate::paths::data_root().join("_pool/kernel/bzImage"),
         };
         if pool.is_file() {
-            let info = KernelInfo {
-                path: pool,
-                drivers_builtin: true,
-            };
+            let info = KernelInfo { path: pool };
             self.store_kernel_cache(info.clone());
             tracing::info!(
                 kernel = %info.path.display(),
                 source = "kernel-pool",
-                "microvm kernel cached (drivers built-in)"
+                "microvm kernel cached"
             );
             return Ok(info);
         }
@@ -122,15 +122,12 @@ impl MicrovmRunner {
         {
             match self.build_flake_kernel(&repo_root).await {
                 Ok(path) => {
-                    let info = KernelInfo {
-                        path,
-                        drivers_builtin: true,
-                    };
+                    let info = KernelInfo { path };
                     self.store_kernel_cache(info.clone());
                     tracing::info!(
                         kernel = %info.path.display(),
                         source = "flake",
-                        "microvm kernel cached (drivers built-in)"
+                        "microvm kernel cached"
                     );
                     return Ok(info);
                 }
@@ -255,50 +252,6 @@ impl MicrovmRunner {
         Ok(path)
     }
 
-    // Kernel modules (only needed when drivers are not built-in).
-
-    /// Resolve kernel modules when the kernel does not have drivers built in.
-    /// Returns `None` for the microvm kernel (drivers built-in).
-    pub async fn ensure_kernel_modules(&self) -> anyhow::Result<Option<PathBuf>> {
-        let kernel = self.ensure_kernel().await?;
-        if kernel.drivers_builtin {
-            tracing::debug!("microvm kernel: drivers built-in, no modules needed");
-            return Ok(None);
-        }
-
-        if let Some(path) = self.check_path_cache(&self.modules_cache) {
-            return Ok(Some(path));
-        }
-
-        let system = crate::build::current_system();
-        tracing::info!(system = %system, "resolving kernel modules from nixpkgs");
-        let expr = format!(
-            "let pkgs = import <nixpkgs> {{ system = \"{system}\"; }}; in pkgs.linux.modules"
-        );
-        let output = Command::new("nix")
-            .args([
-                "build",
-                "--impure",
-                "--no-link",
-                "--print-out-paths",
-                "--expr",
-                &expr,
-            ])
-            .stderr(std::process::Stdio::inherit())
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            anyhow::bail!("failed to resolve kernel modules from nixpkgs");
-        }
-
-        let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let path = PathBuf::from(store_path);
-        self.store_path_cache(&self.modules_cache, path.clone());
-        tracing::info!(modules = %path.display(), "kernel modules cached");
-        Ok(Some(path))
-    }
-
     fn check_path_cache(&self, cache: &Mutex<Option<PathBuf>>) -> Option<PathBuf> {
         if let Ok(cache) = cache.lock() {
             if let Some(ref path) = *cache
@@ -349,8 +302,7 @@ impl MicrovmRunner {
         }
 
         let busybox_path = self.ensure_busybox().await?;
-        let kernel_modules_path = self.ensure_kernel_modules().await?;
-        let pool_dir = russel_core::paths::data_root().join("_pool");
+        let pool_dir = crate::paths::data_root().join("_pool");
         std::fs::create_dir_all(&pool_dir)?;
 
         // Unique temp dir so concurrent deploys never share a work dir (F-18).
@@ -382,24 +334,6 @@ impl MicrovmRunner {
         // Bump AGENT_INITRAMFS_BASENAME when AGENT_INIT_SCRIPT changes so disk cache cannot serve a stale CPIO.
         let initramfs_file = pool_dir.join(AGENT_INITRAMFS_BASENAME);
 
-        // Copy kernel modules when using stock kernel (drivers not built-in).
-        // Same virtio/fuse list as the legacy per-service initramfs.
-        if let Some(ref mod_path) = kernel_modules_path {
-            let mods: &[&str] = &[
-                "drivers/virtio/virtio_ring.ko.xz",
-                "drivers/virtio/virtio.ko.xz",
-                "drivers/virtio/virtio_pci_modern_dev.ko.xz",
-                "drivers/virtio/virtio_pci_legacy_dev.ko.xz",
-                "drivers/virtio/virtio_pci.ko.xz",
-                "net/core/failover.ko.xz",
-                "drivers/net/net_failover.ko.xz",
-                "drivers/net/virtio_net.ko.xz",
-                "fs/fuse/fuse.ko.xz",
-                "fs/fuse/virtiofs.ko.xz",
-            ];
-            self.copy_kernel_modules(mod_path, &work, mods)?;
-        }
-
         let bb_bin = format!("{}/bin/busybox", busybox_path.display());
         let init = AGENT_INIT_SCRIPT;
 
@@ -422,49 +356,6 @@ impl MicrovmRunner {
             "agent initramfs built (config-driven, no app baked in)"
         );
         Ok(initramfs_file)
-    }
-
-    fn copy_kernel_modules(
-        &self,
-        kernel_modules_path: &Path,
-        work: &Path,
-        needed_modules: &[&str],
-    ) -> anyhow::Result<()> {
-        let modules_dest = work.join("modules");
-        std::fs::create_dir_all(&modules_dest)?;
-
-        let kver = self.find_kver(kernel_modules_path)?;
-        let kmod_base = kernel_modules_path
-            .join("lib/modules")
-            .join(&kver)
-            .join("kernel");
-
-        let mut missing: Vec<&str> = Vec::new();
-        for module_rel in needed_modules {
-            let src = kmod_base.join(module_rel);
-            let name = Path::new(module_rel)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(module_rel);
-            let dest = modules_dest.join(name);
-            if src.exists() {
-                std::fs::copy(&src, &dest)?;
-                tracing::debug!(module = %name, "copied kernel module to initramfs");
-            } else {
-                tracing::warn!(module = %module_rel, "kernel module not found");
-                missing.push(module_rel);
-            }
-        }
-        if !missing.is_empty() {
-            anyhow::bail!(
-                "kernel modules not found in {} (kver={kver}): {}. \
-                 The guest would boot without virtio_net and be unreachable. \
-                 Check that your kernel provides these modules or use a microvm-kernel with drivers built-in.",
-                kmod_base.display(),
-                missing.join(", ")
-            );
-        }
-        Ok(())
     }
 
     fn create_busybox_symlinks(&self, work: &Path, bb_bin: &str) -> anyhow::Result<()> {
@@ -505,32 +396,6 @@ impl MicrovmRunner {
         })
         .await??;
         Ok(())
-    }
-
-    fn find_kver(&self, modules_path: &Path) -> anyhow::Result<String> {
-        let mods_dir = modules_path.join("lib/modules");
-        let mut versions: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&mods_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir()
-                && let Some(name) = entry.file_name().to_str()
-            {
-                versions.push(name.to_string());
-            }
-        }
-        if versions.is_empty() {
-            anyhow::bail!(
-                "no kernel version directory found in {}",
-                mods_dir.display()
-            );
-        }
-        if versions.len() > 1 {
-            tracing::warn!(
-                versions = ?versions,
-                "multiple kernel version directories found; selecting greatest (last by version sort)"
-            );
-        }
-        select_kernel_version(&mut versions)
     }
 
     async fn copy_closure_to(&self, store_path: &Path, dest_root: &Path) -> anyhow::Result<()> {
@@ -605,19 +470,24 @@ impl MicrovmRunner {
     /// Returns `BootOutput` with the VM child and all virtiofsd children.
     pub async fn boot_vm(&self, spec: &VmSpec) -> anyhow::Result<BootOutput> {
         tracing::info!(
-            tap = %spec.tap,
+            net = ?spec.net,
             mac = %spec.mac,
             kernel = %spec.kernel.display(),
-            cpus = format!("boot={},max={}", spec.cpus_boot, spec.cpus_max),
+            cpus = %super::spec::cpus_arg(spec.cpus_boot, spec.cpus_max),
             memory = format!("{}M,hotplug_size={}M", spec.memory_mb, spec.memory_hotplug_mb),
             "booting cloud-hypervisor"
         );
+        // Before any virtiofsd starts, so a refused boot leaves nothing behind.
+        // TAP VMs boot fine on older CH (#510); only the vhost-user NIC hits it.
+        if spec.restore_url.is_none() && matches!(spec.net, crate::network::VmNet::VhostUser(_)) {
+            super::preflight::check_ch_supports_cpus(spec.cpus_boot).await?;
+        }
 
         let sock_dir = spec
             .api_socket
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(russel_core::paths::data_root);
+            .unwrap_or_else(crate::paths::data_root);
 
         std::fs::create_dir_all(&sock_dir)?;
         #[cfg(unix)]
@@ -629,18 +499,15 @@ impl MicrovmRunner {
         match spec.fs.as_slice() {
             [] => {}
             [a, b] => {
-                let (ra, rb) = tokio::join!(
-                    self.spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly),
-                    self.spawn_virtiofsd(&b.socket, &b.shared_dir, b.readonly),
-                );
+                let (ra, rb) = tokio::join!(self.spawn_virtiofsd(a), self.spawn_virtiofsd(b),);
                 virtiofsd_children.push(ra?);
                 virtiofsd_children.push(rb?);
             }
             [a, b, c] => {
                 let (ra, rb, rc) = tokio::join!(
-                    self.spawn_virtiofsd(&a.socket, &a.shared_dir, a.readonly),
-                    self.spawn_virtiofsd(&b.socket, &b.shared_dir, b.readonly),
-                    self.spawn_virtiofsd(&c.socket, &c.shared_dir, c.readonly),
+                    self.spawn_virtiofsd(a),
+                    self.spawn_virtiofsd(b),
+                    self.spawn_virtiofsd(c),
                 );
                 virtiofsd_children.push(ra?);
                 virtiofsd_children.push(rb?);
@@ -648,14 +515,20 @@ impl MicrovmRunner {
             }
             _ => {
                 for fs in &spec.fs {
-                    let child = self
-                        .spawn_virtiofsd(&fs.socket, &fs.shared_dir, fs.readonly)
-                        .await?;
+                    let child = self.spawn_virtiofsd(fs).await?;
                     virtiofsd_children.push(child);
                 }
             }
         }
         let mem_mb = spec.memory_mb.max(256);
+
+        // A VM that died leaves its API socket behind, and cloud-hypervisor
+        // refuses to start on it (EADDRINUSE). Relaunches in place hit this.
+        if let Err(e) = std::fs::remove_file(&spec.api_socket)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(file = %spec.api_socket.display(), error = %e, "failed to remove stale API socket");
+        }
 
         let mut cmd = Command::new("cloud-hypervisor");
         cmd.arg("--api-socket")
@@ -668,7 +541,7 @@ impl MicrovmRunner {
                 .arg(format!("source_url={restore_url},resume=true"));
         } else {
             cmd.arg("--cpus")
-                .arg(format!("boot={},max={}", spec.cpus_boot, spec.cpus_max))
+                .arg(super::spec::cpus_arg(spec.cpus_boot, spec.cpus_max))
                 .arg("--memory")
                 .arg(format!(
                     "size={mem_mb}M,shared=on,hotplug_size={}M",
@@ -679,7 +552,7 @@ impl MicrovmRunner {
                 .arg("--console")
                 .arg(&spec.console)
                 .arg("--net")
-                .arg(format!("tap={},mac={}", spec.tap, spec.mac))
+                .arg(spec.net.ch_arg(&spec.mac))
                 .arg("--kernel")
                 .arg(&spec.kernel)
                 .arg("--initramfs")
@@ -764,13 +637,12 @@ impl MicrovmRunner {
         })
     }
 
-    /// Spawn virtiofsd for a socket/shared_dir pair and wait for readiness.
+    /// Spawn virtiofsd for one share and wait for readiness.
     pub(crate) async fn spawn_virtiofsd(
         &self,
-        socket: &Path,
-        shared_dir: &Path,
-        readonly: bool,
+        fs: &FsMount,
     ) -> anyhow::Result<tokio::process::Child> {
+        let (socket, shared_dir, readonly) = (&fs.socket, &fs.shared_dir, fs.readonly);
         // Remove stale socket
         if let Err(e) = std::fs::remove_file(socket)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -790,9 +662,7 @@ impl MicrovmRunner {
 
         let mut cmd = Command::new("virtiofsd");
         // virtiofsd --cache accepts: auto | always | never | metadata (not "none").
-        // readonly (nixstore, cfg): always cache; rw scratch: never cache so
-        // the host sees `.agent_ready` promptly.
-        let cache_policy = if readonly { "always" } else { "never" };
+        let cache_policy = fs.cache.as_str();
         cmd.arg(format!("--socket-path={}", socket.display()))
             .arg(format!("--shared-dir={}", shared_dir.display()))
             .arg(format!("--sandbox={}", virtiofsd_sandbox()))
@@ -828,10 +698,10 @@ impl MicrovmRunner {
 
     /// Gracefully stop a VM through Cloud Hypervisor's REST API.
     pub async fn stop(&self, service_id: &str) -> anyhow::Result<()> {
-        Self::validate_service_id(service_id)?;
+        russel_core::ids::validate_service_id(service_id)?;
 
         let metadata = read_metadata(service_id);
-        let api_socket = russel_core::paths::service_dir(service_id)
+        let api_socket = crate::paths::service_dir(service_id)
             .join("cloud-hypervisor.sock")
             .display()
             .to_string();
@@ -850,25 +720,36 @@ impl MicrovmRunner {
         }
         .await;
 
-        let vm_stopped = if api_result.is_ok() {
-            match vm_pid {
+        let vm_stopped = match api_result {
+            Ok(()) => match vm_pid {
                 Some(pid) => wait_for_process_exit(pid, Duration::from_secs(5)).await,
                 None => true,
+            },
+            Err(error) => {
+                // Cloud Hypervisor can exit on vm.shutdown before it answers, so
+                // a failed request does not mean the VM is still running.
+                let exited = match vm_pid {
+                    Some(pid) => wait_for_process_exit(pid, Duration::from_secs(2)).await,
+                    None => false,
+                };
+                if !exited {
+                    tracing::warn!(service_id, error = %error, "CH API shutdown failed; using process fallback");
+                }
+                exited
             }
-        } else {
-            if let Err(ref error) = api_result {
-                tracing::warn!(service_id, error = %error, "CH API shutdown failed; using process fallback");
-            }
-            false
         };
 
         if !vm_stopped {
             // Metadata TAP → registry lease → service-path marker. Never
             // preferred_subnet / subnet_for (wrong TAP or phantom lease).
-            let tap = stop_tap_identity(
-                service_id,
-                metadata.as_ref().and_then(|m| m.tap_id.as_deref()),
-            );
+            // A passt VM has no TAP; match it by its service path instead.
+            let tap = match metadata.as_ref().map(|m| m.net_mode) {
+                Some(crate::network::MicrovmNetMode::Passt) => None,
+                _ => stop_tap_identity(
+                    service_id,
+                    metadata.as_ref().and_then(|m| m.tap_id.as_deref()),
+                ),
+            };
             let pattern = cloud_hypervisor_stop_pattern(service_id, tap.as_deref());
             self.pkill_service_process(service_id, "cloud-hypervisor", &pattern)
                 .await?;
@@ -878,11 +759,6 @@ impl MicrovmRunner {
         }
 
         // Kill virtiofsd processes (plural — deploy writes an array).
-        let virtiofsd_path = escape_pkill_literal(&format!(
-            "{}/",
-            russel_core::paths::service_dir(service_id).display()
-        ));
-        let virtiofsd_pattern = format!("(^|[[:space:]])virtiofsd .*{virtiofsd_path}");
         let mut virtiofsd_killed = false;
         if let Some(ref meta) = metadata {
             for &pid in &meta.virtiofsd_pids {
@@ -895,6 +771,7 @@ impl MicrovmRunner {
             }
         }
         if !virtiofsd_killed {
+            let virtiofsd_pattern = virtiofsd_stop_pattern(service_id);
             self.pkill_service_process(service_id, "virtiofsd", &virtiofsd_pattern)
                 .await?;
         }
@@ -907,6 +784,26 @@ impl MicrovmRunner {
         };
         if !socat_killed {
             self.pkill_service_process(service_id, "socat", &socat_pattern)
+                .await?;
+        }
+
+        // Kill passt (unprivileged network mode, #461).
+        // Exact service dir only: during a dual-live cutover the candidate's
+        // passt lives under `<id>_g<gen>/` and must survive the old
+        // generation's stop. passt exits by itself when its VM goes away.
+        let passt_socket = escape_pkill_literal(
+            &crate::paths::service_dir(service_id)
+                .join(crate::network::PASST_SOCKET)
+                .display()
+                .to_string(),
+        );
+        let passt_pattern = format!("(^|[[:space:]])passt .*{passt_socket}( |$)");
+        let passt_killed = match metadata.as_ref().and_then(|m| m.passt_pid) {
+            Some(pid) => terminate_owned_process(pid, service_id).await?,
+            None => false,
+        };
+        if !passt_killed {
+            self.pkill_service_process(service_id, "passt", &passt_pattern)
                 .await?;
         }
 
@@ -942,12 +839,41 @@ impl MicrovmRunner {
     /// destroy must not permanently hold the service's port/subnet. Returns
     /// `Ok` only when every step succeeded; otherwise aggregates failures so
     /// callers can leave status `failed` for retry of remaining cleanup.
+    ///
+    /// Keeps every managed volume: redeploy and failed-deploy cleanup use
+    /// this while the next generation still mounts that data.
     pub async fn destroy(&self, service_id: &str) -> anyhow::Result<()> {
-        Self::validate_service_id(service_id)?;
+        self.destroy_inner(service_id, None).await
+    }
+
+    /// Operator destroy: managed volumes follow `policy` (each row's `keep`,
+    /// or the keep/delete override), the same as a container's (#386).
+    pub async fn destroy_with_policy(
+        &self,
+        service_id: &str,
+        policy: russel_core::VolumeDestroyPolicy,
+    ) -> anyhow::Result<()> {
+        self.destroy_inner(service_id, Some(policy)).await
+    }
+
+    async fn destroy_inner(
+        &self,
+        service_id: &str,
+        policy: Option<russel_core::VolumeDestroyPolicy>,
+    ) -> anyhow::Result<()> {
+        russel_core::ids::validate_service_id(service_id)?;
+        // Read before stop; the recorded rows decide which dirs survive.
+        let volumes = crate::container::volumes_recorded_for(service_id);
 
         // Metadata or this service's registry lease only — never invent a
         // hash-preferred TAP that may belong to another collision owner.
         let alloc = network_alloc_for_service(service_id);
+        // Without metadata (a deploy that failed before writing it), assume
+        // the mode this host would have used.
+        let net_mode = match read_metadata(service_id) {
+            Some(meta) => meta.net_mode,
+            None => crate::network::MicrovmNetMode::for_host().unwrap_or_default(),
+        };
         let mut errors: Vec<String> = Vec::new();
 
         if let Err(e) = self.stop(service_id).await {
@@ -957,7 +883,7 @@ impl MicrovmRunner {
 
         match alloc {
             Some(ref alloc) => {
-                if let Err(e) = crate::network::TapForwarder::teardown(alloc).await {
+                if let Err(e) = crate::network::MicrovmNet::teardown(net_mode, alloc).await {
                     tracing::warn!(
                         service_id,
                         error = %e,
@@ -981,19 +907,25 @@ impl MicrovmRunner {
         crate::network::PortAllocator::release(service_id);
         crate::network::release_subnet(service_id);
 
-        for dir in &[
-            format!("/var/lib/microvms/{service_id}"),
-            russel_core::paths::service_dir(service_id)
-                .display()
-                .to_string(),
-        ] {
-            let path = std::path::Path::new(dir);
-            if path.exists() {
-                // F-46: use std::fs::remove_dir_all instead of subprocess rm -rf.
-                if let Err(e) = std::fs::remove_dir_all(path) {
-                    tracing::warn!(service_id, dir, error = %e, "destroy: directory remove failed");
-                    errors.push(format!("remove {dir}: {e}"));
+        // Both dirs keep `volumes/`: with `RUSSEL_DATA_DIR=/var/lib/microvms`
+        // the legacy marker dir *is* the service dir, and a plain
+        // remove_dir_all there would wipe a destroyed container's kept data.
+        let marker_dir = crate::paths::microvm_dir(service_id);
+        let service_dir = crate::paths::service_dir(service_id);
+        let mut dirs = vec![marker_dir];
+        if service_dir != dirs[0] {
+            dirs.push(service_dir.clone());
+        }
+        for dir in &dirs {
+            let removed = match policy {
+                Some(policy) if *dir == service_dir => {
+                    crate::container::cleanup_service_dir_in(dir, &volumes, policy).await
                 }
+                _ => remove_service_dir_keep_volumes(dir).await,
+            };
+            if let Err(e) = removed {
+                tracing::warn!(service_id, dir = %dir.display(), error = %e, "destroy: directory remove failed");
+                errors.push(format!("remove {}: {e}", dir.display()));
             }
         }
         for file in &[
@@ -1018,42 +950,26 @@ impl MicrovmRunner {
             ))
         }
     }
-
-    /// Validate service_id for safe filesystem use.
-    pub fn validate_service_id(service_id: &str) -> anyhow::Result<()> {
-        if service_id.is_empty() {
-            anyhow::bail!("service_id cannot be empty");
-        }
-        if service_id.len() > 128 {
-            anyhow::bail!("service_id too long (max 128 characters)");
-        }
-        if service_id.contains('/') || service_id.contains('\\') {
-            anyhow::bail!("service_id cannot contain path separators");
-        }
-        if !service_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            anyhow::bail!(
-                "service_id can only contain ASCII alphanumeric characters, dashes, and underscores"
-            );
-        }
-        // Reject host state trees (secrets/traefik/_pool/*.bak) so deploy/destroy
-        // cannot wipe /var/lib/russel/{secrets,traefik,_pool} or backup dirs.
-        if russel_core::reserved::is_reserved_service_dir(service_id) {
-            anyhow::bail!("service_id is reserved: {service_id}");
-        }
-        Ok(())
-    }
 }
-/// Select the greatest kernel version from a list of version strings.
-/// Sorts lexicographically and returns the last; exported for unit testing.
-pub(super) fn select_kernel_version(versions: &mut [String]) -> anyhow::Result<String> {
-    if versions.is_empty() {
-        anyhow::bail!("no kernel versions provided");
+/// Remove a microVM service dir, but never its `volumes/` child.
+///
+/// MicroVMs have no managed volumes. A `volumes/` dir here is data a
+/// destroyed container kept (`keep = true`). Without metadata, lifecycle
+/// runtime resolution defaults to microVM, so a second destroy of that
+/// leftover dir reaches this path and must not wipe the kept data.
+pub(super) async fn remove_service_dir_keep_volumes(dir: &Path) -> anyhow::Result<()> {
+    if !dir.exists() {
+        return Ok(());
     }
-    versions.sort();
-    Ok(versions[versions.len() - 1].clone())
+    if !dir.join("volumes").is_dir() {
+        return Ok(crate::container::remove_tree(dir).await?);
+    }
+    crate::container::remove_service_payload_keep_volumes(dir).await?;
+    tracing::warn!(
+        dir = %dir.display(),
+        "destroy: left kept volumes/ in place (remove it by hand to delete the data)"
+    );
+    Ok(())
 }
 
 #[async_trait::async_trait]

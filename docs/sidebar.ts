@@ -53,6 +53,6 @@ export const sidebar = [
   },
   {
     label: 'Project',
-    items: ['project/development', 'project/releases'],
+    items: ['project/development', 'project/releases', 'project/features/v0.1'],
   },
 ];

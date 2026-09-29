@@ -203,45 +203,28 @@ async fn post_deploy(body: &str) -> (StatusCode, String) {
     (status, text)
 }
 
+/// #447: the Russelfile is the whole desired state. Former override fields
+/// are rejected by the JSON extractor, before any deploy pipeline starts.
 #[tokio::test]
-async fn deploy_missing_vm_id_returns_400() {
-    let (status, body) = post_deploy(
-        r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml"}"#,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert!(
-        body.contains("vm_id is required"),
-        "expected vm_id contract message, got: {body}"
-    );
-    // Must not start an NDJSON deploy stream.
-    assert!(
-        !body.contains("application/x-ndjson") && !body.starts_with('{'),
-        "must not invoke deploy pipeline; body={body}"
-    );
-}
-
-#[tokio::test]
-async fn deploy_whitespace_only_vm_id_returns_400() {
-    let (status, body) = post_deploy(
-        r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml","vm_id":"   "}"#,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert!(
-        body.contains("vm_id is required"),
-        "expected vm_id contract message, got: {body}"
-    );
-}
-
-#[tokio::test]
-async fn deploy_null_vm_id_returns_400() {
-    let (status, body) = post_deploy(
-        r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml","vm_id":null}"#,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert!(body.contains("vm_id is required"), "body={body}");
+async fn deploy_rejects_removed_override_fields() {
+    for field in [
+        r#""port":{"host":8080,"guest":3000}"#,
+        r#""host":"api.example.com""#,
+        r#""runtime":"container""#,
+        r#""env":{"A":"1"}"#,
+        r#""podman_args":["-v","/a:/b"]"#,
+    ] {
+        let (status, body) = post_deploy(&format!(
+            r#"{{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml","vm_id":"app",{field}}}"#
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{field}: body={body}"
+        );
+        assert!(body.contains("unknown field"), "{field}: body={body}");
+    }
 }
 
 fn mini_dashboard() -> tempfile::TempDir {
@@ -329,7 +312,7 @@ async fn dashboard_post_deploy_stays_the_api() {
         .oneshot(
             builder
                 .body(Body::from(
-                    r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml"}"#,
+                    r#"{"repo_url":"https://example.com/org/app.git","config_path":"Russelfile.toml","runtime":"container"}"#,
                 ))
                 .expect("request"),
         )
@@ -338,8 +321,9 @@ async fn dashboard_post_deploy_stays_the_api() {
     let status = res.status();
     let bytes = res.into_body().collect().await.expect("body").to_bytes();
     let body = String::from_utf8_lossy(&bytes).into_owned();
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert!(body.contains("vm_id is required"), "body={body}");
+    // The API's JSON extractor answered, not the static dashboard.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+    assert!(body.contains("unknown field"), "body={body}");
 }
 
 #[tokio::test]

@@ -20,6 +20,7 @@ stateDiagram-v2
     destroying --> [*]
     deployed --> building: redeploy/update (dual-live candidate)
     failed --> building: retry
+    failed --> building: relaunch (microVM, restart = unless-stopped)
     rolled_back --> deployed: old gen live again
 ```
 
@@ -28,7 +29,7 @@ stateDiagram-v2
 - **Cold redeploy** (no live prior): backup dirs → kill + wait old children (up to 5 s, then force-kill) → teardown → boot new.
 - **Dual-live redeploy** (live prior): candidate boots under a generation key (`<id>_g<gen>`) with a fresh backend port, `Ingress::swap` cuts Traefik over, old generation drains, candidate promotes.
 - Container redeploys stop the old container only **after** the new podman argv validates (fail-closed).
-- `russel deploy` with an existing id reuses ports after the old generation drains; the allocator prevents cross-service collisions.
+- `russel apply` with an existing id reuses ports after the old generation drains; the allocator prevents cross-service collisions.
 
 ## Rollback
 
@@ -40,6 +41,16 @@ Each successful deploy appends a versioned row to `/var/lib/russel/<id>/deployme
 Rollback validates the `.bak` metadata **before** restoring directories, re-reserves ports with checked `u16::try_from`, restores persisted `desired_state` env, re-boots, and only reports `rolled_back` after readiness. Instant dual-live retain-N=2 cutover (keeping the previous artifact hot) is a follow-up.
 
 Operator guide: [Update and rollback](../guides/update-rollback.md). API: [API reference](../reference/api.md).
+
+## Restart on exit
+
+`restart = "unless-stopped"` keeps a service running without a redeploy.
+
+- **Containers:** Podman's restart policy restarts the container.
+- **MicroVMs:** ctrl relaunches the recorded generation (same build, config, env, volumes, and ports; nothing is rebuilt). This happens when the app or the VMM exits without a `stop` or `destroy`, and at ctrl start when reconcile finds the VM down (host reboot, or the VM died while ctrl was not running).
+- **Crash loops** back off 1s, 2s, 4s, … up to 30s. The service reads `failed` between attempts, and `status` counts `restarts` since the last deploy. A run of 60s resets the backoff. A relaunch keeps the crashed run's console output as `console.log.1`.
+- **`russel stop`** is recorded, so the service stays down across ctrl restarts until the next deploy.
+- A deploy, stop, or destroy during a backoff wins: the pending relaunch is dropped.
 
 ## Update
 

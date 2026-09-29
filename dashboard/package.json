@@ -3,10 +3,11 @@
   "type": "module",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "astro dev --host 127.0.0.1",
     "start": "astro dev --host 127.0.0.1",
-    "build": "astro check && astro build",
+    "build": "astro check && astro build && bun scripts/third-party-licenses.mjs",
     "preview": "astro preview --host 127.0.0.1",
     "dev:lan": "astro dev --host",
     "preview:lan": "astro preview --host",

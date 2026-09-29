@@ -875,3 +875,100 @@ fn test_write_catalog_emits_valid_json() {
     assert_eq!(parsed["schema_version"], 1);
     assert_eq!(parsed["services"]["cat-svc"]["host_port"], 4000);
 }
+
+/// Poll until `service_id` reports `failed`, for up to `limit`.
+async fn wait_for_failed(state: &AppState, service_id: &str, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if state
+            .status(service_id)
+            .is_some_and(|s| s.status == "failed")
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// A failed redeploy of an adopted microVM restores PID supervision, and that
+/// supervisor still notices when the VM later dies.
+#[tokio::test]
+async fn failed_redeploy_restores_pid_supervisor_that_detects_exit() {
+    let state = AppState::default();
+    let mut vm = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = vm.id().expect("child pid");
+    // Adopted after a ctrl restart: known PID, no owned `Child`.
+    state.lock_inner().services.insert(
+        "svc-adopted".into(),
+        app::ServiceState {
+            status: ServiceStatus::Building,
+            vm_state: VmState::Running,
+            runtime: Some(RuntimeKind::Microvm),
+            vm_pid: Some(pid),
+            prebuild_status: Some(ServiceStatus::Deployed),
+            prebuild_vm_state: Some(VmState::Running),
+            ..Default::default()
+        },
+    );
+
+    state.mark_failed("svc-adopted", "build failed".into());
+    assert_eq!(state.status("svc-adopted").unwrap().status, "deployed");
+
+    vm.kill().await.expect("kill");
+    vm.wait().await.expect("reap");
+    // 2s settle, then 5s polls; the first poll runs right after the settle.
+    assert!(
+        wait_for_failed(&state, "svc-adopted", Duration::from_secs(10)).await,
+        "restored PID supervisor must mark the service failed"
+    );
+}
+
+/// An aborted stop re-bumps the generation; the re-spawned process
+/// supervisor must still catch a later cloud-hypervisor exit.
+#[tokio::test]
+async fn aborted_stop_restores_process_supervisor_that_detects_exit() {
+    let state = AppState::default();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id().expect("child pid");
+    state.mark_deployed_with_aux("svc-abort-exit", child, vec![], None, None);
+
+    let LifecycleClaim::Claimed {
+        prior_status,
+        prior_vm_state,
+        claim_generation,
+    } = state.begin_lifecycle_operation(
+        "svc-abort-exit",
+        ServiceStatus::Stopping,
+        VmState::Pending,
+    )
+    else {
+        panic!("expected Claimed");
+    };
+    state.abort_lifecycle_operation(
+        "svc-abort-exit",
+        claim_generation,
+        ServiceStatus::Stopping,
+        prior_status,
+        prior_vm_state,
+    );
+    assert_eq!(state.status("svc-abort-exit").unwrap().status, "deployed");
+
+    let killed = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(killed.success());
+    assert!(
+        wait_for_failed(&state, "svc-abort-exit", Duration::from_secs(5)).await,
+        "restored process supervisor must mark the service failed"
+    );
+    let logs = state.logs("svc-abort-exit").unwrap();
+    assert!(logs.output.contains("PROCESS EXIT"), "{}", logs.output);
+}

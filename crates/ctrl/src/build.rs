@@ -302,7 +302,7 @@ impl NixBuilder {
         cmd.arg("build")
             .arg(&flake_ref)
             .arg("--no-link")
-            .arg("--print-out-paths");
+            .arg("--json");
         if restricted {
             cmd.args(restricted_nix_build_args().iter().copied());
         }
@@ -316,7 +316,7 @@ impl NixBuilder {
                 .arg("build")
                 .arg(&fallback_ref)
                 .arg("--no-link")
-                .arg("--print-out-paths");
+                .arg("--json");
             if restricted {
                 fallback.args(restricted_nix_build_args().iter().copied());
             }
@@ -335,12 +335,7 @@ impl NixBuilder {
             }
         }
 
-        let store_path_raw = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let store_path_raw = select_store_path(&String::from_utf8_lossy(&output.stdout))?;
 
         if store_path_raw.is_empty() {
             anyhow::bail!("nix build produced an empty store path");
@@ -358,6 +353,36 @@ impl NixBuilder {
             using_package,
         })
     }
+}
+
+/// Pick the runtime store path from `nix build --json`.
+///
+/// A multi-output package builds every entry in `meta.outputsToInstall`
+/// (postgresql: `out` and `man`), and nix lists outputs alphabetically, so
+/// the first path can be documentation. Take `out` when present, else the
+/// only output.
+fn select_store_path(json: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Built {
+        outputs: std::collections::BTreeMap<String, String>,
+    }
+    let built: Vec<Built> = serde_json::from_str(json.trim())
+        .map_err(|e| anyhow::anyhow!("unexpected nix build --json output: {e}"))?;
+    let outputs = built
+        .into_iter()
+        .next()
+        .map(|b| b.outputs)
+        .unwrap_or_default();
+    let path = match outputs.get("out") {
+        Some(out) => out.clone(),
+        None if outputs.len() == 1 => outputs.into_values().next().unwrap_or_default(),
+        None if outputs.is_empty() => String::new(),
+        None => anyhow::bail!(
+            "nix build produced outputs {:?} and none is named \"out\"",
+            outputs.keys().collect::<Vec<_>>()
+        ),
+    };
+    Ok(path.trim().to_string())
 }
 
 /// Flake body for `service.package`: wrap a nixpkgs attr when the repo has
@@ -589,6 +614,32 @@ mod tests {
                 }
             });
         });
+    }
+
+    #[test]
+    fn select_store_path_prefers_out_over_man() {
+        // Real `nix build --json nixpkgs#postgresql` shape: man sorts first.
+        let json = r#"[{"drvPath":"/nix/store/x-postgresql-18.6.drv","outputs":{"man":"/nix/store/b-postgresql-18.6-man","out":"/nix/store/a-postgresql-18.6"}}]"#;
+        assert_eq!(
+            select_store_path(json).unwrap(),
+            "/nix/store/a-postgresql-18.6"
+        );
+    }
+
+    #[test]
+    fn select_store_path_single_output_any_name() {
+        let json = r#"[{"drvPath":"/nix/store/x.drv","outputs":{"bin":"/nix/store/b-app-bin"}}]"#;
+        assert_eq!(select_store_path(json).unwrap(), "/nix/store/b-app-bin");
+    }
+
+    #[test]
+    fn select_store_path_rejects_ambiguous_and_garbage() {
+        let json = r#"[{"drvPath":"/nix/store/x.drv","outputs":{"bin":"/nix/store/b","lib":"/nix/store/l"}}]"#;
+        let err = select_store_path(json).unwrap_err().to_string();
+        assert!(err.contains("none is named"), "{err}");
+        assert!(select_store_path("/nix/store/abc-not-json").is_err());
+        // Empty output list falls through to the caller's empty-path check.
+        assert_eq!(select_store_path("[]").unwrap(), "");
     }
 
     #[test]

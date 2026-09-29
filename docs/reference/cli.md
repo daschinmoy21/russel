@@ -48,15 +48,14 @@ russel init [DIR] [--name NAME] [--port PORT] [--memory MEM] [--type|--runtime R
 russel login [<url>] [--token-file PATH]
 russel logout
 russel origin
-russel deploy <repo> [-p HOST:GUEST] [--config PATH] [--vm-id ID]
-  [--host HOST] [--runtime microvm|container] [--env KEY=VALUE...] [--env-file PATH]
-  [-- <podman-args...>]
+russel apply <REPO> [--config PATH] [--force]   # alias: deploy
 russel status [<service_id>]
 russel logs [<service_id>]
 russel ps                      # aliases: list, vms
 russel stop <service_id>
 russel destroy <service_id> [--keep-volumes | --delete-volumes]
-russel update <service_id> [--repo REPO] [--config PATH]
+russel update <service_id> [--refresh] [--repo REPO] [--config PATH]
+russel rollback <service_id> [--version N]
 russel secrets set <name>      # value from stdin
 russel secrets list
 russel secrets delete <name>
@@ -72,13 +71,13 @@ Scaffold `Russelfile.toml` (and optionally `flake.nix`). Documents every field +
 | `--name` | Inferred from `Cargo.toml` / `go.mod` / dir | `service.name` |
 | `--port` | `3000` | `service.port` |
 | `--memory` | `256mb` | `service.memory` |
-| `--type` / `--runtime` | `microvm` | `service.type` |
+| `--type` / `--runtime` | `container` | `service.type`. `microvm` is experimental: needs `/dev/kvm` and `passt`. |
 | `--bin` | `service.name` | `service.bin` |
 | `--package ATTR` | — | nixpkgs attr for containers without a `flake.nix` (e.g. `--package navidrome`); implies `--type container`. Written as `service.package`. Cannot combine with `--with-flake`. |
 | `--with-flake` | off | Also write starter `flake.nix` (Rust/Go/static). Cannot combine with `--package`. |
 | `--force` | off | Overwrite existing files |
 
-Reserved dir names (`secrets`, `traefik`, `_pool`) are rejected as service names.
+`--name` uses the rule the Russelfile load applies to `service.name` (the service id rule: `[A-Za-z0-9_-]`, max 128). Reserved dir names (`secrets`, `traefik`, `_pool`, `_checkouts`) are rejected.
 
 ### `russel login [<url>] [--token-file PATH]`
 
@@ -93,29 +92,23 @@ russel login https://russel.example.com --token-file ~/.config/russel/env
 
 `logout` removes the login file. `origin` prints the resolved URL, auth source (env vs file vs none), and reachability — the first diagnostic alongside `install.sh status`.
 
-### `russel deploy <repo>`
+### `russel apply <REPO> [--config PATH] [--force]`
 
-Deploy or redeploy a service. Streams NDJSON; exit `0` on `deployed`, non-zero on `failed` **or** `rolled_back` (so CI notices rollbacks).
+Deploy the service named by the Russelfile's `service.name` (`russel deploy` is an alias). Streams NDJSON; exit `0` on `deployed` or `unchanged`, non-zero on `failed` **or** `rolled_back` (so CI notices rollbacks).
 
-| Flag | Meaning |
+Every generation records the commit it was built from (`rev`), whether the deployed tree had uncommitted changes (`dirty`), and the Russelfile it loaded. Applying the commit and Russelfile the service is already running returns `unchanged` at once: nothing is rebuilt or restarted. A dirty tree, or a source outside git, always deploys.
+
+| Argument | Meaning |
 |---|---|
 | `REPO` | `https://…`, `http://…`, `ssh://…`, `git@host:path`, or local absolute path (ctrl opt-in only). Relative paths always rejected. |
-| `-p` / `--publish HOST:GUEST` | Publish a host port (repeatable in API; CLI takes one). Optional behind Traefik. |
-| `--host HOST` | Exact Traefik `Host()` name. Must match `[ingress].host`; omitting it lets the Russelfile supply the name. A file with no host rejects a CLI-only `--host`. |
-| `--vm-id ID` | `[A-Za-z0-9-_]` max 128. Derived from repo when omitted; **required by the API**. |
 | `--config PATH` | Repo-relative Russelfile (default `Russelfile.toml`). `openat` + `O_NOFOLLOW`, 1 MiB cap, symlinks rejected. |
-| `--runtime` | Must match `service.type` when both set. Check, not override. |
-| `--env KEY=VALUE` | Repeatable; overrides file + env-file. |
-| `--env-file PATH` | `KEY=VALUE` file (`#` comments, blanks skipped). |
-| `-- …` | Container-only podman passthrough (validated, fail-closed). |
+| `--force` | Deploy even when the result would be `unchanged`, for example to pick up a changed secret. |
+
+Set runtime, environment, host port, and host name in the Russelfile with `service.type`, `[service.env]`, and `[ingress]`. Container Podman flags go in `service.podman_args`.
 
 Remote ctrls need git URLs — local paths resolve on the **ctrl host** and need `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` there (trusted single-tenant only).
 
-`service.port` is the guest listen port. `[ingress].port` is the optional
-host-side backend pin used by Traefik. `-p HOST:GUEST` can provide that pin
-when the file omits it; when both are present, its host number must match
-`ingress.port`, and its guest number must match `service.port`. A deploy with
-neither pin uses an allocated backend port.
+**Service identity and renaming:** `service.name` is the service id. Deploying the same Russelfile from any path or URL targets the same service. To rename a service, change `service.name`, deploy the new name, then run `russel destroy <old-id>`. A service deployed under a different id cannot be updated under that old id; deploy it again using its Russelfile name, then destroy the old id.
 
 ### `russel status [<id>]` / `russel logs [<id>]`
 
@@ -129,7 +122,7 @@ neither pin uses an allocated backend port.
 
 `POST /vm/{id}/stop` (keep metadata/history, remove Traefik file) vs `DELETE /vm/{id}` (stop + remove ports, rootfs/TAP, metadata). Both are idempotent-ish; destroying an unknown id errors clearly.
 
-`destroy` volume flags (container `[[volumes]]` only; microVMs ignore them):
+`destroy` volume flags (`[[volumes]]` on either runtime):
 
 | Flag | Meaning |
 |---|---|
@@ -138,9 +131,13 @@ neither pin uses an allocated backend port.
 
 With neither flag, each volume's `keep` field decides. Absolute `host =` binds are never deleted. See [API](api.md) (`DELETE /vm/{id}?keep_volumes=`) and [Russelfile](russelfile.md).
 
-### `russel update <id>`
+### `russel update <id> [--refresh]`
 
-Re-apply recorded `repo_url` / `config_path` (+ overrides). Same NDJSON stream as deploy. See [Update and rollback](../guides/update-rollback.md).
+Redeploy the running generation's recorded source: the same repo, config path, and **commit**, so nothing new is pulled in. Secrets are resolved again, which makes this the way to restart with a rotated secret. `--refresh` builds the source's current commit instead (the tip of a git URL's default branch, or a local path's HEAD). `--repo` / `--config` select another source and imply `--refresh`. The Russelfile `service.name` must equal `<id>`. Same NDJSON stream as deploy. See [Update and rollback](../guides/update-rollback.md).
+
+### `russel rollback <id> [--version N]`
+
+Redeploy an earlier generation from the history (`GET /vm/{id}/deployments`): its recorded commit exactly, even if the branch has moved since. Without `--version`, the latest `previous` generation. A generation deployed from a dirty tree is not pinned: its commit may not hold the Russelfile or the changes it ran with, so it builds what its source holds now. Same NDJSON stream as deploy.
 
 ### `russel secrets …`
 
@@ -164,7 +161,7 @@ russel ps
 
 ## Exit codes and output
 
-- `deploy`/`update` stream `Progress` lines then `Complete{status: deployed}` or `Error{…}`. `rolled_back` still exits non-zero.
+- `apply`/`update`/`rollback` stream `Progress` lines then `Complete{status: deployed|unchanged}` or `Error{…}`. `rolled_back` still exits non-zero.
 - `truncate_for_error` caps error strings at 256 chars (multibyte-safe).
 - There is no `russel build/develop/check/exec/scale/node/sandbox` verb — builds run inside `deploy`.
 

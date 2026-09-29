@@ -25,6 +25,10 @@ args = ["--http-addr", "0.0.0.0:7700"]
 # then replace the value with "secret://MEILI_MASTER_KEY".
 MEILI_MASTER_KEY = "demo-only-not-for-production"
 MEILI_DB_PATH = "/data"
+# Dumps and snapshots default to paths relative to the workdir, which is on
+# the read-only rootfs; keep them on the volume too.
+MEILI_DUMP_DIR = "/data/dumps"
+MEILI_SNAPSHOT_DIR = "/data/snapshots"
 
 [[volumes]]
 name = "data"

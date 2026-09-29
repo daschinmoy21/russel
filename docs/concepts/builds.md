@@ -50,6 +50,19 @@ export RUSSEL_NIX_RESTRICTED=1   # sandboxed nix build + no auto-flake
 
 Full threat model, `nix.conf` hardening, and sandbox options: [Security: Nix builds](../security/nix-builds.md).
 
+## Garbage collection
+
+Builds run with `--no-link`, so ctrl keeps its own GC roots. Each service has
+`/var/lib/russel/_pool/gcroots/<id>/` with one indirect root per store path it
+may re-exec: the current `metadata.json` paths (app, microVM kernel and
+initramfs, container rootfs) and the deployment journal's `active` and
+`previous` generations. Ctrl syncs the directory after every deploy and
+automatic rollback, and for every service at startup. Older generations lose
+their roots, and destroy removes the directory. `nix-collect-garbage` (or
+NixOS `nix.gc.automatic`) therefore never deletes what a restart, reboot
+recovery, or rollback to the previous generation needs. Rolling back further
+than `previous` rebuilds from the recorded source.
+
 ## Kernel note (microVMs)
 
 MicroVMs must use the Russel-compiled kernel (flake package `.#microvm-kernel`, virtio drivers built-in). Bench and production deploys export `RUSSEL_KERNEL_PATH` to that `bzImage` so ctrl never falls back to a stock nixpkgs kernel (slower / wrong module set):

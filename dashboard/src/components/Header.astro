@@ -1,99 +1,24 @@
 ---
-import {
-  headerBadgeMeta,
-  resolveHeaderConnection,
-  type HeaderConnectionState,
-} from '../lib/api';
-
+// Page heading. The connection status lives in the TopBar so every view
+// shares one probe and one indicator.
 interface Props {
   title: string;
   subtitle?: string;
-  /** Omit or pass `loading` for static shells — never defaults to LIVE before probe. */
-  connection?: HeaderConnectionState;
-  isDemo?: boolean;
 }
 
-const { title, subtitle, connection, isDemo = false } = Astro.props;
-const effective = resolveHeaderConnection(connection, isDemo);
-const { label: badgeLabel, className: badgeClass, title: badgeTitle } =
-  headerBadgeMeta(effective);
+const { title, subtitle } = Astro.props;
 ---
 
-<header class="top-header">
-  <div class="header-titles">
-    <h1 class="page-title">{title}</h1>
-    {subtitle && <p class="subtitle">{subtitle}</p>}
-  </div>
-
-  <div class="header-actions">
-    <span class="api-base-tag" id="apiBaseTag">/api</span>
-    <div class={`badge ${badgeClass}`} id="connBadge" title={badgeTitle}>
-      <span class="badge-dot"></span>
-      {badgeLabel}
-    </div>
-  </div>
+<header class="page-header">
+  <h1 class="page-title">{title}</h1>
+  {subtitle && <p class="subtitle">{subtitle}</p>}
 </header>
 
-<script>
-  import { getApiBase, isDemoMode, api, headerBadgeMeta } from '../lib/api';
-
-  const tag = document.getElementById('apiBaseTag');
-  if (tag) tag.textContent = getApiBase();
-
-  // Client-side probe: SSR can't see localStorage, so re-evaluate connection state
-  const badgeEl = document.getElementById('connBadge');
-  if (badgeEl) {
-    function applyBadge(state: 'live' | 'demo' | 'offline' | 'unauthorized') {
-      const meta = headerBadgeMeta(state, getApiBase(), window.location.origin);
-      badgeEl!.className = `badge ${meta.className}`;
-      badgeEl!.innerHTML = `<span class="badge-dot"></span>${meta.label}`;
-      badgeEl!.title = meta.title;
-    }
-
-    (async () => {
-      if (isDemoMode()) {
-        applyBadge('demo');
-        return;
-      }
-      try {
-        const { connection } = await api.getFleetStatus();
-        applyBadge(connection);
-      } catch {
-        applyBadge('offline');
-      }
-    })();
-  }
-</script>
-
 <style>
-  .top-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    margin-bottom: 1.75rem;
-    gap: 1rem;
-  }
-
-  .header-titles {
+  .page-header {
     display: flex;
     flex-direction: column;
+    margin-bottom: 1.75rem;
     min-width: 0;
-  }
-
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    flex-shrink: 0;
-  }
-
-  .api-base-tag {
-    font-family: var(--font-mono);
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    background: var(--bg-input);
-    border: 1px solid var(--border-card);
-    border-radius: var(--radius-sm);
-    padding: 0.2rem 0.55rem;
   }
 </style>

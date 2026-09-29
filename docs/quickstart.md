@@ -1,111 +1,126 @@
 ---
 title: Quickstart
-description: Deploy your first Russel service in about five minutes on an installed host.
+description: Deploy an example app, update it, roll it back, and remove it, in about five minutes.
 sidebar_position: 2
-keywords: [quickstart, deploy, russel init, basic-http, health check]
+keywords: [quickstart, deploy, apply, russel init, basic-http, health check, rollback]
 ---
 
 # Quickstart
 
-Deploy `examples/basic-http` on the same Linux host that runs `russel-ctrl`. Takes ~5 minutes plus the Nix app build. You use installed binaries throughout — nothing here compiles Russel itself (Russel compiles *your app* with Nix; that is the product working as intended).
+You'll deploy `examples/basic-http`, a small Go web server, as a rootless container on your own server. Then you'll redeploy it, roll it back, and remove it.
 
-Assumes [Installation](getting-started/installation.md) is done: `russel` on PATH, control plane installed and running.
+## Before you start
 
-## What you'll need
+- Finish [Installation](getting-started/installation.md): `russel ps` should work.
+- Run these steps **on the server**. The quickstart deploys from a folder on the server. For deploying from a laptop, see [First deploy](getting-started/first-deploy.md).
+- Get the examples into a folder the `russel` account owns. The control plane runs as `russel`, so it can't read your home directory:
 
-- The control-plane host from Installation (Topology A, same host), with rootless Podman (`podman info` reports rootless) and a writable `/var/lib/russel`.
-- Example apps: your checkout of the public mirror (`git clone https://github.com/daschinmoy21/russel`).
-- This quickstart uses **containers**, so KVM is optional.
+  ```bash
+  sudo install -d -o russel -g russel /srv/russel-apps
+  sudo -u russel git clone https://github.com/daschinmoy21/russel /srv/russel-apps/russel
+  cd /srv/russel-apps/russel
+  ```
 
-## 1. Confirm the install
+## 1. Allow deploys from a local folder
+
+By default the control plane only builds from git URLs. Deploying from a folder on the server needs a one-line opt-in:
 
 ```bash
-./contrib/install.sh status   # from your checkout: endpoint, listener, unit, CLI origin
-russel origin                 # url, auth source, reachable?
-russel ps                     # list workloads (empty is fine)
+echo 'RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1' | sudo tee -a /etc/russel/env
+sudo systemctl restart russel-ctrl
 ```
 
-If you have not logged in yet (the host installer generates the token for you):
+Only do this on a server you alone control.
+
+## 2. Deploy
 
 ```bash
-russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
-russel origin
+russel apply examples/basic-http
 ```
 
-> **Note:** Loopback without a token runs in dev mode (warns, no auth). The `host` installer always configures a token plus `RUSSEL_REQUIRE_AUTH=1`, so you skip dev mode entirely.
+`russel` sends the folder's path to the control plane, which reads `Russelfile.toml`, builds the app with Nix, and starts it. The first build takes a minute or two while Nix fetches Go; later deploys take about a second.
 
-## 2. Allow local example deploys (this host only)
+When it finishes you'll see something like:
 
-Local paths resolve on the **control-plane host**, and ctrl accepts them only with an explicit opt-in. Same-host quickstart qualifies; a remote ctrl does not (use git URLs there — see [First deploy](getting-started/first-deploy.md)):
+```text
+  note: container russel-api running. localhost:3100 -> guest:3000
 
-```bash
-printf 'RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1\n' >> ~/.config/russel/env
-systemctl --user restart russel-ctrl
+  Test:  curl -I http://127.0.0.1:3100/
 ```
 
-## 3. Deploy the example
+The service is called `api` because that's the `name` in the example's Russelfile.
 
-From your checkout:
-
-```bash
-russel deploy examples/basic-http -p 8080:3000 --vm-id test-api --runtime container
-```
-
-`examples/basic-http` already sets `type = "container"`. `--runtime` must match `service.type` when both are given — it is a check, not an override.
-
-The CLI streams progress (`resolve → build → create → start → ready → complete`) and exits `0` on `deployed`. The `build` stage is Nix building the example app on the host.
-
-## 4. Verify
+## 3. Check it
 
 ```bash
-curl http://127.0.0.1:8080/health
-# → ok
-
-russel status test-api
 russel ps
-russel logs test-api
 ```
 
-Without `-p`, Traefik is the primary HTTP ingress: open `http://test-api.russel.local` once Traefik watches `/var/lib/russel/traefik/dynamic`. See [Traefik ingress](guides/traefik-ingress.md).
+```text
+  ID   RUNTIME    STATUS    STATE    PORTS      UPTIME
+  api  container  deployed  running  3100→3000  12s
+```
 
-## 5. Update and roll back
+`PORTS` shows host port → app port. Call the app on the host port:
 
 ```bash
-russel update test-api
-russel deploy examples/basic-http -p 8080:3000 --vm-id test-api --runtime container  # redeploy
+curl http://127.0.0.1:3100/health
+# → ok
+russel logs api
 ```
 
-Each successful deploy appends a versioned row to `/var/lib/russel/test-api/deployments.json` (cap 20). If a redeploy fails after a prior success, Russel attempts automatic rollback and reports `rolled_back` with a non-zero CLI exit so CI notices. Explicit rollback:
+> **Note:** Russel picks a free host port (3100 and up) unless the Russelfile pins one. It can change on the next deploy, so use `russel ps` to find it. To pin it, add `[ingress]` with `port = 8080` to the Russelfile. For a stable name instead of a port, see [Traefik ingress](guides/traefik-ingress.md).
+
+## 4. Redeploy and roll back
+
+Running `apply` again with the same commit and Russelfile does nothing:
 
 ```bash
-curl -X POST http://127.0.0.1:7878/vm/test-api/rollback -H 'Content-Type: application/json' -d '{}'
+russel apply examples/basic-http
+# note: already running 96ef3e713a89 with this Russelfile; nothing to apply
 ```
 
-See [Update and rollback](guides/update-rollback.md).
-
-## 6. Tear down
+Commit a change to the app or edit the Russelfile and `apply` again, or force a redeploy:
 
 ```bash
-russel stop test-api
-russel destroy test-api
+russel apply --force examples/basic-http
 ```
 
-Restarting `russel-ctrl` (`systemctl --user restart russel-ctrl`) does **not** destroy workloads — they keep running detached. Startup reconcile re-adopts live processes and marks the rest `stopped`.
+A redeploy starts the new version next to the old one and switches over only once the new one is ready, so the app keeps serving. If the new version fails to start, the old one keeps running and `apply` exits non-zero.
 
-## Your own app next
+Go back to the previous version yourself:
+
+```bash
+russel rollback api
+```
+
+Russel keeps the last 20 deployments. `russel rollback api --version N` picks an older one. More: [Update and rollback](guides/update-rollback.md).
+
+## 5. Clean up
+
+```bash
+russel destroy api
+```
+
+`russel stop api` stops the app but keeps its history, so a later `apply` or `rollback` can bring it back.
+
+Restarting the control plane (`sudo systemctl restart russel-ctrl`) doesn't stop your apps.
+
+## Deploy your own app
 
 ```bash
 cd my-app
-russel init --type container   # writes Russelfile.toml
-russel init --with-flake       # also writes a starter flake.nix
-russel deploy . -p 8080:3000 --vm-id my-app --runtime container
+russel init        # writes a commented Russelfile.toml
+git add Russelfile.toml && git commit -m "Add Russelfile" && git push
+russel apply https://github.com/you/my-app.git
 ```
 
-`russel init` documents every `Russelfile.toml` field and CLI flag in comments. Full schema: [Russelfile reference](reference/russelfile.md).
+The server clones the repo itself, so this works the same from your laptop. To deploy a folder that is already on the server instead, keep it somewhere the `russel` account owns, like `/srv/russel-apps`, and run `russel apply /srv/russel-apps/my-app`.
+
+If your project has no `flake.nix`, Russel generates one for Rust (`Cargo.toml`), Go (`go.mod`), and static sites. `russel init --with-flake` writes a starter flake you can edit instead. See [Builds](concepts/builds.md) and the [Russelfile reference](reference/russelfile.md).
 
 ## Next steps
 
-- [Installation topologies A/B/C](getting-started/installation.md) — put the client and control plane on different machines.
-- [First deploy](getting-started/first-deploy.md) — `init`, env, secrets, `--env-file`, podman passthrough, git-URL deploys.
-- [Single-VPS checklist](guides/vps-one-dev.md) — the supported one-operator remote path (containers only).
-- [Troubleshooting](guides/troubleshooting.md) — `russel origin`, `install.sh status`, cleartext/401/forward errors.
+- [First deploy](getting-started/first-deploy.md): deploy from git, and add env vars, secrets, and volumes.
+- [Single-VPS checklist](guides/vps-one-dev.md): run Russel on a VPS and reach apps from the internet.
+- [Troubleshooting](guides/troubleshooting.md)

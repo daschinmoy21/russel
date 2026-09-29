@@ -8,12 +8,8 @@ export interface PortMapping {
 export interface DeployRequest {
 	repo_url: string;
 	config_path: string;
+	/** Optional check; must equal the Russelfile service.name. */
 	vm_id?: string;
-	port?: PortMapping;
-	host?: string;
-	runtime?: "microvm" | "container";
-	podman_args?: string[];
-	env?: Record<string, string>;
 }
 
 export interface DeployTiming {
@@ -807,6 +803,11 @@ export function assertCleartextTokenOk(
 
 // ---- Helpers ----
 
+/** `word` for a count of 1, otherwise `word` + "s" ("1 microVM", "0 microVMs"). */
+export function plural(count: number, word: string): string {
+	return count === 1 ? word : `${word}s`;
+}
+
 export function formatUptime(seconds?: number): string {
 	if (!seconds || seconds <= 0) return "—";
 	const d = Math.floor(seconds / 86400);
@@ -817,9 +818,9 @@ export function formatUptime(seconds?: number): string {
 	return `${m}m ${seconds % 60}s`;
 }
 
-/** Align with CLI: only exact `"deployed"` is a successful Complete status. */
+/** Align with CLI: `"deployed"`, or `"unchanged"` when the service already runs this source. */
 export function isDeployStatusSuccess(status: string): boolean {
-	return status === "deployed";
+	return status === "deployed" || status === "unchanged";
 }
 
 /**
@@ -918,7 +919,7 @@ export interface NdjsonDeployOutcome {
 
 /**
  * Feed NDJSON lines through parseDeployEventLine, invoke onEvent, and decide
- * success only when Complete has status === "deployed" and no Error events.
+ * success only when Complete has a success status and no Error events.
  */
 export function reduceDeployEvents(
 	lines: Iterable<string>,
@@ -1346,6 +1347,33 @@ export class RusselClient {
 		}
 	}
 
+	/**
+	 * Cheap connection probe for the top bar: one `GET /vms`, no per-service
+	 * status fan-out. `total` is set only when the fleet is reachable.
+	 */
+	async probeConnection(): Promise<{
+		connection: ConnectionState;
+		total?: number;
+	}> {
+		if (isDemoMode()) {
+			return { connection: "demo", total: MOCK_SERVICES.length };
+		}
+		const result = await this.request("/vms", {
+			signal: AbortSignal.timeout(3000),
+		});
+		if (result.kind !== "success") {
+			return {
+				connection: result.kind === "unauthorized" ? "unauthorized" : "offline",
+			};
+		}
+		try {
+			const data: VmsResponse = await result.response.json();
+			return { connection: "live", total: (data.services || []).length };
+		} catch {
+			return { connection: "offline" };
+		}
+	}
+
 	async getServiceDetail(id: string): Promise<{
 		service: ServiceVM | null;
 		connection: ConnectionState;
@@ -1726,9 +1754,8 @@ export class RusselClient {
 						vm_id: payload.vm_id || "demo-vm",
 						status: "deployed",
 						elapsed_ms: 2400,
-						port: payload.port,
 						message: "Deployment complete!",
-						runtime: payload.runtime || "microvm",
+						runtime: "microvm",
 					},
 				},
 			];

@@ -4,6 +4,7 @@ mod adopt;
 mod app;
 mod helpers;
 mod lifecycle;
+mod restart;
 
 // Stable crate::state::* surface (pre-split public API).
 pub use app::{AppState, DeployGuard, LifecycleClaim};

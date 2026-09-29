@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -10,10 +9,9 @@ use reqwest::header::{AUTHORIZATION, HeaderMap};
 use russel_core::{
     RuntimeKind,
     api::{
-        DeployEvent, DeployRequest, DeployResponse, LogsResponse, PortMapping, ServiceStatus,
-        StatusResponse, VmsResponse,
+        DeployEvent, DeployRequest, DeployResponse, LogsResponse, ServiceStatus, StatusResponse,
+        VmsResponse,
     },
-    config::{Russelfile, merge_env_maps, resolve_ingress_host, resolve_runtime, validate_env_map},
 };
 
 use crate::config::{self, Resolved};
@@ -286,8 +284,8 @@ fn map_control_plane_error(err: reqwest::Error, control_plane: &str) -> anyhow::
                 "cannot reach control plane at {control_plane}: nothing is listening on this machine.\n\
                  \n\
                  Inspect the local service with:\n\
-                   systemctl --user status russel-ctrl\n\
-                   systemctl status russel-ctrl  # system unit / NixOS (services.russel)\n\
+                   systemctl status russel-ctrl  # install.sh host\n\
+                   systemctl status russel       # NixOS (services.russel)\n\
                  If the controller runs on another machine, create a local tunnel with:\n\
                    ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:{port}:127.0.0.1:{port} <user@host>"
             )
@@ -334,7 +332,10 @@ pub enum Command {
     Logout,
     /// Show which control plane this CLI will talk to.
     Origin,
-    Deploy(DeployArgs),
+    /// Build and run the service a Russelfile describes. Applying a source the
+    /// service already runs (same commit and Russelfile) is a no-op.
+    #[command(visible_alias = "deploy")]
+    Apply(DeployArgs),
     Status(StatusArgs),
     Logs(LogsArgs),
     /// List services (`list` is a visible alias; `vms` still works).
@@ -342,8 +343,10 @@ pub enum Command {
     Ps,
     Stop(StopArgs),
     Destroy(DestroyArgs),
-    /// Re-apply desired state from the recorded Russelfile source (or override).
+    /// Redeploy the recorded commit (or, with --refresh, the source's latest).
     Update(UpdateArgs),
+    /// Redeploy an earlier generation from the deployment history.
+    Rollback(RollbackArgs),
     /// Manage host-side secrets (stored on the control plane, not in Russelfile).
     Secrets {
         #[command(subcommand)]
@@ -375,6 +378,21 @@ pub struct UpdateArgs {
     /// Override config path relative to the repo (default: recorded or Russelfile.toml).
     #[arg(long)]
     pub config: Option<String>,
+
+    /// Build the source's current HEAD instead of the recorded commit.
+    #[arg(long)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RollbackArgs {
+    /// Service id to roll back.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// History version to redeploy (default: the previous generation).
+    #[arg(long)]
+    pub version: Option<u32>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -395,43 +413,21 @@ pub struct DeployArgs {
     #[arg(value_name = "REPO")]
     pub repo: String,
 
-    /// Publish a host port (e.g. 8080:3000). Optional: when omitted, Traefik
-    /// provides the primary HTTP ingress via `http://<service_id>.russel.local`.
-    #[arg(short = 'p', long = "publish", value_name = "HOST:GUEST")]
-    pub port: Option<String>,
-
-    #[arg(long, value_name = "ID")]
-    pub vm_id: Option<String>,
-
     #[arg(long, default_value = "Russelfile.toml")]
     pub config: String,
 
-    /// Runtime kind (`microvm` or `container`). Must match Russelfile `service.type` for local repos.
-    #[arg(long, value_name = "RUNTIME")]
-    pub runtime: Option<String>,
+    /// Redeploy even when the service already runs this commit and Russelfile.
+    #[arg(long)]
+    pub force: bool,
 
-    /// Exact Traefik Host() value. Must match Russelfile [ingress].host when set.
-    #[arg(long, value_name = "HOST")]
-    pub host: Option<String>,
-
-    /// Extra `podman run` arguments (container runtime only). Use `--` before flags if needed.
+    /// Trailing tokens are not accepted. Caught so the error can say where
+    /// process argv (`service.args`) and podman flags (`service.podman_args`) go.
     #[arg(
-        long_help = "Extra arguments forwarded to `podman run` when using container runtime. \
-                     Russel sets detach, name, rootfs, port publish, memory, and entrypoint. \
-                     Use `--` before flags if needed (e.g. `-- -v /data:/data:ro`).",
+        hide = true,
         trailing_var_arg = true,
-        allow_hyphen_values = true,
         num_args = 0..
     )]
-    pub podman_args: Vec<String>,
-
-    /// Set an environment variable for the deployed service (repeatable).
-    #[arg(long = "env", value_name = "KEY=VALUE", num_args = 1)]
-    pub env: Vec<String>,
-
-    /// Path to a file with KEY=VALUE lines (comments with #, blank lines skipped).
-    #[arg(long = "env-file", value_name = "PATH")]
-    pub env_file: Option<String>,
+    pub trailing: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -466,72 +462,13 @@ pub struct DestroyArgs {
 
 pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
     let wall = Instant::now();
+    reject_trailing_deploy_args(&args.trailing)?;
     let repo_url = normalize_repo_arg(&args.repo)?;
     warn_remote_local_path_deploy(control_plane, &repo_url);
-    let runtime = resolve_deploy_runtime(&args.repo, &args.config, args.runtime.as_deref())?;
-    let host = resolve_deploy_host(&repo_url, &args.config, args.host.as_deref())?;
-    match runtime {
-        Some(RuntimeKind::Microvm) if !args.podman_args.is_empty() => {
-            anyhow::bail!(
-                "podman passthrough args require container runtime (effective runtime is microvm)"
-            );
-        }
-        None if !args.podman_args.is_empty() => {
-            anyhow::bail!(
-                "podman passthrough args require --runtime container (or a local Russelfile with type = \"container\")"
-            );
-        }
-        _ => {}
-    }
-    let port = args.port.as_deref().map(parse_port_mapping).transpose()?;
-
-    // #300: control plane requires explicit vm_id. Derive a stable id from the
-    // repo path/URL when the operator omits `--vm-id` (never the old shared "api").
-    let vm_id = match args.vm_id.filter(|s| !s.trim().is_empty()) {
-        Some(id) => id.trim().to_string(),
-        None => default_service_id_from_repo(&repo_url).ok_or_else(|| {
-            anyhow!(
-                "could not derive a service id from repo; pass --vm-id explicitly \
-                 (control plane no longer defaults to \"api\")"
-            )
-        })?,
-    };
-
     println!();
-    println!("  \x1b[1;36mrussel deploy\x1b[0m");
+    println!("  \x1b[1;36mrussel apply\x1b[0m");
     println!("  \x1b[2m{}\x1b[0m", repo_url);
     println!();
-
-    step("vm-id", &format!("\x1b[1m{vm_id}\x1b[0m"), "");
-    if let Some(p) = &port {
-        step(
-            "publish",
-            &format!(
-                "localhost:\x1b[1m{}\x1b[0m → guest:\x1b[1m{}\x1b[0m",
-                p.host, p.guest
-            ),
-            "",
-        );
-    }
-    if let Some(runtime) = runtime {
-        step("runtime", &runtime.to_string(), "");
-    }
-    if !args.podman_args.is_empty() {
-        step("podman-args", &args.podman_args.join(" "), "");
-    }
-    println!();
-
-    let mut cli_env: HashMap<String, String> = HashMap::new();
-    if let Some(ref env_file_path) = args.env_file {
-        let file_env = parse_env_file(env_file_path)?;
-        cli_env = merge_env_maps(&cli_env, &file_env);
-    }
-    for raw in &args.env {
-        let (key, value) = parse_env_kv(raw)?;
-        cli_env.insert(key, value);
-    }
-    // Validate CLI env before sending.
-    validate_env_map(&cli_env)?;
 
     let client = http_client(control_plane)?;
     let mut response = client
@@ -539,12 +476,9 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
         .json(&DeployRequest {
             repo_url,
             config_path: args.config,
-            vm_id: Some(vm_id),
-            port,
-            host,
-            runtime,
-            podman_args: args.podman_args,
-            env: cli_env,
+            vm_id: None,
+            rev: None,
+            force: args.force,
         })
         .send()
         .await
@@ -567,10 +501,10 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
 
 /// Control-plane success status for a completed deploy stream.
 ///
-/// Anything other than exact `"deployed"` is treated as failure so CI/scripts
-/// get a non-zero process exit code (see issue #68).
+/// Only `"deployed"` and `"unchanged"` (the service already runs this source)
+/// succeed, so CI/scripts get a non-zero exit code otherwise (see issue #68).
 fn deploy_status_is_success(status: &str) -> bool {
-    status == ServiceStatus::Deployed.as_str()
+    status == ServiceStatus::Deployed.as_str() || status == "unchanged"
 }
 
 fn step(label: &str, value: &str, suffix: &str) {
@@ -639,7 +573,8 @@ fn is_terminal_control(c: char) -> bool {
 }
 
 fn print_deploy_response(r: DeployResponse, wall: Duration) {
-    let ok = r.status == ServiceStatus::Deployed.as_str();
+    let unchanged = r.status == "unchanged";
+    let ok = r.status == ServiceStatus::Deployed.as_str() || unchanged;
     let rolled_back = r.status == "rolled_back";
     let icon = if ok {
         "\x1b[1;32m✓\x1b[0m"
@@ -648,7 +583,9 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     } else {
         "\x1b[1;31m✗\x1b[0m"
     };
-    let label = if ok {
+    let label = if unchanged {
+        "Unchanged"
+    } else if ok {
         "Deployed"
     } else if rolled_back {
         "Rolled back"
@@ -663,8 +600,11 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
     );
     println!();
 
-    step("vm-id", &sanitize_terminal(&r.vm_id), "");
+    step("service", &sanitize_terminal(&r.service_id), "");
     step("status", &r.status, "");
+    if let Some(rev) = &r.rev {
+        step("rev", &sanitize_terminal(rev.get(..12).unwrap_or(rev)), "");
+    }
 
     if let Some(route_host) = &r.route_host {
         println!(
@@ -741,14 +681,18 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         if is_container {
             timing_row("create", t.create_ms, "prepare container rootfs");
             timing_row("start", t.start_ms, "start rootless Podman container");
-            timing_row("ready", t.ready_ms, "container service reachable");
+            timing_row("ready", t.ready_ms, "app accepting connections");
         } else {
             timing_row(
                 "create",
                 t.create_ms,
                 "build minimal initramfs (BusyBox + modules)",
             );
-            timing_row("network", t.network_ms, "TAP + socat port forwarding setup");
+            timing_row(
+                "network",
+                t.network_ms,
+                "port publishing (passt, or TAP + socat)",
+            );
             timing_row(
                 "start",
                 t.start_ms,
@@ -782,52 +726,6 @@ fn timing_row(label: &str, val_ms: u128, desc: &str) {
         "  \x1b[2m{label:>10}\x1b[0m  \x1b[1m{:>6}\x1b[0m  \x1b[32m{bar}\x1b[0m  \x1b[2m{desc}\x1b[0m",
         ms(val_ms)
     );
-}
-
-fn resolve_deploy_runtime(
-    repo: &str,
-    config_path: &str,
-    cli_runtime: Option<&str>,
-) -> Result<Option<RuntimeKind>> {
-    let cli = cli_runtime
-        .map(|value| value.parse::<RuntimeKind>())
-        .transpose()?;
-    let path = PathBuf::from(repo);
-    if path.exists() {
-        let repo_root = path
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize local repo path {repo}"))?;
-        let russelfile_path = repo_root.join(config_path);
-        let config = Russelfile::load(&russelfile_path)
-            .with_context(|| format!("failed to load {}", russelfile_path.display()))?;
-        let resolved = resolve_runtime(config.service.runtime, cli)?;
-        return Ok(Some(resolved));
-    }
-    Ok(cli)
-}
-
-fn resolve_deploy_host(
-    repo: &str,
-    config_path: &str,
-    cli_host: Option<&str>,
-) -> Result<Option<String>> {
-    let path = PathBuf::from(repo);
-    if path.exists() {
-        let repo_root = path
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize local repo path {repo}"))?;
-        let russelfile_path = repo_root.join(config_path);
-        let config = Russelfile::load(&russelfile_path)
-            .with_context(|| format!("failed to load {}", russelfile_path.display()))?;
-        return resolve_ingress_host(
-            config.ingress.as_ref().and_then(|i| i.host.as_deref()),
-            cli_host,
-        );
-    }
-
-    // Remote repositories are resolved by ctrl after cloning, when the
-    // Russelfile is available. Preserve the CLI value for that check.
-    Ok(cli_host.map(str::to_owned))
 }
 
 fn normalize_repo_arg(repo: &str) -> Result<String> {
@@ -866,220 +764,21 @@ fn normalize_repo_arg(repo: &str) -> Result<String> {
     Ok(repo)
 }
 
-/// Parse a single `KEY=VALUE` string into a (key, value) pair.
-fn parse_env_kv(raw: &str) -> Result<(String, String)> {
-    let (key, value) = raw
-        .split_once('=')
-        .ok_or_else(|| anyhow!("env must be KEY=VALUE, got: {raw}"))?;
-    if key.is_empty() {
-        anyhow::bail!("env key must not be empty (argument starts with =)");
+/// `russel deploy . -- --dir /data` used to forward the tokens to
+/// `podman run`, which reads like process argv but never was. Reject them
+/// and point at the two things the operator could have meant.
+fn reject_trailing_deploy_args(trailing: &[String]) -> Result<()> {
+    if trailing.is_empty() {
+        return Ok(());
     }
-    Ok((key.to_string(), value.to_string()))
-}
-
-/// Parse a `--env-file` path.
-///
-/// Each non-empty line is KEY=VALUE.  Rules:
-/// - UTF-8 BOM at the start of the file is stripped.
-/// - Lines are trimmed; blank lines and `#`-only comments are skipped.
-/// - Inline comments (` # …`) are stripped from the value *outside* quotes.
-/// - Single- and double-quoted values are supported; the matching quote pair is
-///   removed and inner `#` is kept.
-/// - CRLF line endings are handled.
-/// - `=` inside a quoted value is kept.
-fn parse_env_file(path: &str) -> Result<HashMap<String, String>> {
-    let mut contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read env file: {path}"))?;
-    // Strip UTF-8 BOM if present.
-    if contents.starts_with('\u{FEFF}') {
-        contents = contents[3..].to_string();
-    }
-    let mut map = HashMap::new();
-    for (i, line) in contents.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let (key, rest) = trimmed
-            .split_once('=')
-            .ok_or_else(|| anyhow!("{}:{}: env line missing '=' separator", path, i + 1))?;
-        if key.is_empty() {
-            anyhow::bail!(
-                "{}:{}: env key must not be empty (argument starts with =)",
-                path,
-                i + 1
-            );
-        }
-        let value = parse_env_value(rest);
-        map.insert(key.to_string(), value);
-    }
-    Ok(map)
-}
-
-/// Strip surrounding quotes and inline comments from a raw RHS value.
-fn parse_env_value(raw: &str) -> String {
-    let raw = raw.trim();
-    // Check for quoted value.
-    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return inner.to_string();
-    }
-    if let Some(inner) = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        return inner.to_string();
-    }
-    // Strip an inline comment: any ` #` sequence (outside quotes) starts a comment.
-    if let Some(pos) = raw.find(" #") {
-        return raw[..pos].trim_end().to_string();
-    }
-    raw.to_string()
-}
-
-fn parse_port_mapping(value: &str) -> Result<PortMapping> {
-    let (host, guest) = value
-        .split_once(':')
-        .ok_or_else(|| anyhow!("port mapping must be HOST:GUEST, e.g. 8080:3000"))?;
-    let host: u16 = host
-        .parse()
-        .with_context(|| format!("invalid host port in {value}"))?;
-    if host == 0 {
-        anyhow::bail!("host port must not be 0 in {value}");
-    }
-    let guest: u16 = guest
-        .parse()
-        .with_context(|| format!("invalid guest port in {value}"))?;
-    if guest == 0 {
-        anyhow::bail!("guest port must not be 0 in {value}");
-    }
-    Ok(PortMapping { host, guest })
-}
-
-/// Derive a stable service id from a repo path or URL when `--vm-id` is omitted.
-///
-/// Joins the full repository namespace path (all segments after a remote host,
-/// or all local path segments) so nested groups cannot collapse — e.g.
-/// `gitlab.example/a/team/app` → `a-team-app` vs `gitlab.example/b/team/app` →
-/// `b-team-app`. Sanitizes to the control-plane `validate_service_id` charset,
-/// truncates to 128 chars, and avoids reserved names (`secrets`, `traefik`,
-/// `_pool`, `*.bak`).
-fn default_service_id_from_repo(repo: &str) -> Option<String> {
-    const MAX_SERVICE_ID_LEN: usize = 128;
-
-    let trimmed = repo.trim().trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        return None;
-    }
-
-    // Normalize common remote forms to path-like segments:
-    //   https://github.com/org/myapp.git  → github.com/org/myapp
-    //   git@github.com:org/myapp.git      → github.com/org/myapp
-    //   ./examples/basic-http             → examples/basic-http
-    let without_git = trimmed
-        .strip_suffix(".git")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/');
-
-    let is_remote = without_git.starts_with("git@")
-        || without_git.starts_with("https://")
-        || without_git.starts_with("http://")
-        || without_git.starts_with("ssh://");
-
-    let path_like = if let Some(rest) = without_git.strip_prefix("git@") {
-        // scp-like: git@host:owner/repo
-        rest.replacen(':', "/", 1)
-    } else {
-        let rest = without_git
-            .strip_prefix("https://")
-            .or_else(|| without_git.strip_prefix("http://"))
-            .or_else(|| without_git.strip_prefix("ssh://"))
-            .unwrap_or(without_git);
-        // ssh://git@host/owner/repo → drop optional git@ user
-        rest.strip_prefix("git@").unwrap_or(rest).to_string()
-    };
-
-    let segments: Vec<&str> = path_like
-        .split(['/', '\\'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        .collect();
-    if segments.is_empty() {
-        return None;
-    }
-
-    // Remotes: drop the host segment and join the full owner/group/repo path so
-    // nested namespaces stay distinct. Local paths: join every segment.
-    // Host-only remote (no path) falls back to sanitized host basename.
-    let id_segments: &[&str] = if is_remote {
-        if segments.len() >= 2 {
-            &segments[1..]
-        } else {
-            // rare: host only — use host basename (strip domain noise later)
-            &segments[..]
-        }
-    } else if segments.len() >= 2 && segments[0].contains('.') {
-        // path-like host/repo without a scheme
-        &segments[1..]
-    } else {
-        &segments[..]
-    };
-
-    if id_segments.is_empty() {
-        return None;
-    }
-    let raw_id = id_segments.join("-");
-
-    let mut out = String::with_capacity(raw_id.len());
-    for c in raw_id.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c);
-        } else if c == '.' {
-            out.push('-');
-        }
-    }
-    // Collapse runs of separators introduced by sanitization.
-    let collapsed: String = {
-        let mut s = String::with_capacity(out.len());
-        let mut prev_sep = false;
-        for c in out.chars() {
-            let sep = c == '-' || c == '_';
-            if sep && prev_sep {
-                continue;
-            }
-            s.push(c);
-            prev_sep = sep;
-        }
-        s
-    };
-    let mut out = collapsed.trim_matches('-').trim_matches('_').to_string();
-    if out.is_empty() {
-        return None;
-    }
-
-    // Mirror control-plane reserved service dirs (metadata::is_reserved_service_dir).
-    // After sanitization dots become dashes, so `*.bak` cannot appear; still
-    // guard exact reserved names.
-    let is_reserved =
-        out == "traefik" || out == "secrets" || out == "_pool" || out.ends_with(".bak");
-    if is_reserved {
-        out.push_str("-svc");
-    }
-
-    // Enforce validate_service_id max length (128).
-    if out.len() > MAX_SERVICE_ID_LEN {
-        out.truncate(MAX_SERVICE_ID_LEN);
-        out = out.trim_end_matches('-').trim_end_matches('_').to_string();
-        if out.is_empty() {
-            return None;
-        }
-        // Truncation could theoretically land on a reserved exact name.
-        if out == "traefik" || out == "secrets" || out == "_pool" {
-            let suffix = "-svc";
-            let keep = MAX_SERVICE_ID_LEN.saturating_sub(suffix.len());
-            out.truncate(keep);
-            out = out.trim_end_matches('-').trim_end_matches('_').to_string();
-            out.push_str(suffix);
-        }
-    }
-
-    Some(out)
+    anyhow::bail!(
+        "unexpected trailing arguments: {}\n\
+         process argv goes in Russelfile service.args \
+         (e.g. args = [\"--dir\", \"/data\"])\n\
+         podman flags go in Russelfile service.podman_args \
+         (e.g. podman_args = [\"-v\", \"/data:/data:ro\"])",
+        trailing.join(" ")
+    )
 }
 
 pub async fn login(args: LoginArgs, resolved: &Resolved) -> Result<()> {
@@ -1447,6 +1146,9 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
     if let Some(config) = args.config {
         body.insert("config_path".into(), serde_json::json!(config));
     }
+    if args.refresh {
+        body.insert("refresh".into(), serde_json::json!(true));
+    }
 
     let client = http_client(control_plane)?;
     let mut response = client
@@ -1462,6 +1164,35 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
     print_deploy_response(response, wall.elapsed());
     if !deploy_status_is_success(&status) {
         anyhow::bail!("update finished with status {status}");
+    }
+    Ok(())
+}
+
+pub async fn rollback(args: RollbackArgs, control_plane: &str) -> Result<()> {
+    let url = service_vm_url(control_plane, &args.id, "/rollback")?;
+    let wall = Instant::now();
+    println!();
+    println!("  \x1b[1;36mrussel rollback\x1b[0m  {}", args.id);
+    println!();
+
+    let mut body = serde_json::Map::new();
+    if let Some(version) = args.version {
+        body.insert("version".into(), serde_json::json!(version));
+    }
+    let client = http_client(control_plane)?;
+    let mut response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))
+        .and_then(|r| ok_status(r, control_plane))?;
+
+    let response = stream_deploy_events(&mut response, "rollback").await?;
+    let status = response.status.clone();
+    print_deploy_response(response, wall.elapsed());
+    if !deploy_status_is_success(&status) {
+        anyhow::bail!("rollback finished with status {status}");
     }
     Ok(())
 }
@@ -1576,27 +1307,12 @@ fn handle_deploy_event(
 
 /// Reject a service id before it is interpolated into a control-plane path.
 ///
-/// Empty, longer than 128 bytes, or any character other than ASCII
-/// alphanumeric, `-`, and `_`. Dots and slashes are rejected so `..` cannot
-/// be resolved by the URL parser into another route. This is the path-safety
-/// half of ctrl `MicrovmRunner::validate_service_id` (ASCII-only; reserved
-/// names are still enforced server-side).
+/// Same rules as the control plane ([`russel_core::ids::validate_service_id`]):
+/// dots and slashes are rejected so `..` cannot be resolved by the URL parser
+/// into another route.
 fn require_service_id(id: &str) -> Result<()> {
-    if id.is_empty() {
-        anyhow::bail!("invalid service id: cannot be empty");
-    }
-    if id.len() > 128 {
-        anyhow::bail!("invalid service id: too long (max 128 bytes)");
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        anyhow::bail!(
-            "invalid service id `{id}`: only ASCII letters, digits, '-' and '_' are allowed"
-        );
-    }
-    Ok(())
+    russel_core::ids::validate_service_id(id)
+        .map_err(|e| anyhow::anyhow!("invalid service id `{id}`: {e}"))
 }
 
 /// Mirror ctrl `validate_secret_name` (`crates/ctrl/src/secrets.rs`).
@@ -1858,96 +1574,14 @@ mod tests {
     }
 
     #[test]
-    fn deploy_status_success_only_deployed() {
+    fn deploy_status_success_is_deployed_or_unchanged() {
         assert!(deploy_status_is_success("deployed"));
         assert!(!deploy_status_is_success("rolled_back"));
+        assert!(deploy_status_is_success("unchanged"));
         assert!(!deploy_status_is_success("failed"));
         assert!(!deploy_status_is_success("building"));
         assert!(!deploy_status_is_success(""));
         assert!(!deploy_status_is_success("Deployed")); // case-sensitive
-    }
-
-    #[test]
-    fn parse_port_mapping_valid() {
-        let pm = parse_port_mapping("8080:3000").unwrap();
-        assert_eq!(pm.host, 8080);
-        assert_eq!(pm.guest, 3000);
-    }
-
-    #[test]
-    fn parse_port_mapping_invalid_format() {
-        assert!(parse_port_mapping("8080").is_err());
-        assert!(parse_port_mapping("").is_err());
-    }
-
-    #[test]
-    fn parse_port_mapping_host_zero_rejected() {
-        let err = parse_port_mapping("0:3000").unwrap_err();
-        assert!(err.to_string().contains("must not be 0"));
-    }
-
-    #[test]
-    fn parse_port_mapping_guest_zero_rejected() {
-        let err = parse_port_mapping("8080:0").unwrap_err();
-        assert!(
-            err.to_string().contains("guest port must not be 0"),
-            "unexpected err: {err}"
-        );
-    }
-
-    #[test]
-    fn default_service_id_from_repo_path_and_url() {
-        assert_eq!(
-            default_service_id_from_repo("./examples/basic-http"),
-            Some("examples-basic-http".into())
-        );
-        assert_eq!(
-            default_service_id_from_repo("https://github.com/org/myapp.git"),
-            Some("org-myapp".into())
-        );
-        assert_eq!(
-            default_service_id_from_repo("git@github.com:org/my.app.git"),
-            Some("org-my-app".into())
-        );
-        // Different owners sharing basename must not collide.
-        assert_eq!(
-            default_service_id_from_repo("https://github.com/alice/app.git"),
-            Some("alice-app".into())
-        );
-        assert_eq!(
-            default_service_id_from_repo("https://github.com/bob/app.git"),
-            Some("bob-app".into())
-        );
-        // Nested namespaces: same final two segments under different groups.
-        assert_eq!(
-            default_service_id_from_repo("https://gitlab.example/a/team/app.git"),
-            Some("a-team-app".into())
-        );
-        assert_eq!(
-            default_service_id_from_repo("https://gitlab.example/b/team/app.git"),
-            Some("b-team-app".into())
-        );
-        assert_ne!(
-            default_service_id_from_repo("https://gitlab.example/a/team/app.git"),
-            default_service_id_from_repo("https://gitlab.example/b/team/app.git"),
-        );
-        // Reserved basenames get a safe suffix so validate_service_id accepts them.
-        assert_eq!(
-            default_service_id_from_repo("https://github.com/org/secrets.git"),
-            Some("org-secrets".into())
-        );
-        assert_eq!(
-            default_service_id_from_repo("secrets"),
-            Some("secrets-svc".into())
-        );
-        assert_eq!(default_service_id_from_repo("."), None);
-        assert_eq!(default_service_id_from_repo(""), None);
-    }
-
-    #[test]
-    fn parse_port_mapping_non_numeric() {
-        assert!(parse_port_mapping("abc:3000").is_err());
-        assert!(parse_port_mapping("8080:xyz").is_err());
     }
 
     #[test]
@@ -2023,97 +1657,31 @@ mod tests {
     }
 
     #[test]
-    fn deploy_parses_trailing_podman_args_after_double_dash() {
-        let cli = Cli::try_parse_from([
-            "russel",
-            "deploy",
-            ".",
-            "--runtime",
-            "container",
-            "--",
-            "-v",
-            "/a:/b",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Deploy(args) => {
-                assert_eq!(args.podman_args, vec!["-v", "/a:/b"]);
-            }
-            _ => panic!("expected deploy subcommand"),
+    fn deploy_rejects_removed_flags() {
+        for args in [
+            vec!["russel", "deploy", ".", "-p", "8080:3000"],
+            vec!["russel", "deploy", ".", "--vm-id", "x"],
+            vec!["russel", "deploy", ".", "--env", "A=1"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
         }
     }
 
     #[test]
-    fn deploy_parses_host_flag() {
-        let cli = Cli::try_parse_from([
-            "russel",
-            "deploy",
-            "https://github.com/org/app.git",
-            "--host",
-            "ABC.com",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Deploy(args) => assert_eq!(args.host.as_deref(), Some("ABC.com")),
-            _ => panic!("expected deploy subcommand"),
-        }
-    }
-
-    #[test]
-    fn local_deploy_host_mismatch_uses_canonical_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("Russelfile.toml"),
-            r#"
-[service]
-name = "app"
-source = "."
-port = 3000
-memory = "256mb"
-
-[ingress]
-host = "app.example.com"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_deploy_host(
-            tmp.path().to_str().unwrap(),
-            "Russelfile.toml",
-            Some("other.example.com"),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "CLI --host other.example.com does not match Russelfile ingress.host (app.example.com)"
-        );
-    }
-
-    #[test]
-    fn local_deploy_host_without_file_host_uses_canonical_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("Russelfile.toml"),
-            r#"
-[service]
-name = "app"
-source = "."
-port = 3000
-memory = "256mb"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_deploy_host(
-            tmp.path().to_str().unwrap(),
-            "Russelfile.toml",
-            Some("app.example.com"),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "CLI --host app.example.com does not match Russelfile (no [ingress].host)"
-        );
+    fn deploy_rejects_trailing_tokens_with_guidance() {
+        // `--dir /data` is process argv and belongs in service.args.
+        let cli = Cli::try_parse_from(["russel", "deploy", ".", "--", "--dir", "/data"]).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected deploy subcommand");
+        };
+        assert_eq!(args.trailing, vec!["--dir", "/data"]);
+        let msg = reject_trailing_deploy_args(&args.trailing)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("--dir /data"), "{msg}");
+        assert!(msg.contains("service.args"), "{msg}");
+        assert!(msg.contains("service.podman_args"), "{msg}");
     }
 
     #[test]
@@ -2121,6 +1689,27 @@ memory = "256mb"
         let err = Cli::try_parse_from(["russel", "--version"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains("0.1.0"));
+    }
+
+    #[test]
+    fn apply_deploy_alias_update_refresh_and_rollback_parse() {
+        for name in ["apply", "deploy"] {
+            let cli = Cli::try_parse_from(["russel", name, ".", "--force"]).unwrap();
+            let Command::Apply(args) = cli.command else {
+                panic!("expected Apply for {name}");
+            };
+            assert!(args.force);
+        }
+        let cli = Cli::try_parse_from(["russel", "update", "api", "--refresh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Update(UpdateArgs { refresh: true, .. })
+        ));
+        let cli = Cli::try_parse_from(["russel", "rollback", "api", "--version", "3"]).unwrap();
+        let Command::Rollback(args) = cli.command else {
+            panic!("expected Rollback");
+        };
+        assert_eq!((args.id.as_str(), args.version), ("api", Some(3)));
     }
 
     #[test]
@@ -2193,111 +1782,6 @@ memory = "256mb"
             }
             _ => panic!("expected init subcommand"),
         }
-    }
-
-    #[test]
-    fn parse_env_kv_valid() {
-        let (k, v) = parse_env_kv("FOO=bar").unwrap();
-        assert_eq!(k, "FOO");
-        assert_eq!(v, "bar");
-    }
-
-    #[test]
-    fn parse_env_kv_equals_in_value() {
-        let (k, v) = parse_env_kv("FOO=bar=baz").unwrap();
-        assert_eq!(k, "FOO");
-        assert_eq!(v, "bar=baz");
-    }
-
-    #[test]
-    fn parse_env_kv_no_equals() {
-        assert!(parse_env_kv("FOOBAR").is_err());
-    }
-
-    #[test]
-    fn parse_env_kv_empty_key() {
-        let err = parse_env_kv("=value").unwrap_err();
-        assert!(
-            err.to_string().contains("argument starts with ="),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn parse_env_file_valid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "LOG_LEVEL=info\n# comment\n\nFEATURE_X=1\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("LOG_LEVEL"), Some(&"info".to_string()));
-        assert_eq!(map.get("FEATURE_X"), Some(&"1".to_string()));
-        assert_eq!(map.len(), 2);
-    }
-
-    #[test]
-    fn parse_env_file_bom() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        let bom = "\u{FEFF}";
-        std::fs::write(&path, format!("{bom}KEY=val\n")).unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"val".to_string()));
-    }
-
-    #[test]
-    fn parse_env_file_double_quoted_value() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "KEY=\"value with spaces\"\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"value with spaces".to_string()));
-    }
-
-    #[test]
-    fn parse_env_file_single_quoted_value() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "KEY='value with spaces'\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"value with spaces".to_string()));
-    }
-
-    #[test]
-    fn parse_env_file_inline_comment() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "KEY=value # this is a comment\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"value".to_string()));
-    }
-
-    #[test]
-    fn parse_env_file_quoted_value_preserves_hash() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "KEY=\"value # not a comment\"\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"value # not a comment".to_string()));
-    }
-
-    #[test]
-    fn parse_env_file_crlf() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "KEY=val\r\nOTHER=foo\r\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"val".to_string()));
-        assert_eq!(map.get("OTHER"), Some(&"foo".to_string()));
-    }
-
-    #[test]
-    fn parse_env_file_equals_in_value() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("env.txt");
-        std::fs::write(&path, "KEY=val=ue\n").unwrap();
-        let map = parse_env_file(&path.to_string_lossy()).unwrap();
-        assert_eq!(map.get("KEY"), Some(&"val=ue".to_string()));
     }
 
     #[test]
@@ -2611,10 +2095,13 @@ memory = "256mb"
             "got: {msg}"
         );
         assert!(
-            msg.contains("systemctl --user status russel-ctrl"),
+            msg.contains("systemctl status russel-ctrl  # install.sh host"),
             "got: {msg}"
         );
-        assert!(msg.contains("systemctl status russel-ctrl"), "got: {msg}");
+        assert!(
+            msg.contains("systemctl status russel       # NixOS"),
+            "got: {msg}"
+        );
         assert!(
             msg.contains(
                 "ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:7878:127.0.0.1:7878 <user@host>"
@@ -2648,7 +2135,7 @@ memory = "256mb"
         assert!(msg.contains("routing/VPN"), "got: {msg}");
         assert!(msg.contains("HTTPS/TLS reverse proxy"), "got: {msg}");
         assert!(
-            !msg.contains("systemctl --user status russel-ctrl"),
+            !msg.contains("systemctl status russel-ctrl  # install.sh host"),
             "got: {msg}"
         );
         assert!(!msg.contains("ssh -f -N"), "got: {msg}");
@@ -2674,7 +2161,7 @@ memory = "256mb"
         assert_eq!(msg, original);
         for guidance in [
             "nothing is listening on this machine",
-            "systemctl --user status russel-ctrl",
+            "systemctl status russel-ctrl",
             "ssh -f -N",
             "host cannot be reached",
             "routing/VPN",
@@ -2684,30 +2171,6 @@ memory = "256mb"
                 !msg.contains(guidance),
                 "unexpected topology guidance: {msg}"
             );
-        }
-    }
-
-    #[test]
-    fn deploy_parses_mount_style_podman_args() {
-        let cli = Cli::try_parse_from([
-            "russel",
-            "deploy",
-            ".",
-            "--runtime",
-            "container",
-            "--",
-            "--mount",
-            "type=bind,source=/tmp/x,destination=/data",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Deploy(args) => {
-                assert_eq!(
-                    args.podman_args,
-                    vec!["--mount", "type=bind,source=/tmp/x,destination=/data"]
-                );
-            }
-            _ => panic!("expected deploy subcommand"),
         }
     }
 

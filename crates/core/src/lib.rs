@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod env_util;
+pub mod ids;
 pub mod paths;
 pub mod reserved;
 pub mod timeutil;
@@ -8,8 +9,8 @@ pub mod tokens;
 pub mod volumes;
 
 pub use config::{
-    GuestKind, IngressConfig, RuntimeKind, is_valid_dns_name, merge_env_maps, resolve_ingress_host,
-    resolve_ingress_port, resolve_runtime, validate_env_key, validate_env_map,
+    GuestKind, IngressConfig, RuntimeKind, is_valid_dns_name, resolve_ingress_host,
+    resolve_primary_publish, validate_env_key, validate_env_map, validate_publish_host_port,
 };
 pub use paths::{data_root, data_root_from, service_dir};
 pub use volumes::{

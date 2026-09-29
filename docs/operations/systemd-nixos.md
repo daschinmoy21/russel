@@ -1,8 +1,8 @@
 ---
 title: systemd and NixOS
-description: Run russel-ctrl as a user unit or a NixOS service — loopback, tokens, and Podman.
+description: Run russel-ctrl as a dedicated russel account, from the installer or the NixOS module — loopback, tokens, and Podman.
 sidebar_position: 1
-keywords: [systemd, nixos, service, linger, podman, user unit]
+keywords: [systemd, nixos, service, linger, podman, system unit, russel user]
 ---
 
 # systemd and NixOS
@@ -12,38 +12,46 @@ Two supported ways to run `russel-ctrl` persistently. Both keep it on loopback w
 ## What you'll need
 
 - Release `russel-ctrl` built on the host distro (NixOS glibc binaries do not run on Debian).
-- A non-root operator account (host installer refuses root).
-- Rootless Podman for containers; KVM/TAP/iptables privileges for microVMs.
+- `sudo` once, to install. Both setups run russel-ctrl and every workload as a dedicated, unprivileged `russel` account.
+- Rootless Podman for containers; `/dev/kvm` plus `cloud-hypervisor`, `virtiofsd`, and `passt` for microVMs.
 
-## Other Linux — systemd user unit (via installer)
+## Other Linux — system unit as `russel` (via installer)
 
 ```bash
-./contrib/install.sh host
+./contrib/install.sh check
+sudo ./contrib/install.sh host
 ./contrib/install.sh status
 ```
 
-`host` (other-Linux, user-systemd only; refuses NixOS, root, non-Linux, and system-managed `russel*.service` units):
+`check` lists missing prerequisites with a fix for each and changes nothing. `host` runs the same checks first (`--skip-checks` overrides), then:
 
-- Installs `/usr/local/bin/russel-ctrl` (sudo when the dest dir is not writable; restores the previous binary if the restart fails).
-- Installs `contrib/russel-ctrl.service` → `~/.config/systemd/user/russel-ctrl.service` (use `--force-unit` to overwrite a changed unit).
-- Creates `~/.config/russel/env` (`0600`) when missing — never overwrites, never prints tokens.
-- Creates `/var/lib/russel` with mode `0700` when that directory is new. An existing operator-owned directory keeps its current mode. `--take-state-ownership` takes a foreign-owned directory and sets mode `0700`.
-- Enables linger (`loginctl enable-linger`) warning on headless hosts so `/run/user/$(id -u)` and the user manager survive logout.
-- Restarts the active user unit and probes `/vms` (bounded). Alive means HTTP 200 with a `vms` array, or HTTP 401 with `WWW-Authenticate: Bearer realm="russel-ctrl"`.
+- Creates the `russel` system group and account (home `/var/lib/russel`, no login shell), adds a subuid/subgid range after every existing one, and enables linger so `user@<uid>.service` gives it `/run/user/<uid>` and a user bus from boot.
+- Adds the invoking `sudo` user to the `russel` group, and adds `russel` to `kvm` when `/dev/kvm` exists.
+- Creates `/etc/russel` (`root:russel`, `0750`) and `/etc/russel/env` (`root:russel`, `0640`) when missing. Never overwrites, never prints tokens. An old per-user `~/.config/russel/env` token is carried over.
+- Creates `/var/lib/russel` (`russel:russel`, `0700`). A directory owned by anyone else is refused unless `--take-state-ownership`, which hands the whole tree to `russel`.
+- Renders `contrib/russel-ctrl.service` with russel's uid into `/etc/systemd/system/russel-ctrl.service` (`--force-unit` overwrites a changed unit).
+- Installs `/usr/local/bin/russel-ctrl`, keeping the previous binary; a failed restart puts it back.
+- Enables or restarts the unit and probes `/vms` (bounded). Alive means HTTP 200 with a `vms` array, or HTTP 401 with `WWW-Authenticate: Bearer realm="russel-ctrl"`.
 
-Manual equivalent:
+It refuses NixOS, non-Linux, a `russel.service` from the NixOS module, a Nix-store unit, and an old per-user install (it prints the steps to move over).
+
+Manual equivalent (Debian/Ubuntu):
 
 ```bash
+sudo groupadd --system russel
+sudo useradd --system --gid russel --home-dir /var/lib/russel --no-create-home --shell /usr/sbin/nologin russel
+sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 russel   # a range no one else uses
+sudo loginctl enable-linger russel
+sudo usermod --append --groups russel "$USER"
+sudo install -d -o russel -g russel -m 700 /var/lib/russel
+sudo install -d -o root -g russel -m 750 /etc/russel
+printf 'RUSSEL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" | sudo install -o root -g russel -m 640 /dev/stdin /etc/russel/env
 sudo install -Dm755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
-mkdir -p ~/.config/systemd/user ~/.config/russel
-cp contrib/russel-ctrl.service ~/.config/systemd/user/
-umask 077 && printf 'RUSSEL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > ~/.config/russel/env
-sudo mkdir -p /var/lib/russel && sudo chown "$USER:" /var/lib/russel && chmod 700 /var/lib/russel
-loginctl enable-linger "$(id -un)"
-systemctl --user daemon-reload && systemctl --user enable --now russel-ctrl
+sed "s/@RUSSEL_UID@/$(id -u russel)/g" contrib/russel-ctrl.service | sudo tee /etc/systemd/system/russel-ctrl.service >/dev/null
+sudo systemctl daemon-reload && sudo systemctl enable --now russel-ctrl
 ```
 
-Unit defaults (see `contrib/russel-ctrl.service`): loopback bind, `RUSSEL_REQUIRE_AUTH=1`, `EnvironmentFile=%h/.config/russel/env`, state dir handling, restart-on-failure. `Documentation=` points at the public install doc.
+Unit defaults (see `contrib/russel-ctrl.service`): `User=russel`, loopback bind, `RUSSEL_REQUIRE_AUTH=1`, `EnvironmentFile=/etc/russel/env`, the Nix daemon profile on `PATH`, `XDG_RUNTIME_DIR` and the user bus for rootless Podman, `ProtectSystem=strict` with only `/var/lib/russel` and the account's `/run/user/<uid>` writable, restart-on-failure.
 
 ## NixOS — `services.russel`
 
@@ -72,7 +80,7 @@ Use `services.russel`, never `install.sh host`, on NixOS.
 ## Verify
 
 ```bash
-systemctl --user status russel-ctrl
+systemctl status russel-ctrl     # installer; on NixOS the unit is russel.service
 ./contrib/install.sh status
 russel origin && russel ps
 ss -ltnp 'sport = :7878'

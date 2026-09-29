@@ -1,7 +1,35 @@
 # postgres — PostgreSQL from nixpkgs. Russel does not run initdb.
-# Point `host` at a directory you already initialized (initdb -D ...),
-# and list that prefix in RUSSEL_VOLUME_ROOTS (e.g. /srv/russel).
-# A committed flake.nix would win over `package`.
+# Point `host` at a directory you already initialized, and list that prefix
+# in RUSSEL_VOLUME_ROOTS (e.g. /srv/russel). A committed flake.nix would win
+# over `package`.
+#
+# Prepare PGDATA once, as the `russel` account that runs the control plane
+# (`sudo -u russel bash` after `sudo install -d -o russel -g russel /srv/russel`),
+# with the same postgresql major version that `package` builds (nixos-unstable).
+# With install.sh host, also let the unit write there: `sudo systemctl edit
+# russel-ctrl`, add `[Service]` and `ReadWritePaths=/srv/russel`.
+#
+#   pg=$(nix build --no-link --print-out-paths \
+#     'github:NixOS/nixpkgs/nixos-unstable#postgresql^out')
+#   $pg/bin/initdb -D /srv/russel/postgres-data -U postgres \
+#     --no-locale -E UTF8 --auth-local=trust --auth-host=scram-sha-256 --pwprompt
+#   cat >>/srv/russel/postgres-data/postgresql.conf <<'EOF'
+#   listen_addresses = '*'
+#   unix_socket_directories = '/tmp'
+#   EOF
+#   echo 'host all all 0.0.0.0/0 scram-sha-256' \
+#     >>/srv/russel/postgres-data/pg_hba.conf
+#
+# Why each piece:
+# - --no-locale: the container has no locale data, so a host locale such as
+#   en_US.UTF-8 in postgresql.conf fails at startup.
+# - listen_addresses: Podman port forwarding targets the container IP, not
+#   loopback.
+# - unix_socket_directories: the default /run/postgresql does not exist in
+#   the container; /tmp is a writable tmpfs.
+# - no service.user: postgres refuses to run as root. By default Russel runs
+#   the app as the control plane's user (`russel`), which also owns PGDATA
+#   (initdb makes it 0700). Works as a container or a microVM.
 
 [service]
 name = "postgres"

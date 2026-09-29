@@ -6,7 +6,7 @@ use russel_core::api::{LogsResponse, ServiceStatus, StatusResponse, VmState};
 use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 
-use super::app::{AppState, LifecycleClaim, ServiceState, SupervisePoll};
+use super::app::{AppState, LifecycleClaim, ServiceState, SupervisePoll, Supervision};
 use super::helpers::{check_container_running, pid_is_alive, push_capped, read_tail_of_file};
 
 impl AppState {
@@ -31,6 +31,8 @@ impl AppState {
         s.prebuild_status = Some(s.status);
         s.prebuild_vm_state = Some(s.vm_state);
         s.status = ServiceStatus::Building;
+        s.restarts = 0;
+        s.restart_streak = 0;
         // Reset stale vm_state: "failed"/"none" → "pending", preserve "running"
         // for an existing VM process, set new entries to "pending".
         match s.vm_state {
@@ -89,6 +91,20 @@ impl AppState {
         }
     }
 
+    /// Start the liveness supervisor for a workload that stays in place
+    /// across a generation bump (failed redeploy, aborted stop).
+    fn spawn_supervisor(&self, service_id: &str, generation: u64, supervision: Supervision) {
+        match supervision {
+            Supervision::Process => {
+                self.spawn_process_supervisor(service_id.to_string(), generation);
+            }
+            Supervision::Container(container_id) => {
+                self.spawn_container_supervisor(service_id.to_string(), container_id, generation);
+            }
+            Supervision::Pid => self.spawn_pid_supervisor(service_id.to_string(), generation),
+        }
+    }
+
     fn spawn_process_supervisor(&self, service_id: String, generation: u64) {
         // Skip supervisor when no tokio runtime is active (e.g. sync unit
         // tests); the test process is the only observer.
@@ -116,6 +132,7 @@ impl AppState {
                         state
                             .handle_unexpected_process_exit(&service_id, generation, msg)
                             .await;
+                        crate::restart::on_unexpected_exit(&state, &service_id);
                         break;
                     }
                 }
@@ -163,11 +180,13 @@ impl AppState {
                         generation,
                         "adopted microVM PID disappeared"
                     );
-                    state.mark_failed_if_generation(
+                    if state.mark_failed_if_generation(
                         &service_id,
                         generation,
                         format!("adopted microVM PID {pid} no longer alive"),
-                    );
+                    ) {
+                        crate::restart::on_unexpected_exit(&state, &service_id);
+                    }
                     return;
                 }
             }
@@ -375,14 +394,14 @@ impl AppState {
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
-        let needs_supervisor = {
+        let restored = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
             Self::apply_failure_transition(s, &error)
         };
 
-        if let Some(g) = needs_supervisor {
-            self.spawn_process_supervisor(service_id.to_string(), g);
+        if let Some((generation, supervision)) = restored {
+            self.spawn_supervisor(service_id, generation, supervision);
         }
 
         // Best-effort catalog update.
@@ -405,7 +424,7 @@ impl AppState {
         expected_generation: u64,
         error: String,
     ) -> bool {
-        let needs_supervisor = {
+        let restored = {
             let mut inner = self.lock_inner();
             let Some(s) = inner.services.get_mut(service_id) else {
                 return false;
@@ -419,8 +438,8 @@ impl AppState {
             Self::apply_failure_transition(s, &error)
         };
 
-        if let Some(g) = needs_supervisor {
-            self.spawn_process_supervisor(service_id.to_string(), g);
+        if let Some((generation, supervision)) = restored {
+            self.spawn_supervisor(service_id, generation, supervision);
         }
 
         if let Err(e) = self.write_catalog() {
@@ -433,9 +452,13 @@ impl AppState {
     /// Apply the failure state transition to a ServiceState in-place.
     ///
     /// If a prebuild snapshot exists (previous deployment still running),
-    /// restores that state and returns the new generation for supervisor
-    /// restart. Otherwise sets standard `failed`/`failed` state.
-    fn apply_failure_transition(s: &mut ServiceState, error: &str) -> Option<u64> {
+    /// restores that state and returns the new generation plus the supervisor
+    /// that fits the restored workload. Otherwise sets standard
+    /// `failed`/`failed` state.
+    pub(super) fn apply_failure_transition(
+        s: &mut ServiceState,
+        error: &str,
+    ) -> Option<(u64, Supervision)> {
         if s.prebuild_vm_state == Some(VmState::Running) {
             let prev_status = s.prebuild_status.take().unwrap_or_default();
             let prev_vm_state = s.prebuild_vm_state.take().unwrap_or_default();
@@ -448,7 +471,7 @@ impl AppState {
                 &mut s.logs,
                 &format!("BUILD FAILED (previous deployment preserved): {}\n", error),
             );
-            Some(g)
+            Supervision::for_service(s).map(|supervision| (g, supervision))
         } else {
             // No prior VM to restore — standard failure.
             s.prebuild_status = None;
@@ -637,11 +660,10 @@ impl AppState {
             s.vm_state = prior_vm_state;
             s.process_generation = s.process_generation.wrapping_add(1);
             let generation = s.process_generation;
-            let has_children = s.vm_process.is_some() || !s.aux_processes.is_empty();
-            if has_children { Some(generation) } else { None }
+            Supervision::for_service(s).map(|supervision| (generation, supervision))
         };
-        if let Some(generation) = needs_supervisor {
-            self.spawn_process_supervisor(service_id.to_string(), generation);
+        if let Some((generation, supervision)) = needs_supervisor {
+            self.spawn_supervisor(service_id, generation, supervision);
         }
         if let Err(e) = self.write_catalog() {
             tracing::warn!(error = %e, "failed to write catalog after abort_lifecycle_operation");
@@ -733,7 +755,7 @@ impl AppState {
         // read (same pattern as `logs`). `started_at.elapsed()` is wall-clock
         // and cheap, so it is computed inside the critical section alongside
         // the `vm_state` check it depends on.
-        let (status, vm_state, runtime, host_port, guest_port, uptime_seconds) = {
+        let (status, vm_state, runtime, host_port, guest_port, uptime_seconds, restarts) = {
             let inner = self.lock_inner();
             let s = inner.services.get(service_id)?;
             // Only count wall-clock uptime while the workload is actually running.
@@ -750,6 +772,7 @@ impl AppState {
                 s.host_port,
                 s.guest_port,
                 uptime_seconds,
+                (s.restarts > 0).then_some(s.restarts),
             )
         };
 
@@ -769,6 +792,7 @@ impl AppState {
             host_port: host_port.or_else(|| disk.as_ref().and_then(|m| m.host_port)),
             guest_port: guest_port.or_else(|| disk.as_ref().and_then(|m| m.guest_port)),
             route_host,
+            restarts,
         })
     }
 
@@ -801,7 +825,7 @@ impl AppState {
 
         match runtime {
             RuntimeKind::Microvm => {
-                let console_path = russel_core::paths::service_dir(service_id)
+                let console_path = crate::paths::service_dir(service_id)
                     .join("console.log")
                     .display()
                     .to_string();
@@ -890,8 +914,74 @@ impl AppState {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use russel_core::api::{ServiceStatus, VmState};
+    use russel_core::config::RuntimeKind;
+
+    use super::super::app::{AppState, ServiceState, Supervision};
     use crate::deployments::DesiredStateSnapshot;
+
+    /// A deployed service mid-redeploy: `mark_building` snapshot taken.
+    fn redeploying(runtime: RuntimeKind) -> ServiceState {
+        ServiceState {
+            status: ServiceStatus::Building,
+            vm_state: VmState::Running,
+            runtime: Some(runtime),
+            prebuild_status: Some(ServiceStatus::Deployed),
+            prebuild_vm_state: Some(VmState::Running),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_container_redeploy_keeps_container_supervision() {
+        let mut s = redeploying(RuntimeKind::Container);
+        s.container_id = Some("abc123".into());
+        let (generation, supervision) =
+            AppState::apply_failure_transition(&mut s, "build failed").unwrap();
+        assert_eq!(supervision, Supervision::Container("abc123".into()));
+        assert_eq!(generation, s.process_generation);
+        assert_eq!(s.status, ServiceStatus::Deployed);
+        assert_eq!(s.vm_state, VmState::Running);
+    }
+
+    #[test]
+    fn failed_adopted_microvm_redeploy_keeps_pid_supervision() {
+        let mut s = redeploying(RuntimeKind::Microvm);
+        s.vm_pid = Some(4242);
+        let (_, supervision) = AppState::apply_failure_transition(&mut s, "build failed").unwrap();
+        assert_eq!(supervision, Supervision::Pid);
+    }
+
+    #[test]
+    fn failed_first_deploy_needs_no_supervisor() {
+        let mut s = ServiceState {
+            status: ServiceStatus::Building,
+            vm_state: VmState::Pending,
+            prebuild_status: Some(ServiceStatus::Idle),
+            prebuild_vm_state: Some(VmState::None),
+            ..Default::default()
+        };
+        assert!(AppState::apply_failure_transition(&mut s, "build failed").is_none());
+        assert_eq!(s.status, ServiceStatus::Failed);
+    }
+
+    #[test]
+    fn supervision_is_none_without_a_handle_id_or_pid() {
+        let container = ServiceState {
+            runtime: Some(RuntimeKind::Container),
+            vm_pid: Some(1),
+            ..Default::default()
+        };
+        // A container is never PID-supervised, even with a stale vm_pid.
+        assert_eq!(Supervision::for_service(&container), None);
+        let microvm = ServiceState {
+            runtime: Some(RuntimeKind::Microvm),
+            ..Default::default()
+        };
+        assert_eq!(Supervision::for_service(&microvm), None);
+    }
 
     fn ingress_host_from_metadata(meta: &serde_json::Value) -> Option<String> {
         DesiredStateSnapshot::from_metadata_desired_state(meta).ingress_host

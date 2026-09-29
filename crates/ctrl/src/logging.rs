@@ -9,8 +9,8 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
-/// Default file under the state dir. Used when that directory already exists.
-pub const DEFAULT_LOG_FILE: &str = "/var/lib/russel/ctrl.log";
+/// Log file name under the data root (`RUSSEL_DATA_DIR`, default `/var/lib/russel`).
+pub const LOG_FILE_NAME: &str = "ctrl.log";
 
 /// Filter written to the log file (same verbosity ctrl used to dump on stdout).
 pub const FILE_FILTER: &str = "info,russel_ctrl=debug";
@@ -18,7 +18,7 @@ pub const FILE_FILTER: &str = "info,russel_ctrl=debug";
 /// Stderr without `--debug`: warnings and errors only.
 pub const QUIET_STDERR_FILTER: &str = "warn";
 
-/// Where to write `ctrl.log` when `/var/lib/russel` is not writable.
+/// Where to write `ctrl.log` when the data root is not writable.
 pub fn fallback_log_path() -> PathBuf {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -27,13 +27,13 @@ pub fn fallback_log_path() -> PathBuf {
     state.join("russel/ctrl.log")
 }
 
-/// CLI `--log-file` wins; otherwise `/var/lib/russel/ctrl.log` when that dir
-/// exists, else `$XDG_STATE_HOME/russel/ctrl.log`.
+/// CLI `--log-file` wins; otherwise `<data root>/ctrl.log` when that dir
+/// exists and is writable, else `$XDG_STATE_HOME/russel/ctrl.log`.
 pub fn resolve_log_path(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path;
     }
-    let preferred = PathBuf::from(DEFAULT_LOG_FILE);
+    let preferred = crate::paths::data_root().join(LOG_FILE_NAME);
     if preferred
         .parent()
         .is_some_and(|parent| parent.is_dir() && dir_is_writable(parent))

@@ -23,6 +23,7 @@ All `RUSSEL_*` variables in one table. Booleans accept the unified truthy set (`
 | `RUSSEL_NODE_LABELS` | — | `key=val,key2=val2` operator labels (invalid pairs skipped). |
 | `RUSSEL_DATA_DIR` | `/var/lib/russel` | Absolute state root for ctrl and the agent (service dirs, catalog, secrets default, warm pool). Relative values are ignored. Keep mode `0700`. |
 | `RUSSEL_SECRETS_DIR` | `$RUSSEL_DATA_DIR/secrets` (`/var/lib/russel/secrets` when unset) | Secret store override (mainly tests). Files `0600`. |
+| `RUSSEL_MICROVMS_DIR` | `$RUSSEL_DATA_DIR/_microvms`, or `/var/lib/microvms` when `RUSSEL_DATA_DIR` is unset | MicroVM marker dirs (legacy discovery). Creating them is best-effort. |
 
 ## CLI
 
@@ -43,7 +44,8 @@ All `RUSSEL_*` variables in one table. Booleans accept the unified truthy set (`
 | `RUSSEL_NIX_RESTRICTED` | off (`1` = on) | Sandboxed `nix build` + no auto-flake. Required posture for untrusted sources. See [Nix builds](../security/nix-builds.md). |
 | `RUSSEL_KERNEL_PATH` | `.#microvm-kernel` build | MicroVM kernel `bzImage` (virtio built-in). Highest-priority explicit pin, checked before the kernel pool and the flake build. |
 | `RUSSEL_KERNEL_POOL` | `/var/lib/russel/_pool/kernel/bzImage` | Kernel pool `bzImage` (virtio built-in), checked when `RUSSEL_KERNEL_PATH` is unset or missing, before `nix build .#microvm-kernel`. No kernel from any source is a hard error — ctrl never falls back to the stock nixpkgs linux kernel (drivers `=m` breaks microVM boot). |
-| `RUSSEL_VIRTIOFS_SANDBOX` | — | virtiofsd sandbox mode override. |
+| `RUSSEL_VIRTIOFS_SANDBOX` | `chroot` as root, else `namespace` | virtiofsd sandbox mode override (`none` is the escape hatch). |
+| `RUSSEL_MICROVM_NET` | `tap` with `CAP_NET_ADMIN`, else `passt` | MicroVM networking: `passt` (unprivileged, vhost-user NIC + port publish) or `tap` (TAP + socat + `RUSSEL-FORWARD`, needs `CAP_NET_ADMIN`). Recorded per generation in metadata as `net`. |
 | `RUSSEL_TEST_BUSYBOX` | — | Test-only busybox path. |
 
 ## Networking and ingress
@@ -51,7 +53,7 @@ All `RUSSEL_*` variables in one table. Booleans accept the unified truthy set (`
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUSSEL_PUBLISH_BIND` | `127.0.0.1` | Default bind for `-p` publishes. `0.0.0.0` for wildcard; Tailscale IP for tailnet-only. Health probes are bind-aware. |
-| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `/var/lib/russel/traefik/dynamic` | Must match Traefik `providers.file.directory`. |
+| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `$RUSSEL_DATA_DIR/traefik/dynamic` (`/var/lib/russel/traefik/dynamic`) | Must match Traefik `providers.file.directory`. |
 | `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Default suffix for `Host()` rules when `[ingress].host` is omitted (validated DNS name). A file host takes precedence. |
 | `RUSSEL_TRAEFIK_BACKEND` | publish bind (`RUSSEL_PUBLISH_BIND`) | Host Traefik dials for a published backend port. Needed when Traefik runs in another netns than the backend (e.g. rootless Traefik → `10.89.0.1`). Wildcard binds map to loopback for a same-netns Traefik. See [Traefik ingress](../guides/traefik-ingress.md). |
 | `RUSSEL_VOLUME_ROOTS` | — (unset) | Colon-separated absolute prefixes allowlisting absolute `host =` volume binds. Without it, absolute host binds are rejected at deploy. Example: `/srv/data:/mnt/media`. See [Russelfile](russelfile.md). |

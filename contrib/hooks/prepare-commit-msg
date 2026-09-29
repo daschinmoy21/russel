@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Add a DCO `Signed-off-by` trailer for the commit author to every commit
+# message (the same thing `git commit -s` does), unless one is already there.
+# Enable once per clone:
+#
+#   git config core.hooksPath contrib/hooks
+set -euo pipefail
+
+msg_file=$1
+source=${2:-}
+
+# Merge commits are exempt from the DCO check; leave their messages alone.
+if [[ "$source" == merge ]]; then
+  exit 0
+fi
+
+ident="$(git var GIT_AUTHOR_IDENT)"
+signoff="Signed-off-by: ${ident% * *}"
+git interpret-trailers --in-place --if-exists addIfDifferent \
+  --trailer "$signoff" "$msg_file"

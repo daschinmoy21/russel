@@ -2,6 +2,33 @@
 
 Thanks for contributing. This document is the source of truth for how to develop, test, and open pull requests against this repository.
 
+## License and sign-off
+
+Russel is licensed under the [Apache License 2.0](LICENSE). Unless you state otherwise, your contribution is licensed under the same terms (Apache-2.0, section 5).
+
+### Developer Certificate of Origin
+
+Every commit in a pull request must be signed off under the [Developer Certificate of Origin 1.1](https://developercertificate.org/) (DCO). The sign-off certifies that you wrote the change, or otherwise have the right to submit it under the project's license. It is a `Signed-off-by` trailer whose email matches the commit author:
+
+```
+Signed-off-by: Ada Lovelace <ada@example.com>
+```
+
+`git commit -s` adds it using your `user.name` and `user.email`, so set `user.email` to the address you author commits with. To sign every commit automatically, enable the repo hook once per clone:
+
+```bash
+git config core.hooksPath contrib/hooks
+```
+
+To sign off commits already on your branch (this also resets their author to your current identity, so author and sign-off match):
+
+```bash
+git rebase --exec 'git commit --amend --no-edit --reset-author --signoff' origin/main
+git push --force-with-lease
+```
+
+The `DCO` workflow runs `contrib/check-dco.sh` from the base branch (a PR cannot change its own validator) and checks every non-merge commit in a pull request and fails when a sign-off is missing or does not match the author email. Run it locally with `contrib/check-dco.sh origin/main..HEAD`.
+
 ## Project layout
 
 | Path | Role |
@@ -54,6 +81,7 @@ CI jobs that must pass on PRs to `main`:
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Test | `cargo test` |
 | Build (release) | `cargo build --release` |
+| DCO sign-off (outside contributors' PRs) | `contrib/check-dco.sh` |
 
 If CI fails, fix on your branch and push; do not merge red builds.
 
@@ -106,6 +134,10 @@ Extra care (and tests) when touching:
 - Network / TAP / port allocation
 - Metadata and journal writes under `/var/lib/russel`
 
+### Tests and host state
+
+Tests must not touch the real host roots. In `russel-ctrl`, resolve paths with `crate::paths::{data_root, service_dir, microvms_root, microvm_dir}`: in unit tests the first call pins them to a per-process temp dir. Integration tests call `russel_core::paths::pin_temp_roots()` (see `crates/ctrl/tests/api_integration.rs`). Do not set `RUSSEL_DATA_DIR` from a test; parallel tests would race on it.
+
 ## Workflow
 
 1. **Open an issue** (or claim an existing one) for non-trivial work.
@@ -114,7 +146,7 @@ Extra care (and tests) when touching:
    git fetch origin
    git checkout -b fix/short-description origin/main
    ```
-3. **Implement** with small, focused commits.
+3. **Implement** with small, focused commits, each signed off (`git commit -s`, see [Developer Certificate of Origin](#developer-certificate-of-origin)).
 4. **Always run all checks** (format, clippy, full `cargo test --workspace`).
 5. **Push** and open a PR against `main`.
 6. Link issues (`Fixes #N` / `Implements #N`), fill the PR body with summary + test plan.
@@ -135,9 +167,9 @@ Not required for pure unit-test PRs; useful for deploy-path changes:
 ```bash
 cargo build
 ./target/debug/russel-ctrl &
-./target/debug/russel deploy examples/basic-http -p 8080:3000 --vm-id contrib-smoke
+./target/debug/russel deploy examples/basic-http
 curl -sf http://127.0.0.1:8080/health
-./target/debug/russel destroy contrib-smoke
+./target/debug/russel destroy api
 ```
 
 Requirements: writable `/var/lib/russel`, rootless Podman (container example), or KVM for microVM examples. See `README.md` and `docs/examples.md`.
@@ -161,6 +193,7 @@ Body should explain *why* when the diff is non-obvious.
 - Be precise in reviews; prefer code-backed claims (file/line).
 - Assume good intent; suggest alternatives when blocking.
 - Security and data-loss issues block merge until resolved.
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md), not in public issues or PRs.
 
 ## Questions
 

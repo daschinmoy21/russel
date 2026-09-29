@@ -30,6 +30,16 @@ warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; }
 
 # ── Podman identity helper (Issue #278598) ────────────────────────────────────
+# Run a command as the invoking user under `sudo` (the rootless Podman
+# identity), or directly otherwise.
+as_deploy_user() {
+	if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+		sudo -u "$SUDO_USER" -H "$@"
+	else
+		"$@"
+	fi
+}
+
 # When root via sudo, check SUDO_USER's rootless podman (not root's rootful).
 podman_as_deploy_user() {
 	if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then

@@ -1,8 +1,12 @@
 name: Release
 
-# Tag pushes publish the binaries, dashboard dist, and the Russel microVM
-# kernel that contrib/install.sh download mode consumes.
-#   RUSSEL_VERSION=<tag> RUSSEL_RELEASE_BASE=<base> ./contrib/install.sh host
+# Tag pushes build the binaries and dashboard dist that contrib/install.sh
+# download mode consumes and upload them to a draft release. The microVM
+# kernel is not built here (linux from source took ~2h on hosted runners): the
+# maintainer uploads a local `nix build .#microvm-kernel` plus its GPL-2.0
+# corresponding source (`.#microvm-kernel-source`) and publishes the draft
+# with contrib/release-kernel.sh.
+#   sudo RUSSEL_VERSION=<tag> RUSSEL_RELEASE_BASE=<base> ./contrib/install.sh host
 on:
   push:
     tags: ["v*"]
@@ -47,12 +51,15 @@ jobs:
           test -x target/release/russel
           test -x target/release/russel-ctrl
           test -f dashboard/dist/index.html
+          # Written by `bun run build`; ships the npm deps' license notices.
+          test -s dashboard/dist/THIRD-PARTY-LICENSES.txt
           install -m 0755 target/release/russel "russel-${tag}-x86_64"
           install -m 0755 target/release/russel-ctrl "russel-ctrl-${tag}-x86_64"
           install -m 0644 contrib/russel-ctrl.service "russel-ctrl-${tag}.service"
           tar -czf "russel-dashboard-${tag}.tar.gz" -C dashboard/dist .
           ls -l "russel-${tag}-x86_64" "russel-ctrl-${tag}-x86_64" \
-            "russel-ctrl-${tag}.service" "russel-dashboard-${tag}.tar.gz"
+            "russel-ctrl-${tag}.service" "russel-dashboard-${tag}.tar.gz" \
+            LICENSE NOTICE
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -64,61 +71,19 @@ jobs:
             russel-ctrl-${{ github.ref_name }}-x86_64
             russel-ctrl-${{ github.ref_name }}.service
             russel-dashboard-${{ github.ref_name }}.tar.gz
-
-  kernel:
-    name: Kernel ${{ github.ref_name }}
-    runs-on: ubuntu-22.04
-    # The kernel override rebuilds linux from source, which dominates the run.
-    timeout-minutes: 180
-    steps:
-      - name: Free disk for the Nix kernel build
-        run: |
-          set -euo pipefail
-          df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
-            /usr/share/miniconda /usr/lib/jvm || true
-          sudo apt-get clean || true
-          df -h
-
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            max-jobs = auto
-            cores = 0
-
-      - name: Build microVM kernel
-        run: |
-          set -euo pipefail
-          nix build .#microvm-kernel --out-link result-kernel -L
-          test -e result-kernel/bzImage
-          ls -lh result-kernel/bzImage
-          install -m 0644 result-kernel/bzImage \
-            "russel-kernel-${GITHUB_REF_NAME}-x86_64.bzImage"
-          # Stock empty/stub files are a few KB. The virtio-builtin bzImage
-          # is tens of MB (locally ~14MB). Refuse anything that cannot boot.
-          size="$(wc -c <"russel-kernel-${GITHUB_REF_NAME}-x86_64.bzImage")"
-          if [ "${size}" -lt 1000000 ]; then
-            echo "kernel artifact is ${size} bytes; expected a real bzImage" >&2
-            exit 1
-          fi
-          ls -l "russel-kernel-${GITHUB_REF_NAME}-x86_64.bzImage"
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-kernel
-          if-no-files-found: error
-          retention-days: 7
-          path: russel-kernel-${{ github.ref_name }}-x86_64.bzImage
+            LICENSE
+            NOTICE
 
   publish:
     name: Publish ${{ github.ref_name }}
-    needs: [binaries, kernel]
+    needs: [binaries]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    # contrib/release-kernel.sh also rewrites SHA256SUMS; never let two
+    # publish runs for one tag interleave on top of that.
+    concurrency:
+      group: release-publish-${{ github.ref_name }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -130,6 +95,8 @@ jobs:
       - name: Checksums and publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job: gh cannot infer the repo from a remote.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -139,7 +106,8 @@ jobs:
             "russel-ctrl-${tag}-x86_64"
             "russel-ctrl-${tag}.service"
             "russel-dashboard-${tag}.tar.gz"
-            "russel-kernel-${tag}-x86_64.bzImage"
+            LICENSE
+            NOTICE
           )
           for asset in "${assets[@]}"; do
             if [[ ! -f "${asset}" ]]; then
@@ -149,7 +117,27 @@ jobs:
             fi
           done
           sha256sum "${assets[@]}" >SHA256SUMS
-          grep -F "russel-kernel-${tag}-x86_64.bzImage" SHA256SUMS
+
+          kernel="russel-kernel-${tag}-x86_64.bzImage"
+          kernel_source="russel-kernel-${tag}-source.tar"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            # A re-run must keep the locally uploaded kernel's and kernel
+            # source's checksums. If the release lists SHA256SUMS, a failed
+            # download fails the job rather than silently publishing sums
+            # without those lines.
+            names="$(gh release view "${tag}" --json assets -q '.assets[].name')"
+            if grep -qxF SHA256SUMS <<<"${names}"; then
+              gh release download "${tag}" -p SHA256SUMS -O previous-sums
+              for local_asset in "${kernel}" "${kernel_source}"; do
+                if grep -qxF "${local_asset}" <<<"${names}"; then
+                  if ! grep -F "  ${local_asset}" previous-sums >>SHA256SUMS; then
+                    echo "${local_asset} is uploaded but has no SHA256SUMS line; rerun contrib/release-kernel.sh ${tag}" >&2
+                    exit 1
+                  fi
+                fi
+              done
+            fi
+          fi
           cat SHA256SUMS
           ls -l "${assets[@]}" SHA256SUMS
 
@@ -170,7 +158,7 @@ jobs:
 
           \`\`\`bash
           curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \\
-            | RUSSEL_VERSION=${tag} bash -s -- host
+            | sudo RUSSEL_VERSION=${tag} bash -s -- host
           \`\`\`
 
           On a KVM host, \`host\` also downloads \`russel-kernel-${tag}-x86_64.bzImage\`
@@ -182,16 +170,28 @@ jobs:
           - \`russel-${tag}-x86_64\`
           - \`russel-ctrl-${tag}-x86_64\`
           - \`russel-ctrl-${tag}.service\`
-          - \`russel-dashboard-${tag}.tar.gz\`
+          - \`russel-dashboard-${tag}.tar.gz\` (third-party npm licenses in \`THIRD-PARTY-LICENSES.txt\` inside)
           - \`russel-kernel-${tag}-x86_64.bzImage\`
+          - \`russel-kernel-${tag}-source.tar\` (kernel corresponding source)
+          - \`LICENSE\`, \`NOTICE\` (Apache-2.0; the kernel image is GPL-2.0)
           - \`SHA256SUMS\`
+
+          ## Licenses
+
+          Russel is Apache-2.0 (\`LICENSE\`, \`NOTICE\`). The microVM kernel
+          image is Linux, licensed under GPL-2.0. Its complete corresponding
+          source is \`russel-kernel-${tag}-source.tar\` in this release: the
+          upstream tarball, the applied patches, the \`.config\`, and the Nix
+          expressions and nixpkgs rev it was built with (see its \`README\`).
           EOF
 
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" --clobber "${assets[@]}" SHA256SUMS
             gh release edit "${tag}" --title "Russel ${tag}" --notes-file "${notes}"
           else
-            gh release create "${tag}" --title "Russel ${tag}" --notes-file "${notes}" \
-              "${assets[@]}" SHA256SUMS
+            # Draft until contrib/release-kernel.sh adds the kernel and its
+            # SHA256SUMS line, so no one downloads a release without a kernel.
+            gh release create "${tag}" --draft --title "Russel ${tag}" \
+              --notes-file "${notes}" "${assets[@]}" SHA256SUMS
           fi
           gh release view "${tag}"
