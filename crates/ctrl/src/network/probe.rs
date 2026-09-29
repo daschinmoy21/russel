@@ -15,8 +15,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 /// How long an accepted connection must stay open to count as the app.
-/// Forwarders close unbacked connections an order of magnitude faster.
-pub const FORWARDER_CLOSE_WINDOW: Duration = Duration::from_millis(200);
+/// Forwarders close unbacked connections in 15–20 ms, so this keeps about 4x
+/// margin. Every successful probe of a client-speaks-first app waits the full
+/// window, so it is a floor on deploy readiness.
+pub const FORWARDER_CLOSE_WINDOW: Duration = Duration::from_millis(75);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 

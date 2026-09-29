@@ -460,7 +460,10 @@ else
 		' "$repo_path/Russelfile.toml")
 		# postgres races against the PGDATA prepared at ctrl start.
 		local host_vol=""
-		[ "$example" = "postgres" ] && host_vol="${BENCH_PGDATA:-}"
+		if [ "$example" = "postgres" ]; then
+			host_vol="${BENCH_PGDATA:-}"
+			[ "$runtime_kind" = "microvm" ] && host_vol="${BENCH_PGDATA_MICROVM:-$host_vol}"
+		fi
 		awk -v rt="$runtime_kind" -v id="$vm_id" -v hp="$host_port" -v bin="$pin_bin" -v hostvol="$host_vol" '
 			BEGIN { section=""; injected=0; ingress=0 }
 			# Headers may carry trailing whitespace or a comment; tables like
@@ -650,6 +653,7 @@ else
 		mkdir -p "$BENCH_VOLUME_ROOT"
 		[ -n "$RUSSEL_PODMAN_USER" ] && chown "$RUSSEL_PODMAN_USER" "$BENCH_VOLUME_ROOT"
 		BENCH_PGDATA=""
+		BENCH_PGDATA_MICROVM=""
 		if [ -f examples/postgres/Russelfile.toml ]; then
 			pg_out=$(nix build --no-link --print-out-paths \
 				'github:NixOS/nixpkgs/nixos-unstable#postgresql^out' 2>/dev/null || true)
@@ -661,6 +665,16 @@ else
 					echo 'host all all 0.0.0.0/0 trust' >>'$pgdata/pg_hba.conf'"; then
 				BENCH_PGDATA="$pgdata"
 				pass "postgres: PGDATA prepared ($(basename "$pg_out"))"
+				# Under this root ctrl a microVM app runs as nobody, not the
+				# podman user (microvm_app_ids), and postgres needs to own its
+				# 0700 PGDATA. Give the microVM race its own copy.
+				BENCH_PGDATA_MICROVM="$pgdata"
+				if [ "$(id -u)" -eq 0 ]; then
+					BENCH_PGDATA_MICROVM="$BENCH_VOLUME_ROOT/postgres-microvm"
+					cp -a "$pgdata" "$BENCH_PGDATA_MICROVM" &&
+						chown -R 65534:65534 "$BENCH_PGDATA_MICROVM" ||
+						warn "postgres: could not prepare the microVM PGDATA copy"
+				fi
 			else
 				warn "postgres: could not prepare PGDATA; its race will be skipped"
 			fi
@@ -924,8 +938,18 @@ else
 
 				"$RUNTIME" rm -f "$container_name" &>/dev/null || true
 
+				# Same limits as the Russel races: [service] memory and cpus
+				# (default 1), so neither side gets more CPU or memory.
+				read -r base_mem base_cpus < <(awk '
+					/^[[:space:]]*\[/ { in_svc = ($0 ~ /^[[:space:]]*\[service\][[:space:]]*(#.*)?$/) }
+					in_svc && /^[[:space:]]*memory[[:space:]]*=/ && match($0, /[0-9]+/) { mem = substr($0, RSTART, RLENGTH) }
+					in_svc && /^[[:space:]]*cpus[[:space:]]*=/ && match($0, /[0-9]+/) { cpus = substr($0, RSTART, RLENGTH) }
+					END { print (mem ? mem : 256), (cpus ? cpus : 1) }
+				' "$repo_path/Russelfile.toml")
+
 				boot_start=$(date +%s%N)
-				cid=$("$RUNTIME" run -d --name "$container_name" -P --memory=256m "$image_tag" 2>/dev/null || echo "")
+				cid=$("$RUNTIME" run -d --name "$container_name" -P \
+					--memory="${base_mem}m" --cpus="$base_cpus" "$image_tag" 2>/dev/null || echo "")
 				if [ -z "$cid" ]; then
 					DOCKER_BOOT_MS+=("failed")
 					fail "$RUNTIME: failed to start container"
@@ -1041,7 +1065,7 @@ else
 		echo -e "  ${DIM}Note:${NC}"
 		echo -e "  ${DIM}  Russel microVM:  nix build → initramfs → TAP/socat → cloud-hypervisor → curl${NC}"
 		echo -e "  ${DIM}  Russel container: nix build → rootfs adapter → rootless podman --rootfs → curl${NC}"
-		echo -e "  ${DIM}  ${runtime_label} baseline: Dockerfile build + run → curl (not Russel; skipped if no Dockerfile)${NC}"
+		echo -e "  ${DIM}  ${runtime_label} baseline: Dockerfile build + run → curl, same memory/cpus as the Russelfile (skipped if no Dockerfile)${NC}"
 		echo -e "  ${DIM}  Russel deploy API reads runtime and ports from the Russelfile.${NC}"
 		echo -e "  ${DIM}  Warm runs reuse nix/store and image layers; use --cold for cold builds.${NC}"
 		echo -e "  ${DIM}  Examples raced: all examples/*/Russelfile.toml (new apps included).${NC}"

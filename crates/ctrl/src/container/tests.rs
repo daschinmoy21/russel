@@ -7,9 +7,9 @@ use super::podman_user::{
 };
 use super::rootfs::select_nix_tool_store_path;
 use super::runner::{
-    NIX_STORE_MOUNT, is_trusted_container_name, podman_has_cgroup_controller, podman_secret_name,
-    prepare_managed_volume_dirs, remove_tree_with, resolve_container_name, rootless_required_error,
-    secrets_for_container,
+    NIX_STORE_MOUNT, is_trusted_container_name, missing_init_stderr, podman_has_cgroup_controller,
+    podman_secret_name, prepare_managed_volume_dirs, remove_tree_with, resolve_container_name,
+    rootless_required_error, secrets_for_container,
 };
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2181,4 +2181,36 @@ fn secrets_for_container_matches_only_that_container() {
         secrets_for_container(ls, "russel-api_gdeadbeef"),
         vec![podman_secret_name("russel-api_gdeadbeef", "DB_PASSWORD")]
     );
+}
+
+#[test]
+fn build_run_args_runs_an_init_as_pid_1() {
+    // An app as PID 1 never sees SIGTERM without its own handler, so stop
+    // would wait out the timeout and SIGKILL it.
+    let spec = ContainerStartSpec {
+        service_id: "api-1".into(),
+        rootfs: PreparedRootfs {
+            rootfs_path: PathBuf::from("/var/lib/russel/api-1/rootfs"),
+            entrypoint: PathBuf::from("/bin/api"),
+        },
+        host_port: 8080,
+        guest_port: 3000,
+        memory_mb: 256,
+        ..Default::default()
+    };
+    let args = build_run_args(&spec, Path::new("/var/lib/russel/api-1/container.log")).unwrap();
+    let init = args.iter().position(|a| a == "--init").expect("--init");
+    let rootfs = args.iter().position(|a| a == "--rootfs").unwrap();
+    assert!(init < rootfs, "--init must precede --rootfs: {args:?}");
+}
+
+#[test]
+fn missing_init_binary_matches_podman_4_and_5() {
+    assert!(missing_init_stderr(
+        "Error: could not find \"catatonit\" in one of [/usr/libexec/podman]"
+    ));
+    assert!(missing_init_stderr(
+        "Error: container-init binary not found on the host: stat /usr/libexec/podman/catatonit"
+    ));
+    assert!(!missing_init_stderr("Error: port 8080 is already in use"));
 }

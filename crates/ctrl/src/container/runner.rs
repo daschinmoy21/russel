@@ -1,6 +1,7 @@
 //! ContainerRunner lifecycle: start/stop/destroy, run-arg construction.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::passthrough::validate_podman_passthrough_args;
 use super::podman_user::{
@@ -10,6 +11,12 @@ use super::podman_user::{
 use super::rootfs::{PreparedRootfs, RootfsSpec, default_base_dir, prepare_rootfs};
 
 const CONTAINER_NAME_PREFIX: &str = "russel-";
+
+const INIT_FLAG: &str = "--init";
+
+/// Set once `podman run --init` fails for want of an init binary (catatonit
+/// is only a Recommends of Debian's podman). Later runs go without it.
+static INIT_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Trusted Podman names for a service: canonical `russel-{service_id}`, or a
 /// generation-scoped name `russel-{service_id}_g{hex}` that dual-live promote
@@ -124,8 +131,22 @@ impl ContainerRunner {
     }
 
     /// `podman info` JSON, after checking that Podman is rootless.
+    ///
+    /// Cached for the process lifetime once it succeeds: rootless mode and
+    /// the delegated cgroup controllers do not change under a running ctrl,
+    /// and `podman info` costs 60–150 ms on every deploy. A failure is not
+    /// cached, so the next deploy asks again.
     async fn rootless_info() -> anyhow::Result<String> {
+        use tokio::sync::OnceCell;
+        static INFO: OnceCell<String> = OnceCell::const_new();
+        // Cheap, and a rootful podman can pollute the runtime dir at any time.
         sanitize_podman_user_runtime_dir().await?;
+        INFO.get_or_try_init(Self::query_rootless_info)
+            .await
+            .cloned()
+    }
+
+    async fn query_rootless_info() -> anyhow::Result<String> {
         let output = podman_command()
             .await
             .args(["info", "--format", "json"])
@@ -200,7 +221,22 @@ impl ContainerRunner {
             remove_podman_secrets(&name).await;
             return Err(e);
         }
-        let output = run_podman(&args).await?;
+        let mut output = run_podman(&args).await?;
+        if !output.status.success()
+            && args.iter().any(|a| a == INIT_FLAG)
+            && is_missing_init_binary(&output)
+        {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "podman has no init binary (install catatonit); containers run without \
+                 --init, so an app that ignores SIGTERM as PID 1 is killed after the stop timeout"
+            );
+            INIT_UNAVAILABLE.store(true, Ordering::Relaxed);
+            // A failed run can leave the created container holding the name.
+            let _ = run_podman(&["rm".into(), "-f".into(), name.clone()]).await;
+            args.retain(|a| a != INIT_FLAG);
+            output = run_podman(&args).await?;
+        }
         if !output.status.success() {
             remove_podman_secrets(&name).await;
             anyhow::bail!(
@@ -710,6 +746,13 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "/run".to_string(),
     ];
 
+    // The app would be PID 1, and the kernel drops SIGTERM for a PID 1 with
+    // no handler of its own, so `podman stop` waited out its timeout and
+    // SIGKILLed it (meilisearch). Podman's init forwards signals and reaps.
+    if !INIT_UNAVAILABLE.load(Ordering::Relaxed) {
+        args.push(INIT_FLAG.to_string());
+    }
+
     if let Some(cpus) = spec.cpus {
         args.push("--cpus".to_string());
         args.push(cpus.to_string());
@@ -947,8 +990,30 @@ async fn run_podman(args: &[String]) -> anyhow::Result<std::process::Output> {
 }
 
 async fn stop_and_remove_container(name: &str) -> anyhow::Result<()> {
+    // A first deploy has nothing to stop: one `exists` replaces stop, rm and
+    // secret ls. Leftover secrets are still cleared by create_podman_secrets.
+    if container_exists(name).await == Some(false) {
+        return Ok(());
+    }
     stop_container(name).await?;
     remove_container(name).await
+}
+
+/// `podman container exists`: `Some(false)` only on its "no such container"
+/// exit (1). `None` when the answer is unknown, so callers fall back to the
+/// full stop and remove.
+async fn container_exists(name: &str) -> Option<bool> {
+    let output = podman_command()
+        .await
+        .args(["container", "exists", name])
+        .output()
+        .await
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
 }
 
 async fn stop_container(name: &str) -> anyhow::Result<()> {
@@ -1147,6 +1212,17 @@ pub(crate) fn secrets_for_container(ls_output: &str, container: &str) -> Vec<Str
         .filter(|n| n.starts_with(&prefix))
         .map(str::to_string)
         .collect()
+}
+
+/// `podman run --init` failed because the host has no init binary: Podman 5
+/// says `could not find "catatonit"`, Podman 4 `container-init binary not
+/// found on the host`.
+pub(crate) fn is_missing_init_binary(output: &std::process::Output) -> bool {
+    missing_init_stderr(&String::from_utf8_lossy(&output.stderr))
+}
+
+pub(crate) fn missing_init_stderr(stderr: &str) -> bool {
+    stderr.contains("catatonit") || stderr.contains("container-init")
 }
 
 fn is_missing_container(output: &std::process::Output) -> bool {
