@@ -1,165 +1,122 @@
 ---
 title: Architecture
-description: Control plane, deploy pipeline, state, and request flow — the canonical reference.
+description: How the control plane turns a git repo into a running service, where it keeps state, and what survives a restart.
 sidebar_position: 1
-keywords: [architecture, control plane, pipeline, axum, state, reconcile, mermaid]
+keywords: [architecture, control plane, pipeline, state, reconcile]
 ---
 
-Russel is a single-host deployment platform: one Axum control plane takes a source repo, builds it with Nix, and runs the `/nix/store` closure as a microVM or rootless container, with Traefik as the HTTP ingress gateway.
+Russel runs on one Linux host. A single control plane, `russel-ctrl`, takes a git repo, builds it with Nix, and runs the result as a rootless container (or, experimentally, a microVM). Traefik, if you run it, routes host names to the apps.
 
-This page is the canonical architecture reference. Schema lives in [Russelfile](../reference/russelfile.md), wire types in [API](../reference/api.md), flags in [CLI](../reference/cli.md).
-
-## Overall
+## Overview
 
 ```mermaid
 flowchart LR
     subgraph User
-        CLI[russel]
+        CLI[russel CLI<br/>or dashboard]
     end
     subgraph Host["Linux host"]
-        subgraph CP["russel-ctrl (Axum)"]
-            API[HTTP API<br/>:7878]
+        subgraph CP["russel-ctrl"]
+            API[HTTP API<br/>127.0.0.1:7878]
             PIPE[Deploy pipeline]
-            STATE[(In-memory state<br/>+ metadata.json)]
-            HEALTH[Health loop]
-            REC[Startup reconcile]
+            STATE[(Service state<br/>/var/lib/russel)]
         end
-        subgraph Build["Build"]
-            GIT[git clone<br/>checkouts]
-            NIX[nix build<br/>→ /nix/store/hash]
-        end
-        RF["Russelfile.toml<br/>service.port guest<br/>ingress.host Host name<br/>ingress.port host pin"]
+        GIT[git clone]
+        NIX[nix build<br/>→ /nix/store path]
         subgraph RT["Runtimes"]
-            CH[Cloud Hypervisor<br/>microVMs]
             POD[Rootless Podman<br/>containers]
+            CH[Cloud Hypervisor<br/>microVMs, experimental]
         end
-        subgraph Net["Networking"]
-            TAP[TAP rsl-key]
-            SOC[socat forwarder]
-            VFD[virtiofsd]
-        end
-        TRAEFIK["Traefik file provider<br/>:80 / :443"]
-        DYN["dynamic/id.json<br/>Host from ingress.host<br/>or id.domain"]
+        DYN["Traefik route files"]
+        TRAEFIK["Traefik<br/>:80 / :443"]
     end
-    CLI -->|HTTP/JSON + Bearer| API
+    CLI -->|HTTP + token| API
     API --> PIPE
     PIPE --> GIT --> NIX
-    GIT --> RF
-    PIPE --> RF
-    PIPE --> CH
     PIPE --> POD
-    CH --- TAP & VFD
-    SOC --> TAP
+    PIPE --> CH
     PIPE --> STATE
-    PIPE -->|Host rule + backend| DYN
-    DYN -.watch.-> TRAEFIK
-    TRAEFIK -->|127.0.0.1:pin or alloc| SOC
-    TRAEFIK -->|127.0.0.1:pin or alloc| POD
+    PIPE --> DYN
+    DYN -.watched by.-> TRAEFIK
+    TRAEFIK -->|127.0.0.1:host port| POD
+    TRAEFIK -->|127.0.0.1:host port| CH
 ```
 
-Key properties:
+The design in short:
 
-- **Single host, single control plane.** No clustering, no scheduler. Multi-node is not in this release.
-- **Nix is the only build system.** The artifact is always a `/nix/store` path; both runtimes consume it directly.
-- **Two runtimes, one pipeline.** `service.type` selects microVM (default) or container after shared resolve/build. See [Runtimes](./runtimes.md).
-- **Traefik is primary ingress.** `[ingress].host` is the exact `Host()` name; omit it for `<id>.<RUSSEL_TRAEFIK_DOMAIN>`. `-p` / `ingress.port` pin a host-side backend. See [Networking](./networking.md).
-- **Restarts are non-destructive.** Workloads are detached children/containers; startup reconcile re-adopts them. See [Lifecycle](./lifecycle.md).
+- **One host, one control plane.** There is no cluster and no scheduler.
+- **Nix is the only build system.** Every build produces a `/nix/store` path, and both runtimes run it from there. Nothing is copied into an image.
+- **Two runtimes, one pipeline.** `service.type` picks a rootless container (the default) or a microVM after the shared fetch and build steps. See [Runtimes](./runtimes.md).
+- **Apps publish on loopback.** Each app gets a `127.0.0.1` host port. Traefik routes `Host()` names to those ports. See [Networking](./networking.md).
+- **Restarting the control plane doesn't stop apps.** On start-up it finds the running apps again and takes them back over. See [Lifecycle](./lifecycle.md).
 
-### Crate layout
-
-| Crate | Role | Notable modules |
-|---|---|---|
-| `russel-core` | Shared types | `config.rs` (Russelfile schema + validation), `api.rs` (wire types), `tokens.rs` (constant-time compare) |
-| `russel` (crate `russel-cli`) | CLI client | `commands.rs` (deploy/status/logs/ps/stop/destroy/update/secrets/login), `config.rs` (resolve), `init.rs` (scaffold), `ui.rs` |
-| `russel-ctrl` | Control plane | `api/` (router/auth/secrets), `deploy/` (pipeline/runtime/rollback), `state/` (app/lifecycle/helpers), `microvm/` (runner/agent/spec), `container/` (runner/rootfs/passthrough/podman_user), `network/` (tap/subnet/ports), `git/`, `build.rs`, `metadata.rs`, `reconcile.rs`, `health.rs`, `secrets.rs`, `traefik.rs`, `ingress.rs` |
-| `russel-agent` | Node-local agent (experimental) | `routes.rs`, `lifecycle.rs`, `auth.rs` (`RUSSEL_AGENT_TOKEN` → `RUSSEL_API_TOKEN` fallback), `capacity.rs` |
-
-## Deploy pipeline
+## A deploy, step by step
 
 ```mermaid
 sequenceDiagram
     participant U as russel
-    participant A as /deploy (axum)
-    participant P as DeployPipeline
-    participant G as GitClient
-    participant B as NixBuilder
-    participant R as Runtime (CH/Podman)
-    participant I as Ingress (Traefik)
-    U->>A: POST /deploy (repo, config, host, port, env)
-    A->>A: auth, semaphore (max 4), validate service_id
-    A-->>U: NDJSON stream opens
-    A->>P: spawn deploy task
-    P->>G: clone_or_use_local (leases + GC)
-    G-->>P: checkout path
-    P->>P: load Russelfile (openat + O_NOFOLLOW, 1 MiB cap)
-    P->>P: resolve ingress.host and ingress.port against CLI
-    P->>P: merge env (file < request), resolve secret:// refs
-    P->>B: nix build path:repo#packages.sys.default
-    B-->>P: /nix/store/hash
-    alt microvm (experimental)
-        P->>R: TAP + socat + virtiofsd×2 + CH boot
-        R-->>P: reachable (TCP poll guest 10s)
-    else container (default)
-        P->>R: prepare rootfs, podman run --rootfs
-        R-->>P: app answers via host port, container still up (30s)
-    end
-    P->>I: register or swap Host rule + 127.0.0.1 backend
-    P->>P: write metadata.json + desired_state (ingress_host, pin)
-    P-->>U: Complete{status: deployed, route_host}
+    participant A as API
+    participant P as Pipeline
+    participant R as Runtime
+    participant I as Traefik files
+    U->>A: POST /deploy (repo URL, Russelfile path)
+    A->>A: check token, take a deploy slot (max 4)
+    A-->>U: progress stream opens
+    A->>P: start deploy
+    P->>P: clone repo, load Russelfile
+    P->>P: resolve secret:// values
+    P->>P: nix build
+    P->>R: start the new version
+    R-->>P: app answers on its host port
+    P->>I: write or switch the route
+    P->>P: save metadata and deployment history
+    P-->>U: done: deployed
 ```
 
-Stages emit NDJSON (`resolve → build → create → start → ready → complete`). Failure triggers candidate cleanup; redeploy with a prior generation triggers **rollback**. Concurrency is bounded by a semaphore (default 4, `RUSSEL_MAX_CONCURRENT_DEPLOYS`) plus a per-service `mark_building` guard.
+The CLI prints each stage as it arrives: `resolve`, `build`, `create`, `start`, `ready`. If a deploy fails and an earlier version exists, Russel restores it and reports `rolled_back`; the CLI still exits non-zero so scripts notice. At most 4 deploys run at once (`RUSSEL_MAX_CONCURRENT_DEPLOYS`), and only one per service.
 
-Hardening on this path:
+Checks on this path:
 
-- `service_id` restricted to `[A-Za-z0-9-_]` (max 128) before any filesystem use.
-- Russelfile opened via an `openat(2)` descriptor chain with `O_NOFOLLOW` on every component — no validate-then-reopen TOCTOU.
-- Env validated (reserved keys, length, NUL/newline), `secret://` resolved from the host store, then re-validated.
-- **Nix builds assume trusted source** unless `RUSSEL_NIX_RESTRICTED=1` (sandbox + no auto-flake). Threat model: [Nix builds](../security/nix-builds.md).
+- Service names are limited to `A-Z a-z 0-9 _ -`, 128 characters, before they touch the filesystem.
+- The Russelfile must be a real file inside the repo (no symlinks) and under 1 MiB.
+- Env vars are validated when the Russelfile loads and again after secrets are filled in.
+- **Nix builds run code from the repo.** Only deploy repos you trust, or turn on `RUSSEL_NIX_RESTRICTED=1`. See [Nix build security](../security/nix-builds.md).
 
-## State, metadata, reconcile
+## State and restarts
 
-```mermaid
-flowchart TB
-    subgraph Sources["State sources (trust order)"]
-        M[In-memory AppState<br/>Arc-Mutex-StateInner]
-        META[metadata.json<br/>per service — source of truth]
-        CAT[ctrl-catalog.json<br/>informational snapshot]
-        PODL[podman ps labels<br/>container discovery]
-    end
-    STARTUP[Startup reconcile] --> META
-    STARTUP -->|live pid + cmdline identity| ADOPT[adopt as deployed/running]
-    STARTUP -->|dead| STOPPED[register as stopped]
-    ADOPT --> M
-    STOPPED --> M
-    M --> CAT
-```
+Everything lives under `/var/lib/russel`, one folder per service:
 
-- **`metadata.json` is the source of truth**: schema version, `node_id` (`RUSSEL_NODE_ID` → hostname → `local`), runtime, ports, PIDs, TAP identity, store/bin paths, generation id, `repo_url`/`config_path`, and `desired_state` (env refs, podman args, `ingress_host`, host-side pin) so rollback/update/health-restart rebuild the exact Host and pin.
-- **Reconcile** verifies PID identity via `/proc/<pid>/cmdline` (guards PID reuse) before adopting; containers via `podman inspect` + `russel-<id>` naming.
-- **Supervisor** per service is generation-tagged; child exit marks `failed` (bumped `process_generation` invalidates stale supervisors).
-- Logs capped in memory (last 64 KiB); full history on disk (`console.log` / `container.log`).
-- Catalog written atomically (temp + fsync + rename, `0600`) after transitions; informational only, never consulted for decisions.
-- A `flock` on `/var/lib/russel/ctrl.lock` prevents two control planes from fighting.
+| File | What it holds |
+|---|---|
+| `<id>/metadata.json` | The running version: runtime, ports, process ids, store paths, and the settings needed to rebuild it. This is the source of truth. |
+| `<id>/deployments.json` | The last 20 deployments, for rollback. |
+| `<id>/container.log`, `<id>/console.log` | Full app output. |
+| `secrets/` | The secret store. |
+| `traefik/dynamic/` | One route file per service. |
+
+When the control plane starts, it reads each `metadata.json` and checks whether the app is still running. For a microVM it checks the process id and its command line, so a reused process id isn't mistaken for the app. For a container it asks Podman. Running apps are taken back over; the rest are marked stopped. A lock file stops a second control plane from starting on the same folder.
 
 ## Security boundaries
 
-| Layer | Mechanism |
+| Layer | How it's protected |
 |---|---|
-| API auth | Bearer on every route when `RUSSEL_API_TOKEN` set (≥32 chars, printable ASCII, constant-time compare); non-loopback bind refuses to start without a token; `RUSSEL_REQUIRE_AUTH=1` fails closed on loopback |
-| Transport | HTTP-only ctrl; TLS at a proxy or SSH tunnel; CLI refuses Bearer over `http://` to non-loopback unless `--insecure` |
-| Input | `service_id`/bin/config-path/env/secret/podman-allowlist validation; SSRF guard (`https/http/ssh/git@`, link-local + metadata-IP rejection) |
-| Secrets | Host store `0600`/`0700`, atomic writes, names-only over API, resolved at deploy, never in argv |
-| Isolation | microVM KVM boundary + ro store share; container rootless + cap-drop ALL + no-new-privs + ro rootfs |
-| Host | Orphan-only TAP cleanup; no iptables mutation; CH socket + service dirs `0700`; PID ownership via `/proc` |
+| API | Every request needs the token (at least 32 characters). The installer and the NixOS module always require it, and the control plane refuses to listen on a non-loopback address without one. |
+| Transport | Plain HTTP on loopback only. Use an SSH tunnel or an HTTPS proxy. The CLI won't send the token over plain HTTP to another host. |
+| Input | Names, paths, env vars, secrets, and Podman flags are validated. Repo URLs pointing at private, loopback, or cloud-metadata addresses are refused. |
+| Secrets | Stored with mode `0600`, never returned by the API, never put on a command line. |
+| Apps | Containers are rootless, drop all capabilities, and have a read-only root. MicroVMs add a separate kernel. |
 
-Residual risks (DNS-rebinding around the SSRF guard, metadata-IP redirects during clone, `podman inspect` env visibility) are tracked in the archived audits. See [Security overview](../security/overview.md).
+More: [Security overview](../security/overview.md).
 
-## What's intentionally not here
+## Source layout
 
-- There is no `[database]` section and no managed databases. Run Postgres or Redis as ordinary `service.package` services with kept `[[volumes]]` (`examples/postgres`, `examples/redis`).
-- Warm pool (`RUSSEL_WARM_POOL=1`) is experimental, off by default, with known races. Cold boot is already ~2 s via the agent initramfs.
-- Flat `/status` + `/logs` are single-service shims (`400` when >1 service exists). Prefer `/vm/{id}/…`.
+For contributors:
+
+| Crate | Role |
+|---|---|
+| `russel-core` | Shared types: the Russelfile schema and its validation, API types |
+| `russel-cli` | The `russel` command |
+| `russel-ctrl` | The control plane: API, deploy pipeline, runtimes, networking, state |
+| `russel-agent` | Experimental per-node agent for future multi-host use |
 
 ## Related
 

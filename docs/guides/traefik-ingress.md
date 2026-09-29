@@ -1,24 +1,33 @@
 ---
 title: Traefik ingress
-description: Route per-service Host names to Russel backends with the file provider.
+description: Give each app its own host name, with HTTPS from Let's Encrypt, using Traefik and the route files Russel writes.
 sidebar_position: 3
-keywords: [traefik, ingress, file provider, host routing, tls, acme]
+keywords: [traefik, ingress, host routing, tls, acme, lets encrypt, dns]
 ---
 
-Russel integrates with Traefik v2 as the primary HTTP reverse proxy (file provider). No API calls — Russel writes dynamic config files; Traefik watches the directory.
-
-> **Architecture note:** Deploy uses the `Ingress` trait; `TraefikFileIngress` is the default implementation. Future proxies implement the same trait — the pipeline never imports Traefik types directly.
+Russel writes a Traefik route file for every service it deploys. Point Traefik's file provider at that folder and each app is reachable by name, such as `api.example.com`, with no reloads or API calls.
 
 ## What you'll need
 
-- Traefik v2 binary.
-- Russel writing to `/var/lib/russel/traefik/dynamic` (or `RUSSEL_TRAEFIK_DYNAMIC_DIR`).
-- A DNS record mapping each service name to Traefik's IP. DNS remains the
-  operator's job; Russel does not create records.
+- Traefik v2 or v3, installed on the same server and running as a service.
+- A DNS record for each app name, pointing at the server. Russel doesn't manage DNS.
+- Ports 80 and 443 open.
 
-## Static Traefik config
+## 1. Give Traefik a folder it can read
 
-Save as `traefik.yml`:
+By default Russel writes routes to `/var/lib/russel/traefik/dynamic/`. `/var/lib/russel` is private to the `russel` account (mode `0700`), so a Traefik running as its own user can't read it. Give the routes their own folder, writable by `russel` and readable by Traefik's group:
+
+```bash
+sudo install -d -o russel -g traefik -m 750 /var/lib/russel-routes
+echo 'RUSSEL_TRAEFIK_DYNAMIC_DIR=/var/lib/russel-routes' | sudo tee -a /etc/russel/env
+sudo systemctl restart russel-ctrl
+```
+
+Replace `traefik` with the group your Traefik runs as. Russel writes each file with mode `0644`.
+
+## 2. Configure Traefik
+
+A minimal static config (`/etc/traefik/traefik.yml`) for plain HTTP:
 
 ```yaml
 entryPoints:
@@ -27,66 +36,94 @@ entryPoints:
 
 providers:
   file:
-    directory: /var/lib/russel/traefik/dynamic
+    directory: /var/lib/russel-routes
     watch: true
 ```
 
+Restart Traefik, then deploy or update any service. A file named after the service appears in the folder within a second, and Traefik starts routing.
+
+## 3. Pick host names
+
+With no `[ingress]` table, a service is reachable at `<service name>.<RUSSEL_TRAEFIK_DOMAIN>`. The domain defaults to `russel.local`, so the example `api` service is `api.russel.local`.
+
+Set your own domain:
+
 ```bash
-traefik --configFile=traefik.yml
+echo 'RUSSEL_TRAEFIK_DOMAIN=example.com' | sudo tee -a /etc/russel/env
+sudo systemctl restart russel-ctrl
 ```
 
-## Russel environment
-
-| Variable | Default | Description |
-|---|---|---|
-| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `$RUSSEL_DATA_DIR/traefik/dynamic` (`/var/lib/russel/traefik/dynamic`) | Must match `providers.file.directory` |
-| `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Default suffix for `Host()` rules when `[ingress].host` is omitted (validated as a DNS name) |
-| `RUSSEL_TRAEFIK_BACKEND` | publish bind (`RUSSEL_PUBLISH_BIND`) | Host Traefik dials for a published backend port. Set it when Traefik runs in a different netns than the backend — e.g. rootless Podman Traefik reaching a host-published port via `10.89.0.1`. Leave unset when Traefik shares the backend's netns (wildcard binds map to loopback). |
-| `RUSSEL_TRAEFIK_TLS` | off | `1` adds `websecure` + `tls.certResolver` to each router |
-| `RUSSEL_TRAEFIK_CERT_RESOLVER` | `letsencrypt` (fallback when blank) | Must match the static-config resolver name |
-
-## Per-service host and backend
-
-Each Russelfile may choose the exact Traefik name for one service:
+Or give one service an exact name in its Russelfile:
 
 ```toml
 [ingress]
 host = "api.example.com"
-port = 4000 # optional; host-side backend, like -p HOST:guest
 ```
 
-`ingress.host` is used exactly in `Host()` (after canonical lowercase). It can
-be an apex name or a subdomain; it is not combined with the service id. If it
-is omitted, the route uses `<service_id>.<RUSSEL_TRAEFIK_DOMAIN>`. `service.port`
-still names the guest listen port and remains distinct from `ingress.port`.
+`host` is used exactly as written (lowercased), and can be a bare domain like `example.com`. Two services can't claim the same name. To go back to the default name, delete the `[ingress]` table and run `russel update <id> --refresh`.
 
-Use the host name alone for normal browser or `curl https://api.example.com`
-traffic through Traefik. Pin `ingress.port` when a local script needs a stable
-backend such as `curl localhost:4000`, a firewall rule needs one port, or a
-non-HTTP publisher needs a fixed publish port. Traefik continues to listen on
-its configured 80/443 entrypoints; `ingress.port` is not a Traefik listener.
+Test it once DNS points at the server:
 
-## DNS
-
-Traefik routes by `Host` header:
-
-```text
-api.example.com  →  Traefik's IP
+```bash
+curl http://api.example.com/
 ```
 
-Create the DNS records before public traffic or ACME validation. DNS is still
-the operator's job.
+## 4. Add HTTPS
 
-## How it works
+Add a `websecure` entry point and a Let's Encrypt resolver to the static config:
 
-1. **Deploy**: `russel deploy` or `russel update` → ctrl writes `/var/lib/russel/traefik/dynamic/<service_id>.json` (atomic temp + rename).
-2. **Traefik picks up** the router + service (file watch, sub-second).
-3. **Access**: `curl http://<service-host>`.
-4. **Stop/destroy**: ctrl removes the file → Traefik stops routing. Redeploy re-registers the new backend port.
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
 
-No reload, no API calls, no Traefik binary dependency in Russel.
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: you@example.com
+      storage: /var/lib/traefik/acme.json
+      httpChallenge:
+        entryPoint: web
 
-## Example dynamic config (generated)
+providers:
+  file:
+    directory: /var/lib/russel-routes
+    watch: true
+```
+
+Create `acme.json` with mode `0600`, owned by Traefik's user, and on storage that survives reboots:
+
+```bash
+sudo install -m 600 -o traefik -g traefik /dev/null /var/lib/traefik/acme.json
+```
+
+Then tell Russel to request certificates:
+
+```bash
+echo 'RUSSEL_TRAEFIK_TLS=1' | sudo tee -a /etc/russel/env
+echo 'RUSSEL_TRAEFIK_CERT_RESOLVER=letsencrypt' | sudo tee -a /etc/russel/env
+sudo systemctl restart russel-ctrl
+```
+
+Every route now listens on both `web` and `websecure`, and Traefik gets a certificate for each host name on first use. The name must be public (not `russel.local`), resolve to this server, and be reachable on port 80.
+
+## Settings
+
+All of these go in `/etc/russel/env`, followed by `sudo systemctl restart russel-ctrl`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `/var/lib/russel/traefik/dynamic` | Where route files are written. Must match Traefik's `providers.file.directory`. |
+| `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Suffix for services without `[ingress].host`. |
+| `RUSSEL_TRAEFIK_TLS` | off | `1` adds HTTPS to every route. |
+| `RUSSEL_TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Must match the resolver name in Traefik's static config. |
+| `RUSSEL_TRAEFIK_BACKEND` | `127.0.0.1` | The address Traefik uses to reach apps. Change it only when Traefik runs in its own network namespace, such as a rootless Podman container, where the host is `10.89.0.1`. |
+
+## What Russel writes
+
+For a service named `api` on port 3100, the file `api.json` looks like this:
 
 ```json
 {
@@ -109,65 +146,8 @@ No reload, no API calls, no Traefik binary dependency in Russel.
 }
 ```
 
-## TLS / ACME
-
-Use a **public DNS name** (not `russel.local`); ports 80/443 must be reachable for HTTP-01:
-
-```bash
-export RUSSEL_TRAEFIK_DOMAIN=example.com
-export RUSSEL_TRAEFIK_TLS=1
-export RUSSEL_TRAEFIK_CERT_RESOLVER=letsencrypt
-```
-
-```yaml
-entryPoints:
-  web:
-    address: ":80"
-  websecure:
-    address: ":443"
-
-certificatesResolvers:
-  letsencrypt:
-    acme:
-      email: you@example.com
-      # mode 0600, owned by the Traefik user, persistent storage:
-      #   install -m 600 -o traefik -g traefik /dev/null /var/lib/traefik/acme.json
-      storage: /var/lib/traefik/acme.json
-      httpChallenge:
-        entryPoint: web
-
-providers:
-  file:
-    directory: /var/lib/russel/traefik/dynamic
-    watch: true
-```
-
-When `RUSSEL_TRAEFIK_TLS=1`, each service router uses `web` + `websecure` with `tls.certResolver` set. ACME HTTP-01 requests a certificate for the exact name in `Host()`; that name must resolve to this Traefik instance and reach port 80.
-
-## Redeploys, pins, and uniqueness
-
-During a dual-live redeploy, the candidate always gets an ephemeral backend.
-Traefik switches to that backend while keeping the configured `Host()` stable.
-If a host-side port is pinned, Russel tries to reclaim it for a microVM after
-cutover; containers keep the candidate publish port. This container reclaim
-limit does not change the stable Host route.
-
-The metadata desired-state record stores the operator's pin, if any. A journal
-row records the live backend that actually served that generation, so a dual-
-live row may show an ephemeral port while desired state still names the pin.
-
-Russel rejects a route when another service's Traefik JSON already claims the
-same name. Register and deregister take a per-directory write lock around the
-uniqueness scan and the file update. Two concurrent deploys cannot both pass
-the scan.
-
-To drop a custom name, delete the `[ingress]` table from the Russelfile and run
-`russel update <id> --refresh`; the next write returns the service to the configured default
-suffix.
-
-App tunnels are not configured in the Russelfile yet; putting host-wide
-cloudflared in front of Traefik is an operator-level choice.
+Russel writes each file in one step, so Traefik never sees half a file. On an update the file switches to the new version's port once it answers; on `stop` or `destroy` the file is deleted. [Networking](../concepts/networking.md#during-an-update) explains the switch.
 
 ## Related
 
-- [Networking](../concepts/networking.md) · [TLS reverse proxy](./tls-reverse-proxy.md) · [Environment](../reference/environment.md)
+- [Networking](../concepts/networking.md) · [TLS reverse proxy](./tls-reverse-proxy.md) · [Environment reference](../reference/environment.md)

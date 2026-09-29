@@ -386,6 +386,30 @@ fn desired_state_records_file_only_ingress_pin_and_host() {
     assert_eq!(ds["ingress_host"], "abc.com");
 }
 
+/// `[ingress].port` in the Russelfile becomes the desired_state pin that
+/// update, rollback, and health restart replay.
+#[test]
+fn desired_state_records_the_russelfile_ingress_pin() {
+    let repo = TempRepo::new();
+    let toml = format!("{MINIMAL}\n[ingress]\nport = 8081\n");
+    write_config(repo.path(), "Russelfile.toml", &toml);
+    let cfg = load_russelfile_under_repo(repo.path(), "Russelfile.toml").unwrap();
+    let pin = russel_core::config::resolve_primary_publish(&cfg).unwrap();
+    let ds = build_desired_state(
+        "https://example.com/app.git",
+        "Russelfile.toml",
+        RuntimeKind::Container,
+        cfg.service.guest,
+        &std::collections::HashMap::new(),
+        &[],
+        Some(&pin),
+        None,
+        DesiredExtras::default(),
+    );
+    assert_eq!(ds["port"]["host"], 8081);
+    assert_eq!(ds["port"]["guest"], 3000);
+}
+
 #[test]
 fn render_argv_one_entry_per_line() {
     let args = vec!["--listen".to_string(), ":8080".to_string(), String::new()];

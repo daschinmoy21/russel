@@ -1,17 +1,11 @@
 ---
 title: Russelfile reference
-description: Canonical Russelfile.toml schema — every field, default, and validation rule.
+description: Every field in Russelfile.toml, with its default and the rules Russel checks when it loads the file.
 sidebar_position: 3
 keywords: [russelfile, manifest, service type, guest, memory, env, volumes, package, ports, ingress]
 ---
 
-Source of truth is `crates/core/src/config.rs` (`Russelfile`, `deny_unknown_fields`) plus the `russel init` template (`crates/cli/src/init.rs`). This page mirrors both. Unknown fields are rejected.
-
-Scaffold one:
-
-```bash
-russel init --type container --with-flake
-```
+A `Russelfile.toml` describes one service. Russel checks it when it loads, before any build, and rejects unknown fields, so a typo fails loudly. `russel init` writes a commented one for you.
 
 ## Full example
 
@@ -21,145 +15,126 @@ name = "api"
 source = "."
 port = 3000
 memory = "256mb"
-bin = "api"          # optional — defaults to name
-type = "container"   # optional: "container" (default) | "microvm" (experimental)
-guest = "busybox"    # optional: "busybox" (default); "linux" errors until implemented
-cpus = 1             # optional: 1..=32, default 1 (microVM vCPUs; container --cpus)
-debug = false        # optional: container-only shell tools, default false
-# package = "navidrome"  # nixpkgs attr when no committed flake.nix
-# args = ["--loglevel", "info"]  # process argv (both runtimes)
-# user = "root"          # both runtimes; omitted runs the app unprivileged
-# restart = "unless-stopped"  # both runtimes
+bin = "api"                  # optional, defaults to name
+type = "container"           # optional: "container" (default) or "microvm" (experimental)
+cpus = 1                     # optional, 1 to 32
+# package = "navidrome"      # run a nixpkgs package when the repo has no flake
+# args = ["--loglevel", "info"]
+# user = "root"
+# restart = "unless-stopped"
+# debug = false
 
-[ingress]             # optional
-host = "api.example.com" # exact Traefik Host() value
-port = 4000            # optional host-side backend pin
-
-[service.env]        # optional
+[service.env]
 LOG_LEVEL = "info"
-FEATURE_X = "1"
 DB_PASSWORD = "secret://DB_PASSWORD"
 
-# [[volumes]]            # both runtimes (microVMs: one virtiofs share each)
-# name = "data"          # managed under /var/lib/russel/<id>/volumes/data
+[ingress]                    # optional
+host = "api.example.com"
+port = 4000
+
+# [[volumes]]          # optional: folders that persist across restarts
+# name = "data"
 # guest = "/data"
 # rw = true
-# keep = true            # survive destroy unless --delete-volumes
+# keep = true
 
-# [[ports]]              # both runtimes; extra publishes besides service.port
+# [[ports]]            # optional: extra ports besides service.port
 # host = 50300
 # guest = 50300
 ```
 
-There is no `[database]` section. Run Postgres or Redis as their own service with `service.package` and a kept `[[volumes]]` row; see `examples/postgres` and `examples/redis`.
-
-## Fields
+## `[service]`
 
 | Field | Type | Default | Rules |
 |---|---|---|---|
-| `service.name` | `String` | — | Same rule as a service id, checked at load: ASCII `[A-Za-z0-9_-]`, 1–128 chars, not a reserved data-root dir (`secrets`, `traefik`, `_pool`, `_checkouts`). `bin` defaults to it; `russel init` suggests it as the service id. `service.name` is the service id used by deploy, status, logs, update, and destroy. |
-| `service.source` | `String` | — | Folder to build, relative to the Russelfile's folder. Usually `.`. Relative only; no `..`, no absolute, no symlinks out of the repo. `--config apps/api/Russelfile.toml` with `source = "."` builds `apps/api`. |
-| `service.port` | `u16` | — | Guest listen port; `!= 0`. Injected as `PORT`. App must listen on it. |
-| `service.memory` | `Memory` | — | `"<N>mb\|mib"` case-insensitive, `u16` MiB, `>= 16mb`, max 65535. No `gb`/`gib`. Example: `"256mb"`. (Docs saying "minimum 256mb" is a recommendation, not validation.) |
-| `service.type` → `runtime` | `RuntimeKind` | `container` | `"container"` \| `"microvm"`. `microvm` is experimental in v0.1: it needs read-write `/dev/kvm` and `passt` (or `CAP_NET_ADMIN` for TAP networking), and a deploy fails before the build otherwise. No root needed. Set the runtime here; deploy reads it from the Russelfile. |
-| `service.guest` | `GuestKind` | `busybox` | `"busybox"` \| `"linux"`. `linux` parses then fails load with "not implemented yet". Orthogonal to `type` (isolation vs userspace). |
-| `service.bin` | `String?` | `name` | Binary produced by the build, run as `$out/bin/<bin>`. Wider rule than `name`, checked at load: `[A-Za-z0-9._+-]`, 1–256 chars, at least one letter or digit, not `.`/`..`. |
-| `service.cpus` | `u8` | `1` | `1..=32`. Both runtimes: microVM vCPUs, container `podman run --cpus N` (a CPU-time limit). Rootless Podman needs the `cpu` cgroup controller delegated to the podman user (`podman info` → `cgroupControllers`); without it the container runs unlimited and ctrl logs a warning. |
-| `service.debug` | `bool` | `false` | Container-only: adds bash/curl + `/usr/bin/env`. MicroVMs ignore it. |
-| `service.env` | `Map<String,String>` | `{}` | Checked at load. Key `^[A-Za-z_][A-Za-z0-9_]*$`, max 64 keys. Reserved rejected: `PORT`, `VM_IP`, `HOST_IP`, `APP`, `IFS`, `PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELL`. Value: no NUL/`\n`/`\r`, max 4096 B. `secret://NAME` refs resolved at deploy. |
-| `service.package` | `String?` | omitted | nixpkgs attr to wrap when the repo has no committed `flake.nix` (e.g. `navidrome`). Works on both runtimes; a committed flake always wins. Attr must match the package validator (no path traversal). When the build uses package and `bin` is unset, the binary defaults to the attr's last component. |
-| `service.args` | `String[]` | `[]` | Process argv after the entrypoint (`$out/bin/<bin> <args…>`). Max 32 entries, 256 B each, no NUL/newline. Both runtimes: containers get it after the entrypoint, microVMs through `/config/argv` (one entry per line, read verbatim by the guest agent, never through `eval`). Separate from Podman flags, which never reach the process. |
-| `service.podman_args` | `String[]` | `[]` | Extra `podman run` flags, one Podman token per entry (not process argv). Container only. Max 32 entries, 256 B each, no NUL/newline. Russel-owned and isolation-weakening flags are validated fail-closed and rejected by the control plane. |
-| `service.user` | `String?` | omitted | Who the app runs as, on both runtimes. Omitted: an unprivileged user that owns the managed volumes, so files the app writes belong to the same user on the host: the rootless Podman user for a container (Podman `--userns=keep-id`), and the control plane's own uid and gid for a microVM (`nobody` under a root ctrl). The app may still bind ports below 1024, and `HOME` defaults to `/tmp`. `"root"` is the only value, for apps that need it. `service.userns` was removed: `keep-id` is now the default. |
-| `service.restart` | `String?` | omitted | Only `"unless-stopped"` is accepted. Containers get Podman's restart policy. MicroVMs are relaunched by ctrl from the recorded generation (same build and config, nothing rebuilt) when the VM exits without a `stop` or `destroy`, and at ctrl start when the VM is not running. Crash loops back off 1s, 2s, 4s, … up to 30s and read `failed` meanwhile; a run of 60s resets the backoff. `russel stop` keeps it down until the next deploy. `status` reports `restarts`. |
-| `[[volumes]].name` | `String?` | — | Managed dir `/var/lib/russel/<id>/volumes/<name>`. Mutually exclusive with `host`. 1..=64 chars, `[A-Za-z0-9._-]`, must start alphanumeric. Max 16 volume rows. Both runtimes. |
-| `[[volumes]].host` | `String?` | — | Absolute host bind. Requires `RUSSEL_VOLUME_ROOTS` at deploy, and the directory must be owned by the account that runs the control plane (`russel`). Never deleted on destroy. Mutually exclusive with `name`. |
-| `[[volumes]].guest` | `String` | — | Absolute path inside the container or microVM. Not `"/"`. No `..`. Unique per file. MicroVMs also reject paths at, above, or inside the guest agent's own mounts (`/nix/store`, `/config`, `/run/russel`, `/proc`, `/sys`, `/dev`), and do not start the app if a volume fails to mount. |
-| `[[volumes]].rw` | `bool` | `false` | Read-write bind. A container rootfs stays read-only either way. |
-| `[[volumes]].keep` | `bool` | `false` | Only with `name`. Survives `destroy` unless `--delete-volumes` / `keep_volumes=false`. Absolute `host` binds ignore `keep`. |
-| `[[ports]].host` / `.guest` | `u16` | — | Extra publishes (both runtimes). A service with `[[ports]]` redeploys stop-then-start, with a brief gap, because both generations cannot hold the same host port. Additional listeners only; the primary mapping is `service.port` plus `[ingress].port`. Host `>= 1024`, not 0/7878/7946, not the ingress pin; guest not 0 and not `service.port`. Max 8 rows. |
-| `[ingress].host` | `String?` | omitted | Exact Traefik `Host()` value for this service, such as `api.example.com` or `example.com`. Russel trims and canonicalizes it to lowercase. DNS labels are ASCII letters, digits, and hyphens; each is 1–63 characters and the full name is at most 253 characters. Single-label names (`localhost`) are allowed. Wildcards (`*.example.com`) and non-ASCII/IDN are rejected; pass punycode (`xn--...`) if you need IDN. |
-| `[ingress].port` | `u16?` | omitted | Host-side backend port used by Traefik and publishing, like a host-side port pin. It is not `service.port`; it must be at least 1024 and cannot be 7878 or 7946. |
+| `name` | string | required | The service's id, used by every command. Letters, digits, `_`, and `-`, 1 to 128 characters. `secrets`, `traefik`, `_pool`, and `_checkouts` are reserved. |
+| `source` | string | required | Folder to build, relative to the Russelfile. Usually `"."`. Must stay inside the repo: no `..`, no absolute path. |
+| `port` | integer | required | The port the app listens on. Russel passes it to the app as `PORT`. |
+| `memory` | string | required | Memory limit in megabytes: `"256mb"` or `"256mib"`. At least `16mb`, at most `65535mb`. `gb` isn't accepted. |
+| `type` | string | `"container"` | `"container"` or `"microvm"`. MicroVMs are experimental and need `/dev/kvm`, `cloud-hypervisor` v52+, `virtiofsd`, and `passt`; without them the deploy fails before building. See [Runtimes](../concepts/runtimes.md). |
+| `bin` | string | `name` | The binary the build produces, run as `$out/bin/<bin>`. Letters, digits, `.`, `_`, `+`, and `-`, up to 256 characters. |
+| `cpus` | integer | `1` | 1 to 32. The vCPU count for a microVM, or a CPU-time limit (`podman run --cpus`) for a container. A container limit needs the `cpu` cgroup controller delegated to the `russel` account; without it the container runs unlimited and Russel logs a warning. |
+| `package` | string | none | A nixpkgs attribute to run when the repo has no `flake.nix`, such as `"navidrome"`. A committed flake wins. If `bin` is unset, it defaults to the attribute's last part. |
+| `args` | list of strings | `[]` | Arguments passed to the app after its name. Up to 32, each up to 256 bytes, one line each. |
+| `podman_args` | list of strings | `[]` | Extra `podman run` flags, one flag or value per entry. Containers only. Up to 32. Flags that Russel sets itself or that weaken isolation are rejected. |
+| `user` | string | none | Only `"root"` is accepted. Without it the app runs as an unprivileged user that owns its volumes (and can still bind ports below 1024). |
+| `restart` | string | none | Only `"unless-stopped"` is accepted. Restarts the app when it exits; see [Restart on exit](../concepts/lifecycle.md#restart-on-exit). `russel stop` keeps it down until the next deploy. |
+| `debug` | boolean | `false` | Containers only: adds a shell, curl, and `/usr/bin/env` for troubleshooting. Don't leave it on. |
+| `guest` | string | `"busybox"` | What runs inside the sandbox. `"linux"` (a full NixOS userspace) is planned and is rejected for now. |
 
-### Volumes and ports
+## `[service.env]`
 
-`[[volumes]]` and `[[ports]]` work on both runtimes. The container rootfs stays read-only; writable state goes through volume binds. On a microVM each volume is its own virtiofs share (read-only unless `rw = true`), mounted by the guest agent before the app starts; `[[ports]]` rows are published by `passt` (unprivileged ctrl) or one `socat` per row (TAP networking).
+Environment variables for the app, as `KEY = "value"` pairs.
 
-Managed volumes (`name =`) live under `/var/lib/russel/<service_id>/volumes/<name>`. On destroy, `keep = true` keeps that directory unless the operator passes `--delete-volumes` (or `?keep_volumes=false`). `--keep-volumes` keeps every managed dir. Absolute `host =` binds need `RUSSEL_VOLUME_ROOTS` and are never deleted by Russel.
+- Names start with a letter or `_`, followed by letters, digits, or `_`. Up to 64 variables.
+- Values are one line, up to 4096 bytes.
+- `PORT`, `VM_IP`, `HOST_IP`, `APP`, `IFS`, `PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, and `SHELL` are reserved.
+- `"secret://NAME"` is replaced with the stored secret at deploy time.
 
-When ctrl runs as root, each managed volume directory is chowned to the rootless podman user (`RUSSEL_PODMAN_USER`/`SUDO_USER`) so Podman can open the bind source; the service directory itself stays root-owned, and absolute `host =` binds are left to the operator.
+See [Env and secrets](../guides/env-secrets.md).
 
-`service.package` is for nixpkgs apps without a repo flake (`russel init --package navidrome`). Do not combine `--package` with `--with-flake` on init: a committed flake wins at build time and would ignore the package attr.
+## `[ingress]`
 
-### Ingress
+How the app is reached from outside. Optional; an empty table is the same as none.
 
-`service.port` is the guest listen port and is injected as `PORT`. The optional
-`[ingress]` table describes the host-facing Traefik route. An empty table is a
-no-op, the same as omitting it.
+| Field | Type | Default | Rules |
+|---|---|---|---|
+| `host` | string | `<name>.<RUSSEL_TRAEFIK_DOMAIN>` | The exact host name Traefik routes to this service, such as `api.example.com` or `example.com`. Lowercased. Up to 253 characters, in labels of up to 63 letters, digits, and hyphens. No wildcards. For international names, use the `xn--` form. |
+| `port` | integer | picked from 3100 up | Pins the host port the app is published on. At least 1024, and not 7878 or 7946. |
 
-- `ingress.host` is the exact `Host()` name. It is not prefixed with the service
-  name. When omitted, Traefik derives `<service_id>.<RUSSEL_TRAEFIK_DOMAIN>`.
-- `ingress.port` pins the host-side backend. Omit it for the normal HTTP case;
-  Russel allocates a backend port. Pin it when a script needs a stable local
-  port, a firewall rule names one port, or another non-HTTP publisher needs a
-  stable publish port.
-- The Russelfile is the source of truth for ingress. `service.port` is the guest
-  listen port and `PORT`; `[ingress].port` optionally pins the host-side port.
-- HTTPS is not a Russelfile field. `RUSSEL_TRAEFIK_TLS=1` attaches `websecure`
-  plus the cert resolver to every router. ACME issues for whatever lands in
-  `Host()`.
+Pin `port` when a script, firewall rule, or non-HTTP client needs a fixed port. The pin holds across updates, rollbacks, and restarts. Two versions can't share it, so updates stop the old version first and have a short gap, as with `[[ports]]`. Apps reached through Traefik don't need it. HTTPS is set on the control plane with `RUSSEL_TRAEFIK_TLS=1`; see [Traefik ingress](../guides/traefik-ingress.md).
 
-Host validation happens when the Russelfile loads, and a uniqueness check under
-a per-directory write lock happens when Traefik writes the route. DNS records
-still need to be created by the operator.
+## `[[volumes]]`
 
-`--config` must be repo-relative (default `Russelfile.toml`), opened via `openat` + `O_NOFOLLOW` (symlinks rejected), 1 MiB cap.
+Folders that keep data across restarts and updates. Up to 16. They work on both runtimes; on a container the root stays read-only either way.
 
-## Type vs guest
+| Field | Type | Default | Rules |
+|---|---|---|---|
+| `name` | string | | A folder Russel manages, at `/var/lib/russel/<service>/volumes/<name>`. Letters, digits, `.`, `_`, and `-`, starting with a letter or digit, up to 64 characters. Use either `name` or `host`. |
+| `host` | string | | An absolute folder on the server. Allowed only under a prefix listed in `RUSSEL_VOLUME_ROOTS`, and it must be owned by the `russel` account. Russel never deletes it. |
+| `guest` | string | required | Where the folder appears inside the app. Absolute, not `/`, no `..`, unique. MicroVMs also reject `/nix/store`, `/config`, `/run/russel`, `/proc`, `/sys`, and `/dev`. |
+| `rw` | boolean | `false` | Mount it writable |
+| `keep` | boolean | `false` | Keep a managed folder when the service is destroyed. `russel destroy --delete-volumes` deletes it anyway. |
 
-| Field | Values | Status |
+## `[[ports]]`
+
+Extra host ports, next to the main one. Up to 8.
+
+| Field | Type | Rules |
 |---|---|---|
-| `type` | `container` (default), `microvm` | `container` ships; `microvm` is experimental (needs `/dev/kvm`, `cloud-hypervisor` v52+, `virtiofsd`, `passt`; no root). `type` is isolation. |
-| `guest` | `busybox` (default), `linux` | `linux` is a host-built NixOS userspace — parsed, rejected at load until boot exists. |
+| `host` | integer | At least 1024; not 7878, 7946, or the `[ingress].port` |
+| `guest` | integer | Not 0, and not `service.port` |
 
-## Env + secrets
+A service with `[[ports]]` can't run two versions at once, so updates stop the old version first and have a short gap. Leave it out unless you need it.
 
-See [Env and secrets](../guides/env-secrets.md). `secret://NAME` in any env value resolves from `/var/lib/russel/secrets/` at deploy time. Injected runtime vars (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are set by Russel — defining them is an error.
+## Fields that don't exist
 
-## What is not in the schema
+These are rejected when the Russelfile loads:
 
-`Russelfile`, `ServiceConfig`, and `IngressConfig` all use `deny_unknown_fields`.
-These names fail parse:
+- `[database]`: run Postgres or Redis as their own service with `package` and a kept volume. See `examples/postgres` and `examples/redis`.
+- `tls`, `ssl`, `domain`, `tunnel`, `hosts`, or `host_port` under `[ingress]`: HTTPS is a control-plane setting, `RUSSEL_TRAEFIK_TLS`.
+- More than one service per file: use one Russelfile per service, and `--config` to pick one.
 
-- `[ingress]` aliases: `ssl`, `tls`, `tunnel`, `domain`, `host_port`, `hosts`.
-  TLS is `RUSSEL_TRAEFIK_TLS` on the control plane. App tunnels are not in the
-  file; a host-wide proxy in front of Traefik is an ops choice.
-- `[dependencies]` (build/dev/runtime) from early design notes.
-- Multi-service files (`[services.api]`, `runtime = "elixir"`, `[service.api]`)
-  from `vision.md`. One `[service]` table only.
+## The examples
 
-`russel build/develop/check` verbs do not exist. Builds run inside `deploy`.
+| Example | `name` | `port` | `memory` | Notes |
+|---|---|---|---|---|
+| `basic-http` | `api` | 3000 | 256mb | Go server, `bin = "basic-http"` |
+| `microvm-http` | `microvm-http` | 3000 | 256mb | The same app as a microVM |
+| `hello-rust` | `hello-rust` | 3000 | 128mb | Rust |
+| `env-config` | `env-config` | 3000 | 128mb | Uses `secret://DEMO_SECRET` |
+| `shortlink` | `shortlink` | 3000 | 128mb | In-memory URL shortener |
+| `filebrowser` | `filebrowser` | 8080 | 256mb | Requires a login |
+| `static-test` | `static-test` | 8000 | 256mb | `bin = "app"` |
+| `navidrome` | `navidrome` | 4533 | 512mb | `package`, volumes at `/data` and `/music` |
+| `vaultwarden` | `vaultwarden` | 8000 | 512mb | `package`, volume at `/data` |
+| `postgres` | `postgres` | 5432 | 512mb | `package`, data in a `host` folder you prepare |
+| `redis` | `redis` | 6379 | 256mb | `package`, `bin = "redis-server"`, volume at `/data` |
+| `caddy` | `caddy` | 8080 | 128mb | `package`, no volume |
+| `meilisearch` | `meilisearch` | 7700 | 512mb | `package`, volume at `/data` |
 
-## Per-example values
-
-| Example | `name` / `port` / `memory` / `type` / `bin` |
-|---|---|
-| `basic-http` | `api` / 3000 / 256mb / container / `basic-http` |
-| `microvm-http` | `microvm-http` / 3000 / 256mb / microvm / `basic-http` |
-| `hello-rust` | `hello-rust` / 3000 / 128mb / container / `hello-rust` |
-| `env-config` | `env-config` / 3000 / 128mb / container / `env-config` + `[service.env]` with `secret://DEMO_SECRET` |
-| `shortlink` | `shortlink` / 3000 / 128mb / container / `shortlink` |
-| `filebrowser` | `filebrowser` / 8080 / 256mb / container / `filebrowser` (requires auth, loopback bind in guest) |
-| `static-test` | `static-test` / 8000 / 256mb / container / `app` |
-| `navidrome` | `navidrome` / 4533 / 512mb / container / package `navidrome`; `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music` on managed volumes |
-| `vaultwarden` | `vaultwarden` / 8000 / 512mb / container / package `vaultwarden`; `DATA_FOLDER=/data` on a managed volume |
-| `postgres` | `postgres` / 5432 / 512mb / container / package `postgresql`; needs a prepared `host` PGDATA under `RUSSEL_VOLUME_ROOTS` |
-| `redis` | `redis` / 6379 / 256mb / container / package `redis`, bin `redis-server`; `--dir /data` on a managed volume |
-| `caddy` | `caddy` / 8080 / 128mb / container / package `caddy`, bin `caddy`; stateless `file-server`, no volume |
-| `meilisearch` | `meilisearch` / 7700 / 512mb / container / package `meilisearch`, bin `meilisearch`; `MEILI_DB_PATH=/data` on a managed volume |
-
-None of the examples set `[ingress]`. Traefik then uses `<service_id>.<RUSSEL_TRAEFIK_DOMAIN>`.
+None of them set `[ingress]`. More: [Examples](./examples.md).
 
 ## Related
 
-- [First deploy](../getting-started/first-deploy.md) · [Traefik ingress](../guides/traefik-ingress.md) · [Runtimes](../concepts/runtimes.md) · [Env and secrets](../guides/env-secrets.md) · [CLI](./cli.md)
+- [First deploy](../getting-started/first-deploy.md) · [Env and secrets](../guides/env-secrets.md) · [Traefik ingress](../guides/traefik-ingress.md) · [Runtimes](../concepts/runtimes.md) · [CLI](./cli.md)

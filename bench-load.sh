@@ -358,6 +358,9 @@ if [ "$NEED_CTRL" -eq 1 ]; then
 	# Export podman user for ctrl
 	export RUSSEL_PODMAN_USER
 	export RUSSEL_KERNEL_PATH="${RUSSEL_KERNEL_PATH:-}"
+	# Deploys examples/basic-http by absolute path. That is gated off by
+	# default (#196); the bench ctrl is single-tenant and short-lived.
+	export RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1
 
 	# Start russel-ctrl
 	info "starting russel-ctrl on $RUSSEL_CTRL_ADDR..."
@@ -563,42 +566,62 @@ russel_deploy_and_wait() {
 	cfg_name="Russelfile.benchload-${runtime}.toml"
 	cfg_path="$repo_path/$cfg_name"
 
-	# Inject type, memory, cpus; basic-http Russelfile has neither, pin to env
-	awk -v rt="$runtime" -v mem="${MEM_MB}mb" -v cpus="${VCPUS}" '
-		BEGIN { in_service=0; injected=0 }
-		/^type[[:space:]]*=/ { next }
-		/^memory[[:space:]]*=/ { next }
-		/^cpus[[:space:]]*=/ { next }
-		/^\[service\]/ {
+	# CPU cap for the container path, as a TOML array for service.podman_args.
+	local podman_args=""
+	if [ "$runtime" = "container" ] && [ "$USE_CPU_CAP" -eq 1 ]; then
+		if [ "$HAS_CPUSET" -eq 1 ]; then
+			podman_args='["--cpus", "'"$CPU_LIMIT"'", "--cpuset-cpus", "'"$CPUSET"'"]'
+		else
+			podman_args='["--cpus", "'"$CPU_LIMIT"'"]'
+		fi
+	fi
+
+	# The Russelfile is the whole desired state (#454): service.name (the
+	# service id), type, memory, cpus, podman_args and [ingress].port (the
+	# host port hey hits) replace the committed values.
+	awk -v rt="$runtime" -v id="$vm_id" -v mem="${MEM_MB}mb" -v cpus="${VCPUS}" \
+		-v pargs="$podman_args" -v hp="$HOST_PORT" '
+		BEGIN { section=""; injected=0; ingress=0 }
+		/^[[:space:]]*\[/ {
+			section = ""
+			if ($0 ~ /^[[:space:]]*\[service\][[:space:]]*(#.*)?$/) section = "service"
+			else if ($0 ~ /^[[:space:]]*\[ingress\][[:space:]]*(#.*)?$/) section = "ingress"
+		}
+		section == "service" && /^[[:space:]]*(name|type|memory|cpus|podman_args)[[:space:]]*=/ { next }
+		section == "ingress" && /^[[:space:]]*port[[:space:]]*=/ { next }
+		section == "service" && /^[[:space:]]*\[/ {
 			print
+			print "name = \"" id "\""
 			print "type = \"" rt "\""
 			print "memory = \"" mem "\""
 			print "cpus = " cpus
-			in_service=1
+			if (pargs != "") print "podman_args = " pargs
 			injected=1
 			next
 		}
-		/^\[/ { in_service=0 }
+		section == "ingress" && /^[[:space:]]*\[/ {
+			print
+			print "port = " hp
+			ingress=1
+			next
+		}
 		{ print }
 		END {
 			if (!injected) {
 				print "[service]"
+				print "name = \"" id "\""
 				print "type = \"" rt "\""
 				print "memory = \"" mem "\""
 				print "cpus = " cpus
+				if (pargs != "") print "podman_args = " pargs
+			}
+			if (!ingress) {
+				print ""
+				print "[ingress]"
+				print "port = " hp
 			}
 		}
 	' "$repo_path/Russelfile.toml" >"$cfg_path"
-
-	# Build deploy JSON
-	local podman_args_json="[]"
-	if [ "$runtime" = "container" ] && [ "$USE_CPU_CAP" -eq 1 ]; then
-		if [ "$HAS_CPUSET" -eq 1 ]; then
-			podman_args_json='["--cpus","'"$CPU_LIMIT"'","--cpuset-cpus","'"$CPUSET"'"]'
-		else
-			podman_args_json='["--cpus","'"$CPU_LIMIT"'"]'
-		fi
-	fi
 
 	info "deploy $vm_id (runtime=$runtime)..."
 	set +e
@@ -607,10 +630,7 @@ russel_deploy_and_wait() {
 		-d "{
 			\"repo_url\": \"$repo_path\",
 			\"config_path\": \"$cfg_name\",
-			\"vm_id\": \"$vm_id\",
-			\"port\": {\"host\": $HOST_PORT, \"guest\": 3000},
-			\"runtime\": \"$runtime\",
-			\"podman_args\": $podman_args_json
+			\"vm_id\": \"$vm_id\"
 		}" 2>&1)
 	set -euo pipefail
 

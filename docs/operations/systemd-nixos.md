@@ -1,19 +1,19 @@
 ---
 title: systemd and NixOS
-description: Run russel-ctrl as a dedicated russel account, from the installer or the NixOS module — loopback, tokens, and Podman.
+description: Run russel-ctrl as a dedicated russel account, with the installer on Debian or Ubuntu, or with the NixOS module.
 sidebar_position: 1
 keywords: [systemd, nixos, service, linger, podman, system unit, russel user]
 ---
 
-Two supported ways to run `russel-ctrl` persistently. Both keep it on loopback with fail-closed auth and `0700` state.
+There are two supported ways to run `russel-ctrl` as a service: the installer's systemd unit on Debian, Ubuntu, and similar distributions, or the NixOS module. Both listen on `127.0.0.1:7878` only, require the token, and keep state in `/var/lib/russel` with mode `0700`.
 
 ## What you'll need
 
-- Release `russel-ctrl` built on the host distro (NixOS glibc binaries do not run on Debian).
+- A `russel-ctrl` binary for this distribution: a release download, or one built on this machine. A binary built on NixOS won't run on Debian.
 - `sudo` once, to install. Both setups run russel-ctrl and every workload as a dedicated, unprivileged `russel` account.
 - Rootless Podman for containers; `/dev/kvm` plus `cloud-hypervisor`, `virtiofsd`, and `passt` for microVMs.
 
-## Other Linux — system unit as `russel` (via installer)
+## Debian, Ubuntu, and other systemd distributions
 
 ```bash
 ./contrib/install.sh check
@@ -53,7 +53,7 @@ Unit defaults (see `contrib/russel-ctrl.service`): `User=russel`, loopback bind,
 
 ### Why the unit has no `PrivateTmp` or `ProtectSystem`
 
-Isolation comes from the dedicated, unprivileged `russel` account, not from systemd sandboxing. The usual hardening options break rootless Podman here:
+The dedicated, unprivileged `russel` account is what isolates Russel. The usual systemd sandboxing options break rootless Podman here:
 
 - Podman keeps a small **pause process** (`catatonit -P`) that holds the account's namespaces, and every `podman` call joins it. It outlives the control plane on purpose, like the apps do.
 - It keeps the filesystem view of the control plane that first started it. With `PrivateTmp=yes`, that view's `/tmp` and `/var/tmp` are deleted when the service restarts, and every later container fails with `pasta … Failed to mount empty tmpfs for pivot_root()` or `mkdir /var/tmp/…: no such file or directory`. `ProtectSystem=strict` would pin a read-only root the same way.
@@ -62,7 +62,7 @@ Don't add these options back with `systemctl edit`. The control plane also runs 
 
 ### Upgrading from v0.1.0
 
-The v0.1.0 unit had `PrivateTmp=yes`, so containers could not start (#524). Re-running `install.sh host` replaces that unit (your drop-ins in `russel-ctrl.service.d/` are kept), stops the control plane, ends the stale pause process, and starts it again. To do the same by hand:
+The v0.1.0 unit had `PrivateTmp=yes`, so containers could not start. Re-running `install.sh host` replaces that unit (your drop-ins in `russel-ctrl.service.d/` are kept), stops the control plane, ends the stale pause process, and starts it again. To do the same by hand:
 
 ```bash
 sudo systemctl stop russel-ctrl
@@ -70,27 +70,27 @@ sudo pkill -u russel -x catatonit
 sudo systemctl start russel-ctrl
 ```
 
-## NixOS — `services.russel`
+## NixOS: `services.russel`
 
 ```nix
 {
   services.russel.enable = true;
   services.russel.bin = "/usr/local/bin/russel-ctrl"; # or services.russel.package
-  services.russel.environmentFile = "/etc/russel/env"; # 0600, RUSSEL_API_TOKEN=
-  # Existing login account. Linger is set. Set group, or omit it:
+  services.russel.environmentFile = "/etc/russel/env"; # mode 0600, holds RUSSEL_API_TOKEN=...
+  # Run as an existing account in place of a new "russel" one (linger is turned on for it):
   # services.russel.user = "you";
   # services.russel.group = "users";
   # services.russel.createUser = false;
-  # NNP on, no Podman (does not configure microVMs):
+  # Skip the rootless Podman setup (containers will not run):
   # services.russel.rootlessPodman = false;
 }
 ```
 
 Module behavior:
 
-- Defaults `127.0.0.1:7878`, `RUSSEL_REQUIRE_AUTH=1`, `/var/lib/russel` mode `0700`, warm pool off.
-- `rootlessPodman` defaults true: `NoNewPrivileges` off, `/run/wrappers` on `PATH` so cap-wrapped `newuidmap` is found, `virtualisation.podman.enable` default on, linger on the service user. Set false only to keep `NoNewPrivileges` on — that does not set up microVMs.
-- KVM/TAP are optional on a container-only VPS. Put Caddy/nginx/Traefik in front for split HTTPS.
+- Listens on `127.0.0.1:7878`, requires the token, keeps `/var/lib/russel` at mode `0700`, and turns the experimental warm pool off.
+- `rootlessPodman` (on by default) sets up what rootless Podman needs: it enables Podman, puts `/run/wrappers` on `PATH` so `newuidmap` is found, turns on linger, and turns off `NoNewPrivileges`, which blocks `newuidmap`. Turn it off only if you won't run containers.
+- For microVMs, add `services.russel.microvms.enable = true;`. For HTTPS, put Caddy, nginx, or Traefik in front ([TLS reverse proxy](../guides/tls-reverse-proxy.md)).
 
 Use `services.russel`, never `install.sh host`, on NixOS.
 

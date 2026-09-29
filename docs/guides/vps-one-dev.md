@@ -33,7 +33,7 @@ Russel trusts whoever holds the API token completely. It is not built for sharin
   ```bash
   umask 077 && mkdir -p ~/.config/russel
   scp user@vps:/etc/russel/env ~/.config/russel/env
-  ./contrib/install.sh connect user@vps
+  curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | bash -s -- connect user@vps
   russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
   russel ps
   ```
@@ -61,7 +61,7 @@ Leave `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY` off on a VPS you deploy to remotely.
 Russel publishes each app on a `127.0.0.1` port on the server, so nothing is public until you choose. Pick one:
 
 - [ ] **Traefik (recommended for web apps).** Russel writes a Traefik route for each service, so `app.example.com` reaches the right app. Traefik can also get TLS certificates from Let's Encrypt. See [Traefik ingress](./traefik-ingress.md).
-- [ ] **Your own reverse proxy.** Pin the port with `[ingress]` and `port = 8080` in the Russelfile, and point Caddy or nginx at `127.0.0.1:8080`.
+- [ ] **Your own reverse proxy.** Pin the port with `[ingress]` and `port = 8080`, and point Caddy or nginx at `127.0.0.1:8080`. The pin holds across updates, rollbacks, and restarts. An update of a pinned service stops the old version before starting the new one, so there is a short gap.
 
 ## 6. Secrets and data
 
@@ -81,14 +81,13 @@ Russel publishes each app on a `127.0.0.1` port on the server, so nothing is pub
 
 ## Good first apps
 
-Every example except `microvm-http` runs as a container on a no-KVM VPS. Russel builds from the **root** of a git repo, so to deploy an example from git, copy its folder into a repo of its own first:
+Every example except `microvm-http` runs as a container on a no-KVM VPS. Deploy one straight from the Russel repo by pointing `--config` at its Russelfile:
 
 ```bash
-cp -r russel/examples/hello-rust hello-rust && cd hello-rust
-git init && git add . && git commit -m "hello-rust"
-git remote add origin git@github.com:you/hello-rust.git && git push -u origin HEAD
-russel deploy https://github.com/you/hello-rust.git
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/hello-rust/Russelfile.toml
 ```
+
+To change an example, copy its folder into a repo of your own and deploy that.
 
 | Example | What it is |
 |---|---|
@@ -107,4 +106,4 @@ All of them: [Examples](../reference/examples.md).
 - More than one server
 - Managed databases: run Postgres or Redis as ordinary services instead
 - TLS in the control plane itself: use SSH or a reverse proxy
-- Guaranteed restart after a server reboot. The control plane comes back by itself, but containers may not. Check `russel ps` after a reboot, and run `russel update <id>` for anything that is down. This is tracked in #450.
+- Guaranteed restart after a server reboot. The control plane comes back by itself, but containers may not. Check `russel ps` after a reboot, and run `russel update <id>` for anything that is down. Bringing services back after a reboot is planned for v0.2.

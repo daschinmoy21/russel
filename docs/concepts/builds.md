@@ -1,75 +1,71 @@
 ---
 title: Builds
-description: How Russel turns source into a Nix closure — flakes, auto-generation, and trust.
+description: How Russel builds your repo with Nix, the flakes it writes when you have none, and how builds are kept safe from garbage collection.
 sidebar_position: 5
-keywords: [nix, flake, auto-generation, build, trusted source, sandbox]
+keywords: [nix, flake, auto-generation, build, garbage collection]
 ---
 
-Nix is the only build system. The deployable artifact is always a `/nix/store` path; both runtimes consume it directly (no image builds, no registry).
+Russel builds everything with Nix. The result is a path in `/nix/store`, and both runtimes run the app from there.
 
 ## What you'll need
 
-- Nix with flakes enabled on the control-plane host.
-- A repo with `packages.<system>.default` (or nothing — Russel can generate it).
+- Nix with flakes enabled on the server (see [Installation](../getting-started/installation.md)).
+- A repo whose flake has `packages.<system>.default`, or no flake at all for Rust, Go, and static sites.
 
-## Pipeline
+## What happens during a build
 
-1. Resolve the repo (clone with leases + GC, or use a trusted local path).
-2. Load `Russelfile.toml` (`openat` + `O_NOFOLLOW`, 1 MiB cap).
-3. Ensure a `flake.nix` exists (use the repo's, or auto-generate).
-4. `nix build path:checkout#packages.<system>.default` → `/nix/store/<hash>`.
-5. Hand the closure to the runtime (virtiofs share for microVMs, `--rootfs` + `/nix/store:ro` bind for containers).
+1. The server clones the repo and loads the Russelfile.
+2. It uses the repo's `flake.nix`, or writes one if there is none.
+3. It runs `nix build` on `packages.<system>.default` in the folder the Russelfile points at.
+4. It hands the resulting `/nix/store` path to the runtime.
 
-There is no `russel build` command. Russel builds automatically during `deploy`. Use `nix build` directly only to inspect an artifact without deploying:
+There is no separate build command: builds happen inside `russel deploy` and `russel update`. To try a build on its own, run Nix yourself:
 
 ```bash
-nix build path:examples/basic-http
+nix build .#default
 ```
 
-## Auto-generation
+## Projects without a flake
 
-If no `flake.nix` is present, Russel writes one from project type:
+If there is no `flake.nix`, Russel writes one based on what it finds:
 
-| Detected file | Project kind | Generated flake |
+| Found | Project | How it's built |
 |---|---|---|
-| `Cargo.toml` | Rust | `crane`/`rustPlatform` build of `bin` |
-| `go.mod` | Go | `buildGoModule` (`vendorHash = null` for vendored/stdlib-only; `lib.fakeHash` hint otherwise) |
-| else | Static | Minimal static server |
+| `Cargo.toml` | Rust | Builds the binary named by `service.bin` |
+| `go.mod` | Go | `buildGoModule`. Works as-is for vendored or standard-library-only modules; otherwise the build fails and prints the `vendorHash` to add. |
+| Neither | Static site | Serves the folder with a small static file server |
 
-`russel init --with-flake` writes the same starter as a **committed** file you own and edit. Control-plane auto-generation in restricted mode carries a "do not edit" marker instead.
+To own and edit the flake yourself, run `russel init --with-flake` and commit the file it writes.
 
-## Trust model
+For apps already packaged in nixpkgs, skip the flake entirely: set `service.package = "navidrome"` (or any nixpkgs attribute) in the Russelfile.
 
-**Nix builds trust the source repo** — a malicious `flake.nix` runs as the build user. On multi-tenant or untrusted-source hosts, only deploy trusted repos and harden the host:
+## Trust
+
+A Nix build runs code from the repo as the `russel` account. Only deploy repos you trust. If you must build repos you don't fully trust, turn on restricted mode:
 
 ```bash
-export RUSSEL_NIX_RESTRICTED=1   # sandboxed nix build + no auto-flake
+echo 'RUSSEL_NIX_RESTRICTED=1' | sudo tee -a /etc/russel/env
+sudo systemctl restart russel-ctrl
 ```
 
-Full threat model, `nix.conf` hardening, and sandbox options: [Security: Nix builds](../security/nix-builds.md).
+That forces Nix's sandbox and turns off flake generation. [Nix build security](../security/nix-builds.md) covers the rest.
 
 ## Garbage collection
 
-Builds run with `--no-link`, so ctrl keeps its own GC roots. Each service has
-`/var/lib/russel/_pool/gcroots/<id>/` with one indirect root per store path it
-may re-exec: the current `metadata.json` paths (app, microVM kernel and
-initramfs, container rootfs) and the deployment journal's `active` and
-`previous` generations. Ctrl syncs the directory after every deploy and
-automatic rollback, and for every service at startup. Older generations lose
-their roots, and destroy removes the directory. `nix-collect-garbage` (or
-NixOS `nix.gc.automatic`) therefore never deletes what a restart, reboot
-recovery, or rollback to the previous generation needs. Rolling back further
-than `previous` rebuilds from the recorded source.
+Russel registers a Nix garbage-collection root for everything a service might need to start again: the running version, the previous version, and (for microVMs) the kernel and boot image. So `nix-collect-garbage`, or NixOS's `nix.gc.automatic`, never deletes what a restart, a reboot, or a rollback to the previous version needs. Older versions lose their roots, and rolling back further than one version rebuilds from source. `russel destroy` removes the service's roots.
 
-## Kernel note (microVMs)
+The roots live in `/var/lib/russel/_pool/gcroots/<id>/`.
 
-MicroVMs must use the Russel-compiled kernel (flake package `.#microvm-kernel`, virtio drivers built-in). Bench and production deploys export `RUSSEL_KERNEL_PATH` to that `bzImage` so ctrl never falls back to a stock nixpkgs kernel (slower / wrong module set):
+## MicroVM kernel
+
+MicroVMs need Russel's own kernel, which has the virtio drivers built in. The installer downloads it to `/var/lib/russel/_pool/kernel/bzImage` on hosts with `/dev/kvm`. To build it yourself from a checkout:
 
 ```bash
-nix build .#microvm-kernel -o result-kernel
-export RUSSEL_KERNEL_PATH="$(readlink -f result-kernel/bzImage)"
+nix build .#microvm-kernel
 ```
+
+Then set `RUSSEL_KERNEL_PATH` to the output of `readlink -f result/bzImage` in `/etc/russel/env` and restart the service. Russel refuses to boot with a stock nixpkgs kernel.
 
 ## Related
 
-- [Architecture](./architecture.md) · [Runtimes](./runtimes.md) · [Nix builds](../security/nix-builds.md) · [App packaging](../guides/vps-one-dev.md#d-first-deploy)
+- [Architecture](./architecture.md) · [Runtimes](./runtimes.md) · [Nix build security](../security/nix-builds.md) · [Russelfile](../reference/russelfile.md)

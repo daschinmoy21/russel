@@ -1,123 +1,96 @@
 ---
 title: Runtimes
-description: microVM vs container isolation, guest userspace, and hardened defaults.
+description: Rootless containers and experimental microVMs, what each needs, and what the app sees inside.
 sidebar_position: 2
-keywords: [runtime, microvm, container, guest, busybox, podman, rootfs]
+keywords: [runtime, container, microvm, podman, cloud hypervisor, rootfs, guest]
 ---
 
-`service.type` selects **isolation**. `service.guest` selects **userspace inside that isolation**. They are orthogonal — do not conflate them.
+`service.type` in the Russelfile picks how an app is isolated:
 
-## At a glance
-
-| `service.type` | Isolation | Host needs | Best for |
+| `service.type` | Isolation | The host needs | Use it for |
 |---|---|---|---|
-| `container` (default) | Rootless Podman `--rootfs` | Rootless Podman | Cheap no-KVM VPS, fastest spawn-to-ready |
-| `microvm` (experimental) | KVM / Cloud Hypervisor | `/dev/kvm` (kvm group), `virtiofsd`, `passt`; no root. A root ctrl uses TAP + `socat` + `iptables` instead of `passt` | Stronger isolation, secret-heavy workloads |
+| `container` (default) | Rootless Podman | Podman with rootless support | Everything, including VPSes without KVM |
+| `microvm` (experimental) | A small VM with its own kernel (Cloud Hypervisor) | `/dev/kvm`, `cloud-hypervisor` v52+, `virtiofsd`, `passt` | Trying out stronger isolation on KVM hardware |
 
-| `service.guest` | What pid 1 / rootfs is | Status |
-|---|---|---|
-| `busybox` (default) | microVM: busybox `/init` execs one ELF. Container: hardened rootfs, no distro | Ships |
-| `linux` | Host-built NixOS userspace (bash, coreutils, glibc, `$HOME`) | Parsed, then **rejected at load** until the boot path lands |
+Neither runtime needs root.
 
-```toml
-[service]
-type = "container"  # or "microvm"
-guest = "busybox"   # omit or busybox; linux errors until implemented
-```
-
-Set the runtime with `service.type` in the Russelfile.
-
-## Filesystem contract
+## What the app sees
 
 Both runtimes give the app the same filesystem, so a Russelfile behaves the same on either:
 
 | Path | Access |
 |---|---|
-| `/` | read-only |
-| `/nix/store` | read-only (the app closure) |
-| `/tmp` | tmpfs, writable, `noexec`, lost on restart |
-| `/run` | tmpfs, writable, `noexec`, lost on restart |
-| `[[volumes]]` guest paths | read-only, or writable with `rw = true`; the only data that persists |
+| `/` | Read-only |
+| `/nix/store` | Read-only. The app and its dependencies live here. |
+| `/tmp`, `/run` | Writable, in memory, not executable, cleared on restart |
+| `[[volumes]]` paths | Read-only, or writable with `rw = true`. The only data that survives a restart. |
 
-An app that writes anywhere else gets `Read-only file system` on both runtimes. MicroVM guests also reserve `/config` (the deploy config) and `/run/russel` (a readiness marker), and `[[volumes]]` cannot use those paths.
+An app that writes anywhere else gets `Read-only file system`.
 
-The app runs as an unprivileged user by default, on both runtimes: the rootless Podman user in a container, the control plane's uid and gid in a microVM (which the guest names `app` in its `/etc/passwd`). That user owns the managed volumes, may bind ports below 1024, and gets `HOME=/tmp` unless the Russelfile sets `HOME`. Set `service.user = "root"` for an app that needs root inside its sandbox.
+The app runs as an unprivileged user that owns its volumes. It can still bind ports below 1024, and `HOME` is `/tmp` unless you set it. For an app that must run as root inside its sandbox, set `service.user = "root"`.
 
-## MicroVM (Cloud Hypervisor)
+Russel sets `PORT` to `service.port`. Listen on `0.0.0.0`: an app bound to `127.0.0.1` can't be reached from outside its container.
 
-> **Experimental in v0.1:** MicroVMs run from the same unprivileged `russel-ctrl` as containers. They need read-write `/dev/kvm` (put the ctrl user in the `kvm` group) and `passt` on PATH: `passt --vhost-user` is the VM NIC and publishes the port, the way pasta does for rootless Podman, and `virtiofsd` uses its unprivileged namespace sandbox. A ctrl that holds `CAP_NET_ADMIN` (root) uses a TAP, `socat`, and the `RUSSEL-FORWARD` iptables chain instead; `RUSSEL_MICROVM_NET=tap|passt` forces either. A deploy without the prerequisites fails before the build with the missing one.
-
-```mermaid
-flowchart TB
-    subgraph Host
-        VFD1[virtiofsd<br/>/nix/store ro]
-        VFD2[virtiofsd<br/>cfg dir ro]
-        SCR[virtiofsd<br/>scratch rw → /run/russel]
-        SOC[socat<br/>127.0.0.1:host_port]
-        TAP[TAP rsl-key<br/>10.x.y.1/30]
-        CH[cloud-hypervisor<br/>--api-socket --kernel --initramfs]
-    end
-    subgraph Guest["guest (no systemd)"]
-        INIT[/init<br/>busybox/]
-        MODS[insmod virtio chain<br/>if modules =m]
-        APP[app binary<br/>from /nix/store]
-    end
-    SOC <-->|host_port ↔ 10.x.y.2:guest_port| TAP
-    TAP <-->|virtio-net| CH
-    VFD1 <-->|virtiofs nixstore| CH
-    VFD2 <-->|virtiofs russelcfg| CH
-    SCR <-->|virtiofs scratch| CH
-    CH --> INIT --> MODS --> APP
-    INIT -.->|reads /config/deploy.env| VFD2
-```
-
-- **Direct CH orchestration**, no `microvm.nix`/systemd in the guest. Kernel → busybox `/init` → app; cold boot ~2 s. `/init` runs the app as its child; when the app exits, `/init` writes `app exited with status N` to `console.log` and powers the VM off, which ctrl sees as the VM going down.
-- **Virtiofs, not image packaging**: host `/nix/store` mounted read-only; app closure never copied.
-- **Generic agent initramfs**: one cached CPIO for all services. Per-service config (`VM_IP`, `HOST_IP`, `PORT`, `APP`, user env) arrives via a second virtiofs share (`russelcfg`) as shell-quoted `deploy.env` (mounted read-only). Guest writes `.agent_ready` to a separate `scratch/` share (`/run/russel` in-guest, no quota — bounded to that dir).
-- **Kernel**: prefer the repo's `microvm-kernel` flake attr (virtio/fuse built-in `=y`); fallback is stock nixpkgs kernel + `insmod` of the virtio chain in `/init`.
-- **Readiness**: TCP poll of the guest IP across TAP (10 s), then a host-port check (2 s) through `socat` that the app answers (the connection must stay open 200 ms; `socat` closes it at once when the guest refuses). Under passt, the host port after the guest's `.net_ready` marker. Throughout, ctrl watches the `cloud-hypervisor` process: the agent powers the guest off when the app exits, so a VM exit fails the deploy at once with the app's exit code and the console tail. Updates also watch it for 2 s after the first answer: [When a deploy counts as ready](./lifecycle.md#when-a-deploy-counts-as-ready).
-- **Lifecycle**: graceful stop via CH REST socket (`vm.shutdown` + `vmm.shutdown`), fallback to PID-ownership-verified signals, then pattern-anchored `pkill`. Destroy tears down TAP, `socat`, `virtiofsd`, ports, service dir.
-- Each VM gets `--memory size=XM,shared=on` (shared required for virtiofs), 1 vCPU (Russelfile `cpus` validated `1..=32`), serial log at `/var/lib/russel/<id>/console.log`, and an API socket.
-
-Warm pool (`RUSSEL_WARM_POOL=1`, snapshot/restore of a golden paused VM) is experimental and off by default.
-
-## Container (rootless Podman `--rootfs`)
+## Containers
 
 ```mermaid
-flowchart TB
-    subgraph Host
-        ROOTFS["/var/lib/russel/id/rootfs<br/>(read-only, no shell)"]
-        STORE[/nix/store<br/>bind ro/]
-        POD[podman run --rootfs<br/>rootless]
-        C[container<br/>cap-drop ALL, no-new-privs,<br/>ro rootfs, tmpfs /tmp+/run]
-    end
-    TRAEFIK[Traefik / -p] -->|127.0.0.1:host_port| C
-    POD --> C
-    ROOTFS --> POD
-    STORE --> C
+flowchart LR
+    TRAEFIK[Traefik or curl] -->|127.0.0.1:host port| C
+    STORE["/nix/store (read-only)"] --> C
+    ROOTFS["Minimal root folder<br/>(read-only, no shell)"] --> C[Rootless container]
 ```
 
-- **`--rootfs`, not images.** Minimal Docker-like tree (etc files, `/bin/<app>` symlink into the closure) + host `/nix/store` bind-mounted read-only. No registry, no pulls, no Dockerfile.
-- **Rootless only.** When ctrl runs as root (for example to use microVM TAP networking), podman runs as `RUSSEL_PODMAN_USER` or `SUDO_USER` via `sudo -u <user> -H …`; rootless verified via `podman info`. Headless hosts may need `loginctl enable-linger $USER` for `/run/user/$(id -u)`.
-- **Hardened defaults**: `--cap-drop ALL`, `--security-opt no-new-privileges`, `--read-only`, tmpfs `/tmp` + `/run`, `--memory` from the Russelfile. `debug = true` opts into bash/curl + `/usr/bin/env`.
-- Entry points must be statically linked or use an absolute `/nix/store/…` interpreter (no shell, no `/usr/bin/env` by default). Do not pass a bare Nix package path as `--rootfs` yourself — use `russel deploy`.
-- **Fail-closed redeploy**: old container stops only after the new podman argv validates. Readiness (30 s): the app must accept a connection through the published host port that stays open for 200 ms or gets data. pasta, the rootless forwarder, accepts and then closes within ~20 ms when nothing listens behind it, so a bare connect proves nothing. Meanwhile `podman inspect` watches the container; an exit or restart fails the deploy at once with the exit code and the last 40 log lines. An app bound only to `127.0.0.1` times out with a hint to bind `0.0.0.0`. The health checker (`RUSSEL_HEALTH_RESTART`) uses the same probe. Logs via `k8s-file` at `<service>/container.log`, fallback `podman logs`.
-- **Exit watcher**: after a deploy, ctrl polls `podman inspect` (1 s for the first minute, then 5 s). An exit, a Podman restart (`RestartCount` went up), or a removed container marks the service `failed`; a restarted container that stays up 10 s reads `deployed` again. See [Health](./lifecycle.md#health).
-- Optional `service.podman_args` are validated fail-closed; see [Russelfile](../reference/russelfile.md).
+- **No image.** Russel builds a tiny root folder (a few `/etc` files and a link to your binary) and starts it with `podman run --rootfs`, with the host's `/nix/store` mounted read-only. There is no registry, no pull, and no Dockerfile.
+- **Locked down by default.** All Linux capabilities are dropped, privilege escalation is blocked, the root is read-only, and memory is capped at `service.memory`. `debug = true` adds a shell and curl for troubleshooting; don't leave it on.
+- **Entry point.** The binary must be statically linked or use an absolute `/nix/store` interpreter, because there is no shell or `/usr/bin/env`.
+- **Ready means answering.** A deploy waits up to 30 s for the app to accept a connection on its published port and keep it open. A container that exits or restarts during that time fails the deploy at once, with its exit code and last 40 lines of output.
+- **Watched after deploy.** Russel checks the container every second for the first minute, then every 5 s. If it exits, is removed, or is restarted by Podman, the service shows `failed`. See [Lifecycle: Health](./lifecycle.md#health).
+- **Logs** are written to `/var/lib/russel/<id>/container.log`.
 
-> **Note:** plain container env is passed as `podman -e` and is visible via `podman inspect`. Resolved `secret://` values go through Podman secrets (`--secret ...,type=env`), so keep anything sensitive behind `secret://`.
+Plain env vars are visible to anyone who can run `podman inspect` as the `russel` account. `secret://` values are passed as Podman secrets and don't show up there, so put anything sensitive behind `secret://`.
+
+## MicroVMs (experimental)
+
+Each app gets its own Linux kernel. The VM boots in about 2 s into a tiny init that mounts the host's `/nix/store` and starts the app.
+
+```mermaid
+flowchart LR
+    TRAEFIK[Traefik or curl] -->|127.0.0.1:host port| PASST[passt]
+    PASST <-->|virtual network card| VM
+    STORE["/nix/store (read-only)"] -->|virtiofs| VM[Cloud Hypervisor VM<br/>init → app]
+    CFG["Deploy config (read-only)"] -->|virtiofs| VM
+```
+
+- **Needs:** read-write `/dev/kvm` (the installer adds `russel` to the `kvm` group), `cloud-hypervisor` v52 or newer (older versions hang with `cpus` > 1), `virtiofsd`, and `passt` on `PATH`. A deploy without them fails before the build and names what's missing.
+- **Networking** uses `passt`, which gives the VM a network card and publishes its port on the host, the same job `pasta` does for rootless Podman.
+- **Files** reach the VM over virtiofs: `/nix/store` read-only, the deploy config read-only, and each volume as its own share. The app is never copied.
+- **Kernel.** Use Russel's kernel, which has the virtio drivers built in. The installer puts it at `/var/lib/russel/_pool/kernel/bzImage`.
+- **When the app exits**, the init powers the VM off, and Russel sees the VM stop. A deploy fails at once with the app's exit code and the end of its console output, in `/var/lib/russel/<id>/console.log`.
+- **Resources:** `service.memory` of RAM and `service.cpus` vCPUs (default 1).
+
+The guest reserves `/config` and `/run/russel`, so volumes can't use those paths.
+
+A control plane running as root uses a TAP device, `socat`, and an iptables chain in place of `passt`. That setup exists for development and benchmarks; see [Networking](./networking.md#microvms-as-root).
+
+## Guest userspace
+
+`service.guest` is separate from `service.type`: it picks what runs inside the sandbox.
+
+| `service.guest` | What runs | Status |
+|---|---|---|
+| `busybox` (default) | Just your binary, started by a tiny init | Works |
+| `linux` | A full NixOS userspace | Not implemented yet; rejected when the Russelfile loads |
 
 ## Choosing
 
-- No `/dev/kvm` (most cheap VPS)? Use `type = "container"` everywhere.
-- Need the strongest boundary? Use `type = "microvm"` on KVM-capable metal.
-- Need a shell in the container for debugging? Set `debug = true` temporarily — do not ship it.
+- No `/dev/kvm`, which is most cheap VPSes: use containers.
+- KVM hardware and you want to try a separate kernel per app: `type = "microvm"`, knowing it's experimental.
+
+To compare the two, deploy the same Go app both ways:
 
 ```bash
-# MicroVM
-russel deploy examples/microvm-http
-# Container
-russel deploy examples/basic-http
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/basic-http/Russelfile.toml
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/microvm-http/Russelfile.toml
 ```
 
 ## Related

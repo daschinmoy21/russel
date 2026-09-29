@@ -178,9 +178,8 @@ impl DesiredStateSnapshot {
             .unwrap_or_default();
         // A pinned port in desired_state is the operator's requested ingress
         // pin. Only fill missing values from the live workload, whose backend
-        // may be ephemeral after a dual-live cutover. Port 0 is never a valid
-        // pin (reserve rejects it; the pipeline filters it from `fixed_host`),
-        // so treat it as absent on both sides.
+        // is allocated when nothing is pinned. Port 0 is never a valid pin
+        // (reserve rejects it), so treat it as absent on both sides.
         if snap.host_port.filter(|&h| h != 0).is_none() {
             snap.host_port = host_port.filter(|&h| h != 0);
         }
@@ -846,6 +845,71 @@ mod tests {
         assert_eq!(snap.host_port, Some(4000));
         assert_eq!(snap.guest_port, Some(3000));
         assert_eq!(snap.ingress_host.as_deref(), Some("abc.com"));
+    }
+
+    /// A pinned deploy records the pin in desired_state and in the row;
+    /// rolling back to it (after a later deploy) replays the pin.
+    #[test]
+    fn rollback_target_keeps_the_ingress_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        let pinned = serde_json::json!({
+            "repo_url": "https://example.com/app.git",
+            "config_path": "Russelfile.toml",
+            "runtime": "container",
+            "port": {"host": 8081, "guest": 3000}
+        });
+        for generation in ["aaaa1111", "bbbb2222"] {
+            append_success_at(
+                &path,
+                AppendSuccess {
+                    generation_id: Some(generation.into()),
+                    runtime: Some(RuntimeKind::Container),
+                    store_path: Some(format!("/nix/store/{generation}")),
+                    repo_url: Some("https://example.com/app.git".into()),
+                    config_path: Some("Russelfile.toml".into()),
+                    host_port: Some(8081),
+                    guest_port: Some(3000),
+                    message: Some("deploy complete".into()),
+                    desired_state: Some(DesiredStateSnapshot::from_desired_json(
+                        Some(&pinned),
+                        Some(8081),
+                        Some(3000),
+                    )),
+                },
+            )
+            .unwrap();
+        }
+        let target = select_rollback_target_at(&path, None).unwrap();
+        assert_eq!(target.generation_id.as_deref(), Some("aaaa1111"));
+        assert_eq!(target.host_port, Some(8081));
+        let source = target.recorded_source();
+        assert_eq!(
+            (source.host_port, source.guest_port),
+            (Some(8081), Some(3000))
+        );
+        assert!(source.redeploy_request("api").is_some());
+    }
+
+    /// Health restart reads metadata. A service updated before pinned
+    /// updates went cold was left on an allocated port; the pin in
+    /// desired_state still wins, so the restart goes back to it.
+    #[test]
+    fn health_restart_source_keeps_the_pin_over_a_drifted_port() {
+        let meta = serde_json::json!({
+            "repo_url": "https://example.com/app.git",
+            "config_path": "Russelfile.toml",
+            "runtime": "container",
+            "host_port": 3107,
+            "guest_port": 3000,
+            "desired_state": {
+                "repo_url": "https://example.com/app.git",
+                "runtime": "container",
+                "port": {"host": 8081, "guest": 3000}
+            }
+        });
+        let snap = DesiredStateSnapshot::from_metadata_with_legacy(&meta).unwrap();
+        assert_eq!((snap.host_port, snap.guest_port), (Some(8081), Some(3000)));
     }
 
     #[test]

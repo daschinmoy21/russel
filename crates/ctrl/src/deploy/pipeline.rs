@@ -274,9 +274,8 @@ pub(super) fn validate_live_ingress_port(port: Option<u16>) -> anyhow::Result<()
     let Some(port) = port else {
         return Ok(());
     };
-    // Privileged pins are rejected here as well as in `PortAllocator::reserve`:
-    // dual-live redeploys allocate an ephemeral candidate backend and never
-    // reserve the pin, but the pin still returns via `fixed_host` reclaim.
+    // `PortAllocator::reserve` rejects these at boot too; checking here fails
+    // the deploy before the build instead of after it.
     reject_live_listen_collision(port, "ingress.port")
 }
 
@@ -474,9 +473,6 @@ impl DeployPipeline {
                     runtime = %output.runtime,
                     "deploy succeeded"
                 );
-                let fixed_port_socat = output.fixed_port_socat;
-                let fixed_host_port = output.fixed_host_port;
-                let recorded_host = fixed_host_port.unwrap_or(host_port);
                 let (message, vm_ip, microvm_config_path) = match output.workload {
                     DeployWorkload::Microvm {
                         alloc,
@@ -490,14 +486,11 @@ impl DeployPipeline {
                         let mut aux = vec![*socat_child];
                         aux.extend(extra_forwarders);
                         aux.extend(virtiofsd_children);
-                        if let Some(fixed) = fixed_port_socat {
-                            aux.push(fixed);
-                        }
                         self.state.mark_deployed_with_aux(
                             &service_id,
                             *vm_child,
                             aux,
-                            Some(recorded_host),
+                            Some(host_port),
                             Some(guest_port),
                         );
                         (
@@ -763,12 +756,6 @@ pub(crate) struct DeployOutput {
     pub(super) timing: DeployTiming,
     pub(super) route_host: Option<String>,
     pub(super) workload: DeployWorkload,
-    /// Extra socat for the operator's pinned host port after dual-live cutover.
-    ///
-    /// Held here, not in `AppState`, until `mark_deployed_with_aux`. That call
-    /// replaces `aux_processes`, which dropped and killed a child pushed earlier.
-    pub(super) fixed_port_socat: Option<tokio::process::Child>,
-    pub(super) fixed_host_port: Option<u16>,
     /// Commit this generation was built from.
     pub(super) rev: Option<String>,
 }

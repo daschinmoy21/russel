@@ -1,98 +1,81 @@
 ---
 title: Examples
-description: Thirteen deployable services — what each proves and how to run it.
+description: Thirteen ready-to-deploy example services, from a minimal web server to Postgres and Vaultwarden, and what each one shows.
 sidebar_position: 5
 keywords: [examples, basic-http, microvm-http, hello-rust, env-config, shortlink, filebrowser, static-test, navidrome, vaultwarden, postgres, redis, caddy, meilisearch]
 ---
 
-All examples live in `examples/` and deploy with the same verbs. VPS smoke tests should use `type = "container"` examples (`microvm-http` needs KVM).
-
-Deploy any of them straight from GitHub by pointing `--config` at its Russelfile; the build runs in that example's folder:
+The `examples/` folder of the Russel repo holds thirteen services. Deploy any of them straight from GitHub by pointing `--config` at its Russelfile:
 
 ```bash
-russel deploy https://github.com/daschinmoy21/russel.git --config examples/vaultwarden/Russelfile.toml
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/<name>/Russelfile.toml
 ```
 
-The `Deploy` column below uses a local checkout instead (needs `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1`, see [First deploy](../getting-started/first-deploy.md)).
+Then find its port and try it:
 
-## Index
+```bash
+russel ps
+curl http://127.0.0.1:<host-port>/
+```
 
-| Example | Runtime | What it proves | Deploy |
+Use the example's `service.name` with `russel status` and `russel logs`. For `basic-http` that's `api`; for the rest it's the folder name.
+
+## The list
+
+All run as containers, and so work on a VPS without KVM, except `microvm-http`.
+
+| Example | What it shows |
+|---|---|
+| `basic-http` | A small Go server with `/health` and a static page. The Quickstart uses it. |
+| `microvm-http` | The same Go server as a microVM. Needs KVM. |
+| `hello-rust` | A minimal Rust HTTP server |
+| `env-config` | Env vars and a `secret://` value. Set the secret first (below). |
+| `shortlink` | An in-memory URL shortener |
+| `filebrowser` | A web file manager with a login |
+| `static-test` | A static site on port 8000 |
+| `navidrome` | A music server from nixpkgs, with two volumes |
+| `vaultwarden` | A Bitwarden-compatible password server from nixpkgs |
+| `postgres` | PostgreSQL from nixpkgs, with its data in a folder you prepare |
+| `redis` | Redis from nixpkgs, with a data volume |
+| `caddy` | Caddy serving files, with no state |
+| `meilisearch` | A search engine from nixpkgs, with a data volume |
+
+## `env-config`
+
+Store the secret before deploying, or the deploy fails:
+
+```bash
+printf '%s' "not-a-real-secret" | russel secrets set DEMO_SECRET
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/env-config/Russelfile.toml
+```
+
+Its `/` page returns `GREETING` and `LOG_LEVEL` as JSON, plus whether `DEMO_SECRET` is set and how long it is. It never returns the secret itself.
+
+## `filebrowser`
+
+Filebrowser requires a login. The example sets a demo password in its Russelfile; change it to a `secret://` value before exposing the app anywhere. Its start script is `entrypoint.sh`, next to the Russelfile.
+
+## Apps from nixpkgs
+
+`navidrome`, `vaultwarden`, `postgres`, `redis`, `caddy`, and `meilisearch` have no `flake.nix`. Each sets `service.package` to a nixpkgs attribute and runs it directly.
+
+Apps that listen on `127.0.0.1` by default are told to use `0.0.0.0`, because a container app listening only on loopback can't be reached through its published port.
+
+| Example | Port | Volumes | Notes |
 |---|---|---|---|
-| `basic-http` | container | Go `/health` + static assets; the default first deploy | `russel deploy examples/basic-http` |
-| `microvm-http` | microvm | Same app as `basic-http` on the microVM path | `russel deploy examples/microvm-http` |
-| `hello-rust` | container | Pure-std Rust HTTP, 128mb | `russel deploy examples/hello-rust` |
-| `env-config` | container | `[service.env]` + `secret://DEMO_SECRET` | Set secret first, then deploy (below) |
-| `shortlink` | container | In-memory URL shortener | `russel deploy examples/shortlink` |
-| `filebrowser` | container | nixpkgs filebrowser wrapper; **requires auth, loopback bind in guest** | See filebrowser notes |
-| `static-test` | container | Python static site on port 8000 | `russel deploy examples/static-test` |
-| `navidrome` | container | nixpkgs `navidrome` via `service.package`; `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music` | `russel deploy examples/navidrome` |
-| `vaultwarden` | container | nixpkgs `vaultwarden` via `service.package`; `DATA_FOLDER=/data` | `russel deploy examples/vaultwarden` |
-| `postgres` | container | nixpkgs `postgresql` via `service.package`; absolute `host` bind | See package notes |
-| `redis` | container | nixpkgs `redis` via `service.package`; managed `data` volume | `russel deploy examples/redis` |
-| `caddy` | container | nixpkgs `caddy` via `service.package`; stateless file server | `russel deploy examples/caddy` |
-| `meilisearch` | container | nixpkgs `meilisearch` via `service.package`; managed `data` volume | `russel deploy examples/meilisearch` |
+| `navidrome` | 4533 | `data`, `music` | `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music`. The music volume starts empty. Both are kept on destroy. |
+| `vaultwarden` | 8000 | `data` | API only: nixpkgs doesn't ship the web vault. Kept on destroy. |
+| `postgres` | 5432 | none | Data lives in a `host` folder under `RUSSEL_VOLUME_ROOTS`. Russel doesn't run `initdb`; the Russelfile's comments list the setup steps. |
+| `redis` | 6379 | `data` | Uses a demo password |
+| `caddy` | 8080 | none | `caddy file-server --listen :8080` |
+| `meilisearch` | 7700 | `data` | Uses a demo master key. All its data folders point into `/data`, because the root is read-only. |
 
-For `basic-http` (whose `service.name` is `api`):
-
-```bash
-russel ps                                   # find the host port
-curl http://127.0.0.1:<host-port>/health
-russel status api && russel logs api
-```
-
-For another example, use the `service.name` in that example's Russelfile with `russel status` and `russel logs`.
-
-## `env-config` (env + secrets)
-
-Add this to `examples/env-config/Russelfile.toml` to pin the direct host port:
-
-```toml
-[ingress]
-port = 8080
-```
-
-```bash
-printf '%s' "bench-secret" | russel secrets set DEMO_SECRET
-russel deploy examples/env-config
-curl http://127.0.0.1:8080/
-```
-
-Russelfile sets `LOG_LEVEL`, `GREETING`, and `DEMO_SECRET = "secret://DEMO_SECRET"`. Change these values in `[service.env]` to configure the service.
-
-## `filebrowser` (auth-gated)
-
-- Russelfile: port 8080, 256mb, container, `bin = "filebrowser"`.
-- Guest binds loopback and requires auth — do not expose it with `RUSSEL_PUBLISH_BIND=0.0.0.0` without credentials.
-- Demo password handling warns loudly; entrypoint + test script live next to the example (`entrypoint.sh`, `entrypoint_test.sh`).
-
-## Package demos (`service.package`)
-
-These wrap a nixpkgs attr directly, so no `flake.nix`. Their Dockerfiles use the
-upstream image at the same version, only as the bench baseline. All are
-`container`. Apps that default to a loopback listener must bind `0.0.0.0`
-instead: pasta targets the container IP, so a `127.0.0.1` listener is
-unreachable through a published host port.
-
-| Example | Port | Managed volume | Notes |
-|---|---|---|---|
-| `navidrome` | 4533 | `data`, `music` | `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music`; music volume starts empty; `keep = true` |
-| `vaultwarden` | 8000 | `data` | `DATA_FOLDER=/data`; API only (`WEB_VAULT_ENABLED=false`: nixpkgs ships no web vault); `ROCKET_ADDRESS=0.0.0.0`; `keep = true` |
-| `postgres` | 5432 | no | Russel does not run `initdb`; `-D` points at a prepared `host` PGDATA under `RUSSEL_VOLUME_ROOTS` (preparation steps in its Russelfile); runs unprivileged by default, which postgres requires (it refuses root) |
-| `redis` | 6379 | `data` | `--dir /data`, `--bind 0.0.0.0`, demo `--requirepass` |
-| `caddy` | 8080 | no | stateless `caddy file-server --listen :8080` |
-| `meilisearch` | 7700 | `data` | `MEILI_DB_PATH`, `MEILI_DUMP_DIR`, `MEILI_SNAPSHOT_DIR` on `/data` (the rootfs is read-only); `MEILI_MASTER_KEY` demo key |
-
-`redis` and `meilisearch` ship public demo secrets (`demo-only-not-for-production`); override them with `secret://` refs before exposing anything.
-
-## `basic-http` vs `microvm-http`
-
-Same Go app, different `service.type`. Use them as a runtime A/B: identical `/health` + static `index.html`, only the isolation differs. Container settings in the `basic-http` Russelfile apply there; KVM/TAP/`RUSSEL_KERNEL_PATH` apply to `microvm-http`.
+`redis` and `meilisearch` ship public demo passwords (`demo-only-not-for-production`). Replace them with `secret://` values before exposing either.
 
 ## Dockerfiles
 
-Per-example Dockerfiles exist as a **baseline for benchmarks** (`bench.sh` raw-podman path), not as a Russel input. Russel never consumes Dockerfiles — it consumes the Nix closure.
+Some examples include a Dockerfile. Russel ignores them; they exist so [Benchmarks](../guides/benchmarks.md) can compare against plain Podman.
 
 ## Related
 
-- [First deploy](../getting-started/first-deploy.md) · [Russelfile](./russelfile.md) · [Benchmarks](../guides/benchmarks.md)
+- [Quickstart](../quickstart.md) · [Russelfile](./russelfile.md) · [Benchmarks](../guides/benchmarks.md)

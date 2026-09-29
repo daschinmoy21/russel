@@ -48,19 +48,19 @@ curl http://127.0.0.1:3100/health
 russel logs api
 ```
 
-> **Note:** Russel picks a free host port (3100 and up) unless the Russelfile pins one. It can change on the next deploy, so use `russel ps` to find it. To pin it, add `[ingress]` with `port = 8080` to the Russelfile. For a stable name instead of a port, see [Traefik ingress](./guides/traefik-ingress.md).
+> **Note:** Russel picks a free host port (3100 and up), and an update can move the app to a new one, so use `russel ps` to find it. For a name that stays the same, use [Traefik ingress](./guides/traefik-ingress.md). To keep one port, pin it with `[ingress].port`.
 
 ## 3. Update and roll back
 
-After the first deploy, ship changes with `russel update`. Commit a change to the app or the Russelfile, then build the source's latest commit:
+After the first deploy, use `russel update` to ship changes. `--refresh` builds the latest commit on the repo's default branch:
 
 ```bash
 russel update api --refresh
 ```
 
-Without `--refresh`, `update` rebuilds the commit that is already running, which is how you pick up a changed secret. Running `deploy` again with the same commit and Russelfile does nothing.
+You can't push to the example repo, so here this rebuilds the same code. With your own app, you push a commit and then run the same command. Without `--refresh`, `update` rebuilds the commit that is already running, which is how you pick up a changed secret.
 
-A redeploy starts the new version next to the old one and switches traffic over once the new one answers, so the app keeps serving. The old one keeps running for 2 more seconds (`switch · New version is live; …`). If the new version fails to start, or crashes within those 2 seconds, traffic stays on (or goes back to) the old one and `update` exits non-zero. [When a deploy counts as ready](./concepts/lifecycle.md#when-a-deploy-counts-as-ready) has the details.
+An update starts the new version next to the old one and switches traffic once the new one answers, so the app keeps serving. The old version keeps running for 2 more seconds. If the new version fails to start, or crashes within those 2 seconds, traffic stays on (or goes back to) the old one and `update` exits non-zero. [When a deploy counts as ready](./concepts/lifecycle.md#when-a-deploy-counts-as-ready) has the details.
 
 Go back to the previous version yourself:
 
@@ -89,7 +89,9 @@ git add Russelfile.toml && git commit -m "Add Russelfile" && git push
 russel deploy https://github.com/you/my-app.git
 ```
 
-The server clones the repo itself, so this works the same from your laptop. To deploy a folder that is already on the server instead, keep it somewhere the `russel` account owns, like `/srv/russel-apps`, and run `russel deploy /srv/russel-apps/my-app`. After that, `russel update my-app --refresh` ships each new commit.
+The server clones the repo itself, so this works the same from your laptop. After that, push a commit and run `russel update my-app --refresh` to ship it. For a private repo, see [Single-VPS checklist: Deploy from git](./guides/vps-one-dev.md#4-deploy-from-git).
+
+Deploying a folder that is already on the server is off by default. It needs `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` in `/etc/russel/env`; see [First deploy](./getting-started/first-deploy.md#2-deploy).
 
 If your project has no `flake.nix`, Russel generates one for Rust (`Cargo.toml`), Go (`go.mod`), and static sites. `russel init --with-flake` writes a starter flake you can edit instead. See [Builds](./concepts/builds.md) and the [Russelfile reference](./reference/russelfile.md).
 

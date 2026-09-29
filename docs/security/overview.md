@@ -1,39 +1,43 @@
 ---
 title: Security overview
-description: Threat model, auth, transport, input validation, secrets, and residual risks.
+description: Who Russel trusts, what protects the server and the apps, what's still open, and the rules for running it safely.
 sidebar_position: 1
-keywords: [security, threat model, auth, bearer, ssrf, secrets, isolation]
+keywords: [security, threat model, auth, token, ssrf, secrets, isolation]
 ---
 
-Russel is a privileged daemon for a **single trusted operator**. It is not multi-tenant. Harden the host, keep ctrl on loopback, and only deploy trusted repos unless `RUSSEL_NIX_RESTRICTED=1`.
+Russel is built for **one trusted operator on one server**. Anyone with the API token can deploy code that runs on the server, so the token is as sensitive as an SSH key. Russel doesn't separate users or teams from each other.
 
-## Trust boundaries
+## What protects what
 
-| Layer | Mechanism |
+| Area | Protection |
 |---|---|
-| API auth | Bearer on every route when `RUSSEL_API_TOKEN` set (≥32 chars after trim, printable ASCII, constant-time compare). Non-loopback bind refuses to start without a token. `RUSSEL_REQUIRE_AUTH=1` fails closed even on loopback. Loopback without a token is dev mode (warns). |
-| Transport | HTTP-only ctrl. Terminate TLS at Caddy/nginx/Traefik or use the anchored SSH tunnel. CLI/dashboard refuse Bearer over `http://` to non-loopback unless `--insecure` / `RUSSEL_INSECURE_CLEARTEXT=1`. |
-| Input validation | `service_id` `[A-Za-z0-9-_]` max 128; `bin` `[A-Za-z0-9._+-]` max 256; config path `openat` + `O_NOFOLLOW` chain, 1 MiB cap, symlinks rejected; env key/value rules (reserved incl. `IFS`/`PATH`/`LD_*`, no NUL/newline, 4096 B, 64 keys); secret-name charset; podman passthrough allowlist (Russel-owned + isolation-weakening flags rejected). |
-| SSRF guard | Repo URLs `https/http/ssh/git@` only; literal-IP hosts checked against link-local + cloud-metadata ranges (all schemes). `repo_url` userinfo redacted in logs/metadata. |
-| Secrets | Host store `0600`/`0700`, atomic writes, names-only over API, resolved at deploy, never in argv. microVM `deploy.env` is `0600`; containers get `secret://` values as Podman secrets (not in argv or `podman inspect`); plain `-e` values are visible via `podman inspect`. |
-| Workload isolation | microVM: KVM boundary, ro store share, no guest shell. Container: rootless, `--cap-drop ALL`, `no-new-privileges`, `--read-only`, tmpfs `/tmp` + `/run`. |
-| Host integrity | Orphan-only TAP cleanup; no host-chain iptables mutation; CH socket + service dirs `0700`; PID ownership via `/proc/<pid>/cmdline` before signals; kill + wait with timeout; deploy semaphore (default 4) + per-service guard; `flock` single-instance. |
+| The server | The control plane and every app run as the unprivileged `russel` account. Nothing runs as root after install. An app that escaped its sandbox would land in that account, with no `sudo`, no SSH keys, and none of your files. |
+| The API | Every request needs the token: at least 32 characters, compared in constant time. The control plane refuses to listen on a public address without one. |
+| The connection | The control plane speaks plain HTTP on `127.0.0.1` only. Reach it through an SSH tunnel or an HTTPS proxy. The CLI and dashboard refuse to send the token over plain HTTP to another host. |
+| Apps | Containers are rootless, drop all Linux capabilities, can't gain privileges, and have a read-only root. MicroVMs (experimental) add a separate kernel. |
+| Secrets | Stored with mode `0600` in a `0700` folder, never returned by the API, and never put on a command line. Containers receive them as Podman secrets. |
+| Input | Service names, paths, env vars, secret names, and Podman flags are checked before use. The Russelfile must be a real file in the repo, under 1 MiB. |
+| Git URLs | Only `https://`, `http://`, `ssh://`, and `git@` URLs. Hosts that are, or resolve to, private, loopback, link-local, or cloud-metadata addresses are refused, and HTTP redirects are not followed. |
 
-## What is still open
+## Known limits
 
-- DNS-rebinding around the SSRF guard (no DNS resolution), metadata-IP redirects during clone.
-- Plain (non-`secret://`) container env is visible via `podman inspect` (by design; use `secret://` for anything sensitive).
-- Nix builds trust source repos (see [Nix builds](./nix-builds.md)).
-- No native ctrl TLS, no CORS, no deb/OCI packaging, no multi-tenant isolation, no managed DBs.
+- **Builds run repo code.** A Nix build runs code from the repo as the `russel` account. Deploy only repos you trust, or see [Nix build security](./nix-builds.md).
+- **DNS rebinding.** Russel resolves a git host and checks the address before cloning, but `git` resolves it again. A malicious DNS server could answer differently the second time.
+- **Plain env vars are visible** to `podman inspect` as the `russel` account. Use `secret://` for anything sensitive.
+- **No built-in HTTPS** in the control plane. Use a proxy or the tunnel.
+- **No isolation between users or teams.** Everyone with the token has full control.
 
-## Operator rules
+## Rules for running it
 
-1. Bind `127.0.0.1:7878`; expose via proxy/tunnel only.
-2. Strong token + `RUSSEL_REQUIRE_AUTH=1`; env file `0600`; `/var/lib/russel` `0700`.
-3. Firewall blocks `:7878` directly; proxy strips `/api`, keeps NDJSON unbuffered.
-4. Git URLs remotely; local paths only on trusted hosts with the explicit opt-in.
-5. `type = "container"` on no-KVM VPS; microVMs only where KVM/TAP/iptables are privileged.
+1. Keep the control plane on `127.0.0.1:7878`, and block 7878 in the firewall.
+2. Keep `/etc/russel/env` private: the installer makes it `root:russel`, mode `0640`. Anyone in the `russel` group can read the token, so add only people you trust with the server.
+3. Reach the API through the SSH tunnel or an HTTPS proxy only.
+4. Deploy from git URLs. Leave `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY` off unless you are the server's only user.
+5. Put every password and key behind `secret://`.
+6. Use containers on servers without KVM. Treat microVMs as experimental.
+
+To report a vulnerability, see `SECURITY.md` in the repo.
 
 ## Related
 
-- [Nix builds](./nix-builds.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [Env and secrets](../guides/env-secrets.md) · [Environment](../reference/environment.md)
+- [Nix build security](./nix-builds.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [Env and secrets](../guides/env-secrets.md) · [Environment reference](../reference/environment.md)

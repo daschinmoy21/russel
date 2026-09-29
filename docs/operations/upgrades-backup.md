@@ -1,60 +1,78 @@
 ---
 title: Upgrades and backups
-description: Upgrade binaries without losing tokens, state, or history — and back up what matters.
+description: Upgrade Russel without losing your token, secrets, or history, and back up the files that matter.
 sidebar_position: 2
-keywords: [upgrade, backup, state, metadata, secrets, deployments]
+keywords: [upgrade, backup, restore, state, secrets, deployments]
 ---
 
-Upgrades replace binaries and restart the unit. They must never delete the env file or state dir.
+An upgrade replaces the `russel-ctrl` binary and restarts the service. Your apps keep running through it, and your token and state stay where they are.
 
 ## What to back up
 
-| Path | Contains | Perms |
-|---|---|---|
-| `/etc/russel/env` | `RUSSEL_API_TOKEN` (+ optional ctrl env) | `0640` `root:russel` (installer), `0600` (NixOS) |
-| `~/.config/russel/config.toml` | CLI login (URL + token) | `0600` |
-| `/var/lib/russel/` | `metadata.json` per service, `deployments.json` history, `secrets/` store, `traefik/dynamic/`, `rootfs/`, logs | `0700` `russel:russel` (secrets `0600`) |
-| `/nix/store` | Build closures (rebuilt if lost, but slow) | — |
+| Path | Holds |
+|---|---|
+| `/etc/russel/env` | The API token and any control-plane settings |
+| `/var/lib/russel/` | Secrets, volumes, deployment history, and each service's metadata and logs |
+| `~/.config/russel/config.toml` | The CLI's saved login, on each machine you use it from |
+
+The Nix store doesn't need a backup: Russel rebuilds anything missing on the next deploy, just more slowly.
 
 ```bash
-umask 077
-sudo tar -czf russel-backup-$(date +%F).tar.gz /etc/russel/env /var/lib/russel ~/.config/russel/config.toml
+sudo tar -czf russel-backup-$(date +%F).tar.gz /etc/russel/env /var/lib/russel
+sudo chmod 600 russel-backup-*.tar.gz
 ```
 
-Restore as root with `tar -xzpf` so ownership (`russel`, and the rootless Podman sub-ids inside volumes) comes back as it was.
+The archive contains your secrets, so store it somewhere private. Restore it as root with `sudo tar -xzpf … -C /`, which keeps file owners, including the rootless Podman ids inside volumes.
 
-Bench scripts move/replace `/var/lib/russel` (and legacy `/var/lib/microvms`) with a `flock` run-lock — never run bench and prod ctrl on the same state dir.
+## Upgrade: Debian, Ubuntu, and other systemd distributions
 
-## Upgrade — other Linux
+Run the installer again with the new version:
 
-Rebuild the release from an updated checkout of the public mirror, then reinstall from that checkout:
+```bash
+curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
+  | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
+```
+
+It keeps `/etc/russel/env` and `/var/lib/russel`, replaces the binary, and restarts the service. If the new version doesn't come up, it puts the old binary back. Upgrade the CLI on each machine the same way, with `cli` in place of `host` and without `sudo`.
+
+From source:
 
 ```bash
 cd russel && git pull
 cargo build --release -p russel-cli -p russel-ctrl
-sudo ./contrib/install.sh host # replaces binary, keeps env + state, restarts unit
-./contrib/install.sh status
+sudo ./contrib/install.sh host
+./contrib/install.sh cli
 ```
 
-Direct replacement (not from v0.1.0: that leaves its broken unit in place, so use `install.sh host` or follow [systemd and NixOS: Upgrading from v0.1.0](./systemd-nixos.md)):
+Upgrading from v0.1.0 also replaces its service unit, which stopped containers from starting. Use the installer for that upgrade, because copying the binary by hand leaves the old unit in place. See [systemd and NixOS](./systemd-nixos.md).
+
+Check the result:
 
 ```bash
-sudo install -Dm755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
-sudo systemctl restart russel-ctrl
-./contrib/install.sh status
+russel --version
+russel ps
 ```
 
-The installer restores the previous binary if the restart probe fails. Verify with `russel ps` and one `russel status <id>`.
+## Upgrade: NixOS
 
-## Upgrade — NixOS
+Build the new `russel-ctrl` on the machine, install it at the path `services.russel.bin` points to, and restart:
 
-Normal module activation flow; retains the configured `environmentFile` and state dir. Bump the flake input / `services.russel.package`, `nixos-rebuild switch`, then `russel ps`.
+```bash
+cd russel && git pull
+cargo build --release -p russel-ctrl
+sudo install -m 755 target/release/russel-ctrl /usr/local/bin/russel-ctrl
+sudo systemctl restart russel
+```
 
-## Rollback of the control plane
+If you set `services.russel.package` instead, update that package and run `nixos-rebuild switch`. Either way `environmentFile` and `/var/lib/russel` are left alone.
 
-- Other Linux: the installer keeps the previous binary on failed restart; otherwise reinstall the prior `target/release/russel-ctrl` and `sudo systemctl restart russel-ctrl`.
-- Workload rollback (app versions) is separate — see [Update and rollback](../guides/update-rollback.md). Ctrl restarts never destroy workloads; reconcile re-adopts them.
+## Going back to the previous version
+
+- **Installer:** if the new version fails to start, the installer restores the old binary for you. To go back later, run the installer again with the older `RUSSEL_VERSION`.
+- **Apps:** rolling back an app is separate from rolling back Russel; see [Update and rollback](../guides/update-rollback.md).
+
+Restarting or replacing the control plane never stops or removes your apps. On start it finds them and takes them back over.
 
 ## Related
 
-- [systemd and NixOS](./systemd-nixos.md) · [Update and rollback](../guides/update-rollback.md) · [Troubleshooting](../guides/troubleshooting.md)
+- [systemd and NixOS](./systemd-nixos.md) · [Installation](../getting-started/installation.md#upgrade) · [Troubleshooting](../guides/troubleshooting.md)

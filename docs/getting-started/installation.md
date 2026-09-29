@@ -36,7 +36,7 @@ sudo apt install -y podman uidmap dbus-user-session git
 **Install Nix** with the multi-user (daemon) installer, and turn on flakes for everyone:
 
 ```bash
-sh <(curl -L https://nixos.org/nix/install) --daemon
+curl -L https://nixos.org/nix/install | sh -s -- --daemon
 echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
 sudo systemctl restart nix-daemon
 ```
@@ -129,12 +129,12 @@ Install the CLI on the laptop (Option A with `cli`, or Option B's `install.sh cl
 ```bash
 umask 077 && mkdir -p ~/.config/russel
 scp user@server:/etc/russel/env ~/.config/russel/env
-./contrib/install.sh connect user@server
+curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | bash -s -- connect user@server
 russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
 russel ps
 ```
 
-`connect` starts a background SSH forward from the laptop's `127.0.0.1:7878` to the server's. It fails loudly if the forward cannot be set up. Keep it running while you use the CLI or dashboard. If you prefer to run it by hand:
+From a checkout, `./contrib/install.sh connect user@server` does the same. `connect` starts a background SSH forward from the laptop's `127.0.0.1:7878` to the server's. It fails loudly if the forward cannot be set up. Keep it running while you use the CLI or dashboard. If you prefer to run it by hand:
 
 ```bash
 ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
@@ -198,7 +198,7 @@ Run the same install command with the new version. Your token and `/var/lib/russ
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | sudo RUSSEL_VERSION=v0.2.0 bash -s -- host
+  | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
 ```
 
 From source: `git pull`, rebuild, and run `sudo ./contrib/install.sh host` again. If the new binary fails to start, the installer puts the old one back.

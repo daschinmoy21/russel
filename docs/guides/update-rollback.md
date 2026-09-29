@@ -1,74 +1,69 @@
 ---
 title: Update and rollback
-description: Re-apply the Russelfile from the recorded source and roll back to prior versions.
+description: Ship new commits with russel update, see past deployments, and go back to an earlier one.
 sidebar_position: 5
-keywords: [update, rollback, redeploy, deployments, desired state]
+keywords: [update, rollback, redeploy, deployments, history]
 ---
 
-Redeploying an existing id kills + waits for the old generation before reusing ports. If the new deploy fails after a prior success, Russel attempts automatic rollback and reports `rolled_back` (CLI still exits non-zero so CI notices).
+Use `russel deploy` once per service. After that, `russel update` ships changes and `russel rollback` goes back.
 
-## Generations are pinned to commits
+## Every deployment is pinned to a commit
 
-Every deploy records the commit it built (`rev`) and whether the deployed tree had uncommitted changes (`dirty`). A clean tree means the Russelfile is committed too, so the commit pins it. That makes deploys work like Nix generations:
+Each deployment records the commit it was built from. When the working tree was clean, that commit also pins the Russelfile. So:
 
-- `russel deploy` (alias `apply`) of the commit and Russelfile a running service already has returns `unchanged` without rebuilding or restarting. Pass `--force` to redeploy anyway, or use `russel update`. A dirty tree or a source outside git always deploys.
-- `update` and `rollback` rebuild a clean generation's recorded commit exactly, even after the branch has moved. A dirty generation builds what its source holds now. A local path is cloned for this, so your working tree is never touched.
+- Running `russel deploy` again with the commit and Russelfile the service already runs does nothing and reports `unchanged`. Pass `--force` to redeploy anyway.
+- `update` (without `--refresh`) and `rollback` rebuild a recorded commit exactly, even after the branch has moved on.
+- A deployment made from a folder with uncommitted changes isn't pinned. Rebuilding it uses whatever the folder holds at that time.
 
 ## Update
 
-Deploy once with `russel deploy`, then use `russel update` for everything after that. To ship new commits:
+Ship the latest commit on the repo's default branch:
 
 ```bash
-russel update <id> --refresh
+russel update my-app --refresh
 ```
 
-Without `--refresh`, `russel update` redeploys the running generation's `repo_url`, `config_path`, and commit. Secrets are resolved again, so this is how to restart with a rotated secret. `--refresh` builds the source's current commit instead, and so does passing `--repo` or `--config`. The file's `service.name` must equal `<id>`:
+Rebuild the commit that's already running, for example after changing a secret:
 
 ```bash
-russel update <id> [--refresh] [--repo REPO] [--config PATH]
+russel update my-app
 ```
 
-Same NDJSON stream, semaphore, and shutdown guards as `deploy`. API: `POST /vm/{id}/update` with optional `{"repo_url":…, "config_path":…, "refresh":true}`.
+Deploy from a different repo or Russelfile path (this implies `--refresh`). The Russelfile's `service.name` must still be `my-app`:
 
-## Deployment history
+```bash
+russel update my-app --repo https://github.com/you/fork.git --config Russelfile.toml
+```
 
-Each success appends a versioned row to `/var/lib/russel/<id>/deployments.json` (cap 20, newest first). Prior `active` becomes `previous` (one); older `previous` rows become `superseded`.
+The new version starts next to the old one and traffic switches once it answers. If the new version fails, or crashes within 2 s, the old one keeps serving and `update` exits non-zero. Services with `[[ports]]` or a pinned `[ingress].port` stop first and have a short gap, and keep their ports. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers each case.
+
+## See past deployments
+
+Russel keeps the last 20 deployments of each service, newest first:
+
+```bash
+TOKEN="$(sed -n 's/^RUSSEL_API_TOKEN=//p' ~/.config/russel/env)"
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7878/vm/my-app/deployments
+```
 
 | Field | Meaning |
 |---|---|
-| `version` | Monotonic per-service number |
-| `status` | `active` / `previous` / `superseded` / `rolled_back` |
-| `desired_state` | What the deploy resolved (`repo_url`, `config_path`, `rev`, `dirty`, `runtime`, `env`, `podman_args`, ports). Rebuilds reuse only `repo_url`, `config_path`, and `rev` |
-| `rollback_ready` | Whether this row can be a rollback target |
+| `version` | Number that goes up with each deployment of this service |
+| `status` | `active` (running now), `previous` (the one before), `superseded` (older), or `rolled_back` |
+| `desired_state` | What was deployed: repo, Russelfile path, commit (`rev`), whether the tree was dirty, runtime, env, ports |
+| `rollback_ready` | Whether you can roll back to it |
+
+## Roll back
 
 ```bash
-curl http://127.0.0.1:7878/vm/my-app/deployments
+russel rollback my-app              # the previous deployment
+russel rollback my-app --version 3  # a specific one
 ```
 
-## Explicit rollback
+A rollback rebuilds that deployment's commit through the normal pipeline, so it takes as long as a deploy and streams the same progress. A deployment with no recorded source can't be rolled back, and the command says so.
 
-```bash
-russel rollback my-app               # latest previous with rollback_ready
-russel rollback my-app --version 3
-```
-
-or through the API:
-
-```bash
-curl -X POST http://127.0.0.1:7878/vm/my-app/rollback \
-  -H 'Content-Type: application/json' -d '{}'          # latest previous with rollback_ready
-curl -X POST http://127.0.0.1:7878/vm/my-app/rollback \
-  -H 'Content-Type: application/json' -d '{"version": 3}'
-```
-
-`POST /vm/{id}/rollback` redeploys the target row's `repo_url`, `config_path`, and `rev` through the normal pipeline (NDJSON stream), so it builds the target generation's code even if the branch has moved. A row marked `dirty` is not pinned (its commit may not hold the Russelfile or the changes it ran with) and builds what its source holds now, as do `update` and health restarts of a dirty generation. A row from before commits were recorded has no `rev` and builds what its source points to now. No recorded source → `409` with a clear message. Rollback validates the `.bak` metadata **before** restoring directories, re-reserves ports with checked conversions, restores persisted `desired_state` env, re-boots, and only reports `rolled_back` after readiness.
-
-## Zero-downtime note
-
-Live-prior redeploys use dual-live candidates (`<id>_g<gen>` + fresh backend port + `Ingress::swap` cutover, then drain + promote). Between the swap and the drain, the previous generation keeps running for 2 s. If the new one crashes in that window, traffic goes back to the previous one and `update` fails, so an update can't replace a working version with one that dies on start-up. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers every case, including first deploys and services with `[[ports]]`.
-
-Instant retain-N=2 cutover (keeping the previous artifact hot without a rebuild) is a follow-up — current rollback re-runs the pipeline.
+Russel also rolls back on its own: if an update fails after an earlier version worked, it restores that version, waits for it to answer, and reports `rolled_back`. The CLI exits non-zero so scripts still see the failure.
 
 ## Related
 
-- [Lifecycle](../concepts/lifecycle.md) · [API](../reference/api.md) · [Troubleshooting](./troubleshooting.md)
+- [Lifecycle](../concepts/lifecycle.md) · [CLI reference](../reference/cli.md) · [API reference](../reference/api.md) · [Troubleshooting](./troubleshooting.md)

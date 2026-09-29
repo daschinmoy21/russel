@@ -1,31 +1,27 @@
 ---
 title: TLS reverse proxy
-description: Terminate TLS for russel-ctrl with Caddy or nginx — loopback ctrl, /api stripping, unbuffered NDJSON.
+description: Reach the control plane and dashboard over HTTPS by putting Caddy, nginx, or Traefik in front of it.
 sidebar_position: 2
-keywords: [tls, caddy, nginx, reverse proxy, https, api stripping, ndjson]
+keywords: [tls, https, caddy, nginx, traefik, reverse proxy]
 ---
 
-`russel-ctrl` speaks plain HTTP and has no built-in TLS. For split access, keep it on `127.0.0.1:7878` and terminate TLS at Caddy or nginx. The CLI refuses to send a Bearer token over cleartext HTTP to a non-loopback host.
-
-## Recommended layout
+`russel-ctrl` only speaks plain HTTP on `127.0.0.1:7878`. To reach it from elsewhere without an SSH tunnel, put a reverse proxy on the same server that handles HTTPS and forwards to it.
 
 ```text
-CLI / dashboard
-      | HTTPS + Bearer
-      v
-Reverse proxy :443
-      | HTTP on loopback
-      v
-russel-ctrl 127.0.0.1:7878
+CLI or browser ──HTTPS──> proxy :443 ──HTTP──> russel-ctrl 127.0.0.1:7878
 ```
 
-The dashboard and CLI use the same HTTPS origin in topology C. The dashboard token is entered at runtime and stored in tab-scoped `sessionStorage`; CLI login writes the CLI config and does not fill the dashboard.
+The control plane serves the dashboard at `/` and the API at both `/` and `/api/`, so the proxy forwards everything as-is. The only special setting: turn off response buffering, because deploys stream their progress line by line, and a buffering proxy holds it all back until the deploy ends.
 
-On other Linux, install the loopback control plane with `./contrib/install.sh host`. On NixOS use `services.russel`. Keep the env file mode `0600` and fail-closed auth on.
+## What you'll need
+
+- A working install ([Installation](../getting-started/installation.md)).
+- A DNS name for the server, such as `russel.example.com`.
+- Ports 80 and 443 open. Keep 7878 closed.
 
 ## Caddy
 
-Ctrl already serves the dashboard at `/` and the API at both `/vms` and `/api/vms`. A proxy can forward the whole origin to loopback:
+Caddy gets and renews the certificate on its own once DNS points at the server.
 
 ```caddyfile
 russel.example.com {
@@ -35,30 +31,9 @@ russel.example.com {
 }
 ```
 
-Serving `dashboard/dist` yourself and stripping `/api` still works:
-
-```caddyfile
-russel.example.com {
-    root * /srv/russel/dashboard/dist
-
-    handle_path /api/* {
-        reverse_proxy 127.0.0.1:7878 {
-            flush_interval -1
-        }
-    }
-
-    handle {
-        try_files {path} {path}/ /index.html
-        file_server
-    }
-}
-```
-
-`flush_interval -1` keeps deploy NDJSON progress streams unbuffered. Caddy obtains and renews certificates when DNS points at the host.
+`flush_interval -1` sends deploy progress through as it happens.
 
 ## nginx
-
-The rewrite changes `/api/vms` to `/vms` before proxying to `127.0.0.1:7878/`. Static dashboard stays on the same HTTPS origin:
 
 ```nginx
 server {
@@ -67,34 +42,24 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/russel.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/russel.example.com/privkey.pem;
-    root /srv/russel/dashboard/dist;
 
-    location /api/ {
-        rewrite ^/api/(.*)$ /$1 break;
+    location / {
         proxy_pass http://127.0.0.1:7878;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
-        proxy_set_header Authorization $http_authorization;
-        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_buffering off;
         proxy_read_timeout 3600s;
     }
-
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
 }
 ```
 
-`/api/` must keep `proxy_buffering off` so deploy NDJSON events arrive as emitted. If the dashboard uses the bare `/api` path, add a matching exact-location rewrite to `/`.
+`proxy_buffering off` streams deploy progress, and the long `proxy_read_timeout` keeps slow first builds from being cut off.
 
-Minimal ctrl-only proxy (no dashboard) is the same `location /` variant with `proxy_buffering off` + long `proxy_read_timeout` — see the pre-stack `security-tls.md` history if needed.
+## Traefik
 
-## Traefik for the control plane
-
-Point a separate router at loopback ctrl (do not expose `:7878` publicly). Do not confuse this with app ingress:
+If you already run Traefik for your apps, add a router for the control plane to its dynamic config. Put it in its own file, outside the folder Russel writes to:
 
 ```yaml
 http:
@@ -112,36 +77,24 @@ http:
           - url: "http://127.0.0.1:7878"
 ```
 
-If Traefik already runs for app ingress, add this router alongside the per-service `Host(<id>.<domain>)` files Russel writes.
+Traefik streams responses by default, so no extra setting is needed.
 
-## SSH alternative
-
-Without a public cert, use the installer-managed tunnel:
+## Log in
 
 ```bash
-./contrib/install.sh connect user@host
-russel login http://127.0.0.1:7878 --token-file ~/.config/russel/env
+russel login https://russel.example.com --token-file ~/.config/russel/env
+russel ps
 ```
 
-Manual equivalent (loopback-anchored, fail if the forward fails):
-
-```bash
-ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
-  -L 127.0.0.1:7878:127.0.0.1:7878 user@host
-```
-
-Keep the tunnel open for CLI/Vite dashboard. Dashboard Settings `/api`.
+For the dashboard, open `https://russel.example.com/`, go to **Settings**, paste the token, and leave the API address at `/api`.
 
 ## Checklist
 
-- [ ] `russel-ctrl` binds `127.0.0.1:7878`
-- [ ] Strong `RUSSEL_API_TOKEN` from a private mode-`0600` env file
-- [ ] Proxy terminates TLS; firewall blocks direct `:7878`
-- [ ] `/api/` strips its prefix before forwarding to ctrl
-- [ ] Caddy low-latency flushing or nginx `proxy_buffering off` for deploy streams
-- [ ] CLI + dashboard use the HTTPS origin in topology C
-- [ ] Dashboard token entered at runtime; CLI login does not populate it
+- [ ] `russel-ctrl` listens on `127.0.0.1:7878` only, and the firewall blocks 7878.
+- [ ] The token file stays private: the installer's `/etc/russel/env` is `root:russel`, mode `0640`.
+- [ ] The proxy doesn't buffer responses.
+- [ ] `russel origin` shows the HTTPS address and says it's reachable.
 
 ## Related
 
-- [Installation](../getting-started/installation.md) · [Single-VPS checklist](./vps-one-dev.md) · [Security overview](../security/overview.md)
+- [Installation](../getting-started/installation.md) · [Dashboard](../getting-started/dashboard.md) · [Single-VPS checklist](./vps-one-dev.md) · [Security overview](../security/overview.md)

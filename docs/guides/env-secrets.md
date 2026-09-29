@@ -1,20 +1,13 @@
 ---
 title: Env and secrets
-description: Configure services with env maps and the host secret store.
+description: Set environment variables in the Russelfile and keep secrets on the server, out of your repo.
 sidebar_position: 4
-keywords: [env, secrets, secret store, env-file, reserved keys]
+keywords: [env, environment variables, secrets, secret store, reserved keys]
 ---
 
-Environment values are declared in the Russelfile under `[service.env]`. Secrets are stored on the host and referenced as `secret://NAME`.
+Environment variables go in the Russelfile under `[service.env]`. Secrets are stored on the server and referenced from the Russelfile as `secret://NAME`, so the repo never contains them.
 
-## Env rules (enforced)
-
-Loading the Russelfile checks `[service.env]`, so a bad key fails before any build. The control plane re-checks the map after resolving secrets.
-
-- Key: `^[A-Za-z_][A-Za-z0-9_]*$`, max 64 keys.
-- Reserved keys rejected: `PORT`, `VM_IP`, `HOST_IP`, `APP`, `IFS`, `PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELL`.
-- Value: no NUL / `\n` / `\r`, max 4096 B.
-- `service.name` uses the service id rule (`[A-Za-z0-9_-]`, max 128). `service.bin` allows the wider `[A-Za-z0-9._+-]`, max 256; it is injected via shell-quoted `deploy.env`.
+## Env vars
 
 ```toml
 [service.env]
@@ -22,45 +15,58 @@ LOG_LEVEL = "info"
 FEATURE_X = "1"
 ```
 
-```bash
-russel deploy .
-```
+Russel checks these when it loads the Russelfile, before any build, and again after filling in secrets.
 
-Injected runtime vars (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are set by Russel — do not define them.
+### Env rules
+
+- Names start with a letter or `_`, followed by letters, digits, or `_`.
+- At most 64 variables. Each value is at most 4096 bytes, on one line.
+- These names are reserved and rejected: `PORT`, `VM_IP`, `HOST_IP`, `APP`, `IFS`, `PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELL`.
+
+Russel sets `PORT` to `service.port` for you. `VM_IP`, `HOST_IP`, and `APP` are set inside microVMs.
 
 ## Secrets
 
-Host store: `/var/lib/russel/secrets/` (dir `0700`, files `0600`, atomic create-new + `O_NOFOLLOW` + fsync + rename). Override dir with `RUSSEL_SECRETS_DIR` (tests only).
+Store a secret by piping its value in. It never appears in your shell history or on a command line:
 
 ```bash
-printf '%s' "$DB_PASSWORD" | russel secrets set DB_PASSWORD   # value from stdin, never argv
-russel secrets list        # names only — values are never returned
+printf '%s' "$DB_PASSWORD" | russel secrets set DB_PASSWORD
+russel secrets list            # names only; values are never shown
 russel secrets delete OLD_KEY
 ```
 
-HTTP (Bearer when configured): `GET /secrets`, `POST /secrets/{name}` (`{"value":"…"}`), `DELETE /secrets/{name}`. Validation failures → `400`; I/O failures → `500`.
-
-Reference in any env map:
+Use it in any env value:
 
 ```toml
 [service.env]
 DB_PASSWORD = "secret://DB_PASSWORD"
 ```
 
-The control plane resolves the value at deploy time and re-validates. Missing secret fails the deploy fail-closed.
+Russel fills in the value at deploy time. If the secret doesn't exist, the deploy fails.
 
-## Runtime differences
+Secret names use letters, digits, `_`, and `-`, up to 64 characters. They're stored in `/var/lib/russel/secrets/`, one file per secret with mode `0600`.
 
-| Runtime | Delivery | Visibility |
+### Changing a secret
+
+Set the new value, then rebuild the running version so it picks it up:
+
+```bash
+printf '%s' "$NEW_PASSWORD" | russel secrets set DB_PASSWORD
+russel update my-app
+```
+
+## Who can see what
+
+| Runtime | Plain env vars | `secret://` values |
 |---|---|---|
-| microVM | `deploy.env` (`0600` in a `0700` dir) via read-only `russelcfg` virtiofs share | Host root + guest init only |
-| Container | Plain values: `podman -e`. `secret://` values: a Podman secret `russel-<id>.<KEY>` (created over stdin, injected with `--secret ...,type=env`) | Plain values show in `podman inspect`; secret values do not, and never reach argv. Podman keeps them in its secret store (`0600`, podman user). Removed with the container. |
+| Container | Visible to `podman inspect` as the `russel` account | Passed as Podman secrets. Not visible to `podman inspect`, never on a command line, removed with the container. |
+| microVM | Written to a private config file shared read-only with the VM | Same as plain vars |
 
-`russel-agent` lifetime RPCs forward the same env contract; agent env passthrough is documented in the agent crate.
+Either way, put anything sensitive behind `secret://`.
 
 ## Example
 
-See `examples/env-config/Russelfile.toml`:
+`examples/env-config` reads two plain variables and one secret:
 
 ```toml
 [service]
@@ -68,7 +74,6 @@ name = "env-config"
 source = "."
 port = 3000
 memory = "128mb"
-type = "container"
 
 [service.env]
 LOG_LEVEL = "info"
@@ -77,11 +82,12 @@ DEMO_SECRET = "secret://DEMO_SECRET"
 ```
 
 ```bash
-printf '%s' "bench-secret" | russel secrets set DEMO_SECRET
-russel deploy examples/env-config
-curl http://127.0.0.1:8080/
+printf '%s' "not-a-real-secret" | russel secrets set DEMO_SECRET
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/env-config/Russelfile.toml
+russel ps                                # find its host port
+curl http://127.0.0.1:<host-port>/
 ```
 
 ## Related
 
-- [First deploy](../getting-started/first-deploy.md) · [Russelfile](../reference/russelfile.md) · [API](../reference/api.md) · [Security overview](../security/overview.md)
+- [First deploy](../getting-started/first-deploy.md) · [Russelfile](../reference/russelfile.md) · [API: secrets](../reference/api.md#endpoints) · [Security overview](../security/overview.md)

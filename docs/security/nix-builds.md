@@ -1,56 +1,66 @@
 ---
 title: Nix build security
-description: Threat model for building untrusted flakes — sandboxing, restricted mode, and nix.conf hardening.
+description: What a malicious repo can do during a build, and how to limit it with restricted mode and nix.conf settings.
 sidebar_position: 2
-keywords: [nix, sandbox, restricted, threat model, flake, auto-generation]
+keywords: [nix, sandbox, restricted, threat model, flake, build security]
 ---
 
-**Nix builds trust the source repo** — a malicious `flake.nix` runs as the build user. Single-operator trusted repos are the default posture. Anything else needs the hardening below.
+A Nix build evaluates the repo's `flake.nix`, and that code runs on your server as the `russel` account. Deploying someone's repo is like running their script. Russel's default assumes you deploy your own, trusted repos.
 
-## Threat model
+## What a malicious repo could do
 
-- Attacker controls the repo (flake, builder expressions, hooks).
-- Build runs as the control-plane user with that user's filesystem/network reachability.
-- Impact without hardening: arbitrary code as the build user, store poisoning, exfiltration via build-time network, host-file reads through impure evaluation.
-- Out of scope for this page: guest escape (see [Runtimes](../concepts/runtimes.md)), ctrl API auth (see [Security overview](./overview.md)).
+Without the settings below, a build could:
+
+- read files the `russel` account can read, through impure evaluation;
+- send data out over the network during the build;
+- put misleading paths into the Nix store.
+
+Escaping an app's sandbox at runtime is a separate question; see [Runtimes](../concepts/runtimes.md). API access is covered in the [Security overview](./overview.md).
 
 ## Restricted mode
 
+If you build repos you don't fully trust, turn on restricted mode:
+
 ```bash
-export RUSSEL_NIX_RESTRICTED=1   # sandboxed nix build + no auto-flake
+echo 'RUSSEL_NIX_RESTRICTED=1' | sudo tee -a /etc/russel/env
+sudo systemctl restart russel-ctrl
 ```
 
-- Forces sandboxed `nix build` (no impure access beyond the sandbox).
-- Disables flake auto-generation (attacker cannot coax a generated flake into an unsafe shape; missing `flake.nix` fails instead).
+Restricted mode:
 
-Use it whenever the source is not fully trusted. Production multi-user hosts should default it on.
+- always builds inside Nix's sandbox, with no access to the host beyond it;
+- stops Russel from writing a flake for repos without one, so every build uses a `flake.nix` that was committed and can be reviewed.
 
-## `nix.conf` hardening
+## `nix.conf` settings
+
+These tighten the Nix daemon for every user. Add them to `/etc/nix/nix.conf` and restart `nix-daemon`:
 
 ```ini
 sandbox = true
 sandbox-fallback = false
-allowed-users = russel
-trusted-users = root
 require-sigs = true
 allow-import-from-derivation = false
+trusted-users = root
 ```
 
-- Keep the store (`/nix/store`) and state (`/var/lib/russel`) on persistent, backed-up volumes.
-- Build users must not be in `trusted-users` beyond what the daemon needs.
-- Pin inputs (`flake.lock`); review auto-generated flakes before committing them (`russel init --with-flake` writes an owned starter instead of a restricted-mode marker).
+- `sandbox = true` with `sandbox-fallback = false` makes a build fail when the sandbox can't be set up.
+- `require-sigs = true` only accepts signed binaries from caches.
+- `allow-import-from-derivation = false` stops evaluation from running a build to decide what to build.
+- Keep `russel` out of `trusted-users`. Trusted users can change daemon settings and bypass these rules.
 
-## Auto-generation note
+## Also
 
-Auto-generated flakes (Rust/Go/static) live in the checkout and evaluate with the repo's purity. In restricted mode they are disabled — commit an explicit `flake.nix` (via `russel init --with-flake` or hand-written) so the build is reviewable.
+- Commit `flake.lock` so inputs are pinned.
+- Review a generated flake before relying on it: `russel init --with-flake` writes one you can read and commit.
+- Back up `/var/lib/russel` and `/etc/russel/env`. Russel can rebuild the Nix store, but not your secrets, volumes, or history.
 
 ## Checklist
 
-- [ ] Trusted repos only, or `RUSSEL_NIX_RESTRICTED=1`
-- [ ] `sandbox = true`, signatures required, least-privilege build user
-- [ ] No auto-flake on untrusted sources; committed `flake.nix` reviewed
-- [ ] Store + state backed up; env/secrets files `0600`
+- [ ] Only trusted repos, or `RUSSEL_NIX_RESTRICTED=1`
+- [ ] Sandbox on with no fallback, signatures required
+- [ ] `russel` isn't a trusted Nix user
+- [ ] Committed, reviewed `flake.nix` and `flake.lock` for anything you didn't write
 
 ## Related
 
-- [Builds](../concepts/builds.md) · [Security overview](./overview.md) · [Environment](../reference/environment.md)
+- [Builds](../concepts/builds.md) · [Security overview](./overview.md) · [Environment reference](../reference/environment.md)

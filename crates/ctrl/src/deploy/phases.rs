@@ -13,7 +13,9 @@ use russel_core::{
     config::{
         RuntimeKind, Russelfile, resolve_ingress_host, resolve_primary_publish, validate_env_map,
     },
-    volumes::{ResolvedVolume, extra_port_key, resolve_volumes, volume_roots_from_env},
+    volumes::{
+        ExtraPortSpec, ResolvedVolume, extra_port_key, resolve_volumes, volume_roots_from_env,
+    },
 };
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
     ingress::{Backend, HostRule},
     metadata::load_metadata_from_disk,
     microvm::{KernelInfo, ready},
-    network::{MicrovmNetMode, PortAllocator, TapForwarder},
+    network::PortAllocator,
 };
 
 use super::WATCH_WINDOW;
@@ -181,10 +183,7 @@ impl DeployPipeline {
 
         // Armed once boot reserves ports, so dropping it releases them.
         let mut reservation = None;
-        let mut booted = match self
-            .boot(service_id, &plan, &built, &slot, &mut reservation, &tx)
-            .await
-        {
+        let mut booted = match self.boot(&plan, &built, &slot, &mut reservation, &tx).await {
             Ok(booted) => booted,
             Err(error) => {
                 return self
@@ -203,8 +202,7 @@ impl DeployPipeline {
             .await?;
         self.hold(service_id, &slot, &mut booted.workload, previous_route, &tx)
             .await?;
-        let fixed_port = self
-            .cutover(service_id, &plan, &slot, &booted.workload, &tx)
+        self.cutover(service_id, &plan, &slot, &booted.workload, &tx)
             .await;
         self.record(service_id, &request, &plan, &built, &slot, &booted.workload)
             .await;
@@ -214,7 +212,6 @@ impl DeployPipeline {
             .ok_or_else(|| anyhow::anyhow!("port reservation dropped before deploy completed"))?
             .disarm();
 
-        let (fixed_port_socat, fixed_host_port) = fixed_port.unzip();
         Ok(DeployInnerResult::Success(Box::new(DeployOutput {
             store_path: built.output.store_path,
             port: booted.workload.port().clone(),
@@ -229,8 +226,6 @@ impl DeployPipeline {
             },
             route_host: plan.ingress_host,
             workload: booted.workload,
-            fixed_port_socat,
-            fixed_host_port,
             rev: plan.rev.map(|r| r.rev),
         })))
     }
@@ -291,9 +286,7 @@ impl DeployPipeline {
         tx: &Events,
     ) -> anyhow::Result<Slot> {
         let prior_runtime = resolve_prior_runtime(service_id).await?;
-        // Extra pinned ports cannot move while the old generation still holds
-        // them, so skip dual-live and replace in place.
-        let dual_live = prior_runtime.is_some() && plan.config.ports.is_empty();
+        let dual_live = is_dual_live(prior_runtime, plan.pin_mapping.as_ref(), &plan.config.ports);
 
         // Generation identity: when replacing a live service, boot the candidate
         // under `{service_id}_g{gen}` so the active generation keeps its TAP/port
@@ -408,7 +401,6 @@ impl DeployPipeline {
     /// `reservation` is armed once the primary port is held.
     async fn boot(
         &self,
-        service_id: &str,
         plan: &Plan,
         built: &Built,
         slot: &Slot,
@@ -418,32 +410,13 @@ impl DeployPipeline {
         let key = &slot.runtime_key;
         // Determine port first, then arm the reservation (F-28: avoid
         // releasing the old service's port on early allocation failure).
-        let port = match plan.pin_mapping.clone() {
-            Some(pinned) if !slot.dual_live => {
-                PortAllocator::reserve(key, pinned.host)?;
-                pinned
-            }
-            pinned => {
-                // Dual-live always allocates a fresh backend port for the
-                // candidate so the active generation keeps its listener. Fixed
-                // -p is Traefik-facing after cutover; backend port may differ
-                // across generations.
-                if pinned.is_some() {
-                    tracing::info!(
-                        service_id,
-                        "dual-live redeploy: ignoring fixed -p for candidate backend; \
-                         Traefik host stays stable via Ingress::swap"
-                    );
-                }
-                let ports = self.ports.clone();
-                let owned_key = key.clone();
-                let host = tokio::task::spawn_blocking(move || ports.next(&owned_key)).await??;
-                PortMapping {
-                    host,
-                    guest: plan.config.service.port,
-                }
-            }
-        };
+        let ports = self.ports.clone();
+        let owned_key = key.clone();
+        let pin = plan.pin_mapping.clone();
+        let guest = plan.config.service.port;
+        let port =
+            tokio::task::spawn_blocking(move || reserve_primary(&ports, &owned_key, pin, guest))
+                .await??;
         // Arm before extras so a failed extra reserve releases primary + prior extras.
         *reservation = Some(PortReservation::new(key));
         for (i, extra) in plan.config.ports.iter().enumerate() {
@@ -741,8 +714,7 @@ impl DeployPipeline {
 
     /// Retire what the new generation replaced. Cold: drop the `.bak` dirs.
     /// Dual-live: drain and destroy the old generation, then promote the
-    /// candidate to the stable service id. Returns the socat and host port
-    /// when a pinned host port was won back.
+    /// candidate to the stable service id.
     async fn cutover(
         &self,
         service_id: &str,
@@ -750,14 +722,14 @@ impl DeployPipeline {
         slot: &Slot,
         workload: &DeployWorkload,
         tx: &Events,
-    ) -> Option<(tokio::process::Child, u16)> {
+    ) {
         if !slot.dual_live {
             if slot.has_backup {
                 slot.dirs.remove_backups().await;
             }
             self.state
                 .attach_flake_path(service_id, plan.build_path.clone());
-            return None;
+            return;
         }
 
         // Drain old generation only after successful swap.
@@ -802,32 +774,18 @@ impl DeployPipeline {
             );
             // Keep state under runtime_key so stop/destroy can find it.
             self.state.attach_flake_path(key, plan.build_path.clone());
-            return None;
+            return;
         }
 
-        // Re-key port + in-memory state to the stable service id.
+        // Re-key port + in-memory state to the stable service id. Dual-live
+        // has no pinned ports (`is_dual_live`), so only the primary moves.
         PortAllocator::release_service(key);
         if let Err(e) = PortAllocator::claim_existing(service_id, workload.port().host) {
             tracing::warn!(service_id, error = %e, "failed to claim port under service_id after promote");
         }
-        for (i, extra) in plan.config.ports.iter().enumerate() {
-            if let Err(e) =
-                PortAllocator::claim_existing(&extra_port_key(service_id, i), extra.host)
-            {
-                tracing::warn!(
-                    service_id,
-                    index = i,
-                    host = extra.host,
-                    error = %e,
-                    "failed to claim extra port under service_id after promote"
-                );
-            }
-        }
         self.state.rekey_service(key, service_id);
         self.state
             .attach_flake_path(service_id, plan.build_path.clone());
-
-        reclaim_fixed_port(service_id, plan, workload).await
     }
 
     /// Record the source, the deployment history row, and GC roots.
@@ -951,64 +909,42 @@ fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> an
     })
 }
 
-/// H4: after the old generation is destroyed, reclaim the operator's fixed
-/// `-p` for TAP microVMs only (spawn extra socat — never
-/// TapForwarder::setup, which deletes TAP). Containers keep the candidate
-/// publish port (rebind would require podman recreate), and so do passt
-/// microVMs, whose guest IP the host cannot dial; Traefik is SoT.
-async fn reclaim_fixed_port(
-    service_id: &str,
-    plan: &Plan,
-    workload: &DeployWorkload,
-) -> Option<(tokio::process::Child, u16)> {
-    // Keep 0 out of recovery even if an invalid mapping slipped through.
-    let fixed = plan
-        .pin_mapping
-        .as_ref()
-        .map(|p| p.host)
-        .filter(|&h| h != 0)?;
-    let DeployWorkload::Microvm {
-        alloc,
-        port,
-        net_mode: MicrovmNetMode::Tap,
-        ..
-    } = workload
-    else {
-        return None;
-    };
-    let ephemeral = port.host;
-    if fixed == ephemeral {
-        return None;
-    }
-    // service_id currently holds ephemeral via claim_existing in cutover.
-    if let Err(e) = PortAllocator::reserve(service_id, fixed) {
-        tracing::warn!(
-            service_id,
-            fixed,
-            error = %e,
-            "dual-live fixed port not free — using candidate ephemeral"
-        );
-        return None;
-    }
-    tracing::info!(
-        service_id,
-        fixed,
-        ephemeral,
-        "reclaimed fixed host port after dual-live cutover"
-    );
-    match TapForwarder::spawn_socat(service_id, fixed, &alloc.vm_ip, port.guest).await {
-        Ok(socat) => Some((socat, fixed)),
-        Err(e) => {
-            tracing::warn!(
-                service_id,
-                error = %e,
-                "dual-live fixed-port socat spawn failed; \
-                 traffic remains on ephemeral {ephemeral}"
-            );
-            // Restore ephemeral registration for status/list.
-            let _ = PortAllocator::claim_existing(service_id, ephemeral);
-            None
+/// Whether a replace boots the new generation beside the live one
+/// (dual-live) or stops the live one first (cold).
+///
+/// Dual-live gives the new generation its own host port while the old one
+/// still holds its own, so a pinned host port (`[ingress].port` or a
+/// `[[ports]]` row) cannot move over until the old one is gone. Pinned
+/// services are replaced cold so the pin holds on every runtime: a container
+/// or passt microVM publishes its host port at create and cannot rebind it
+/// afterwards. The cold path still refuses a crashing version: the new one
+/// is watched for [`WATCH_WINDOW`] in `boot`, and a crash restores the
+/// previous generation from its `.bak` dirs.
+fn is_dual_live(
+    prior_runtime: Option<RuntimeKind>,
+    pin: Option<&PortMapping>,
+    extra_ports: &[ExtraPortSpec],
+) -> bool {
+    prior_runtime.is_some() && pin.is_none() && extra_ports.is_empty()
+}
+
+/// The new generation's primary publish under `key`: the pinned host port
+/// when `[ingress].port` is set, else a free one from the allocator.
+fn reserve_primary(
+    ports: &PortAllocator,
+    key: &str,
+    pin: Option<PortMapping>,
+    guest: u16,
+) -> anyhow::Result<PortMapping> {
+    match pin {
+        Some(pinned) => {
+            PortAllocator::reserve(key, pinned.host)?;
+            Ok(pinned)
         }
+        None => Ok(PortMapping {
+            host: ports.next(key)?,
+            guest,
+        }),
     }
 }
 
@@ -1070,5 +1006,80 @@ async fn watch_candidate(
                 &tail,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::network::{port_test_lock, reserve_test_port};
+
+    fn pin(host: u16) -> PortMapping {
+        PortMapping { host, guest: 3000 }
+    }
+
+    #[test]
+    fn pinned_update_is_replaced_cold_on_every_runtime() {
+        for runtime in [RuntimeKind::Container, RuntimeKind::Microvm] {
+            assert!(!is_dual_live(Some(runtime), Some(&pin(8081)), &[]));
+        }
+    }
+
+    #[test]
+    fn unpinned_update_is_dual_live() {
+        assert!(is_dual_live(Some(RuntimeKind::Container), None, &[]));
+        assert!(is_dual_live(Some(RuntimeKind::Microvm), None, &[]));
+    }
+
+    #[test]
+    fn first_deploy_and_extra_ports_are_cold() {
+        assert!(!is_dual_live(None, None, &[]));
+        let extra = [ExtraPortSpec {
+            host: 5432,
+            guest: 5432,
+        }];
+        assert!(!is_dual_live(Some(RuntimeKind::Container), None, &extra));
+    }
+
+    /// The port side of two `russel update`s of a container with
+    /// `[ingress].port`: the live generation holds the pin, the cold path
+    /// releases it (`vacate` → `destroy_prior_runtime`), and the new
+    /// generation reserves it again under the service id.
+    #[test]
+    fn pinned_container_update_keeps_the_pinned_port() {
+        let _lock = port_test_lock();
+        let id = "pin-keep";
+        let pinned = pin(reserve_test_port(id));
+        let ports = PortAllocator;
+
+        // Why dual-live cannot keep a pin: a candidate beside the live
+        // generation cannot take the port the live one holds.
+        let candidate = "pin-keep_gcafe";
+        assert!(reserve_primary(&ports, candidate, Some(pinned.clone()), 3000).is_err());
+        PortAllocator::release_service(candidate);
+
+        for _update in 0..2 {
+            assert!(!is_dual_live(
+                Some(RuntimeKind::Container),
+                Some(&pinned),
+                &[]
+            ));
+            PortAllocator::release_service(id);
+            let port = reserve_primary(&ports, id, Some(pinned.clone()), 3000).unwrap();
+            assert_eq!((port.host, port.guest), (pinned.host, pinned.guest));
+            assert_eq!(PortAllocator::allocated_port(id), Some(pinned.host));
+        }
+        PortAllocator::release_service(id);
+    }
+
+    #[test]
+    fn unpinned_candidate_gets_an_allocated_port() {
+        let _lock = port_test_lock();
+        let key = "pin-none_gbeef";
+        let port = reserve_primary(&PortAllocator, key, None, 3000).unwrap();
+        assert_eq!(port.guest, 3000);
+        assert_eq!(PortAllocator::allocated_port(key), Some(port.host));
+        PortAllocator::release_service(key);
     }
 }
