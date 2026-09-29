@@ -17,7 +17,7 @@
 # Without a local target/release build the installer downloads release assets
 # for RUSSEL_VERSION and verifies each one against the release SHA256SUMS:
 #
-#   curl -fsSL <raw install.sh url> | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
+#   curl -fsSL <raw install.sh url> | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
 #
 # RUSSEL_RELEASE_BASE overrides the artifact base URL. Private GitHub
 # releases also need RUSSEL_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.
@@ -433,7 +433,7 @@ prepare_release() {
   fi
   if ! version="$(release_version)"; then
     echo "no ${RELEASE}/${binary} and RUSSEL_VERSION is unset" >&2
-    echo "set RUSSEL_VERSION (for example v0.1.0), or build with: cargo build --release" >&2
+    echo "set RUSSEL_VERSION (for example v0.1.1), or build with: cargo build --release" >&2
     return 1
   fi
   require_command curl || return $?

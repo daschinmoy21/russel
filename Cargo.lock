@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "russel-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "russel-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "russel-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "russel-ctrl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",

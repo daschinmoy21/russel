@@ -72,9 +72,9 @@ Pick **one** of these. Both run the same checks first and stop if something is m
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
+  | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | RUSSEL_VERSION=v0.1.0 bash -s -- cli
+  | RUSSEL_VERSION=v0.1.1 bash -s -- cli
 ```
 
 The installer downloads the binaries and checks each one against the release `SHA256SUMS` before installing anything. You must name a version; there is no "latest".
@@ -231,7 +231,7 @@ Then `russel deploy` your services again.
 
 | Flag or variable | Meaning |
 |---|---|
-| `RUSSEL_VERSION` | Release to download, such as `v0.1.0`. Required unless you run the script from a checkout with a `target/release` build. |
+| `RUSSEL_VERSION` | Release to download, such as `v0.1.1`. Required unless you run the script from a checkout with a `target/release` build. |
 | `RUSSEL_RELEASE_BASE` | Download from a mirror instead of GitHub Releases. |
 | `--take-state-ownership` | Give an existing `/var/lib/russel` owned by another user (and everything in it) to `russel`. |
 | `--force-unit` | Replace an existing `/etc/systemd/system/russel-ctrl.service` that differs from the shipped one. Review your changes first. |

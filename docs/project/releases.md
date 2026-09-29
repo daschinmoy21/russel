@@ -7,7 +7,7 @@ keywords: [changelog, releases, init, login, nixos, install]
 
 Curated, operator-visible changes. Full history is `git log`.
 
-## 2026-09-29 — containers start under the installed service, and examples deploy from GitHub (#524–#527)
+## 2026-09-29 — v0.1.1: containers start under the installed service, and examples deploy from GitHub (#524–#527)
 
 Fixes from the fresh-machine acceptance run of v0.1.0 (#420).
 

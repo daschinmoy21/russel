@@ -30,7 +30,7 @@ russel-ctrl --log-file /var/lib/russel/ctrl.log
 
 | Flag / env | Default | Meaning |
 |---|---|---|
-| `--version` | — | Print the crate version (`0.1.0` on this release) and exit |
+| `--version` | — | Print the crate version (`0.1.1` on this release) and exit |
 | `--control-plane URL` / `RUSSEL_CONTROL_PLANE` | `russel login` config, else `http://127.0.0.1:7878` | Which ctrl to hit |
 | `--insecure` / `RUSSEL_INSECURE_CLEARTEXT=1\|true\|yes` | off | Allow Bearer over plain HTTP to non-loopback (not recommended; prefer HTTPS) |
 | `RUSSEL_API_TOKEN` | — | Bearer token; **wins** over the login file |

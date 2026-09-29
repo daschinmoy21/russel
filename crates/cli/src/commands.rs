@@ -1684,7 +1684,7 @@ mod tests {
     fn version_flag_is_display_version() {
         let err = Cli::try_parse_from(["russel", "--version"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
-        assert!(err.to_string().contains("0.1.0"));
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

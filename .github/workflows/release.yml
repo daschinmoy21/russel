@@ -145,7 +145,7 @@ jobs:
           cat >"${notes}" <<EOF
           # Russel ${tag}
 
-          First tagged one-operator release.
+          One-operator release. Changes: https://github.com/daschinmoy21/russel/blob/${tag}/docs/project/releases.md
 
           ## Compatibility
 
