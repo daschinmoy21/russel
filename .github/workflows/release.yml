@@ -20,7 +20,7 @@ env:
 jobs:
   binaries:
     name: Binaries ${{ github.ref_name }}
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       # ubuntu-22.04 is glibc 2.35. ubuntu-latest (24.04) binaries fail to
@@ -77,7 +77,7 @@ jobs:
   publish:
     name: Publish ${{ github.ref_name }}
     needs: [binaries]
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     # contrib/release-kernel.sh also rewrites SHA256SUMS; never let two
     # publish runs for one tag interleave on top of that.
