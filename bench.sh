@@ -671,9 +671,10 @@ else
 				BENCH_PGDATA_MICROVM="$pgdata"
 				if [ "$(id -u)" -eq 0 ]; then
 					BENCH_PGDATA_MICROVM="$BENCH_VOLUME_ROOT/postgres-microvm"
-					cp -a "$pgdata" "$BENCH_PGDATA_MICROVM" &&
-						chown -R 65534:65534 "$BENCH_PGDATA_MICROVM" ||
+					if ! cp -a "$pgdata" "$BENCH_PGDATA_MICROVM" ||
+						! chown -R 65534:65534 "$BENCH_PGDATA_MICROVM"; then
 						warn "postgres: could not prepare the microVM PGDATA copy"
+					fi
 				fi
 			else
 				warn "postgres: could not prepare PGDATA; its race will be skipped"
