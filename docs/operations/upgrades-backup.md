@@ -30,7 +30,7 @@ Run the installer again with the new version:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
+  | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 ```
 
 It keeps `/etc/russel/env` and `/var/lib/russel`, replaces the binary, and restarts the service. If the new version doesn't come up, it puts the old binary back. Upgrade the CLI on each machine the same way, with `cli` in place of `host` and without `sudo`.
@@ -43,8 +43,6 @@ cargo build --release -p russel-cli -p russel-ctrl
 sudo ./contrib/install.sh host
 ./contrib/install.sh cli
 ```
-
-Upgrading from v0.1.0 also replaces its service unit, which stopped containers from starting. Use the installer for that upgrade, because copying the binary by hand leaves the old unit in place. See [systemd and NixOS](./systemd-nixos.md).
 
 Check the result:
 

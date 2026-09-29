@@ -881,7 +881,7 @@ expect_main_rc 1 host
 [[ "$(<"${CASE_KERNEL}.previous")" == 'kernel-download' ]] || die "kernel backup missing"
 pass "failed upgrade restores the previous pool kernel with the binary"
 
-# The v0.1.0 unit had PrivateTmp=yes: rootless Podman's pause process pinned
+# The pre-release unit had PrivateTmp=yes: rootless Podman's pause process pinned
 # its private /tmp and every container failed (#524). Upgrading replaces that
 # unit without --force-unit and resets the pause process before restarting.
 new_case
@@ -894,12 +894,12 @@ make_host_binary new-binary
 SYSTEM_ACTIVE=1
 expect_main_rc 0 host
 assert_output_contains 'breaks rootless Podman'
-if grep -q '^PrivateTmp=' "$UNIT_FILE"; then die "v0.1.0 unit was not replaced"; fi
+if grep -q '^PrivateTmp=' "$UNIT_FILE"; then die "pre-release unit was not replaced"; fi
 grep -Fq -- '-u russel -x catatonit' "${CASE_ROOT}/pkill.log" || die "pause process was not reset"
 [[ "$(call_count "${CASE_ROOT}/systemctl-system.log" restart)" == 1 ]] || die "unit was not restarted"
-pass "upgrade replaces the v0.1.0 PrivateTmp unit and resets Podman's pause process"
+pass "upgrade replaces the pre-release PrivateTmp unit and resets Podman's pause process"
 
-# A stopped v0.1.0 unit still leaves the pause process behind (KillMode=process).
+# A stopped pre-release unit still leaves the pause process behind (KillMode=process).
 new_case
 make_host_binary old-binary
 set_curl_mode 401
@@ -909,7 +909,7 @@ printf '%s\n' 'PrivateTmp=yes' >>"$UNIT_FILE"
 make_host_binary new-binary
 expect_main_rc 0 host
 grep -Fq -- '-u russel -x catatonit' "${CASE_ROOT}/pkill.log" || die "pause process was not reset for a stopped unit"
-pass "upgrade resets Podman's pause process when the v0.1.0 unit is stopped"
+pass "upgrade resets Podman's pause process when the pre-release unit is stopped"
 
 # An operator-edited unit without PrivateTmp is still kept, and Podman is left alone.
 new_case

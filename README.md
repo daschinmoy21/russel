@@ -50,7 +50,7 @@ On a Debian 12 / Ubuntu 22.04+ server with Nix (daemon install, flakes on) and r
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | bash -s -- check
-curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
+curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 ```
 
 Then install the CLI where you work and log in. The [installation guide](docs/getting-started/installation.md) covers the laptop side, SSH tunnels vs HTTPS, and NixOS.

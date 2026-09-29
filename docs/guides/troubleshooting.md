@@ -42,7 +42,7 @@ Then find your message below.
 | `guest = "linux"` … `is not implemented yet` | Only the default guest works today | Remove `guest`, or set `guest = "busybox"`. |
 | `podman passthrough arg denied for security` | A blocked flag in `service.podman_args` | Remove it. Use `[[volumes]]` for host folders and `[ingress]` for ports. |
 | Deploy progress hangs behind a proxy | The proxy buffers the response | Caddy: `flush_interval -1`. nginx: `proxy_buffering off`. |
-| The app is on a different port after an update | Each update publishes the new version on a fresh port | Check `russel ps`, or reach the app by name through Traefik. To keep one port, pin it with `[ingress].port`. A pinned service updated with v0.1.1 or earlier may have left its pin; one `russel update` puts it back. |
+| The app is on a different port after an update | Each update publishes the new version on a fresh port | Check `russel ps`, or reach the app by name through Traefik. To keep one port, pin it with `[ingress].port`. A pinned service updated with a pre-release build may have left its pin; one `russel update` puts it back. |
 
 ## Running apps
 
@@ -55,8 +55,8 @@ Then find your message below.
 | A service turns `failed` later | It exited, or failed 3 health checks in a row | `russel logs <id>`. Set `RUSSEL_HEALTH_RESTART=1` to redeploy automatically. |
 | `Read-only file system` in the app's output | The app writes outside `/tmp`, `/run`, or a volume | Add a `[[volumes]]` entry with `rw = true` for that path. |
 | Podman errors about `/run/user`, cgroups, or `newuidmap` | Rootless Podman isn't fully set up for the `russel` account | Run `install.sh check`. Then, as that account: `sudo -u russel XDG_RUNTIME_DIR=/run/user/$(id -u russel) podman info`. `loginctl show-user russel -p Linger` should say `yes`. |
-| `crun: error creating systemd unit libpod-….scope` | A v0.1.0 control plane | Upgrade: re-run `install.sh host` with a newer `RUSSEL_VERSION`. |
-| `Failed to mount empty tmpfs for pivot_root()`, or `mkdir /var/tmp/…: no such file or directory` | The v0.1.0 service unit left Podman in a broken state | Re-run `install.sh host` with a newer version. See [Upgrading from v0.1.0](../operations/systemd-nixos.md). |
+| `crun: error creating systemd unit libpod-….scope` | A control plane from a pre-release build | Upgrade: re-run `install.sh host` with `RUSSEL_VERSION=v0.1.0` or newer. |
+| `Failed to mount empty tmpfs for pivot_root()`, or `mkdir /var/tmp/…: no such file or directory` | A pre-release service unit (with `PrivateTmp=yes`) left Podman in a broken state | Re-run `install.sh host` with `RUSSEL_VERSION=v0.1.0` or newer. See [systemd and NixOS](../operations/systemd-nixos.md). |
 | Traefik doesn't route | Traefik reads a different folder, can't read it, or DNS is wrong | Check that `<id>.json` appears in the folder set in `providers.file.directory`, that Traefik can read it, and that the name resolves to the server. See [Traefik ingress](./traefik-ingress.md). |
 
 ## MicroVMs

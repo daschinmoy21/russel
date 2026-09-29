@@ -7,12 +7,15 @@ keywords: [changelog, releases, init, login, nixos, install]
 
 Curated, operator-visible changes. Full history is `git log`.
 
-## v0.1.1 (2026-09-29): containers start under the installed service, and examples deploy from GitHub (#524–#527)
+## v0.1.0 (2026-09-30): first public release
 
-Fixes from the fresh-machine acceptance run of v0.1.0 (#420).
+The first release: everything below this entry, plus these changes. Two earlier tags (v0.1.0 on 2026-09-29 and v0.1.1) were withdrawn and folded into this one.
 
-- **Containers start under `install.sh host` and the NixOS module** (#524). With v0.1.0 every container failed: Podman asked the `russel` account's user manager for a systemd scope, which systemd refuses for a process in a system unit. The control plane now runs Podman with `--cgroup-manager=cgroupfs` when it runs unprivileged in a delegated system unit. `--cpus` and `--memory` still apply.
-- **The unit drops `PrivateTmp`, `ProtectSystem`, and `ProtectHome`** (#524). Podman's pause process outlives the unit and kept the first control plane's private `/tmp`, which systemd deleted on restart. Re-running `install.sh host` replaces a v0.1.0 unit even without `--force-unit`, keeps your drop-ins, and ends the stale pause process. `[[volumes]].host` roots no longer need `ReadWritePaths=`. See [systemd and NixOS: Upgrading from v0.1.0](../operations/systemd-nixos.md).
+- **Container deploys are faster** (#540). The control plane asks Podman for its settings once instead of on every deploy, skips stopping and removing on a first deploy, and waits 75 ms instead of 200 ms to confirm the app is up. Spawn-to-ready in the bench dropped by 150 to 420 ms per app, to within about 100 ms of a plain `podman run`.
+- **Stopping a container reaches the app** (#540). Containers run with `--init`, so Podman's init is PID 1 and passes SIGTERM on. Before, an app with no SIGTERM handler of its own (meilisearch) ignored it as PID 1, so every stop and replace waited 10 s and then killed it. On a host without catatonit (it is only recommended by Debian's podman package), the control plane logs one warning and runs containers without `--init`.
+- An update keeps the service's `[ingress].port` pin (#538). Before, the first `russel update` of a pinned container or passt microVM moved it to an allocated port. Pinned services now update cold; one `russel update` puts a lost pin back.
+- **Containers start under `install.sh host` and the NixOS module** (#524). Before, every container failed: Podman asked the `russel` account's user manager for a systemd scope, which systemd refuses for a process in a system unit. The control plane now runs Podman with `--cgroup-manager=cgroupfs` when it runs unprivileged in a delegated system unit. `--cpus` and `--memory` still apply.
+- **The unit drops `PrivateTmp`, `ProtectSystem`, and `ProtectHome`** (#524). Podman's pause process outlives the unit and kept the first control plane's private `/tmp`, which systemd deleted on restart. Re-running `install.sh host` replaces a pre-release unit even without `--force-unit`, keeps your drop-ins, and ends the stale pause process. `[[volumes]].host` roots no longer need `ReadWritePaths=`. See [systemd and NixOS](../operations/systemd-nixos.md).
 - **The build runs in the Russelfile's folder joined with `service.source`** (#525). Before, it always ran at the repo root and `source` was only validated. `russel deploy https://github.com/daschinmoy21/russel.git --config examples/basic-http/Russelfile.toml` now builds that example, so the quickstart needs no local checkout or `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY`. A Russelfile in a subfolder that relied on building the repo root must now set `source` to reach it, or move to the root.
 - `russel ps` no longer lists `.config`, `.local`, or `.cache` in `/var/lib/russel` as services (#526). Every dot-directory in the data root is skipped.
 - No cleartext-token warning for a loopback control plane (#527). Plain HTTP to a non-loopback host is still refused without `--insecure`.
@@ -62,7 +65,7 @@ Fixes from the fresh-machine acceptance run of v0.1.0 (#420).
 
 ## 2026-09-26: kernel uploaded from the maintainer's build
 
-- `release.yml` no longer builds the microVM kernel (linux from source ran past 2h on hosted runners and the first v0.1.0 run was cancelled). It builds the binaries, dashboard, `LICENSE`, and `NOTICE`, and leaves a **draft** release. A re-run keeps an uploaded kernel's `SHA256SUMS` line and fails instead of dropping it.
+- `release.yml` no longer builds the microVM kernel (linux from source ran past 2h on hosted runners and the first release run was cancelled). It builds the binaries, dashboard, `LICENSE`, and `NOTICE`, and leaves a **draft** release. A re-run keeps an uploaded kernel's `SHA256SUMS` line and fails instead of dropping it.
 - `contrib/release-kernel.sh <tag> [--repo OWNER/NAME] [--publish]` checks that the local tag matches the release repo's tag, builds `packages.x86_64-linux.microvm-kernel` at that commit, uploads `russel-kernel-<tag>-x86_64.bzImage`, adds it to `SHA256SUMS`, and reads the sums back to confirm the line landed. `--publish` takes the release out of draft only once every asset is present with a checksum line. `--repo` defaults to `daschinmoy21/russel`, where `contrib/install.sh` downloads from.
 - The publish job sets `GH_REPO`: it has no checkout, so `gh release` could not resolve the repository before.
 
@@ -73,9 +76,9 @@ Fixes from the fresh-machine acceptance run of v0.1.0 (#420).
 - ctrl code resolves host paths through `russel_ctrl::paths`; `crates/ctrl/clippy.toml` bans the direct `russel_core::paths` calls. `/var/lib/microvms` literals go through `paths::microvms_root()` (still `/var/lib/microvms` in production; making it configurable is #413).
 - The port-hold tests use OS-assigned ports instead of fixed 4010–4012, which failed when another process on the host held them.
 
-## v0.1.0 (2026-09-24)
+## 2026-09-24: release workflow and `--version`
 
-- First git tag. Release workflow builds `russel` + `russel-ctrl` on Ubuntu 22.04 (glibc 2.35), the dashboard dist, and `nix build .#microvm-kernel`, then refuses to publish if `russel-kernel-<tag>-x86_64.bzImage` is missing or under 1MB.
+- Release workflow builds `russel` + `russel-ctrl` on Ubuntu 22.04 (glibc 2.35), the dashboard dist, and `nix build .#microvm-kernel`, then refuses to publish if `russel-kernel-<tag>-x86_64.bzImage` is missing or under 1MB.
 - `russel --version` prints the crate version.
 - `install.sh host` on a KVM machine fails closed when the kernel asset is absent. Optional `RUSSEL_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` for private GitHub release URLs.
 

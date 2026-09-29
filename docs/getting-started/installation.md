@@ -72,9 +72,9 @@ Pick **one** of these. Both run the same checks first and stop if something is m
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
+  | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | RUSSEL_VERSION=v0.1.1 bash -s -- cli
+  | RUSSEL_VERSION=v0.1.0 bash -s -- cli
 ```
 
 The installer downloads the binaries and checks each one against the release `SHA256SUMS` before installing anything. You must name a version; there is no "latest".
@@ -198,12 +198,10 @@ Run the same install command with the new version. Your token and `/var/lib/russ
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/install.sh \
-  | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
+  | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 ```
 
 From source: `git pull`, rebuild, and run `sudo ./contrib/install.sh host` again. If the new binary fails to start, the installer puts the old one back.
-
-Upgrading from v0.1.0 also replaces its service unit, whose `PrivateTmp=yes` stopped containers from starting, and resets rootless Podman for the `russel` account. Drop-ins in `/etc/systemd/system/russel-ctrl.service.d/` are kept. Details: [systemd and NixOS: Upgrading from v0.1.0](../operations/systemd-nixos.md).
 
 Never delete `/etc/russel/env` or `/var/lib/russel` when upgrading. Backups: [Upgrades + backups](../operations/upgrades-backup.md).
 
@@ -231,7 +229,7 @@ Then `russel deploy` your services again.
 
 | Flag or variable | Meaning |
 |---|---|
-| `RUSSEL_VERSION` | Release to download, such as `v0.1.1`. Required unless you run the script from a checkout with a `target/release` build. |
+| `RUSSEL_VERSION` | Release to download, such as `v0.1.0`. Required unless you run the script from a checkout with a `target/release` build. |
 | `RUSSEL_RELEASE_BASE` | Download from a mirror instead of GitHub Releases. |
 | `--take-state-ownership` | Give an existing `/var/lib/russel` owned by another user (and everything in it) to `russel`. |
 | `--force-unit` | Replace an existing `/etc/systemd/system/russel-ctrl.service` that differs from the shipped one. Review your changes first. |

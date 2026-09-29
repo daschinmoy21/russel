@@ -60,16 +60,6 @@ The dedicated, unprivileged `russel` account is what isolates Russel. The usual 
 
 Don't add these options back with `systemctl edit`. The control plane also runs Podman with `--cgroup-manager=cgroupfs`: from a system unit, systemd won't let the account's user manager take over container processes.
 
-### Upgrading from v0.1.0
-
-The v0.1.0 unit had `PrivateTmp=yes`, so containers could not start. Re-running `install.sh host` replaces that unit (your drop-ins in `russel-ctrl.service.d/` are kept), stops the control plane, ends the stale pause process, and starts it again. To do the same by hand:
-
-```bash
-sudo systemctl stop russel-ctrl
-sudo pkill -u russel -x catatonit
-sudo systemctl start russel-ctrl
-```
-
 ## NixOS: `services.russel`
 
 ```nix

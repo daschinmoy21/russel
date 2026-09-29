@@ -17,7 +17,7 @@
 # Without a local target/release build the installer downloads release assets
 # for RUSSEL_VERSION and verifies each one against the release SHA256SUMS:
 #
-#   curl -fsSL <raw install.sh url> | sudo RUSSEL_VERSION=v0.1.1 bash -s -- host
+#   curl -fsSL <raw install.sh url> | sudo RUSSEL_VERSION=v0.1.0 bash -s -- host
 #
 # RUSSEL_RELEASE_BASE overrides the artifact base URL. Private GitHub
 # releases also need RUSSEL_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.
@@ -433,7 +433,7 @@ prepare_release() {
   fi
   if ! version="$(release_version)"; then
     echo "no ${RELEASE}/${binary} and RUSSEL_VERSION is unset" >&2
-    echo "set RUSSEL_VERSION (for example v0.1.1), or build with: cargo build --release" >&2
+    echo "set RUSSEL_VERSION (for example v0.1.0), or build with: cargo build --release" >&2
     return 1
   fi
   require_command curl || return $?
@@ -1179,7 +1179,7 @@ install_system_unit() {
     return 1
   fi
 
-  # Only the v0.1.0 unit had PrivateTmp=yes, and it breaks every container
+  # Only the pre-release unit had PrivateTmp=yes, and it breaks every container
   # (#524), so replace it even without --force-unit. Drop-ins are untouched.
   local replace_broken=0
   if unit_pins_private_tmp "$unit_file" && ! run_cmp -s -- "$unit_file" "$rendered"; then
@@ -1417,10 +1417,10 @@ system_unit_is_active() {
   run_systemctl_system is-active --quiet russel-ctrl >/dev/null 2>&1
 }
 
-# The v0.1.0 unit had PrivateTmp=yes. Rootless Podman's pause process
+# The pre-release unit had PrivateTmp=yes. Rootless Podman's pause process
 # (`catatonit -P`) outlives the unit and keeps that first ctrl's private /tmp,
 # which systemd deleted, so every podman call fails until it is gone (#524).
-# v0.1.0 could not start containers, so none depend on it yet.
+# Pre-release builds could not start containers, so none depend on it yet.
 unit_pins_private_tmp() {
   local unit=$1
   [[ -f "$unit" ]] && grep -Eq '^PrivateTmp=(yes|true|1)' -- "$unit"
