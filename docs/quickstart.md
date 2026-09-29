@@ -33,7 +33,7 @@ Only do this on a server you alone control.
 ## 2. Deploy
 
 ```bash
-russel apply examples/basic-http
+russel deploy examples/basic-http
 ```
 
 `russel` sends the folder's path to the control plane, which reads `Russelfile.toml`, builds the app with Nix, and starts it. The first build takes a minute or two while Nix fetches Go; later deploys take about a second.
@@ -69,22 +69,17 @@ russel logs api
 
 > **Note:** Russel picks a free host port (3100 and up) unless the Russelfile pins one. It can change on the next deploy, so use `russel ps` to find it. To pin it, add `[ingress]` with `port = 8080` to the Russelfile. For a stable name instead of a port, see [Traefik ingress](./guides/traefik-ingress.md).
 
-## 4. Redeploy and roll back
+## 4. Update and roll back
 
-Running `apply` again with the same commit and Russelfile does nothing:
-
-```bash
-russel apply examples/basic-http
-# note: already running 96ef3e713a89 with this Russelfile; nothing to apply
-```
-
-Commit a change to the app or edit the Russelfile and `apply` again, or force a redeploy:
+After the first deploy, ship changes with `russel update`. Commit a change to the app or the Russelfile, then build the source's latest commit:
 
 ```bash
-russel apply --force examples/basic-http
+russel update api --refresh
 ```
 
-A redeploy starts the new version next to the old one and switches traffic over once the new one answers, so the app keeps serving. The old one keeps running for 2 more seconds (`switch · New version is live; …`). If the new version fails to start, or crashes within those 2 seconds, traffic stays on (or goes back to) the old one and `apply` exits non-zero. [When a deploy counts as ready](./concepts/lifecycle.md#when-a-deploy-counts-as-ready) has the details.
+Without `--refresh`, `update` rebuilds the commit that is already running, which is how you pick up a changed secret. Running `deploy` again with the same commit and Russelfile does nothing.
+
+A redeploy starts the new version next to the old one and switches traffic over once the new one answers, so the app keeps serving. The old one keeps running for 2 more seconds (`switch · New version is live; …`). If the new version fails to start, or crashes within those 2 seconds, traffic stays on (or goes back to) the old one and `update` exits non-zero. [When a deploy counts as ready](./concepts/lifecycle.md#when-a-deploy-counts-as-ready) has the details.
 
 Go back to the previous version yourself:
 
@@ -100,7 +95,7 @@ Russel keeps the last 20 deployments. `russel rollback api --version N` picks an
 russel destroy api
 ```
 
-`russel stop api` stops the app but keeps its history, so a later `apply` or `rollback` can bring it back.
+`russel stop api` stops the app but keeps its history, so a later `update` or `rollback` can bring it back.
 
 Restarting the control plane (`sudo systemctl restart russel-ctrl`) doesn't stop your apps.
 
@@ -110,10 +105,10 @@ Restarting the control plane (`sudo systemctl restart russel-ctrl`) doesn't stop
 cd my-app
 russel init        # writes a commented Russelfile.toml
 git add Russelfile.toml && git commit -m "Add Russelfile" && git push
-russel apply https://github.com/you/my-app.git
+russel deploy https://github.com/you/my-app.git
 ```
 
-The server clones the repo itself, so this works the same from your laptop. To deploy a folder that is already on the server instead, keep it somewhere the `russel` account owns, like `/srv/russel-apps`, and run `russel apply /srv/russel-apps/my-app`.
+The server clones the repo itself, so this works the same from your laptop. To deploy a folder that is already on the server instead, keep it somewhere the `russel` account owns, like `/srv/russel-apps`, and run `russel deploy /srv/russel-apps/my-app`. After that, `russel update my-app --refresh` ships each new commit.
 
 If your project has no `flake.nix`, Russel generates one for Rust (`Cargo.toml`), Go (`go.mod`), and static sites. `russel init --with-flake` writes a starter flake you can edit instead. See [Builds](./concepts/builds.md) and the [Russelfile reference](./reference/russelfile.md).
 

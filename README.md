@@ -25,10 +25,10 @@ API_TOKEN = "secret://API_TOKEN"   # stored on the control plane, never in the f
 ```
 
 ```bash
-russel apply https://github.com/you/app.git   # build with Nix, start, switch traffic
+russel deploy https://github.com/you/app.git  # first deploy: build with Nix and start
 russel ps                                     # services, ports, state
 russel logs api
-russel update api --refresh                   # redeploy the source's latest commit
+russel update api --refresh                   # later: ship the latest commit, zero downtime
 russel rollback api                           # back to the previous generation
 ```
 

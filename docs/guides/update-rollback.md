@@ -11,18 +11,24 @@ Redeploying an existing id kills + waits for the old generation before reusing p
 
 Every deploy records the commit it built (`rev`) and whether the deployed tree had uncommitted changes (`dirty`). A clean tree means the Russelfile is committed too, so the commit pins it. That makes deploys work like Nix generations:
 
-- `russel apply` (alias `deploy`) of the commit and Russelfile a running service already has returns `unchanged` without rebuilding or restarting. Pass `--force` to redeploy anyway. A dirty tree or a source outside git always deploys.
+- `russel deploy` (alias `apply`) of the commit and Russelfile a running service already has returns `unchanged` without rebuilding or restarting. Pass `--force` to redeploy anyway, or use `russel update`. A dirty tree or a source outside git always deploys.
 - `update` and `rollback` rebuild a clean generation's recorded commit exactly, even after the branch has moved. A dirty generation builds what its source holds now. A local path is cloned for this, so your working tree is never touched.
 
-## Update (redeploy the recorded commit)
+## Update
 
-`russel update` redeploys the running generation's `repo_url`, `config_path`, and commit. Secrets are resolved again, so this is how to restart with a rotated secret. `--refresh` builds the source's current commit instead, and so does passing `--repo` or `--config`. The file's `service.name` must equal `<id>`:
+Deploy once with `russel deploy`, then use `russel update` for everything after that. To ship new commits:
+
+```bash
+russel update <id> --refresh
+```
+
+Without `--refresh`, `russel update` redeploys the running generation's `repo_url`, `config_path`, and commit. Secrets are resolved again, so this is how to restart with a rotated secret. `--refresh` builds the source's current commit instead, and so does passing `--repo` or `--config`. The file's `service.name` must equal `<id>`:
 
 ```bash
 russel update <id> [--refresh] [--repo REPO] [--config PATH]
 ```
 
-Same NDJSON stream, semaphore, and shutdown guards as `apply`. API: `POST /vm/{id}/update` with optional `{"repo_url":…, "config_path":…, "refresh":true}`.
+Same NDJSON stream, semaphore, and shutdown guards as `deploy`. API: `POST /vm/{id}/update` with optional `{"repo_url":…, "config_path":…, "refresh":true}`.
 
 ## Deployment history
 
@@ -59,7 +65,7 @@ curl -X POST http://127.0.0.1:7878/vm/my-app/rollback \
 
 ## Zero-downtime note
 
-Live-prior redeploys use dual-live candidates (`<id>_g<gen>` + fresh backend port + `Ingress::swap` cutover, then drain + promote). Between the swap and the drain, the previous generation keeps running for 2 s. If the new one crashes in that window, traffic goes back to the previous one and `apply` fails, so an update can't replace a working version with one that dies on start-up. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers every case, including first deploys and services with `[[ports]]`.
+Live-prior redeploys use dual-live candidates (`<id>_g<gen>` + fresh backend port + `Ingress::swap` cutover, then drain + promote). Between the swap and the drain, the previous generation keeps running for 2 s. If the new one crashes in that window, traffic goes back to the previous one and `update` fails, so an update can't replace a working version with one that dies on start-up. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers every case, including first deploys and services with `[[ports]]`.
 
 Instant retain-N=2 cutover (keeping the previous artifact hot without a rebuild) is a follow-up — current rollback re-runs the pipeline.
 

@@ -10,7 +10,7 @@ Russel is a self-hosted platform for deploying Nix-built services as **Russel co
 
 ```bash
 russel init       # write a Russelfile.toml for this project
-russel apply .    # build it with Nix and run it
+russel deploy .   # build it with Nix and run it
 russel ps         # see it running, and on which port
 ```
 

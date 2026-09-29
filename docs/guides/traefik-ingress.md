@@ -79,7 +79,7 @@ the operator's job.
 
 ## How it works
 
-1. **Deploy**: `russel apply` → ctrl writes `/var/lib/russel/traefik/dynamic/<service_id>.json` (atomic temp + rename).
+1. **Deploy**: `russel deploy` or `russel update` → ctrl writes `/var/lib/russel/traefik/dynamic/<service_id>.json` (atomic temp + rename).
 2. **Traefik picks up** the router + service (file watch, sub-second).
 3. **Access**: `curl http://<service-host>`.
 4. **Stop/destroy**: ctrl removes the file → Traefik stops routing. Redeploy re-registers the new backend port.
@@ -162,7 +162,7 @@ uniqueness scan and the file update. Two concurrent deploys cannot both pass
 the scan.
 
 To drop a custom name, delete the `[ingress]` table from the Russelfile and run
-`russel apply .`; the next write returns the service to the configured default
+`russel update <id> --refresh`; the next write returns the service to the configured default
 suffix.
 
 App tunnels are not configured in the Russelfile yet; putting host-wide

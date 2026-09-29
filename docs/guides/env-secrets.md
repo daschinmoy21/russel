@@ -23,7 +23,7 @@ FEATURE_X = "1"
 ```
 
 ```bash
-russel apply .
+russel deploy .
 ```
 
 Injected runtime vars (`PORT`, `VM_IP`, `HOST_IP`, `APP`) are set by Russel — do not define them.
@@ -78,7 +78,7 @@ DEMO_SECRET = "secret://DEMO_SECRET"
 
 ```bash
 printf '%s' "bench-secret" | russel secrets set DEMO_SECRET
-russel apply examples/env-config
+russel deploy examples/env-config
 curl http://127.0.0.1:8080/
 ```
 

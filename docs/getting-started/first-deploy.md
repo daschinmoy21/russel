@@ -44,7 +44,7 @@ Full schema: [Russelfile reference](../reference/russelfile.md). If no `flake.ni
 ## 2. Deploy
 
 ```bash
-russel apply .
+russel deploy .
 ```
 
 | Flag | Meaning |
@@ -53,12 +53,12 @@ russel apply .
 | `--config PATH` | Russelfile path inside the repo (default `Russelfile.toml`). Must not be a symlink; 1 MiB max. The build always uses the repo root. |
 | `--force` | Redeploy even when the service already runs this commit and Russelfile. |
 
-The CLI shows each phase (`resolve → build → create → start → ready`) and prints the host port when it finishes. Running `apply` again with the same commit and Russelfile does nothing. A real change starts the new version next to the old one and switches over once it is ready.
+The CLI shows each phase (`resolve → build → create → start → ready`) and prints the host port when it finishes. Use `deploy` for the first deploy and [`update`](#6-update) after that. Running `deploy` again with the same commit and Russelfile does nothing.
 
 Remote control plane? Use a git URL — local paths are resolved on the **control-plane host**, not the laptop, and need `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` on the control plane (trusted single-tenant hosts only):
 
 ```bash
-russel apply https://github.com/you/app.git
+russel deploy https://github.com/you/app.git
 ```
 
 The repository Russelfile supplies `service.name`, `service.type`, `[ingress]`, and `[service.env]`.
@@ -84,7 +84,7 @@ DB_PASSWORD = "secret://DB_PASSWORD"
 ```
 
 ```bash
-russel apply .
+russel update my-app --refresh   # or `russel deploy .` if it isn't deployed yet
 ```
 
 > **Note (containers):** plain env is passed as `podman -e` and is visible via `podman inspect`. `secret://` values are delivered as Podman secrets, so they stay out of argv and `podman inspect`. Full model: [Env + secrets](../guides/env-secrets.md).
@@ -117,14 +117,14 @@ russel logs my-app
 
 ## 6. Update
 
-Rebuild the service from the commit and Russelfile recorded at its last deploy. Add `--refresh` to build the source's latest commit instead:
+After the first deploy, use `update`. `--refresh` builds the source's latest commit, which is how you ship changes. Without it, `update` rebuilds the commit and Russelfile recorded at the last deploy, for example to pick up a changed secret:
 
 ```bash
-russel update my-app
-russel update my-app --refresh
+russel update my-app --refresh   # ship the latest commit
+russel update my-app             # rebuild what's running
 ```
 
-Output looks the same as `apply`. Details + rollback: [Update and rollback](../guides/update-rollback.md).
+A new version starts next to the old one, and traffic switches once it answers. Output looks the same as `deploy`. Details + rollback: [Update and rollback](../guides/update-rollback.md).
 
 ## 7. Stop / destroy
 

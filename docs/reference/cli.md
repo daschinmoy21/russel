@@ -46,7 +46,7 @@ russel init [DIR] [--name NAME] [--port PORT] [--memory MEM] [--type|--runtime R
 russel login [<url>] [--token-file PATH]
 russel logout
 russel origin
-russel apply <REPO> [--config PATH] [--force]   # alias: deploy
+russel deploy <REPO> [--config PATH] [--force]  # alias: apply
 russel status [<service_id>]
 russel logs [<service_id>]
 russel ps                      # aliases: list, vms
@@ -90,17 +90,17 @@ russel login https://russel.example.com --token-file ~/.config/russel/env
 
 `logout` removes the login file. `origin` prints the resolved URL, auth source (env vs file vs none), and reachability — the first diagnostic alongside `install.sh status`.
 
-### `russel apply <REPO> [--config PATH] [--force]`
+### `russel deploy <REPO> [--config PATH] [--force]`
 
-Deploy the service named by the Russelfile's `service.name` (`russel deploy` is an alias). Streams NDJSON; exit `0` on `deployed` or `unchanged`, non-zero on `failed` **or** `rolled_back` (so CI notices rollbacks).
+Deploy the service named by the Russelfile's `service.name` (`russel apply` is the same command). Use it for the first deploy; after that, ship changes with `russel update <id> --refresh`. Streams NDJSON; exit `0` on `deployed` or `unchanged`, non-zero on `failed` **or** `rolled_back` (so CI notices rollbacks).
 
-Every generation records the commit it was built from (`rev`), whether the deployed tree had uncommitted changes (`dirty`), and the Russelfile it loaded. Applying the commit and Russelfile the service is already running returns `unchanged` at once: nothing is rebuilt or restarted. A dirty tree, or a source outside git, always deploys.
+Every generation records the commit it was built from (`rev`), whether the deployed tree had uncommitted changes (`dirty`), and the Russelfile it loaded. Deploying the commit and Russelfile the service is already running returns `unchanged` at once: nothing is rebuilt or restarted. A dirty tree, or a source outside git, always deploys.
 
 | Argument | Meaning |
 |---|---|
 | `REPO` | `https://…`, `http://…`, `ssh://…`, `git@host:path`, or local absolute path (ctrl opt-in only). Relative paths always rejected. |
 | `--config PATH` | Repo-relative Russelfile (default `Russelfile.toml`). `openat` + `O_NOFOLLOW`, 1 MiB cap, symlinks rejected. |
-| `--force` | Deploy even when the result would be `unchanged`, for example to pick up a changed secret. |
+| `--force` | Deploy even when the result would be `unchanged`. `russel update <id>` does the same for a running service. |
 
 Set runtime, environment, host port, and host name in the Russelfile with `service.type`, `[service.env]`, and `[ingress]`. Container Podman flags go in `service.podman_args`.
 
@@ -131,7 +131,7 @@ With neither flag, each volume's `keep` field decides. Absolute `host =` binds a
 
 ### `russel update <id> [--refresh]`
 
-Redeploy the running generation's recorded source: the same repo, config path, and **commit**, so nothing new is pulled in. Secrets are resolved again, which makes this the way to restart with a rotated secret. `--refresh` builds the source's current commit instead (the tip of a git URL's default branch, or a local path's HEAD). `--repo` / `--config` select another source and imply `--refresh`. The Russelfile `service.name` must equal `<id>`. Same NDJSON stream as deploy. See [Update and rollback](../guides/update-rollback.md).
+The command for every deploy after the first. `--refresh` is how you ship changes: it builds the source's current commit. Without it, `update` redeploys the running generation's recorded source: the same repo, config path, and **commit**, so nothing new is pulled in. Secrets are resolved again, which makes this the way to restart with a rotated secret. With `--refresh`, the commit is the tip of a git URL's default branch, or a local path's HEAD. `--repo` / `--config` select another source and imply `--refresh`. The Russelfile `service.name` must equal `<id>`. Same NDJSON stream as deploy. See [Update and rollback](../guides/update-rollback.md).
 
 ### `russel rollback <id> [--version N]`
 
@@ -159,7 +159,7 @@ russel ps
 
 ## Exit codes and output
 
-- `apply`/`update`/`rollback` stream `Progress` lines then `Complete{status: deployed|unchanged}` or `Error{…}`. `rolled_back` still exits non-zero.
+- `deploy`/`update`/`rollback` stream `Progress` lines then `Complete{status: deployed|unchanged}` or `Error{…}`. `rolled_back` still exits non-zero.
 - `truncate_for_error` caps error strings at 256 chars (multibyte-safe).
 - There is no `russel build/develop/check/exec/scale/node/sandbox` verb — builds run inside `deploy`.
 

@@ -29,7 +29,7 @@ stateDiagram-v2
 - **Cold redeploy** (a prior generation that can't run beside the new one: the service has `[[ports]]`, whose fixed host ports two generations can't both bind): backup dirs → kill + wait old children (up to 5 s, then force-kill) → teardown → boot new.
 - **Dual-live redeploy** (live prior, no `[[ports]]`): candidate boots under a generation key (`<id>_g<gen>`) with a fresh backend port, `Ingress::swap` cuts Traefik over, a 2 s hold watches the candidate (next section), old generation drains, candidate promotes.
 - Container redeploys stop the old container only **after** the new podman argv validates (fail-closed).
-- `russel apply` with an existing id reuses ports after the old generation drains; the allocator prevents cross-service collisions.
+- A redeploy (`russel update`) reuses ports after the old generation drains; the allocator prevents cross-service collisions.
 
 ## When a deploy counts as ready
 
@@ -37,15 +37,15 @@ stateDiagram-v2
 
 | Deploy | What Russel waits for | If the app crashes right after answering |
 |---|---|---|
-| **First deploy** (nothing running yet) | The first answer, nothing more. | `apply` has already reported `deployed`. The service then reads `failed` within about a second: for a microVM the guest powers off and ctrl's supervisor sees the VM exit; for a container ctrl's exit watcher sees it exited or restarted in `podman inspect`. With `restart = "unless-stopped"` it is restarted ([Restart on exit](#restart-on-exit)). |
-| **Update or rollback, dual-live** | The first answer. Traffic switches to the new version at once, and the previous version keeps running for **2 s**: `switch · New version is live; keeping the previous one running for 2s in case it crashes`. | Traffic goes back to the previous version, which never stopped. The new one is torn down, and `apply` fails with `new version crashed within 2s of answering` plus the app's last output. |
-| **Update, cold** (`[[ports]]`) | The first answer, then **2 s** in which the new version must stay up. The previous version is already stopped. | The previous version is restored from its backup, and `apply` fails with `rolled_back`. |
+| **First deploy** (nothing running yet) | The first answer, nothing more. | `deploy` has already reported `deployed`. The service then reads `failed` within about a second: for a microVM the guest powers off and ctrl's supervisor sees the VM exit; for a container ctrl's exit watcher sees it exited or restarted in `podman inspect`. With `restart = "unless-stopped"` it is restarted ([Restart on exit](#restart-on-exit)). |
+| **Update or rollback, dual-live** | The first answer. Traffic switches to the new version at once, and the previous version keeps running for **2 s**: `switch · New version is live; keeping the previous one running for 2s in case it crashes`. | Traffic goes back to the previous version, which never stopped. The new one is torn down, and `update` fails with `new version crashed within 2s of answering` plus the app's last output. |
+| **Update, cold** (`[[ports]]`) | The first answer, then **2 s** in which the new version must stay up. The previous version is already stopped. | The previous version is restored from its backup, and `update` fails with `rolled_back`. |
 | **Relaunch** (`restart = "unless-stopped"`) | The first answer. | The supervisor sees the exit and backs off before the next try ([Restart on exit](#restart-on-exit)). |
 
 Why it works this way:
 
 - **A crash is caught during the deploy only when there is something to protect.** A first deploy has no older version to keep, so waiting would only slow every deploy down. The supervisor reports the crash afterwards.
-- **Updates switch traffic straight away.** The 2 s run while the new version already serves, with the old one still up as the fallback. Users of the app get the new version as soon as it answers; only `apply` returns 2 s later, so that its exit code is honest (a script's `russel apply && …` never continues past a version that died).
+- **Updates switch traffic straight away.** The 2 s run while the new version already serves, with the old one still up as the fallback. Users of the app get the new version as soon as it answers; only `update` returns 2 s later, so that its exit code is honest (a script's `russel update … && …` never continues past a version that died).
 - **A VM or container exit is the signal**, not another probe. A microVM's agent powers the guest off when the app exits, so `cloud-hypervisor` exiting means the app died. A container shows up as exited (or restarted) in `podman inspect`. An exit before the app answers at all fails at once, without waiting out the 30 s readiness timeout.
 - **2 s is a trade-off, not a guarantee.** It catches apps that die while starting (bad config, a missing file, a failed migration). An app that crashes later still deploys, and is then caught like a first deploy.
 - **Cold updates are the slow case.** The old version can't run beside the new one, so the 2 s pass before anything serves, and a crash means a restore from backup. Leave `[[ports]]` out unless the service needs it.
@@ -73,10 +73,10 @@ Operator guide: [Update and rollback](../guides/update-rollback.md). API: [API r
 
 ## Update
 
-`POST /vm/{id}/update` (CLI `russel update <id>`) redeploys from the recorded `repo_url` / `config_path`, preserving original env/podman args unless overridden:
+`POST /vm/{id}/update` (CLI `russel update <id>`) redeploys from the recorded `repo_url`, `config_path`, and commit. Env, ports, and Podman flags come from the Russelfile at that commit. `--refresh` builds the source's latest commit instead; it is how you ship changes after the first `russel deploy`:
 
 ```bash
-russel update <id> [--repo REPO] [--config PATH]
+russel update <id> [--refresh] [--repo REPO] [--config PATH]
 ```
 
 Same NDJSON stream as `deploy`, same semaphore + shutdown guards.

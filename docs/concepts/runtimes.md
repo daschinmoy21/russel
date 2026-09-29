@@ -100,7 +100,7 @@ flowchart TB
 - **`--rootfs`, not images.** Minimal Docker-like tree (etc files, `/bin/<app>` symlink into the closure) + host `/nix/store` bind-mounted read-only. No registry, no pulls, no Dockerfile.
 - **Rootless only.** When ctrl runs as root (for example to use microVM TAP networking), podman runs as `RUSSEL_PODMAN_USER` or `SUDO_USER` via `sudo -u <user> -H …`; rootless verified via `podman info`. Headless hosts may need `loginctl enable-linger $USER` for `/run/user/$(id -u)`.
 - **Hardened defaults**: `--cap-drop ALL`, `--security-opt no-new-privileges`, `--read-only`, tmpfs `/tmp` + `/run`, `--memory` from the Russelfile. `debug = true` opts into bash/curl + `/usr/bin/env`.
-- Entry points must be statically linked or use an absolute `/nix/store/…` interpreter (no shell, no `/usr/bin/env` by default). Do not pass a bare Nix package path as `--rootfs` yourself — use `russel apply`.
+- Entry points must be statically linked or use an absolute `/nix/store/…` interpreter (no shell, no `/usr/bin/env` by default). Do not pass a bare Nix package path as `--rootfs` yourself — use `russel deploy`.
 - **Fail-closed redeploy**: old container stops only after the new podman argv validates. Readiness (30 s): the app must accept a connection through the published host port that stays open for 200 ms or gets data. pasta, the rootless forwarder, accepts and then closes within ~20 ms when nothing listens behind it, so a bare connect proves nothing. Meanwhile `podman inspect` watches the container; an exit or restart fails the deploy at once with the exit code and the last 40 log lines. An app bound only to `127.0.0.1` times out with a hint to bind `0.0.0.0`. The health checker (`RUSSEL_HEALTH_RESTART`) uses the same probe. Logs via `k8s-file` at `<service>/container.log`, fallback `podman logs`.
 - **Exit watcher**: after a deploy, ctrl polls `podman inspect` (1 s for the first minute, then 5 s). An exit, a Podman restart (`RestartCount` went up), or a removed container marks the service `failed`; a restarted container that stays up 10 s reads `deployed` again. See [Health](./lifecycle.md#health).
 - Optional `service.podman_args` are validated fail-closed; see [Russelfile](../reference/russelfile.md).
@@ -115,9 +115,9 @@ flowchart TB
 
 ```bash
 # MicroVM
-russel apply examples/microvm-http
+russel deploy examples/microvm-http
 # Container
-russel apply examples/basic-http
+russel deploy examples/basic-http
 ```
 
 ## Related

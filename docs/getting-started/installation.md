@@ -10,7 +10,7 @@ Russel has two programs:
 | Program | Where it runs | What it does |
 |---|---|---|
 | `russel-ctrl` | Your Linux server (the **control plane**) | Builds apps with Nix and runs them. Serves the HTTP API and the dashboard on `127.0.0.1:7878`. |
-| `russel` | Your laptop, or the server itself | The CLI: `apply`, `ps`, `logs`, `rollback`, … |
+| `russel` | Your laptop, or the server itself | The CLI: `deploy`, `update`, `ps`, `logs`, `rollback`, … |
 
 This page gets both running. It takes about 15 minutes on a fresh server, most of it installing Nix and Podman.
 
@@ -213,7 +213,7 @@ Earlier builds of `install.sh host` ran russel-ctrl as your own user, from `~/.c
 2. `systemctl --user disable --now russel-ctrl`, then delete `~/.config/systemd/user/russel-ctrl.service`.
 3. `sudo ./contrib/install.sh --take-state-ownership host`. This gives `/var/lib/russel` (secrets, history, volumes) to `russel`, and keeps the token from `~/.config/russel/env`, so your existing `russel login` keeps working.
 
-Then `russel apply` your services again.
+Then `russel deploy` your services again.
 
 ## Installer reference
 

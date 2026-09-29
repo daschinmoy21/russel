@@ -11,19 +11,19 @@ All examples live in `examples/` and deploy with the same verbs. VPS smoke tests
 
 | Example | Runtime | What it proves | Deploy |
 |---|---|---|---|
-| `basic-http` | container | Go `/health` + static assets; the default first deploy | `russel apply examples/basic-http` |
-| `microvm-http` | microvm | Same app as `basic-http` on the microVM path | `russel apply examples/microvm-http` |
-| `hello-rust` | container | Pure-std Rust HTTP, 128mb | `russel apply examples/hello-rust` |
+| `basic-http` | container | Go `/health` + static assets; the default first deploy | `russel deploy examples/basic-http` |
+| `microvm-http` | microvm | Same app as `basic-http` on the microVM path | `russel deploy examples/microvm-http` |
+| `hello-rust` | container | Pure-std Rust HTTP, 128mb | `russel deploy examples/hello-rust` |
 | `env-config` | container | `[service.env]` + `secret://DEMO_SECRET` | Set secret first, then deploy (below) |
-| `shortlink` | container | In-memory URL shortener | `russel apply examples/shortlink` |
+| `shortlink` | container | In-memory URL shortener | `russel deploy examples/shortlink` |
 | `filebrowser` | container | nixpkgs filebrowser wrapper; **requires auth, loopback bind in guest** | See filebrowser notes |
-| `static-test` | container | Python static site on port 8000 | `russel apply examples/static-test` |
-| `navidrome` | container | nixpkgs `navidrome` via `service.package`; `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music` | `russel apply examples/navidrome` |
-| `vaultwarden` | container | nixpkgs `vaultwarden` via `service.package`; `DATA_FOLDER=/data` | `russel apply examples/vaultwarden` |
+| `static-test` | container | Python static site on port 8000 | `russel deploy examples/static-test` |
+| `navidrome` | container | nixpkgs `navidrome` via `service.package`; `ND_DATAFOLDER=/data`, `ND_MUSICFOLDER=/music` | `russel deploy examples/navidrome` |
+| `vaultwarden` | container | nixpkgs `vaultwarden` via `service.package`; `DATA_FOLDER=/data` | `russel deploy examples/vaultwarden` |
 | `postgres` | container | nixpkgs `postgresql` via `service.package`; absolute `host` bind | See package notes |
-| `redis` | container | nixpkgs `redis` via `service.package`; managed `data` volume | `russel apply examples/redis` |
-| `caddy` | container | nixpkgs `caddy` via `service.package`; stateless file server | `russel apply examples/caddy` |
-| `meilisearch` | container | nixpkgs `meilisearch` via `service.package`; managed `data` volume | `russel apply examples/meilisearch` |
+| `redis` | container | nixpkgs `redis` via `service.package`; managed `data` volume | `russel deploy examples/redis` |
+| `caddy` | container | nixpkgs `caddy` via `service.package`; stateless file server | `russel deploy examples/caddy` |
+| `meilisearch` | container | nixpkgs `meilisearch` via `service.package`; managed `data` volume | `russel deploy examples/meilisearch` |
 
 For `basic-http` (whose `service.name` is `api`):
 
@@ -46,7 +46,7 @@ port = 8080
 
 ```bash
 printf '%s' "bench-secret" | russel secrets set DEMO_SECRET
-russel apply examples/env-config
+russel deploy examples/env-config
 curl http://127.0.0.1:8080/
 ```
 

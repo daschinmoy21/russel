@@ -47,7 +47,7 @@ Rather use HTTPS than a tunnel? See [TLS reverse proxy](./tls-reverse-proxy.md).
 A remote control plane can't see your laptop's files, so deploy from a git URL. The server clones and builds it:
 
 ```bash
-russel apply https://github.com/you/app.git
+russel deploy https://github.com/you/app.git
 russel ps
 russel logs app
 ```
@@ -87,7 +87,7 @@ Every example except `microvm-http` runs as a container on a no-KVM VPS. Russel 
 cp -r russel/examples/hello-rust hello-rust && cd hello-rust
 git init && git add . && git commit -m "hello-rust"
 git remote add origin git@github.com:you/hello-rust.git && git push -u origin HEAD
-russel apply https://github.com/you/hello-rust.git
+russel deploy https://github.com/you/hello-rust.git
 ```
 
 | Example | What it is |
@@ -107,4 +107,4 @@ All of them: [Examples](../reference/examples.md).
 - More than one server
 - Managed databases: run Postgres or Redis as ordinary services instead
 - TLS in the control plane itself: use SSH or a reverse proxy
-- Guaranteed restart after a server reboot. The control plane comes back by itself, but containers may not. Check `russel ps` after a reboot, and run `russel apply --force` for anything that is down. This is tracked in #450.
+- Guaranteed restart after a server reboot. The control plane comes back by itself, but containers may not. Check `russel ps` after a reboot, and run `russel update <id>` for anything that is down. This is tracked in #450.
