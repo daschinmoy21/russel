@@ -295,6 +295,7 @@ async fn spawn_passt(
     alloc: &SubnetAllocation,
     publishes: &[(u16, u16)],
 ) -> anyhow::Result<tokio::process::Child> {
+    crate::paths::check_unix_socket_path(socket)?;
     if let Some(dir) = socket.parent() {
         crate::microvm::ensure_private_dir(dir)?;
     }
@@ -316,6 +317,7 @@ async fn spawn_passt(
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
@@ -328,10 +330,18 @@ async fn spawn_passt(
     let deadline = Instant::now() + Duration::from_secs(2);
     while !socket.exists() {
         if let Ok(Some(status)) = child.try_wait() {
+            let stderr = read_exited_stderr(&mut child).await;
+            let detail = if stderr.is_empty() {
+                format!(
+                    "is host port {} free?",
+                    publishes.first().map(|p| p.0).unwrap_or_default()
+                )
+            } else {
+                stderr
+            };
             anyhow::bail!(
-                "passt exited with {status} before creating {} (is host port {} free?)",
+                "passt exited with {status} before creating {} ({detail})",
                 socket.display(),
-                publishes.first().map(|p| p.0).unwrap_or_default()
             );
         }
         if Instant::now() >= deadline {
@@ -339,7 +349,31 @@ async fn spawn_passt(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    // Keep draining stderr for passt's lifetime so a full pipe never blocks it.
+    if let Some(stderr) = child.stderr.take() {
+        let service_id = service_id.to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(service_id, "passt: {line}");
+            }
+        });
+    }
     Ok(child)
+}
+
+/// Stderr of a passt that already exited, trimmed; empty if unreadable.
+async fn read_exited_stderr(child: &mut tokio::process::Child) -> String {
+    use tokio::io::AsyncReadExt;
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    // passt has exited, so EOF is immediate unless it left a child holding
+    // the pipe; don't let that hang the deploy.
+    let _ = tokio::time::timeout(Duration::from_millis(500), stderr.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 #[cfg(test)]

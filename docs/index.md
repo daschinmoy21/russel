@@ -2,11 +2,9 @@
 title: Russel documentation
 description: Self-hosted platform for deploying Nix-built services as microVMs or rootless containers.
 sidebar_position: 1
-slug: /
+sidebarTitle: Introduction
 keywords: [russel, nix, microvm, cloud-hypervisor, podman, self-hosted, deployment]
 ---
-
-# Russel documentation
 
 Russel is a self-hosted platform for deploying Nix-built services as **Russel containers** (rootless Podman `--rootfs`, the default) or, experimentally, **microVMs** (Cloud Hypervisor + KVM). You push a repo with a `Russelfile.toml`; Russel builds it with Nix and runs the resulting `/nix/store` closure. No registries, no image builds, no YAML DSL.
 
@@ -34,20 +32,20 @@ russel ps         # see it running, and on which port
    - `container` (default): minimal rootfs → rootless `podman --rootfs` + `/nix/store:ro` bind → `[ingress].port` or an allocated `127.0.0.1` host port.
 4. **Route** — Register with the `Ingress` trait. Default `TraefikFileIngress` writes a dynamic file; Traefik routes `Host(<service.name>.<domain>)` to the backend.
 
-See [Concepts: Architecture](concepts/architecture.md) for the full pipeline, [Concepts: Runtimes](concepts/runtimes.md) for the isolation tradeoff, and [Concepts: Networking](concepts/networking.md) for TAP/subnet/ports.
+See [Concepts: Architecture](./concepts/architecture.md) for the full pipeline, [Concepts: Runtimes](./concepts/runtimes.md) for the isolation tradeoff, and [Concepts: Networking](./concepts/networking.md) for TAP/subnet/ports.
 
 ## Choose your path
 
 | I want to… | Start here |
 |---|---|
-| Deploy in 5 minutes on this machine | [Quickstart](quickstart.md) |
-| Install the client + control plane (same host, SSH tunnel, or HTTPS) | [Getting started: Installation](getting-started/installation.md) |
-| Run one VPS as a single operator | [Guides: Single-VPS checklist](guides/vps-one-dev.md) |
-| Expose the API or apps over TLS | [Guides: TLS reverse proxy](guides/tls-reverse-proxy.md) · [Guides: Traefik ingress](guides/traefik-ingress.md) |
-| Write a `Russelfile.toml` | [Reference: Russelfile](reference/russelfile.md) · `russel init` in [Reference: CLI](reference/cli.md) |
-| Call the API directly | [Reference: API](reference/api.md) |
-| Harden a host | [Security: Overview](security/overview.md) · [Security: Nix builds](security/nix-builds.md) |
-| Operate upgrades, backups, systemd/NixOS | [Operations](operations/systemd-nixos.md) |
+| Deploy in 5 minutes on this machine | [Quickstart](./quickstart.md) |
+| Install the client + control plane (same host, SSH tunnel, or HTTPS) | [Getting started: Installation](./getting-started/installation.md) |
+| Run one VPS as a single operator | [Guides: Single-VPS checklist](./guides/vps-one-dev.md) |
+| Expose the API or apps over TLS | [Guides: TLS reverse proxy](./guides/tls-reverse-proxy.md) · [Guides: Traefik ingress](./guides/traefik-ingress.md) |
+| Write a `Russelfile.toml` | [Reference: Russelfile](./reference/russelfile.md) · `russel init` in [Reference: CLI](./reference/cli.md) |
+| Call the API directly | [Reference: API](./reference/api.md) |
+| Harden a host | [Security: Overview](./security/overview.md) · [Security: Nix builds](./security/nix-builds.md) |
+| Operate upgrades, backups, systemd/NixOS | [Operations](./operations/systemd-nixos.md) |
 
 ## Product surface
 
@@ -80,6 +78,6 @@ The live contract is `reference/` plus the code (`crates/core/src/config.rs`, `c
 
 ## Next steps
 
-- [Quickstart: deploy `examples/basic-http` locally](quickstart.md)
-- [Installation topologies A/B/C](getting-started/installation.md)
-- [Russelfile reference](reference/russelfile.md)
+- [Quickstart: deploy `examples/basic-http` locally](./quickstart.md)
+- [Installation topologies A/B/C](./getting-started/installation.md)
+- [Russelfile reference](./reference/russelfile.md)

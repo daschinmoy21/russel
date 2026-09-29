@@ -5,8 +5,6 @@ sidebar_position: 3
 keywords: [russelfile, manifest, service type, guest, memory, env, volumes, package, ports, ingress]
 ---
 
-# Russelfile reference
-
 Source of truth is `crates/core/src/config.rs` (`Russelfile`, `deny_unknown_fields`) plus the `russel init` template (`crates/cli/src/init.rs`). This page mirrors both. Unknown fields are rejected.
 
 Scaffold one:
@@ -164,4 +162,4 @@ None of the examples set `[ingress]`. Traefik then uses `<service_id>.<RUSSEL_TR
 
 ## Related
 
-- [First deploy](../getting-started/first-deploy.md) · [Traefik ingress](../guides/traefik-ingress.md) · [Runtimes](../concepts/runtimes.md) · [Env and secrets](../guides/env-secrets.md) · [CLI](cli.md)
+- [First deploy](../getting-started/first-deploy.md) · [Traefik ingress](../guides/traefik-ingress.md) · [Runtimes](../concepts/runtimes.md) · [Env and secrets](../guides/env-secrets.md) · [CLI](./cli.md)

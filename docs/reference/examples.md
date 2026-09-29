@@ -5,8 +5,6 @@ sidebar_position: 5
 keywords: [examples, basic-http, microvm-http, hello-rust, env-config, shortlink, filebrowser, static-test, navidrome, vaultwarden, postgres, redis, caddy, meilisearch]
 ---
 
-# Examples
-
 All examples live in `examples/` and deploy with the same verbs. VPS smoke tests should use `type = "container"` examples (`microvm-http` needs KVM).
 
 ## Index
@@ -89,4 +87,4 @@ Per-example Dockerfiles exist as a **baseline for benchmarks** (`bench.sh` raw-p
 
 ## Related
 
-- [First deploy](../getting-started/first-deploy.md) · [Russelfile](russelfile.md) · [Benchmarks](../guides/benchmarks.md)
+- [First deploy](../getting-started/first-deploy.md) · [Russelfile](./russelfile.md) · [Benchmarks](../guides/benchmarks.md)

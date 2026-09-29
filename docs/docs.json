@@ -37,5 +37,16 @@
         "pages": ["project/development", "project/releases", "project/features/v0.1"]
       }
     ]
-  }
+  },
+  "redirects": [
+    { "source": "/architecture", "destination": "/concepts/architecture" },
+    { "source": "/auto-generation", "destination": "/concepts/builds" },
+    { "source": "/deployment", "destination": "/getting-started/first-deploy" },
+    { "source": "/examples", "destination": "/reference/examples" },
+    { "source": "/install", "destination": "/getting-started/installation" },
+    { "source": "/russelfile", "destination": "/reference/russelfile" },
+    { "source": "/security-tls", "destination": "/guides/tls-reverse-proxy" },
+    { "source": "/traefik", "destination": "/guides/traefik-ingress" },
+    { "source": "/vps-one-dev", "destination": "/guides/vps-one-dev" }
+  ]
 }

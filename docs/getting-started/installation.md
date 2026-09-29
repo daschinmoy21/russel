@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [install, topology, ssh tunnel, https, caddy, nginx, nixos, systemd, check]
 ---
 
-# Installation
-
 Russel has two programs:
 
 | Program | Where it runs | What it does |
@@ -157,7 +155,7 @@ The CLI refuses to send the token over plain `http://` to anything but loopback.
 
 ## 4. Open the dashboard
 
-Open `http://127.0.0.1:7878/` (through the tunnel from a laptop, or your HTTPS URL). Paste the token from `/etc/russel/env` into **Settings**. The dashboard keeps it for that browser tab only; `russel login` does not fill it in. More: [Dashboard](dashboard.md).
+Open `http://127.0.0.1:7878/` (through the tunnel from a laptop, or your HTTPS URL). Paste the token from `/etc/russel/env` into **Settings**. The dashboard keeps it for that browser tab only; `russel login` does not fill it in. More: [Dashboard](./dashboard.md).
 
 ## 5. Check the install
 
@@ -239,4 +237,4 @@ Then `russel apply` your services again.
 
 ## Related
 
-- [Quickstart](../quickstart.md) · [First deploy](first-deploy.md) · [Single-VPS checklist](../guides/vps-one-dev.md) · [Troubleshooting](../guides/troubleshooting.md) · [CLI reference](../reference/cli.md)
+- [Quickstart](../quickstart.md) · [First deploy](./first-deploy.md) · [Single-VPS checklist](../guides/vps-one-dev.md) · [Troubleshooting](../guides/troubleshooting.md) · [CLI reference](../reference/cli.md)

@@ -85,7 +85,8 @@ pub(crate) struct ServiceState {
     pub(crate) prebuild_vm_state: Option<VmState>,
     /// Bumped when process ownership changes so the matching supervisor exits.
     pub(crate) process_generation: u64,
-    /// Relaunches under `restart = "unless-stopped"` since the last deploy.
+    /// Relaunches under `restart = "unless-stopped"` since the last deploy:
+    /// by ctrl for a microVM, by Podman for a container.
     pub(crate) restarts: u32,
     /// Consecutive relaunches that did not stay up; drives crash-loop backoff.
     pub(crate) restart_streak: u32,
@@ -131,7 +132,7 @@ pub(super) enum SupervisePoll {
 pub(crate) enum Supervision {
     /// Owned `Child` handles from a cold boot: poll `try_wait`.
     Process,
-    /// Podman container: poll `podman inspect` by id.
+    /// Podman container: poll `podman inspect` by id (`container_watch`).
     Container(String),
     /// Adopted microVM with a known PID and no `Child`: poll `/proc`.
     Pid,

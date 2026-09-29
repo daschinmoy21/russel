@@ -1,0 +1,18 @@
+# Files in docs/ that are not pages on the docs site (gitignore syntax: a
+# leading / anchors a pattern to docs/, or it would match at any depth).
+
+# How this folder maps to the site; for repo readers only.
+/README.md
+
+# Legacy redirect stubs. The repo still links to them (CONTRIBUTING, CLI
+# error text); on the site, `redirects` in docs.json sends their URLs to the
+# new pages.
+/architecture.md
+/auto-generation.md
+/deployment.md
+/examples.md
+/install.md
+/russelfile.md
+/security-tls.md
+/traefik.md
+/vps-one-dev.md

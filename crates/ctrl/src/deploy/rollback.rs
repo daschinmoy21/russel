@@ -16,7 +16,7 @@ use crate::{
     metadata::{
         build_container_metadata, build_microvm_metadata, prior_runtime_from_disk, write_metadata,
     },
-    microvm::{BootOutput, MicrovmRunner},
+    microvm::{BootOutput, MicrovmRunner, ready},
     network::{
         MICROVM_READY_TIMEOUT, MicrovmNet, MicrovmNetMode, PortAllocator, SubnetAllocation,
         TapForwarder, subnet_for,
@@ -488,7 +488,7 @@ impl RecordedMicrovm {
         }
         .await;
 
-        let (vm_child, virtiofsd_children, net) = match boot_result {
+        let (mut vm_child, virtiofsd_children, net) = match boot_result {
             Ok(v) => v,
             Err(e) => {
                 cleanup_launch_resources(
@@ -502,17 +502,39 @@ impl RecordedMicrovm {
         let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
 
         // 7. Readiness BEFORE marking deployed / writing durable success metadata
-        let ready = MicrovmNet::wait_ready(
-            net_mode,
-            service_id,
-            &alloc,
-            host_port,
-            guest_port,
-            MICROVM_READY_TIMEOUT,
+        // A VM that exits fails at once (#493). No settle window: a relaunch
+        // or a cold-path restore replaces nothing that is still running, and
+        // the supervisor sees a later crash.
+        let outcome = ready::wait_until_ready(
+            MicrovmNet::wait_ready(
+                net_mode,
+                service_id,
+                &alloc,
+                host_port,
+                guest_port,
+                MICROVM_READY_TIMEOUT,
+            ),
+            &mut vm_child,
+            Duration::ZERO,
         )
         .await;
-        if !ready {
+        if !matches!(outcome, ready::ReadyOutcome::Ready) {
             // Tear down the partial boot; do not report success for a dead service.
+            // Read the console first: cleanup may remove the service dir.
+            let error = match outcome {
+                ready::ReadyOutcome::Exited(status) => ready::exited_error(
+                    status,
+                    &ready::console_tail(
+                        &crate::paths::service_dir(service_id).join("console.log"),
+                        ready::CONSOLE_TAIL_LINES,
+                    ),
+                ),
+                _ => format!(
+                    "recorded microVM not reachable on {}:{guest_port} within {}s",
+                    alloc.vm_ip,
+                    MICROVM_READY_TIMEOUT.as_secs()
+                ),
+            };
             let mut aux = vec![net.forwarder];
             aux.extend(net.extra_forwarders);
             aux.extend(virtiofsd_children);
@@ -526,11 +548,7 @@ impl RecordedMicrovm {
                 Some(aux),
             )
             .await;
-            anyhow::bail!(
-                "recorded microVM not reachable on {}:{guest_port} within {}s",
-                alloc.vm_ip,
-                MICROVM_READY_TIMEOUT.as_secs()
-            );
+            anyhow::bail!("{error}");
         }
 
         // 8. Write metadata + mark deployed only after readiness
@@ -623,6 +641,15 @@ pub(crate) fn resolve_rollback_app_paths(
     }
 }
 
+/// Where a recorded path is while the service dir sits at its `.bak` name:
+/// paths inside `live_dir` move with it, others stay put.
+fn path_while_backed_up(path: &str, live_dir: &str, bak_dir: &str) -> PathBuf {
+    match Path::new(path).strip_prefix(live_dir) {
+        Ok(rel) => Path::new(bak_dir).join(rel),
+        Err(_) => PathBuf::from(path),
+    }
+}
+
 pub(crate) async fn attempt_container_rollback(
     service_id: &str,
     russel_dir: &str,
@@ -654,7 +681,8 @@ pub(crate) async fn attempt_container_rollback(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing rootfs_path in container metadata"))?;
     // Fail before renaming anything if the previous generation was collected.
-    if !Path::new(old_rootfs_path).exists() {
+    // A rootfs inside the service dir is still under `.bak` at this point.
+    if !path_while_backed_up(old_rootfs_path, russel_dir, russel_bak).exists() {
         anyhow::bail!(
             "previous rootfs_path no longer exists (garbage-collected?): {old_rootfs_path}"
         );
@@ -815,6 +843,25 @@ pub(crate) async fn attempt_container_rollback(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn rootfs_inside_the_service_dir_is_looked_up_under_bak() {
+        // The cold path renames the service dir to .bak before booting the new
+        // generation; the old rootfs is there when rollback checks it.
+        assert_eq!(
+            path_while_backed_up("/d/api/rootfs", "/d/api", "/d/api.bak"),
+            PathBuf::from("/d/api.bak/rootfs")
+        );
+        assert_eq!(
+            path_while_backed_up("/nix/store/x-rootfs", "/d/api", "/d/api.bak"),
+            PathBuf::from("/nix/store/x-rootfs")
+        );
+        // A sibling that only shares the prefix string is not inside it.
+        assert_eq!(
+            path_while_backed_up("/d/api2/rootfs", "/d/api", "/d/api.bak"),
+            PathBuf::from("/d/api2/rootfs")
+        );
+    }
 
     #[test]
     fn resolve_app_paths_both_present_with_bin_suffix() {

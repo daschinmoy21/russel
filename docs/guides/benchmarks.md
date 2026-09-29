@@ -5,8 +5,6 @@ sidebar_position: 7
 keywords: [benchmark, performance, boot time, spawn-to-ready, bench.sh]
 ---
 
-# Benchmarks
-
 Warm-run snapshot (2026-07-24, NixOS, podman 5.8.2, rootless containers via `SUDO_USER`, microVM via Cloud Hypervisor). Total wall ~271 s (clean debug + release + tests + 7 app races).
 
 **MicroVMs must use the Russel-compiled kernel** (flake `.#microvm-kernel`, virtio built-in). `bench.sh` builds it and exports `RUSSEL_KERNEL_PATH` so ctrl never falls back to stock nixpkgs. Numbers below assume that kernel.

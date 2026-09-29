@@ -482,6 +482,10 @@ impl MicrovmRunner {
         if spec.restore_url.is_none() && matches!(spec.net, crate::network::VmNet::VhostUser(_)) {
             super::preflight::check_ch_supports_cpus(spec.cpus_boot).await?;
         }
+        crate::paths::check_unix_socket_path(&spec.api_socket)?;
+        for fs in &spec.fs {
+            crate::paths::check_unix_socket_path(&fs.socket)?;
+        }
 
         let sock_dir = spec
             .api_socket

@@ -5,8 +5,6 @@ sidebar_position: 5
 keywords: [update, rollback, redeploy, deployments, desired state]
 ---
 
-# Update and rollback
-
 Redeploying an existing id kills + waits for the old generation before reusing ports. If the new deploy fails after a prior success, Russel attempts automatic rollback and reports `rolled_back` (CLI still exits non-zero so CI notices).
 
 ## Generations are pinned to commits
@@ -61,8 +59,10 @@ curl -X POST http://127.0.0.1:7878/vm/my-app/rollback \
 
 ## Zero-downtime note
 
-Live-prior redeploys use dual-live candidates (`<id>_g<gen>` + fresh backend port + `Ingress::swap` cutover, then drain + promote). Instant retain-N=2 cutover (keeping the previous artifact hot without a rebuild) is a follow-up — current rollback re-runs the pipeline.
+Live-prior redeploys use dual-live candidates (`<id>_g<gen>` + fresh backend port + `Ingress::swap` cutover, then drain + promote). Between the swap and the drain, the previous generation keeps running for 2 s. If the new one crashes in that window, traffic goes back to the previous one and `apply` fails, so an update can't replace a working version with one that dies on start-up. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers every case, including first deploys and services with `[[ports]]`.
+
+Instant retain-N=2 cutover (keeping the previous artifact hot without a rebuild) is a follow-up — current rollback re-runs the pipeline.
 
 ## Related
 
-- [Lifecycle](../concepts/lifecycle.md) · [API](../reference/api.md) · [Troubleshooting](troubleshooting.md)
+- [Lifecycle](../concepts/lifecycle.md) · [API](../reference/api.md) · [Troubleshooting](./troubleshooting.md)

@@ -5,8 +5,6 @@ sidebar_position: 5
 keywords: [nix, flake, auto-generation, build, trusted source, sandbox]
 ---
 
-# Builds
-
 Nix is the only build system. The deployable artifact is always a `/nix/store` path; both runtimes consume it directly (no image builds, no registry).
 
 ## What you'll need
@@ -74,4 +72,4 @@ export RUSSEL_KERNEL_PATH="$(readlink -f result-kernel/bzImage)"
 
 ## Related
 
-- [Architecture](architecture.md) · [Runtimes](runtimes.md) · [Nix builds](../security/nix-builds.md) · [App packaging](../guides/vps-one-dev.md#d-first-deploy)
+- [Architecture](./architecture.md) · [Runtimes](./runtimes.md) · [Nix builds](../security/nix-builds.md) · [App packaging](../guides/vps-one-dev.md#d-first-deploy)

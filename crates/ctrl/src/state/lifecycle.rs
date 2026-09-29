@@ -7,7 +7,7 @@ use russel_core::config::RuntimeKind;
 use tokio::process::Child;
 
 use super::app::{AppState, LifecycleClaim, ServiceState, SupervisePoll, Supervision};
-use super::helpers::{check_container_running, pid_is_alive, push_capped, read_tail_of_file};
+use super::helpers::{pid_is_alive, push_capped, read_tail_of_file};
 
 impl AppState {
     /// Mark a service as building. Rejects if the service already exists in a
@@ -99,7 +99,14 @@ impl AppState {
                 self.spawn_process_supervisor(service_id.to_string(), generation);
             }
             Supervision::Container(container_id) => {
-                self.spawn_container_supervisor(service_id.to_string(), container_id, generation);
+                // The container outlived a failed redeploy or an aborted stop;
+                // its restart count so far is not a new crash.
+                self.spawn_container_supervisor(
+                    service_id.to_string(),
+                    container_id,
+                    generation,
+                    None,
+                );
             }
             Supervision::Pid => self.spawn_pid_supervisor(service_id.to_string(), generation),
         }
@@ -274,7 +281,7 @@ impl AppState {
     }
 
     /// Mark a container deployment as running (no VM child processes).
-    /// Spawns a lightweight liveness supervisor that polls podman.
+    /// Spawns the container exit watcher (see `container_watch`).
     ///
     /// When `host_port` / `guest_port` are provided they are stored on the
     /// in-memory service state so status and health probes do not depend solely
@@ -316,81 +323,14 @@ impl AppState {
             service_id.to_string(),
             container_id.to_string(),
             generation,
+            // Freshly started by this deploy: any restart is a crash.
+            Some(0),
         );
 
         // Best-effort catalog update.
         if let Err(e) = self.write_catalog() {
             tracing::warn!(error = %e, "failed to write catalog after mark_deployed_container");
         }
-    }
-
-    /// Lightweight container liveness supervisor: polls podman inspect every 30s.
-    /// If the container is no longer running, marks the service failed.
-    pub(super) fn spawn_container_supervisor(
-        &self,
-        service_id: String,
-        container_id: String,
-        generation: u64,
-    ) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let state = self.clone();
-        tokio::spawn(async move {
-            // Initial delay to let container settle.
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                interval.tick().await;
-                // Check we still own this generation.
-                {
-                    let inner = state.lock_inner();
-                    let Some(s) = inner.services.get(&service_id) else {
-                        return;
-                    };
-                    if s.process_generation != generation {
-                        return;
-                    }
-                    if s.status != ServiceStatus::Deployed || s.vm_state != VmState::Running {
-                        return;
-                    }
-                }
-                // Poll podman inspect for the container.
-                // Require two consecutive failures before marking failed —
-                // podman inspect can transiently return false even when the
-                // container is healthy (e.g. brief podman state inconsistency).
-                let alive = check_container_running(&container_id).await;
-                if alive {
-                    consecutive_failures = 0;
-                    continue;
-                }
-                consecutive_failures += 1;
-                if consecutive_failures < 2 {
-                    tracing::warn!(
-                        service_id = %service_id,
-                        container_id = %container_id,
-                        consecutive_failures,
-                        "container appears down — will retry next cycle"
-                    );
-                    continue;
-                }
-                tracing::warn!(
-                    service_id = %service_id,
-                    container_id = %container_id,
-                    "container is no longer running after {consecutive_failures} checks — marking failed"
-                );
-                // Use generation-conditional mark so a concurrent redeploy
-                // that bumps process_generation is not wrongly marked failed.
-                state.mark_failed_if_generation(
-                    &service_id,
-                    generation,
-                    format!("container {container_id} is not running"),
-                );
-                return;
-            }
-        });
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {

@@ -5,8 +5,6 @@ sidebar_position: 2
 keywords: [nix, sandbox, restricted, threat model, flake, auto-generation]
 ---
 
-# Nix build security
-
 **Nix builds trust the source repo** — a malicious `flake.nix` runs as the build user. Single-operator trusted repos are the default posture. Anything else needs the hardening below.
 
 ## Threat model
@@ -14,7 +12,7 @@ keywords: [nix, sandbox, restricted, threat model, flake, auto-generation]
 - Attacker controls the repo (flake, builder expressions, hooks).
 - Build runs as the control-plane user with that user's filesystem/network reachability.
 - Impact without hardening: arbitrary code as the build user, store poisoning, exfiltration via build-time network, host-file reads through impure evaluation.
-- Out of scope for this page: guest escape (see [Runtimes](../concepts/runtimes.md)), ctrl API auth (see [Security overview](overview.md)).
+- Out of scope for this page: guest escape (see [Runtimes](../concepts/runtimes.md)), ctrl API auth (see [Security overview](./overview.md)).
 
 ## Restricted mode
 
@@ -55,4 +53,4 @@ Auto-generated flakes (Rust/Go/static) live in the checkout and evaluate with th
 
 ## Related
 
-- [Builds](../concepts/builds.md) · [Security overview](overview.md) · [Environment](../reference/environment.md)
+- [Builds](../concepts/builds.md) · [Security overview](./overview.md) · [Environment](../reference/environment.md)

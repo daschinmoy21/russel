@@ -5,14 +5,12 @@ sidebar_position: 2
 keywords: [quickstart, deploy, apply, russel init, basic-http, health check, rollback]
 ---
 
-# Quickstart
-
 You'll deploy `examples/basic-http`, a small Go web server, as a rootless container on your own server. Then you'll redeploy it, roll it back, and remove it.
 
 ## Before you start
 
-- Finish [Installation](getting-started/installation.md): `russel ps` should work.
-- Run these steps **on the server**. The quickstart deploys from a folder on the server. For deploying from a laptop, see [First deploy](getting-started/first-deploy.md).
+- Finish [Installation](./getting-started/installation.md): `russel ps` should work.
+- Run these steps **on the server**. The quickstart deploys from a folder on the server. For deploying from a laptop, see [First deploy](./getting-started/first-deploy.md).
 - Get the examples into a folder the `russel` account owns. The control plane runs as `russel`, so it can't read your home directory:
 
   ```bash
@@ -69,7 +67,7 @@ curl http://127.0.0.1:3100/health
 russel logs api
 ```
 
-> **Note:** Russel picks a free host port (3100 and up) unless the Russelfile pins one. It can change on the next deploy, so use `russel ps` to find it. To pin it, add `[ingress]` with `port = 8080` to the Russelfile. For a stable name instead of a port, see [Traefik ingress](guides/traefik-ingress.md).
+> **Note:** Russel picks a free host port (3100 and up) unless the Russelfile pins one. It can change on the next deploy, so use `russel ps` to find it. To pin it, add `[ingress]` with `port = 8080` to the Russelfile. For a stable name instead of a port, see [Traefik ingress](./guides/traefik-ingress.md).
 
 ## 4. Redeploy and roll back
 
@@ -86,7 +84,7 @@ Commit a change to the app or edit the Russelfile and `apply` again, or force a 
 russel apply --force examples/basic-http
 ```
 
-A redeploy starts the new version next to the old one and switches over only once the new one is ready, so the app keeps serving. If the new version fails to start, the old one keeps running and `apply` exits non-zero.
+A redeploy starts the new version next to the old one and switches traffic over once the new one answers, so the app keeps serving. The old one keeps running for 2 more seconds (`switch · New version is live; …`). If the new version fails to start, or crashes within those 2 seconds, traffic stays on (or goes back to) the old one and `apply` exits non-zero. [When a deploy counts as ready](./concepts/lifecycle.md#when-a-deploy-counts-as-ready) has the details.
 
 Go back to the previous version yourself:
 
@@ -94,7 +92,7 @@ Go back to the previous version yourself:
 russel rollback api
 ```
 
-Russel keeps the last 20 deployments. `russel rollback api --version N` picks an older one. More: [Update and rollback](guides/update-rollback.md).
+Russel keeps the last 20 deployments. `russel rollback api --version N` picks an older one. More: [Update and rollback](./guides/update-rollback.md).
 
 ## 5. Clean up
 
@@ -117,10 +115,10 @@ russel apply https://github.com/you/my-app.git
 
 The server clones the repo itself, so this works the same from your laptop. To deploy a folder that is already on the server instead, keep it somewhere the `russel` account owns, like `/srv/russel-apps`, and run `russel apply /srv/russel-apps/my-app`.
 
-If your project has no `flake.nix`, Russel generates one for Rust (`Cargo.toml`), Go (`go.mod`), and static sites. `russel init --with-flake` writes a starter flake you can edit instead. See [Builds](concepts/builds.md) and the [Russelfile reference](reference/russelfile.md).
+If your project has no `flake.nix`, Russel generates one for Rust (`Cargo.toml`), Go (`go.mod`), and static sites. `russel init --with-flake` writes a starter flake you can edit instead. See [Builds](./concepts/builds.md) and the [Russelfile reference](./reference/russelfile.md).
 
 ## Next steps
 
-- [First deploy](getting-started/first-deploy.md): deploy from git, and add env vars, secrets, and volumes.
-- [Single-VPS checklist](guides/vps-one-dev.md): run Russel on a VPS and reach apps from the internet.
-- [Troubleshooting](guides/troubleshooting.md)
+- [First deploy](./getting-started/first-deploy.md): deploy from git, and add env vars, secrets, and volumes.
+- [Single-VPS checklist](./guides/vps-one-dev.md): run Russel on a VPS and reach apps from the internet.
+- [Troubleshooting](./guides/troubleshooting.md)

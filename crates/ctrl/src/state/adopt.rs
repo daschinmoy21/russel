@@ -66,7 +66,8 @@ impl AppState {
 
     /// Adopt a running container observed from disk metadata.
     ///
-    /// Spawns a container liveness supervisor (same as `mark_deployed_container`).
+    /// Spawns the container exit watcher, with the restart count it has now
+    /// as the baseline: restarts from before ctrl started are not new crashes.
     /// If the service already has live Child handles, does nothing.
     pub fn adopt_running_container(
         &self,
@@ -113,6 +114,7 @@ impl AppState {
             service_id.to_string(),
             container_id.to_string(),
             generation,
+            None,
         );
     }
 

@@ -5,9 +5,16 @@ sidebar_position: 2
 keywords: [changelog, releases, init, login, nixos, install]
 ---
 
-# Changelog
-
 Curated, operator-visible changes. Full history is `git log`.
+
+## 2026-09-28 — an update can't replace a working version with one that crashes on start-up (#493)
+
+- **Updates and rollbacks (dual-live)** switch traffic to the new version as soon as it answers, then keep the previous version running for 2 s (`switch · New version is live; keeping the previous one running for 2s in case it crashes`). If the new version dies in that window, traffic goes back to the previous one, the new one is torn down, and `apply` fails with `new version crashed within 2s of answering` and the app's last output. Before, one accepted connection was enough: an app that listened and then crashed (postgres without `/dev/shm`) reported `deployed`, and the previous version was already drained. Both runtimes.
+- **Cold updates** (services with `[[ports]]`) require the new version to stay up for 2 s after it answers; a crash restores the previous version from its backup (`rolled_back`).
+- **First deploys** are unchanged in speed: `deployed` at the first answer. A crash right after is reported within about a second by the supervisor (microVMs) or the exit watcher (containers).
+- A microVM whose guest exits before the app answers fails at once with `app exited during startup (exit code N)` and the guest console tail, instead of after the 30 s readiness timeout.
+- Fixed: a failed container cold update never rolled back. The rollback looked for the previous rootfs at its live path while it sat under `.bak`, and failed with `previous rootfs_path no longer exists`.
+- Details and trade-offs: [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready).
 
 ## 2026-09-28 — a dedicated `russel` account, and host checks (#515, breaking for existing `host` installs)
 

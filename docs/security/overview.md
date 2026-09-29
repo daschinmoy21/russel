@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [security, threat model, auth, bearer, ssrf, secrets, isolation]
 ---
 
-# Security overview
-
 Russel is a privileged daemon for a **single trusted operator**. It is not multi-tenant. Harden the host, keep ctrl on loopback, and only deploy trusted repos unless `RUSSEL_NIX_RESTRICTED=1`.
 
 ## Trust boundaries
@@ -25,7 +23,7 @@ Russel is a privileged daemon for a **single trusted operator**. It is not multi
 
 - DNS-rebinding around the SSRF guard (no DNS resolution), metadata-IP redirects during clone.
 - Plain (non-`secret://`) container env is visible via `podman inspect` (by design; use `secret://` for anything sensitive).
-- Nix builds trust source repos (see [Nix builds](nix-builds.md)).
+- Nix builds trust source repos (see [Nix builds](./nix-builds.md)).
 - No native ctrl TLS, no CORS, no deb/OCI packaging, no multi-tenant isolation, no managed DBs.
 
 ## Operator rules
@@ -38,4 +36,4 @@ Russel is a privileged daemon for a **single trusted operator**. It is not multi
 
 ## Related
 
-- [Nix builds](nix-builds.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [Env and secrets](../guides/env-secrets.md) · [Environment](../reference/environment.md)
+- [Nix builds](./nix-builds.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [Env and secrets](../guides/env-secrets.md) · [Environment](../reference/environment.md)

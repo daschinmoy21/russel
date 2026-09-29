@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [cli, russel init, login, deploy, ps, status, logs, secrets, update]
 ---
 
-# CLI reference
-
 Binaries are `russel` (client) and `russel-ctrl` (control plane). Crate name stays `russel-cli`; the **command** is `russel`. Install: [Installation](../getting-started/installation.md). Building from source is covered in [Contributing](../project/development.md).
 
 ## `russel-ctrl`
@@ -129,7 +127,7 @@ Remote ctrls need git URLs — local paths resolve on the **ctrl host** and need
 | `--keep-volumes` | Keep every managed volume dir (`/var/lib/russel/<id>/volumes/*`) |
 | `--delete-volumes` | Delete every managed volume dir, even `keep = true` ones |
 
-With neither flag, each volume's `keep` field decides. Absolute `host =` binds are never deleted. See [API](api.md) (`DELETE /vm/{id}?keep_volumes=`) and [Russelfile](russelfile.md).
+With neither flag, each volume's `keep` field decides. Absolute `host =` binds are never deleted. See [API](./api.md) (`DELETE /vm/{id}?keep_volumes=`) and [Russelfile](./russelfile.md).
 
 ### `russel update <id> [--refresh]`
 
@@ -167,4 +165,4 @@ russel ps
 
 ## Related
 
-- [First deploy](../getting-started/first-deploy.md) · [API](api.md) · [Russelfile](russelfile.md) · [Troubleshooting](../guides/troubleshooting.md)
+- [First deploy](../getting-started/first-deploy.md) · [API](./api.md) · [Russelfile](./russelfile.md) · [Troubleshooting](../guides/troubleshooting.md)

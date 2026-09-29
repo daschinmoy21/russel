@@ -5,8 +5,6 @@ sidebar_position: 4
 keywords: [env, secrets, secret store, env-file, reserved keys]
 ---
 
-# Env and secrets
-
 Environment values are declared in the Russelfile under `[service.env]`. Secrets are stored on the host and referenced as `secret://NAME`.
 
 ## Env rules (enforced)

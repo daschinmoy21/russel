@@ -5,8 +5,6 @@ sidebar_position: 3
 keywords: [traefik, ingress, file provider, host routing, tls, acme]
 ---
 
-# Traefik gateway setup
-
 Russel integrates with Traefik v2 as the primary HTTP reverse proxy (file provider). No API calls — Russel writes dynamic config files; Traefik watches the directory.
 
 > **Architecture note:** Deploy uses the `Ingress` trait; `TraefikFileIngress` is the default implementation. Future proxies implement the same trait — the pipeline never imports Traefik types directly.
@@ -172,4 +170,4 @@ cloudflared in front of Traefik is an operator-level choice.
 
 ## Related
 
-- [Networking](../concepts/networking.md) · [TLS reverse proxy](tls-reverse-proxy.md) · [Environment](../reference/environment.md)
+- [Networking](../concepts/networking.md) · [TLS reverse proxy](./tls-reverse-proxy.md) · [Environment](../reference/environment.md)

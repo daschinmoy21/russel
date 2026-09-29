@@ -5,8 +5,6 @@ sidebar_position: 3
 keywords: [networking, tap, subnet, socat, ports, traefik, ingress, iptables]
 ---
 
-# Networking
-
 Russel has two data planes (microVM userspace forwarding vs container port publish) and one primary HTTP ingress (Traefik). Published host ports (`-p`) are an escape hatch.
 
 ## MicroVM networking
@@ -104,4 +102,4 @@ No pin is needed for normal HTTP apps. Setup: [Traefik ingress](../guides/traefi
 
 ## Related
 
-- [Architecture](architecture.md) · [Runtimes](runtimes.md) · [Traefik ingress](../guides/traefik-ingress.md) · [Environment](../reference/environment.md)
+- [Architecture](./architecture.md) · [Runtimes](./runtimes.md) · [Traefik ingress](../guides/traefik-ingress.md) · [Environment](../reference/environment.md)

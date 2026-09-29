@@ -5,8 +5,6 @@ sidebar_position: 6
 keywords: [troubleshooting, diagnostics, origin, status, 401, offline, cleartext, ports]
 ---
 
-# Troubleshooting
-
 Start with the two anchored diagnostics, then match your symptom below.
 
 ```bash
@@ -36,7 +34,7 @@ Loopback connect errors mean **nothing is listening on this machine**. Check the
 |---|---|---|
 | `relative paths are rejected` | CLI sent a relative path | Use an absolute trusted-host path (with opt-in) or a git URL |
 | `local path deploys … disabled` | Remote ctrl without opt-in | Use `https://…`/`ssh://…`/`git@…`; enable `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1` only on single-tenant trusted hosts |
-| `invalid env key / reserved` | Reserved or bad charset | See [Env and secrets](env-secrets.md) reserved list |
+| `invalid env key / reserved` | Reserved or bad charset | See [Env and secrets](./env-secrets.md) reserved list |
 | `secret not found` | `secret://NAME` with no host secret | `russel secrets set NAME` on the ctrl host |
 | Build fails with `nix` not found | The service only looks in the Nix daemon profile, `/nix/var/nix/profiles/default/bin` | Install Nix with the daemon installer (`--daemon`); a single-user install lives in one user's home. `install.sh check` tells you which one you have |
 | `passt exited … before creating …/passt.sock (is host port … free?)` with a free port (microVMs) | The socket path is longer than the 107-byte limit for Unix sockets | Use a shorter `RUSSEL_DATA_DIR` |
@@ -58,7 +56,9 @@ Repo URLs accept `https://`, `http://`, `ssh://`, `git@host:path` only. `repo_ur
 | Podman errors about `/run/user`, cgroups, or `newuidmap` | The `russel` account's rootless Podman is missing a piece | Run `install.sh check`. Then look as the account itself: `sudo -u russel XDG_RUNTIME_DIR=/run/user/$(id -u russel) podman info`, and `loginctl show-user russel -p Linger` should say `yes` |
 | `podman_args rejected` | Blocked Podman flag in `service.podman_args` | Drop Russel-owned or isolation-weakening flags |
 
-| `container exited during startup (…, exit code N)` or `container crashed during startup` | The app exited (or crash-looped under a restart policy) before it accepted connections | Read the quoted container output; fix config, args, or env. A live previous generation keeps serving (or is rolled back) |
+| `container exited during startup (…, exit code N)`, `container crashed during startup`, or (microVMs) `app exited during startup (exit code N)` | The app exited (or crash-looped under a restart policy) before it accepted connections, or, on an update, within 2 s after it did | Read the quoted container output or guest console; fix config, args, or env. A live previous generation keeps serving (or is rolled back) |
+| `new version crashed within 2s of answering; traffic is back on the previous version` | An update's new version answered, then died while the previous one was still running | Same fix as above. Nothing to recover: the previous version never stopped. See [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) |
+| `apply` said `deployed`, but `russel ps` shows `failed` soon after | A first deploy's app crashed right after answering. First deploys don't wait (nothing older to protect) | `russel logs <id>`; fix and `apply` again. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) |
 | `app did not accept connections on port N within 30s` | The container is up but nothing answers on `service.port`: still starting, wrong port, or bound to `127.0.0.1` | Listen on `0.0.0.0:$PORT`; check `service.port` matches the app |
 | `microVMs are experimental and need …` | MicroVM deploy on a ctrl without read-write `/dev/kvm`, or without `passt` on PATH (fails before the build) | Use `type = "container"` (the default), or add the ctrl user to the `kvm` group and install `passt` |
 | `service.args requires service.type = "container"` | `args` on a microVM | Remove `args` or switch to `type = "container"`; the microVM guest does not pass argv yet |
@@ -83,4 +83,4 @@ File issues with the command, full NDJSON tail, `russel origin` output, and the 
 
 ## Related
 
-- [Installation](../getting-started/installation.md) · [TLS reverse proxy](tls-reverse-proxy.md) · [API](../reference/api.md)
+- [Installation](../getting-started/installation.md) · [TLS reverse proxy](./tls-reverse-proxy.md) · [API](../reference/api.md)

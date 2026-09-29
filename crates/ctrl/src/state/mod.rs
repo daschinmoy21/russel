@@ -2,6 +2,7 @@
 
 mod adopt;
 mod app;
+mod container_watch;
 mod helpers;
 mod lifecycle;
 mod restart;

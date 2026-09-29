@@ -1,11 +1,11 @@
 //! The phases of one deploy (#415), in order: plan → build → prepare_slot →
-//! boot → swap_ingress → cutover → record. Each phase is one function that
+//! boot → swap_ingress → hold → cutover → record. Each phase is one function that
 //! takes what the earlier phases produced; `deploy_inner` only sequences them.
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use russel_core::{
@@ -19,16 +19,20 @@ use russel_core::{
 use crate::{
     build::BuildOutput,
     container::{
-        attach_managed_volumes, destroy_preserving_volumes, detach_managed_volumes,
-        restore_backed_up_service_dir, validate_podman_args_for_runtime,
+        CONTAINER_READY_TIMEOUT, LOG_TAIL_LINES, ReadyOutcome, attach_managed_volumes,
+        container_log_path, destroy_preserving_volumes, detach_managed_volumes, log_tail,
+        not_ready_error, restore_backed_up_service_dir, validate_podman_args_for_runtime,
+        watch_container,
     },
     deployments::{self, AppendSuccess, DesiredStateSnapshot},
     git::{CheckoutLease, SourceRev, redact_repo_url},
     ingress::{Backend, HostRule},
-    microvm::KernelInfo,
+    metadata::load_metadata_from_disk,
+    microvm::{KernelInfo, ready},
     network::{MicrovmNetMode, PortAllocator, TapForwarder},
 };
 
+use super::WATCH_WINDOW;
 use super::pipeline::{
     DeployInnerResult, DeployOutput, DeployPipeline, DeployWorkload, DesiredExtras, ResolvedSource,
     build_desired_state, carry_history, new_generation_id, promote_generation,
@@ -175,7 +179,7 @@ impl DeployPipeline {
 
         // Armed once boot reserves ports, so dropping it releases them.
         let mut reservation = None;
-        let booted = match self
+        let mut booted = match self
             .boot(service_id, &plan, &built, &slot, &mut reservation, &tx)
             .await
         {
@@ -187,7 +191,15 @@ impl DeployPipeline {
             }
         };
 
+        // The live generation's route, to point back at from `hold`.
+        let previous_route = if slot.dual_live {
+            self.live_route(service_id, &plan)
+        } else {
+            None
+        };
         self.swap_ingress(service_id, &plan, &slot, &booted.workload)
+            .await?;
+        self.hold(service_id, &slot, &mut booted.workload, previous_route, &tx)
             .await?;
         let fixed_port = self
             .cutover(service_id, &plan, &slot, &booted.workload, &tx)
@@ -438,6 +450,15 @@ impl DeployPipeline {
         }
 
         let generation_id = Some(slot.generation_id.as_str());
+        // A cold replace already stopped the live generation, so a crash right
+        // after answering must fail in boot, where the .bak restore still
+        // covers it. Dual-live watches in `hold` instead, with traffic already
+        // switched; a first deploy has nothing to protect and does not wait.
+        let settle = if slot.prior_runtime.is_some() && !slot.dual_live {
+            WATCH_WINDOW
+        } else {
+            Duration::ZERO
+        };
         let (workload, create_ms, start_ms, network_ms, ready_ms) = match plan.runtime {
             RuntimeKind::Microvm => {
                 self.deploy_microvm(
@@ -455,6 +476,7 @@ impl DeployPipeline {
                     plan.desired_state.as_ref(),
                     &plan.volumes,
                     built.output.using_package,
+                    settle,
                 )
                 .await?
             }
@@ -471,6 +493,7 @@ impl DeployPipeline {
                     plan.desired_state.as_ref(),
                     &plan.volumes,
                     built.output.using_package,
+                    settle,
                 )
                 .await?
             }
@@ -605,23 +628,113 @@ impl DeployPipeline {
         let Err(error) = result else {
             return Ok(());
         };
+        self.destroy_candidate(slot, workload, "ingress failure")
+            .await;
+        Err(error)
+    }
 
+    /// Tear down the new generation in full: its network, its VM or
+    /// container, and its ports. The live generation is not touched.
+    async fn destroy_candidate(&self, slot: &Slot, workload: &DeployWorkload, why: &str) {
         let key = &slot.runtime_key;
         workload.teardown_network().await;
         match workload {
             DeployWorkload::Microvm { .. } => {
                 if let Err(e) = self.runner.destroy(key).await {
-                    tracing::warn!(runtime_key = %key, error = %e, "failed to destroy microVM after ingress failure");
+                    tracing::warn!(runtime_key = %key, error = %e, why, "failed to destroy candidate microVM");
                 }
             }
             DeployWorkload::Container { .. } => {
                 if let Err(e) = destroy_preserving_volumes(key).await {
-                    tracing::warn!(runtime_key = %key, error = %e, "failed to destroy container after ingress failure");
+                    tracing::warn!(runtime_key = %key, error = %e, why, "failed to destroy candidate container");
                 }
             }
         }
         PortAllocator::release_service(key);
-        Err(error)
+    }
+
+    /// The live generation's route: the host port it publishes and the Host
+    /// rule it is served under, which this deploy may change. `None` when the
+    /// port is unknown.
+    fn live_route(&self, service_id: &str, plan: &Plan) -> Option<(u16, Vec<HostRule>)> {
+        let meta = load_metadata_from_disk(service_id);
+        let port = self
+            .state
+            .status(service_id)
+            .and_then(|s| s.host_port)
+            .or_else(|| meta.as_ref().and_then(|m| m.host_port))
+            .filter(|p| *p > 0)?;
+        let host_rules = match meta {
+            Some(m) => m
+                .ingress_host
+                .map(|host| vec![HostRule { host }])
+                .unwrap_or_default(),
+            None => plan.host_rules.clone(),
+        };
+        Some((port, host_rules))
+    }
+
+    /// Dual-live only. Traffic is on the new generation now, but the previous
+    /// one is still running. Keep it for [`WATCH_WINDOW`]: if the new one dies
+    /// meanwhile (#493), point traffic back, tear the new one down, and fail
+    /// the deploy. The previous generation was never stopped, so nothing has
+    /// to be restored.
+    async fn hold(
+        &self,
+        service_id: &str,
+        slot: &Slot,
+        workload: &mut DeployWorkload,
+        previous_route: Option<(u16, Vec<HostRule>)>,
+        tx: &Events,
+    ) -> anyhow::Result<()> {
+        if !slot.dual_live {
+            return Ok(());
+        }
+        let _ = tx
+            .send(DeployEvent::Progress {
+                phase: "switch".into(),
+                description: format!(
+                    "New version is live; keeping the previous one running for {}s in case it crashes",
+                    WATCH_WINDOW.as_secs()
+                ),
+            })
+            .await;
+        let Some(error) = watch_candidate(&slot.runtime_key, workload, WATCH_WINDOW).await else {
+            return Ok(());
+        };
+        tracing::warn!(
+            service_id,
+            runtime_key = %slot.runtime_key,
+            error = %error,
+            "new generation died inside the watch window; switching traffic back"
+        );
+
+        let switched_back = match previous_route {
+            Some((port, host_rules)) => match self
+                .ingress
+                .swap(service_id, &Backend::from_publish(port), &host_rules)
+                .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(service_id, error = %e, "could not point the route back at the previous generation");
+                    false
+                }
+            },
+            None => false,
+        };
+        self.destroy_candidate(slot, workload, "crashed inside the watch window")
+            .await;
+        let outcome = if switched_back {
+            "traffic is back on the previous version, which kept running"
+        } else {
+            "the previous version kept running, but its ingress route could not be restored; \
+             run `russel apply --force` with a working build"
+        };
+        anyhow::bail!(
+            "new version crashed within {}s of answering; {outcome}: {error}",
+            WATCH_WINDOW.as_secs()
+        )
     }
 
     /// Retire what the new generation replaced. Cold: drop the `.bak` dirs.
@@ -917,6 +1030,41 @@ impl Drop for PortReservation {
     fn drop(&mut self) {
         if self.armed {
             PortAllocator::release_service(&self.service_id);
+        }
+    }
+}
+
+/// Watch a new generation for `window`. `Some(error)` when it died meanwhile:
+/// its VM exited (the agent powers the guest off when the app exits) or its
+/// container exited or restarted. The error quotes the console or log tail.
+async fn watch_candidate(
+    runtime_key: &str,
+    workload: &mut DeployWorkload,
+    window: Duration,
+) -> Option<String> {
+    match workload {
+        DeployWorkload::Microvm { vm_child, .. } => {
+            let status = ready::watch(vm_child, window).await?;
+            let console = crate::paths::service_dir(runtime_key).join("console.log");
+            Some(ready::exited_error(
+                status,
+                &ready::console_tail(&console, ready::CONSOLE_TAIL_LINES),
+            ))
+        }
+        DeployWorkload::Container {
+            container_name,
+            port,
+            ..
+        } => {
+            let state = watch_container(container_name, window).await?;
+            let tail = log_tail(&container_log_path(runtime_key), LOG_TAIL_LINES);
+            Some(not_ready_error(
+                &ReadyOutcome::Died(state),
+                port.host,
+                port.guest,
+                CONTAINER_READY_TIMEOUT,
+                &tail,
+            ))
         }
     }
 }

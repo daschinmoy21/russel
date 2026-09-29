@@ -48,8 +48,7 @@ pub(super) fn parse_rfc3339_to_instant(rfc3339: &str) -> Option<Instant> {
 /// Result of `podman inspect` for `.State.Running`.
 ///
 /// [`ContainerProbe::Unknown`] means the probe did not run or podman failed
-/// unexpectedly. Callers that only need a bool (see [`check_container_running`])
-/// treat that as not running; startup reconcile must not.
+/// unexpectedly; startup reconcile must not treat that as stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContainerProbe {
     Running,
@@ -107,14 +106,6 @@ pub(crate) async fn probe_container(container_id: &str) -> ContainerProbe {
         &stdout,
         &stderr,
     )
-}
-
-/// Whether `podman inspect` reports the container running.
-///
-/// [`ContainerProbe::Unknown`] collapses to `false` for bool callers. Reconcile
-/// uses [`probe_container`] so a broken podman is not treated as stopped.
-pub(crate) async fn check_container_running(container_id: &str) -> bool {
-    matches!(probe_container(container_id).await, ContainerProbe::Running)
 }
 
 /// Check if a PID is still alive via /proc/{pid}/stat.

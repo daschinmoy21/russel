@@ -5,15 +5,13 @@ sidebar_position: 3
 keywords: [dashboard, astro, vite, api base, 401, offline, sessionStorage]
 ---
 
-# Dashboard
-
 `russel-ctrl` serves the dashboard on the same listener as the API (`http://127.0.0.1:7878/` by default). Open that URL and keep Settings at `/api`. CLI login does not fill the dashboard token.
 
 The UI is the Astro app in `dashboard/`. Ctrl looks for a built `dist/` next to the binary, in `/usr/local/share/russel/dashboard`, or in `dashboard/dist` of a checkout. `./contrib/install.sh ctrl` and `host` copy `dashboard/dist` into that share path. `--no-dashboard` skips it. `--dashboard-dir` / `RUSSEL_DASHBOARD_DIR` pin a dist.
 
 ## What you'll need
 
-- A running `russel-ctrl` ([Installation](installation.md)) with a built dashboard dist.
+- A running `russel-ctrl` ([Installation](./installation.md)) with a built dashboard dist.
 - `bun` only if you are changing the dashboard source (`bun run dev` / `bun run build`).
 
 ## Run it
@@ -65,4 +63,4 @@ CI runs `bun test` before the dashboard build.
 
 ## Related
 
-- [Installation](installation.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [Troubleshooting](../guides/troubleshooting.md)
+- [Installation](./installation.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md) · [Troubleshooting](../guides/troubleshooting.md)

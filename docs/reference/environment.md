@@ -5,8 +5,6 @@ sidebar_position: 4
 keywords: [environment, env vars, RUSSEL_CTRL_ADDR, RUSSEL_API_TOKEN, traefik, health]
 ---
 
-# Environment reference
-
 All `RUSSEL_*` variables in one table. Booleans accept the unified truthy set (`1|true|yes`, case-insensitive) unless noted. Sources: `crates/ctrl/src/main.rs`, `network/ports.rs`, `traefik.rs`, `health.rs`, `build.rs`, `git/`, `warm_pool.rs`, `secrets.rs`, `agent/*`, `microvm/runner.rs`, `cli/commands.rs` + `config.rs`.
 
 ## Control plane core
@@ -56,7 +54,7 @@ All `RUSSEL_*` variables in one table. Booleans accept the unified truthy set (`
 | `RUSSEL_TRAEFIK_DYNAMIC_DIR` | `$RUSSEL_DATA_DIR/traefik/dynamic` (`/var/lib/russel/traefik/dynamic`) | Must match Traefik `providers.file.directory`. |
 | `RUSSEL_TRAEFIK_DOMAIN` | `russel.local` | Default suffix for `Host()` rules when `[ingress].host` is omitted (validated DNS name). A file host takes precedence. |
 | `RUSSEL_TRAEFIK_BACKEND` | publish bind (`RUSSEL_PUBLISH_BIND`) | Host Traefik dials for a published backend port. Needed when Traefik runs in another netns than the backend (e.g. rootless Traefik → `10.89.0.1`). Wildcard binds map to loopback for a same-netns Traefik. See [Traefik ingress](../guides/traefik-ingress.md). |
-| `RUSSEL_VOLUME_ROOTS` | — (unset) | Colon-separated absolute prefixes allowlisting absolute `host =` volume binds. Without it, absolute host binds are rejected at deploy. Example: `/srv/data:/mnt/media`. See [Russelfile](russelfile.md). |
+| `RUSSEL_VOLUME_ROOTS` | — (unset) | Colon-separated absolute prefixes allowlisting absolute `host =` volume binds. Without it, absolute host binds are rejected at deploy. Example: `/srv/data:/mnt/media`. See [Russelfile](./russelfile.md). |
 | `RUSSEL_TRAEFIK_TLS` | off | `1` (+ truthy set incl. `on`) adds `websecure` + `tls.certResolver`. |
 | `RUSSEL_TRAEFIK_CERT_RESOLVER` | `letsencrypt` fallback | Must match the static-config resolver name. |
 | `RUSSEL_FORWARD` | filter on | `allow` skips the `RUSSEL-FORWARD` guest filter (single-tenant debug only — guests can pivot via host routing). |
@@ -89,4 +87,4 @@ All `RUSSEL_*` variables in one table. Booleans accept the unified truthy set (`
 
 ## Related
 
-- [Installation](../getting-started/installation.md) · [Networking](../concepts/networking.md) · [API](api.md) · [Security overview](../security/overview.md)
+- [Installation](../getting-started/installation.md) · [Networking](../concepts/networking.md) · [API](./api.md) · [Security overview](../security/overview.md)

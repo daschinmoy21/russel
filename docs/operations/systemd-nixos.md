@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [systemd, nixos, service, linger, podman, system unit, russel user]
 ---
 
-# systemd and NixOS
-
 Two supported ways to run `russel-ctrl` persistently. Both keep it on loopback with fail-closed auth and `0700` state.
 
 ## What you'll need
@@ -88,4 +86,4 @@ ss -ltnp 'sport = :7878'
 
 ## Related
 
-- [Installation](../getting-started/installation.md) · [Upgrades + backups](upgrades-backup.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md)
+- [Installation](../getting-started/installation.md) · [Upgrades + backups](./upgrades-backup.md) · [TLS reverse proxy](../guides/tls-reverse-proxy.md)

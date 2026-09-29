@@ -3,6 +3,7 @@
 mod agent;
 pub(crate) mod preflight;
 mod process;
+pub(crate) mod ready;
 mod runner;
 mod spec;
 

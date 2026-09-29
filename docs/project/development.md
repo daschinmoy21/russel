@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [contributing, dev setup, clippy, tests, stacked prs]
 ---
 
-# Contributing
-
 Source of truth for workflow is `CONTRIBUTING.md` at the repo root. This page summarizes it for the docs site.
 
 ## Setup
@@ -52,8 +50,8 @@ Stacked PRs (#350–#353 install-scripts) are on `main`. New work that cannot la
 
 - `reference/` + code are the contract. README drift is a bug — update docs with behavior.
 - New flags/fields/env vars need all three: code, `reference/` page, and (for operator-visible paths) a guide snippet.
-- Docs style follows this site: frontmatter (`title`, `description`, `sidebar_position`), `What you'll need`, numbered steps, `Verify`, `Related`, copyable `bash` blocks, `| tables |` for options.
+- Docs style follows this site: frontmatter (`title`, `description`), `What you'll need`, numbered steps, `Verify`, `Related`, copyable `bash` blocks, `| tables |` for options. The site is built by Mintlify from `docs/`; [docs/README.md](https://github.com/daschinmoy21/russel/blob/main/docs/README.md) has the page and link rules, and `cd docs && npx mint dev` previews it.
 
 ## Related
 
-- [Changelog](releases.md) · [Architecture](../concepts/architecture.md)
+- [Changelog](./releases.md) · [Architecture](../concepts/architecture.md)

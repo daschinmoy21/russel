@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [architecture, control plane, pipeline, axum, state, reconcile, mermaid]
 ---
 
-# Architecture
-
 Russel is a single-host deployment platform: one Axum control plane takes a source repo, builds it with Nix, and runs the `/nix/store` closure as a microVM or rootless container, with Traefik as the HTTP ingress gateway.
 
 This page is the canonical architecture reference. Schema lives in [Russelfile](../reference/russelfile.md), wire types in [API](../reference/api.md), flags in [CLI](../reference/cli.md).
@@ -63,9 +61,9 @@ Key properties:
 
 - **Single host, single control plane.** No clustering, no scheduler. Multi-node is not in this release.
 - **Nix is the only build system.** The artifact is always a `/nix/store` path; both runtimes consume it directly.
-- **Two runtimes, one pipeline.** `service.type` selects microVM (default) or container after shared resolve/build. See [Runtimes](runtimes.md).
-- **Traefik is primary ingress.** `[ingress].host` is the exact `Host()` name; omit it for `<id>.<RUSSEL_TRAEFIK_DOMAIN>`. `-p` / `ingress.port` pin a host-side backend. See [Networking](networking.md).
-- **Restarts are non-destructive.** Workloads are detached children/containers; startup reconcile re-adopts them. See [Lifecycle](lifecycle.md).
+- **Two runtimes, one pipeline.** `service.type` selects microVM (default) or container after shared resolve/build. See [Runtimes](./runtimes.md).
+- **Traefik is primary ingress.** `[ingress].host` is the exact `Host()` name; omit it for `<id>.<RUSSEL_TRAEFIK_DOMAIN>`. `-p` / `ingress.port` pin a host-side backend. See [Networking](./networking.md).
+- **Restarts are non-destructive.** Workloads are detached children/containers; startup reconcile re-adopts them. See [Lifecycle](./lifecycle.md).
 
 ### Crate layout
 
@@ -165,4 +163,4 @@ Residual risks (DNS-rebinding around the SSRF guard, metadata-IP redirects durin
 
 ## Related
 
-- [Runtimes](runtimes.md) · [Networking](networking.md) · [Lifecycle](lifecycle.md) · [Builds](builds.md) · [API](../reference/api.md)
+- [Runtimes](./runtimes.md) · [Networking](./networking.md) · [Lifecycle](./lifecycle.md) · [Builds](./builds.md) · [API](../reference/api.md)

@@ -5,8 +5,6 @@ sidebar_position: 2
 keywords: [tls, caddy, nginx, reverse proxy, https, api stripping, ndjson]
 ---
 
-# Control-plane TLS
-
 `russel-ctrl` speaks plain HTTP and has no built-in TLS. For split access, keep it on `127.0.0.1:7878` and terminate TLS at Caddy or nginx. The CLI refuses to send a Bearer token over cleartext HTTP to a non-loopback host.
 
 ## Recommended layout
@@ -146,4 +144,4 @@ Keep the tunnel open for CLI/Vite dashboard. Dashboard Settings `/api`.
 
 ## Related
 
-- [Installation](../getting-started/installation.md) · [Single-VPS checklist](vps-one-dev.md) · [Security overview](../security/overview.md)
+- [Installation](../getting-started/installation.md) · [Single-VPS checklist](./vps-one-dev.md) · [Security overview](../security/overview.md)

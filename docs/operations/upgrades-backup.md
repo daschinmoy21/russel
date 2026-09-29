@@ -5,8 +5,6 @@ sidebar_position: 2
 keywords: [upgrade, backup, state, metadata, secrets, deployments]
 ---
 
-# Upgrades and backups
-
 Upgrades replace binaries and restart the unit. They must never delete the env file or state dir.
 
 ## What to back up
@@ -59,4 +57,4 @@ Normal module activation flow; retains the configured `environmentFile` and stat
 
 ## Related
 
-- [systemd and NixOS](systemd-nixos.md) · [Update and rollback](../guides/update-rollback.md) · [Troubleshooting](../guides/troubleshooting.md)
+- [systemd and NixOS](./systemd-nixos.md) · [Update and rollback](../guides/update-rollback.md) · [Troubleshooting](../guides/troubleshooting.md)

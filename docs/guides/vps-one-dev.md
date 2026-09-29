@@ -5,8 +5,6 @@ sidebar_position: 1
 keywords: [vps, checklist, single operator, containers, host, connect, status]
 ---
 
-# Single-VPS checklist
-
 This is the path Russel v0.1 is built for: **one person, one Linux VPS**, apps running as rootless containers, deployed from a laptop over SSH. Tick the boxes as you go.
 
 Russel trusts whoever holds the API token completely. It is not built for sharing a server between people or teams.
@@ -42,7 +40,7 @@ Russel trusts whoever holds the API token completely. It is not built for sharin
 
 - [ ] Open `http://127.0.0.1:7878/` on the laptop for the dashboard, and paste the token into Settings.
 
-Rather use HTTPS than a tunnel? See [TLS reverse proxy](tls-reverse-proxy.md).
+Rather use HTTPS than a tunnel? See [TLS reverse proxy](./tls-reverse-proxy.md).
 
 ## 4. Deploy from git
 
@@ -62,7 +60,7 @@ Leave `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY` off on a VPS you deploy to remotely.
 
 Russel publishes each app on a `127.0.0.1` port on the server, so nothing is public until you choose. Pick one:
 
-- [ ] **Traefik (recommended for web apps).** Russel writes a Traefik route for each service, so `app.example.com` reaches the right app. Traefik can also get TLS certificates from Let's Encrypt. See [Traefik ingress](traefik-ingress.md).
+- [ ] **Traefik (recommended for web apps).** Russel writes a Traefik route for each service, so `app.example.com` reaches the right app. Traefik can also get TLS certificates from Let's Encrypt. See [Traefik ingress](./traefik-ingress.md).
 - [ ] **Your own reverse proxy.** Pin the port with `[ingress]` and `port = 8080` in the Russelfile, and point Caddy or nginx at `127.0.0.1:8080`.
 
 ## 6. Secrets and data
@@ -73,7 +71,7 @@ Russel publishes each app on a `127.0.0.1` port on the server, so nothing is pub
   printf '%s' "$DB_PASSWORD" | russel secrets set DB_PASSWORD
   ```
 
-  Then reference them in the Russelfile as `DB_PASSWORD = "secret://DB_PASSWORD"` under `[service.env]`. See [Env + secrets](env-secrets.md).
+  Then reference them in the Russelfile as `DB_PASSWORD = "secret://DB_PASSWORD"` under `[service.env]`. See [Env + secrets](./env-secrets.md).
 - [ ] Keep app data in `[[volumes]]` so it survives redeploys. See the [Russelfile reference](../reference/russelfile.md).
 
 ## 7. Backups and upgrades

@@ -5,13 +5,11 @@ sidebar_position: 2
 keywords: [deploy, russel init, env, secrets, podman args, update]
 ---
 
-# First deploy
-
 This guide takes a fresh app from `russel init` to a verified deploy, with env, secrets, and container Podman arguments.
 
 ## What you'll need
 
-- A running control plane ([Installation](installation.md), [Quickstart](../quickstart.md)).
+- A running control plane ([Installation](./installation.md), [Quickstart](../quickstart.md)).
 - `russel login` completed (`russel origin` shows the right URL and auth).
 
 ## 1. Scaffold
@@ -149,6 +147,6 @@ More: [Troubleshooting](../guides/troubleshooting.md).
 
 ## Next steps
 
-- [Dashboard](dashboard.md) — inspect the same deploy in the UI.
+- [Dashboard](./dashboard.md) — inspect the same deploy in the UI.
 - [Russelfile reference](../reference/russelfile.md) — every field + validation rule.
 - [API reference](../reference/api.md) — drive deploys from scripts.

@@ -15,12 +15,12 @@ use crate::{
     container::{
         CONTAINER_READY_TIMEOUT, ContainerStartSpec, LOG_TAIL_LINES, ReadyOutcome, RootfsSpec,
         container_log_path, default_base_dir, inspect_state, log_tail, not_ready_error,
-        wait_until_ready,
+        wait_until_ready, watch_container,
     },
     metadata::{
         build_container_metadata_with_gen, build_microvm_metadata_with_gen, write_metadata,
     },
-    microvm::{BootOutput, KernelInfo},
+    microvm::{BootOutput, KernelInfo, ready},
     network::{
         MICROVM_READY_TIMEOUT, MicrovmNet, MicrovmNetMode, SubnetAllocation, TapForwarder,
         subnet_for,
@@ -45,6 +45,10 @@ impl DeployPipeline {
         desired_state: Option<&serde_json::Value>,
         volumes: &[russel_core::volumes::ResolvedVolume],
         using_package: bool,
+        // How long the guest must stay up after the app answers: WATCH_WINDOW
+        // on a cold replace, which already stopped the live generation; zero
+        // otherwise (a first deploy, or dual-live, which watches at cutover).
+        settle: Duration,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         crate::microvm::check_volume_guest_paths(volumes)?;
         let run_as = super::RunAs::from_user(config.service.user.as_deref());
@@ -130,7 +134,7 @@ impl DeployPipeline {
         let cfg_dir_path = PathBuf::from(&cfg_dir);
         let pool = shared_warm_pool();
         let BootOutput {
-            vm_child,
+            mut vm_child,
             virtiofsd_children,
         } = pool
             .restore_or_boot(
@@ -213,21 +217,32 @@ impl DeployPipeline {
             guest_port = port.guest,
             "polling VM readiness"
         );
-        let up = MicrovmNet::wait_ready(
-            net.mode,
-            service_id,
-            &alloc,
-            port.host,
-            port.guest,
-            MICROVM_READY_TIMEOUT,
+        let outcome = ready::wait_until_ready(
+            MicrovmNet::wait_ready(
+                net.mode,
+                service_id,
+                &alloc,
+                port.host,
+                port.guest,
+                MICROVM_READY_TIMEOUT,
+            ),
+            &mut vm_child,
+            settle,
         )
         .await;
         let ready_ms = t.elapsed().as_millis();
-        if !up {
-            let console_log = crate::paths::service_dir(service_id)
-                .join("console.log")
-                .display()
-                .to_string();
+        let console_path = crate::paths::service_dir(service_id).join("console.log");
+        if let ready::ReadyOutcome::Exited(status) = outcome {
+            anyhow::bail!(
+                "{}",
+                ready::exited_error(
+                    status,
+                    &ready::console_tail(&console_path, ready::CONSOLE_TAIL_LINES)
+                )
+            );
+        }
+        if matches!(outcome, ready::ReadyOutcome::TimedOut) {
+            let console_log = console_path.display().to_string();
             let cfg_env = format!("{cfg_dir}/deploy.env");
             let mut detail = format!("VM not reachable in {}s", MICROVM_READY_TIMEOUT.as_secs());
             detail.push_str(&format!(
@@ -304,6 +319,8 @@ impl DeployPipeline {
         desired_state: Option<&serde_json::Value>,
         volumes: &[russel_core::volumes::ResolvedVolume],
         using_package: bool,
+        // Same as deploy_microvm: WATCH_WINDOW on a cold replace, else zero.
+        settle: Duration,
     ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
         tracing::info!(
             service_id,
@@ -414,6 +431,16 @@ impl DeployPipeline {
             CONTAINER_READY_TIMEOUT,
         )
         .await;
+        // A cold replace already stopped the live generation: a crash right
+        // after answering must fail here, where the .bak restore covers it (#493).
+        let outcome = match outcome {
+            ReadyOutcome::Ready if !settle.is_zero() => {
+                watch_container(&running.container_name, settle)
+                    .await
+                    .map_or(ReadyOutcome::Ready, ReadyOutcome::Died)
+            }
+            other => other,
+        };
         let ready_ms = t.elapsed().as_millis();
         if outcome != ReadyOutcome::Ready {
             let tail = log_tail(&container_log_path(service_id), LOG_TAIL_LINES);

@@ -5,8 +5,6 @@ sidebar_position: 2
 keywords: [api, endpoints, deploy, ndjson, auth, bearer, rollback, secrets]
 ---
 
-# API reference
-
 Base URL defaults to `http://127.0.0.1:7878` (override with `RUSSEL_CTRL_ADDR`). All endpoints are HTTP/JSON behind `auth_middleware`. `POST /deploy`, `/update`, `/rollback` return **NDJSON event streams** (`Progress` lines then `Complete` or `Error`). Source: `crates/ctrl/src/api/router.rs`, wire types `crates/core/src/api.rs`.
 
 ## Authentication
@@ -124,4 +122,4 @@ Prefer `russel secrets set` over hand-built JSON (stdin, never argv).
 
 ## Related
 
-- [CLI](cli.md) · [Lifecycle](../concepts/lifecycle.md) · [Update and rollback](../guides/update-rollback.md) · [Environment](environment.md)
+- [CLI](./cli.md) · [Lifecycle](../concepts/lifecycle.md) · [Update and rollback](../guides/update-rollback.md) · [Environment](./environment.md)

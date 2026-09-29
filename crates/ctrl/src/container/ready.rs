@@ -38,7 +38,12 @@ impl ContainerState {
 
     /// The process exited (or crashed and was restarted) since it started.
     pub fn has_died(&self) -> bool {
-        self.restarts > 0 || matches!(self.status.as_str(), "exited" | "stopped" | "dead")
+        self.restarts > 0 || self.has_exited()
+    }
+
+    /// The process is down now (and no restart policy has relaunched it yet).
+    pub fn has_exited(&self) -> bool {
+        matches!(self.status.as_str(), "exited" | "stopped" | "dead")
     }
 }
 
@@ -87,23 +92,74 @@ where
     }
 }
 
-/// `podman inspect` state for a container, or `None` when it cannot be read.
-pub async fn inspect_state(container_name: &str) -> Option<ContainerState> {
-    let output = podman_command()
-        .await
-        .args([
-            "inspect",
-            container_name,
-            "--format",
-            "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}",
-        ])
-        .output()
-        .await
-        .ok()?;
+/// Watch a container that already answered for `window` (#493): its state
+/// when it exited or restarted meanwhile, `None` when it stayed up. An app
+/// can listen and then crash, which the readiness probe alone misses.
+pub async fn watch_container(container_name: &str, window: Duration) -> Option<ContainerState> {
+    watch_state(|| inspect_state(container_name), window).await
+}
+
+async fn watch_state<S, SF>(mut state: S, window: Duration) -> Option<ContainerState>
+where
+    S: FnMut() -> SF,
+    SF: Future<Output = Option<ContainerState>>,
+{
+    let deadline = Instant::now() + window;
+    loop {
+        if let Some(s) = state().await.filter(ContainerState::has_died) {
+            return Some(s);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Bound on one `podman inspect`, so a hung Podman cannot stall a poll loop.
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One `podman inspect` of a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    State(ContainerState),
+    /// Podman has no such container: it was removed outside Russel.
+    Gone,
+    /// Inspect failed, timed out, or printed something unexpected.
+    Unknown,
+}
+
+/// `podman inspect` a container, telling a removed container apart from an
+/// inspect that could not run.
+pub async fn observe(container_name: &str) -> Observed {
+    let mut cmd = podman_command().await;
+    cmd.kill_on_drop(true).args([
+        "inspect",
+        container_name,
+        "--format",
+        "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}",
+    ]);
+    let Ok(Ok(output)) = tokio::time::timeout(INSPECT_TIMEOUT, cmd.output()).await else {
+        return Observed::Unknown;
+    };
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        return if stderr.contains("no such object") || stderr.contains("no such container") {
+            Observed::Gone
+        } else {
+            Observed::Unknown
+        };
     }
     ContainerState::parse(&String::from_utf8_lossy(&output.stdout))
+        .map_or(Observed::Unknown, Observed::State)
+}
+
+/// `podman inspect` state for a container, or `None` when it cannot be read.
+pub async fn inspect_state(container_name: &str) -> Option<ContainerState> {
+    match observe(container_name).await {
+        Observed::State(s) => Some(s),
+        Observed::Gone | Observed::Unknown => None,
+    }
 }
 
 /// Last `lines` lines of a Podman `k8s-file` log, message text only.
@@ -204,6 +260,28 @@ mod tests {
         )
         .await;
         assert_eq!(out, ReadyOutcome::Ready);
+    }
+
+    #[tokio::test]
+    async fn watch_catches_an_exit_after_the_app_answered() {
+        // #493: up for the probe, gone a moment later.
+        let mut polls = 0;
+        let died = watch_state(
+            || {
+                polls += 1;
+                let line = if polls < 3 {
+                    "running 0 0"
+                } else {
+                    "exited 1 0"
+                };
+                async move { ContainerState::parse(line) }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(died.map(|s| s.exit_code), Some(1));
+        let stayed = watch_state(|| async { Some(running()) }, Duration::from_millis(250)).await;
+        assert!(stayed.is_none());
     }
 
     #[tokio::test]

@@ -15,6 +15,16 @@ pub use env::{build_container_env, shell_quote, validate_bin_name};
 pub use pipeline::DeployPipeline;
 pub(crate) use rollback::{FailedLaunch, RecordedMicrovm};
 
+/// How long a new generation that replaces a live one must keep running after
+/// its app first answers, before the old one is gone for good (#493). An app
+/// that listens and then crashes (postgres without /dev/shm died ~200 ms after
+/// its port opened) fails the deploy inside this window, and the previous
+/// generation keeps its traffic or gets it back. First deploys and relaunches
+/// have nothing live to protect and skip it; later crashes are the
+/// supervisor's job. See docs/concepts/lifecycle.md, "When a deploy counts as
+/// ready".
+pub(crate) const WATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Who the app runs as inside its sandbox (#466).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunAs {
