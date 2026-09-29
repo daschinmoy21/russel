@@ -36,7 +36,7 @@ sudo ./contrib/install.sh host # replaces binary, keeps env + state, restarts un
 ./contrib/install.sh status
 ```
 
-Direct replacement:
+Direct replacement (not from v0.1.0: that leaves its broken unit in place, so use `install.sh host` or follow [systemd and NixOS: Upgrading from v0.1.0](./systemd-nixos.md)):
 
 ```bash
 sudo install -Dm755 target/release/russel-ctrl /usr/local/bin/russel-ctrl

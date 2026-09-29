@@ -203,6 +203,8 @@ curl -fsSL https://raw.githubusercontent.com/daschinmoy21/russel/main/contrib/in
 
 From source: `git pull`, rebuild, and run `sudo ./contrib/install.sh host` again. If the new binary fails to start, the installer puts the old one back.
 
+Upgrading from v0.1.0 also replaces its service unit, whose `PrivateTmp=yes` stopped containers from starting, and resets rootless Podman for the `russel` account. Drop-ins in `/etc/systemd/system/russel-ctrl.service.d/` are kept. Details: [systemd and NixOS: Upgrading from v0.1.0](../operations/systemd-nixos.md).
+
 Never delete `/etc/russel/env` or `/var/lib/russel` when upgrading. Backups: [Upgrades + backups](../operations/upgrades-backup.md).
 
 ### Moving from an older per-user install

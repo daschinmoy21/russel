@@ -7,6 +7,17 @@ keywords: [changelog, releases, init, login, nixos, install]
 
 Curated, operator-visible changes. Full history is `git log`.
 
+## 2026-09-29 — containers start under the installed service, and examples deploy from GitHub (#524–#527)
+
+Fixes from the fresh-machine acceptance run of v0.1.0 (#420).
+
+- **Containers start under `install.sh host` and the NixOS module** (#524). With v0.1.0 every container failed: Podman asked the `russel` account's user manager for a systemd scope, which systemd refuses for a process in a system unit. The control plane now runs Podman with `--cgroup-manager=cgroupfs` when it runs unprivileged in a delegated system unit. `--cpus` and `--memory` still apply.
+- **The unit drops `PrivateTmp`, `ProtectSystem`, and `ProtectHome`** (#524). Podman's pause process outlives the unit and kept the first control plane's private `/tmp`, which systemd deleted on restart. Re-running `install.sh host` replaces a v0.1.0 unit even without `--force-unit`, keeps your drop-ins, and ends the stale pause process. `[[volumes]].host` roots no longer need `ReadWritePaths=`. See [systemd and NixOS: Upgrading from v0.1.0](../operations/systemd-nixos.md).
+- **The build runs in the Russelfile's folder joined with `service.source`** (#525). Before, it always ran at the repo root and `source` was only validated. `russel deploy https://github.com/daschinmoy21/russel.git --config examples/basic-http/Russelfile.toml` now builds that example, so the quickstart needs no local checkout or `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY`. A Russelfile in a subfolder that relied on building the repo root must now set `source` to reach it, or move to the root.
+- `russel ps` no longer lists `.config`, `.local`, or `.cache` in `/var/lib/russel` as services (#526). Every dot-directory in the data root is skipped.
+- No cleartext-token warning for a loopback control plane (#527). Plain HTTP to a non-loopback host is still refused without `--insecure`.
+- `install.sh check` finds `useradd` and `usermod` in `/usr/sbin` when run without `sudo`, and `host` waits up to 30 s for a freshly started control plane instead of reporting a good install as failed.
+
 ## 2026-09-28 — an update can't replace a working version with one that crashes on start-up (#493)
 
 - **Updates and rollbacks (dual-live)** switch traffic to the new version as soon as it answers, then keep the previous version running for 2 s (`switch · New version is live; keeping the previous one running for 2s in case it crashes`). If the new version dies in that window, traffic goes back to the previous one, the new one is torn down, and `apply` fails with `new version crashed within 2s of answering` and the app's last output. Before, one accepted connection was enough: an app that listened and then crashed (postgres without `/dev/shm`) reported `deployed`, and the previous version was already drained. Both runtimes.
