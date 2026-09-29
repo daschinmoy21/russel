@@ -55,6 +55,8 @@ pub(crate) async fn promote_generation(runtime_key: &str, service_id: &str) -> a
     // whenever `keep` left `volumes/` behind.
     let russel_from = crate::paths::service_dir(runtime_key);
     let russel_to = crate::paths::service_dir(service_id);
+    // The previous generation is destroyed, so its link is unused.
+    crate::paths::remove_generation_links(service_id);
     if russel_from.exists() {
         if russel_to.exists() {
             detach_managed_volumes(&russel_to).await?;
@@ -73,11 +75,24 @@ pub(crate) async fn promote_generation(runtime_key: &str, service_id: &str) -> a
                     russel_to.display()
                 )
             })?;
+        // Podman keeps the paths the candidate was started with (`--rootfs`,
+        // the log file) and opens them again when its restart policy
+        // relaunches the container. Keep the old name as a link (#548).
+        if let Err(e) = tokio::fs::symlink(service_id, &russel_from).await {
+            tracing::warn!(
+                link = %russel_from.display(),
+                error = %e,
+                "cannot link generation dir; a Podman crash restart will fail"
+            );
+        }
         attach_managed_volumes(&russel_to).await?;
     }
     let micro_from = crate::paths::microvm_dir(runtime_key).display().to_string();
     let micro_to = crate::paths::microvm_dir(service_id).display().to_string();
-    if Path::new(&micro_from).exists() {
+    // With both roots equal the rename above moved it, and the link now
+    // stands at `micro_from`.
+    let same_root = Path::new(&micro_from) == russel_from;
+    if !same_root && Path::new(&micro_from).exists() {
         if Path::new(&micro_to).exists() {
             anyhow::bail!("promote target already exists: {micro_to}");
         }
@@ -868,5 +883,54 @@ mod ingress_tests {
                 .contains("9000")
         );
         reject_live_listen_collision(7878, "[[ports]] host").unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod promote_tests {
+    use super::*;
+    use crate::paths::service_dir;
+
+    fn is_link(p: &Path) -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    /// #548: Podman relaunches a crashed container from the `--rootfs` and log
+    /// paths it was started with, which name the generation dir.
+    #[tokio::test]
+    async fn promote_keeps_the_generation_path_resolving() {
+        let first = service_dir("p548_gdeadbeef");
+        std::fs::create_dir_all(first.join("rootfs")).unwrap();
+        std::fs::write(first.join("rootfs/marker"), b"first").unwrap();
+        promote_generation("p548_gdeadbeef", "p548").await.unwrap();
+        assert!(is_link(&first));
+        assert_eq!(
+            std::fs::read(first.join("rootfs/marker")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(service_dir("p548").join("rootfs/marker")).unwrap(),
+            b"first"
+        );
+
+        // The next update drops the previous generation's link.
+        let second = service_dir("p548_g0badcafe");
+        std::fs::create_dir_all(second.join("rootfs")).unwrap();
+        std::fs::write(second.join("rootfs/marker"), b"second").unwrap();
+        promote_generation("p548_g0badcafe", "p548").await.unwrap();
+        assert!(!is_link(&first) && !first.exists());
+        assert!(is_link(&second));
+        assert_eq!(
+            std::fs::read(second.join("rootfs/marker")).unwrap(),
+            b"second"
+        );
+
+        // Destroy clears it; a real generation dir (a live candidate) stays.
+        let candidate = service_dir("p548_g12345678");
+        std::fs::create_dir_all(&candidate).unwrap();
+        crate::paths::remove_generation_links("p548");
+        assert!(!is_link(&second));
+        assert!(candidate.is_dir());
     }
 }

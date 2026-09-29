@@ -23,6 +23,35 @@ pub fn service_dir(service_id: &str) -> PathBuf {
     data_root().join(service_id)
 }
 
+/// Whether `name` is `<service_id>_g<hex>`, a dual-live generation key.
+fn is_generation_key_of(name: &str, service_id: &str) -> bool {
+    name.strip_prefix(service_id)
+        .and_then(|rest| rest.strip_prefix("_g"))
+        .is_some_and(|g| !g.is_empty() && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Remove the `<service_id>_g<hex>` links that promote leaves in the data
+/// root (#548). Only symlinks go: a real generation dir is a live candidate.
+pub fn remove_generation_links(service_id: &str) {
+    let Ok(entries) = std::fs::read_dir(data_root()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+        let name = entry.file_name();
+        if !is_link
+            || !name
+                .to_str()
+                .is_some_and(|n| is_generation_key_of(n, service_id))
+        {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(link = %entry.path().display(), error = %e, "cannot remove generation link");
+        }
+    }
+}
+
 /// Parent of the per-service microVM marker dirs.
 pub fn microvms_root() -> PathBuf {
     isolate_in_tests();

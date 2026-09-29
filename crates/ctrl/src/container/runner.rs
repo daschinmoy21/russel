@@ -311,6 +311,7 @@ impl ContainerRunner {
         let name = resolve_container_name(service_id);
         stop_container(&name).await?;
         remove_container(&name).await?;
+        crate::paths::remove_generation_links(service_id);
         let volumes = volumes_recorded_for(service_id);
         cleanup_service_dir_in(&default_base_dir(service_id), &volumes, policy).await
     }
@@ -340,6 +341,7 @@ pub async fn destroy_preserving_volumes(service_id: &str) -> anyhow::Result<()> 
     let name = resolve_container_name(service_id);
     stop_container(&name).await?;
     remove_container(&name).await?;
+    crate::paths::remove_generation_links(service_id);
     remove_service_payload_keep_volumes(&default_base_dir(service_id)).await
 }
 

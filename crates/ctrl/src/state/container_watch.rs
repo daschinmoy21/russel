@@ -416,6 +416,42 @@ mod tests {
         assert_eq!(status(&state, "svc").0, "deployed");
     }
 
+    /// #548: promote moves the candidate's state to the stable id. The old
+    /// generation's watcher (whose container is now gone) must not fail the
+    /// promoted service, even when both generations had the same number.
+    #[tokio::test]
+    async fn rekey_ends_both_old_watchers() {
+        let state = AppState::default();
+        let old = deployed(&state, "svc");
+        let candidate = deployed(&state, "svc_gdeadbeef");
+        assert_eq!(old, candidate);
+        let watch = |id: &'static str, g: u64, answers: Vec<Observed>| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .watch_container(id, "c1", g, Some(0), script(answers), TIMING)
+                    .await
+            })
+        };
+        let old_watcher = watch("svc", old, vec![Observed::Gone]);
+        let candidate_watcher = watch("svc_gdeadbeef", candidate, vec![st("running 0 0")]);
+
+        // Cutover: drain the old generation, then promote.
+        state.take_processes("svc");
+        state.rekey_service("svc_gdeadbeef", "svc");
+        let new = state.lock_inner().services["svc"].process_generation;
+        assert!(new > old + 1, "{new}");
+
+        for w in [old_watcher, candidate_watcher] {
+            tokio::time::timeout(Duration::from_secs(1), w)
+                .await
+                .expect("old watcher exits after rekey")
+                .unwrap();
+        }
+        assert_eq!(status(&state, "svc").0, "deployed");
+        assert!(state.status("svc_gdeadbeef").is_none());
+    }
+
     #[tokio::test]
     async fn stop_ends_the_watcher() {
         let state = AppState::default();

@@ -637,16 +637,37 @@ impl AppState {
 
     /// Move in-memory process ownership from a generation runtime key to the
     /// stable service id after a zero-downtime promote.
+    ///
+    /// The candidate's supervisor watched `from` and the old generation's
+    /// watched `to`; both must end, and the promoted workload needs its own
+    /// (#548). The new generation is above both so neither old one matches.
     pub fn rekey_service(&self, from: &str, to: &str) {
         if from == to {
             return;
         }
-        let mut inner = self.lock_inner();
-        if let Some(mut s) = inner.services.remove(from) {
+        let respawn = {
+            let mut inner = self.lock_inner();
+            let Some(mut s) = inner.services.remove(from) else {
+                return;
+            };
             // Drop residual entry for `to` (old generation already drained).
-            let _ = inner.services.remove(to);
+            let old_generation = inner
+                .services
+                .remove(to)
+                .map_or(0, |old| old.process_generation);
+            s.process_generation = s.process_generation.max(old_generation).wrapping_add(1);
             push_capped(&mut s.logs, &format!("rekeyed generation {from} -> {to}\n"));
+            let respawn = Supervision::for_service(&s).map(|sup| (s.process_generation, sup));
             inner.services.insert(to.to_string(), s);
+            respawn
+        };
+        match respawn {
+            // Started by this deploy: any restart from here on is a crash.
+            Some((generation, Supervision::Container(container_id))) => {
+                self.spawn_container_supervisor(to.to_string(), container_id, generation, Some(0))
+            }
+            Some((generation, supervision)) => self.spawn_supervisor(to, generation, supervision),
+            None => {}
         }
     }
 

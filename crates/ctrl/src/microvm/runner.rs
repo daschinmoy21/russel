@@ -910,6 +910,7 @@ impl MicrovmRunner {
         // the port/subnet leases held indefinitely.
         crate::network::PortAllocator::release(service_id);
         crate::network::release_subnet(service_id);
+        crate::paths::remove_generation_links(service_id);
 
         // Both dirs keep `volumes/`: with `RUSSEL_DATA_DIR=/var/lib/microvms`
         // the legacy marker dir *is* the service dir, and a plain

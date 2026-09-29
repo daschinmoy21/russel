@@ -291,7 +291,16 @@ impl DeployPipeline {
         // Generation identity: when replacing a live service, boot the candidate
         // under `{service_id}_g{gen}` so the active generation keeps its TAP/port
         // until ingress.swap and cutover complete (zero-downtime path).
-        let generation_id = new_generation_id();
+        let mut generation_id = new_generation_id();
+        // A promote link (#548) may already hold this name, and the
+        // generation it names can still be running under it.
+        while std::fs::symlink_metadata(crate::paths::service_dir(&format!(
+            "{service_id}_g{generation_id}"
+        )))
+        .is_ok()
+        {
+            generation_id = new_generation_id();
+        }
         let runtime_key = if dual_live {
             let key = format!("{service_id}_g{generation_id}");
             russel_core::ids::validate_service_id(&key)?;
