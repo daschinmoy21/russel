@@ -99,7 +99,7 @@ Every generation records the commit it was built from (`rev`), whether the deplo
 | Argument | Meaning |
 |---|---|
 | `REPO` | `https://…`, `http://…`, `ssh://…`, `git@host:path`, or local absolute path (ctrl opt-in only). Relative paths always rejected. |
-| `--config PATH` | Repo-relative Russelfile (default `Russelfile.toml`). `openat` + `O_NOFOLLOW`, 1 MiB cap, symlinks rejected. |
+| `--config PATH` | Repo-relative Russelfile (default `Russelfile.toml`). `openat` + `O_NOFOLLOW`, 1 MiB cap, symlinks rejected. The build runs in its folder joined with `service.source`. |
 | `--force` | Deploy even when the result would be `unchanged`. `russel update <id>` does the same for a running service. |
 
 Set runtime, environment, host port, and host name in the Russelfile with `service.type`, `[service.env]`, and `[ingress]`. Container Podman flags go in `service.podman_args`.

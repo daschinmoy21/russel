@@ -49,7 +49,26 @@ sed "s/@RUSSEL_UID@/$(id -u russel)/g" contrib/russel-ctrl.service | sudo tee /e
 sudo systemctl daemon-reload && sudo systemctl enable --now russel-ctrl
 ```
 
-Unit defaults (see `contrib/russel-ctrl.service`): `User=russel`, loopback bind, `RUSSEL_REQUIRE_AUTH=1`, `EnvironmentFile=/etc/russel/env`, the Nix daemon profile on `PATH`, `XDG_RUNTIME_DIR` and the user bus for rootless Podman, `ProtectSystem=strict` with only `/var/lib/russel` and the account's `/run/user/<uid>` writable, restart-on-failure.
+Unit defaults (see `contrib/russel-ctrl.service`): `User=russel`, loopback bind, `RUSSEL_REQUIRE_AUTH=1`, `EnvironmentFile=/etc/russel/env`, the Nix daemon profile on `PATH`, `XDG_RUNTIME_DIR` and the user bus for rootless Podman, `Delegate=yes` and `KillMode=process` so apps keep running when the control plane restarts, restart-on-failure.
+
+### Why the unit has no `PrivateTmp` or `ProtectSystem`
+
+Isolation comes from the dedicated, unprivileged `russel` account, not from systemd sandboxing. The usual hardening options break rootless Podman here:
+
+- Podman keeps a small **pause process** (`catatonit -P`) that holds the account's namespaces, and every `podman` call joins it. It outlives the control plane on purpose, like the apps do.
+- It keeps the filesystem view of the control plane that first started it. With `PrivateTmp=yes`, that view's `/tmp` and `/var/tmp` are deleted when the service restarts, and every later container fails with `pasta … Failed to mount empty tmpfs for pivot_root()` or `mkdir /var/tmp/…: no such file or directory`. `ProtectSystem=strict` would pin a read-only root the same way.
+
+Don't add these options back with `systemctl edit`. The control plane also runs Podman with `--cgroup-manager=cgroupfs`: from a system unit, systemd won't let the account's user manager take over container processes.
+
+### Upgrading from v0.1.0
+
+The v0.1.0 unit had `PrivateTmp=yes`, so containers could not start (#524). Re-running `install.sh host` replaces that unit (your drop-ins in `russel-ctrl.service.d/` are kept), stops the control plane, ends the stale pause process, and starts it again. To do the same by hand:
+
+```bash
+sudo systemctl stop russel-ctrl
+sudo pkill -u russel -x catatonit
+sudo systemctl start russel-ctrl
+```
 
 ## NixOS — `services.russel`
 

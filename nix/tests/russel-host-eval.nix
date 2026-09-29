@@ -78,7 +78,9 @@ assert failedAssertions default == [ ];
 assert defaultSc.User == "russel";
 assert defaultSc.Group == "russel";
 assert isNo defaultSc.NoNewPrivileges;
-assert lib.any (p: p == "/run/user") (lib.toList defaultSc.ReadWritePaths);
+# Rootless Podman's pause process outlives the unit; a private /tmp or a
+# read-only root pinned into it breaks every later podman call (#524).
+assert !(defaultSc ? PrivateTmp) && !(defaultSc ? ProtectSystem) && !(defaultSc ? ProtectHome);
 assert lib.hasInfix "/run/wrappers/bin" default.config.systemd.services.russel.environment.PATH;
 assert default.config.users.users.russel.isSystemUser;
 assert default.config.users.users.russel.linger;

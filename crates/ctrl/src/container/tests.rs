@@ -2,7 +2,9 @@ use super::passthrough::{
     podman_passthrough_disabled_from, validate_nix_store_source,
     validate_podman_passthrough_args_with,
 };
-use super::podman_user::{configured_podman_user, resolve_podman_user};
+use super::podman_user::{
+    configured_podman_user, needs_cgroupfs_manager, resolve_podman_user, unified_cgroup_path,
+};
 use super::rootfs::select_nix_tool_store_path;
 use super::runner::{
     NIX_STORE_MOUNT, is_trusted_container_name, podman_has_cgroup_controller, podman_secret_name,
@@ -1894,6 +1896,41 @@ fn configured_podman_user_trims_whitespace() {
     with_russel_podman_user_env(Some("  myuser  "), || {
         assert_eq!(configured_podman_user(), Some("myuser".to_string()));
     });
+}
+
+#[test]
+fn unified_cgroup_path_reads_the_v2_line() {
+    assert_eq!(
+        unified_cgroup_path("0::/system.slice/russel-ctrl.service\n"),
+        Some("/system.slice/russel-ctrl.service")
+    );
+    // Hybrid hosts list v1 controllers first.
+    assert_eq!(
+        unified_cgroup_path(
+            "12:pids:/user.slice\n0::/user.slice/user-1000.slice/session-3.scope\n"
+        ),
+        Some("/user.slice/user-1000.slice/session-3.scope")
+    );
+    assert_eq!(unified_cgroup_path("1:name=systemd:/init.scope\n"), None);
+}
+
+#[test]
+fn cgroupfs_manager_only_for_an_owned_system_unit_cgroup() {
+    let unit = Some("/system.slice/russel-ctrl.service");
+    // install.sh host / NixOS module: unprivileged ctrl, Delegate=yes (#524).
+    assert!(needs_cgroupfs_manager(unit, Some(988), 988));
+    // Not delegated to us: cgroupfs couldn't create cgroups there either.
+    assert!(!needs_cgroupfs_manager(unit, Some(0), 988));
+    assert!(!needs_cgroupfs_manager(unit, None, 988));
+    // Root ctrl (privileged microVM mode) keeps its own handling.
+    assert!(!needs_cgroupfs_manager(unit, Some(0), 0));
+    // Login sessions and user units keep the systemd manager.
+    let user_unit =
+        Some("/user.slice/user-988.slice/user@988.service/app.slice/russel-ctrl.service");
+    assert!(!needs_cgroupfs_manager(user_unit, Some(988), 988));
+    let session = Some("/user.slice/user-1000.slice/session-3.scope");
+    assert!(!needs_cgroupfs_manager(session, Some(1000), 1000));
+    assert!(!needs_cgroupfs_manager(None, Some(988), 988));
 }
 
 #[test]

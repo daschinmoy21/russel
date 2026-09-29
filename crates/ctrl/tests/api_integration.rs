@@ -308,6 +308,26 @@ async fn vms_list_includes_seeded_service() {
 }
 
 #[tokio::test]
+async fn vms_list_skips_dot_dirs_in_the_data_root() {
+    let _env = EnvGuard::open_auth();
+    // `install.sh host` makes the data root the `russel` account's home, so
+    // Podman and systemd create these on a fresh install (#526).
+    let root = russel_ctrl::paths::data_root();
+    std::fs::create_dir_all(root.join(".config/containers")).unwrap();
+    std::fs::create_dir_all(root.join(".local/share")).unwrap();
+
+    let res = get(app(AppState::default()), "/vms").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    let vms = body["vms"].as_array().expect("vms array");
+    assert!(
+        !vms.iter()
+            .any(|v| v.as_str().is_some_and(|id| id.starts_with('.'))),
+        "dot-dirs listed as services: {vms:?}"
+    );
+}
+
+#[tokio::test]
 async fn vms_list_skips_dir_with_only_kept_volumes() {
     let _env = EnvGuard::open_auth();
     // What `destroy` leaves behind for a `keep = true` volume.

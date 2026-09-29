@@ -50,7 +50,7 @@ russel deploy .
 | Flag | Meaning |
 |---|---|
 | `REPO` | A git URL (`https://…`, `ssh://…`, `git@host:path`) or a local folder. The CLI turns a local folder into an absolute path; the control plane accepts it only with `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1`. |
-| `--config PATH` | Russelfile path inside the repo (default `Russelfile.toml`). Must not be a symlink; 1 MiB max. The build always uses the repo root. |
+| `--config PATH` | Russelfile path inside the repo (default `Russelfile.toml`). Must not be a symlink; 1 MiB max. The build runs in the Russelfile's folder joined with `service.source`, so one repo can hold several services. |
 | `--force` | Redeploy even when the service already runs this commit and Russelfile. |
 
 The CLI shows each phase (`resolve → build → create → start → ready`) and prints the host port when it finishes. Use `deploy` for the first deploy and [`update`](#6-update) after that. Running `deploy` again with the same commit and Russelfile does nothing.

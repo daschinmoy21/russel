@@ -68,6 +68,18 @@ case "$mode" in
   200-valid) printf '%s' '{"vms":[]}' >"$output"; printf '200' ;;
   200-garbage) printf '%s' '{"status":"ok"}' >"$output"; printf '200' ;;
   503) printf '%s' 'busy' >"$output"; printf '503' ;;
+  # A freshly started ctrl: refused for the first 3 probes, then up.
+  slow-start-401)
+    count_file="${MOCK_CURL_MODE_FILE}.count"
+    count=0
+    [[ -f "$count_file" ]] && count=$(<"$count_file")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$count_file"
+    ((count > 3)) || exit 7
+    : >"$output"
+    write_headers 'WWW-Authenticate: Bearer realm="russel-ctrl"'
+    printf '401'
+    ;;
   *) exit 7 ;;
 esac
 MOCK_CURL
@@ -291,6 +303,7 @@ path_owner() {
   fi
 }
 run_chown() { printf '%s\n' "$*" >>"${CASE_ROOT}/chown.log"; }
+run_sleep() { printf '%s\n' "$*" >>"${CASE_ROOT}/sleep.log"; }
 run_sudo() {
   printf '%s\n' "$*" >>"${CASE_ROOT}/sudo.log"
   case "$1" in
@@ -428,6 +441,7 @@ run_ss() {
   fi
 }
 run_lsof() { :; }
+run_pkill() { printf '%s\n' "$*" >>"${CASE_ROOT}/pkill.log"; }
 run_ssh() {
   {
     printf 'argc=%s\n' "$#"
@@ -568,6 +582,19 @@ if grep -q 'kvm' "${CASE_ROOT}/usermod.log"; then
   die "russel joined kvm without /dev/kvm"
 fi
 pass "host skips the kernel on a container-only host"
+
+# A fresh unit that takes a few seconds to listen is waited for, not failed.
+new_case
+RUSSEL_VERSION=v1.2.3
+export RUSSEL_VERSION
+make_release_assets v1.2.3
+FAKE_KVM=0
+rm -f "${MOCK_CURL_MODE_FILE}.count"
+set_curl_mode slow-start-401
+expect_main_rc 0 host
+[[ -s "${CASE_ROOT}/sleep.log" ]] || die "host did not wait for the unit to listen"
+rm -f "${MOCK_CURL_MODE_FILE}.count"
+pass "host waits for a slow-starting ctrl instead of reporting it unhealthy"
 
 # A KVM host must have the kernel asset. Missing it is a failed install, not a skip.
 new_case
@@ -853,6 +880,50 @@ expect_main_rc 1 host
   || die "failed upgrade left the replacement kernel in the pool"
 [[ "$(<"${CASE_KERNEL}.previous")" == 'kernel-download' ]] || die "kernel backup missing"
 pass "failed upgrade restores the previous pool kernel with the binary"
+
+# The v0.1.0 unit had PrivateTmp=yes: rootless Podman's pause process pinned
+# its private /tmp and every container failed (#524). Upgrading replaces that
+# unit without --force-unit and resets the pause process before restarting.
+new_case
+make_host_binary old-binary
+set_curl_mode 401
+expect_main_rc 0 host
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
+printf '%s\n' 'PrivateTmp=yes' >>"$UNIT_FILE"
+make_host_binary new-binary
+SYSTEM_ACTIVE=1
+expect_main_rc 0 host
+assert_output_contains 'breaks rootless Podman'
+if grep -q '^PrivateTmp=' "$UNIT_FILE"; then die "v0.1.0 unit was not replaced"; fi
+grep -Fq -- '-u russel -x catatonit' "${CASE_ROOT}/pkill.log" || die "pause process was not reset"
+[[ "$(call_count "${CASE_ROOT}/systemctl-system.log" restart)" == 1 ]] || die "unit was not restarted"
+pass "upgrade replaces the v0.1.0 PrivateTmp unit and resets Podman's pause process"
+
+# A stopped v0.1.0 unit still leaves the pause process behind (KillMode=process).
+new_case
+make_host_binary old-binary
+set_curl_mode 401
+expect_main_rc 0 host
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
+printf '%s\n' 'PrivateTmp=yes' >>"$UNIT_FILE"
+make_host_binary new-binary
+expect_main_rc 0 host
+grep -Fq -- '-u russel -x catatonit' "${CASE_ROOT}/pkill.log" || die "pause process was not reset for a stopped unit"
+pass "upgrade resets Podman's pause process when the v0.1.0 unit is stopped"
+
+# An operator-edited unit without PrivateTmp is still kept, and Podman is left alone.
+new_case
+make_host_binary old-binary
+set_curl_mode 401
+expect_main_rc 0 host
+UNIT_FILE="${CASE_ROOT}/${UNIT_FILE_REL}"
+printf '%s\n' '# operator edit' >>"$UNIT_FILE"
+make_host_binary new-binary
+SYSTEM_ACTIVE=1
+expect_main_rc 0 host
+grep -Fq '# operator edit' "$UNIT_FILE" || die "operator unit was replaced"
+[[ ! -s "${CASE_ROOT}/pkill.log" ]] || die "pause process reset without a PrivateTmp unit"
+pass "operator-edited units without PrivateTmp are kept and Podman is untouched"
 
 # Linger is what gives the account /run/user and a user bus, so failing to
 # enable it fails the install before anything starts.

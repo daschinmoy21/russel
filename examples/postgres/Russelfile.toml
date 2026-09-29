@@ -6,8 +6,6 @@
 # Prepare PGDATA once, as the `russel` account that runs the control plane
 # (`sudo -u russel bash` after `sudo install -d -o russel -g russel /srv/russel`),
 # with the same postgresql major version that `package` builds (nixos-unstable).
-# With install.sh host, also let the unit write there: `sudo systemctl edit
-# russel-ctrl`, add `[Service]` and `ReadWritePaths=/srv/russel`.
 #
 #   pg=$(nix build --no-link --print-out-paths \
 #     'github:NixOS/nixpkgs/nixos-unstable#postgresql^out')

@@ -47,7 +47,9 @@ type Events = tokio::sync::mpsc::Sender<DeployEvent>;
 
 /// The Russelfile turned into the deploy's inputs. Every later phase reads it.
 struct Plan {
-    repo_path: PathBuf,
+    /// The Russelfile's folder joined with `service.source`: where Nix builds
+    /// (#525). The repo root for a root Russelfile with `source = "."`.
+    build_path: PathBuf,
     /// Keeps the checkout alive until the deploy ends.
     _checkout: CheckoutLease,
     config: Russelfile,
@@ -249,7 +251,7 @@ impl DeployPipeline {
             .await;
         let output = self
             .builder
-            .build(&plan.repo_path, plan.config.service.package.as_deref())
+            .build(&plan.build_path, plan.config.service.package.as_deref())
             .await?;
         let kernel = if microvm {
             let kernel = self.runner.ensure_kernel().await?;
@@ -754,7 +756,7 @@ impl DeployPipeline {
                 slot.dirs.remove_backups().await;
             }
             self.state
-                .attach_flake_path(service_id, plan.repo_path.clone());
+                .attach_flake_path(service_id, plan.build_path.clone());
             return None;
         }
 
@@ -799,7 +801,7 @@ impl DeployPipeline {
                 "CRITICAL: failed to promote generation dirs; candidate still running under runtime key"
             );
             // Keep state under runtime_key so stop/destroy can find it.
-            self.state.attach_flake_path(key, plan.repo_path.clone());
+            self.state.attach_flake_path(key, plan.build_path.clone());
             return None;
         }
 
@@ -823,7 +825,7 @@ impl DeployPipeline {
         }
         self.state.rekey_service(key, service_id);
         self.state
-            .attach_flake_path(service_id, plan.repo_path.clone());
+            .attach_flake_path(service_id, plan.build_path.clone());
 
         reclaim_fixed_port(service_id, plan, workload).await
     }
@@ -883,6 +885,8 @@ fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> an
     let runtime = config.service.runtime;
     let podman_args = &config.service.podman_args;
     validate_podman_args_for_runtime(runtime, podman_args)?;
+    let build_path =
+        super::config::resolve_build_dir(&repo_path, &request.config_path, &config.service.source)?;
     if runtime == RuntimeKind::Microvm {
         crate::microvm::preflight::check_host_privileges()?;
     }
@@ -933,7 +937,7 @@ fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> an
     ));
 
     Ok(Plan {
-        repo_path,
+        build_path,
         _checkout,
         config,
         rev,

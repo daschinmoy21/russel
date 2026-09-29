@@ -54,6 +54,8 @@ Repo URLs accept `https://`, `http://`, `ssh://`, `git@host:path` only. `repo_ur
 | Symptom | Meaning | Fix |
 |---|---|---|
 | Podman errors about `/run/user`, cgroups, or `newuidmap` | The `russel` account's rootless Podman is missing a piece | Run `install.sh check`. Then look as the account itself: `sudo -u russel XDG_RUNTIME_DIR=/run/user/$(id -u russel) podman info`, and `loginctl show-user russel -p Linger` should say `yes` |
+| `crun: error creating systemd unit libpod-….scope: got failed` | Control plane v0.1.0 under the `install.sh host` system unit: Podman asked systemd for a scope it won't grant | Upgrade: re-run `install.sh host` with a newer `RUSSEL_VERSION` (#524) |
+| `pasta … Failed to mount empty tmpfs for pivot_root()`, or `mkdir /var/tmp/…: no such file or directory` | Podman's pause process is stuck with a deleted private `/tmp` from the v0.1.0 unit's `PrivateTmp=yes` | Re-run `install.sh host` with a newer version, or by hand: `sudo systemctl stop russel-ctrl && sudo pkill -u russel -x catatonit && sudo systemctl start russel-ctrl`. See [Why the unit has no PrivateTmp](../operations/systemd-nixos.md#why-the-unit-has-no-privatetmp-or-protectsystem) |
 | `podman_args rejected` | Blocked Podman flag in `service.podman_args` | Drop Russel-owned or isolation-weakening flags |
 
 | `container exited during startup (…, exit code N)`, `container crashed during startup`, or (microVMs) `app exited during startup (exit code N)` | The app exited (or crash-looped under a restart policy) before it accepted connections, or, on an update, within 2 s after it did | Read the quoted container output or guest console; fix config, args, or env. A live previous generation keeps serving (or is rolled back) |

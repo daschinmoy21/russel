@@ -25,6 +25,16 @@
 # points at a checkout root.
 set -euo pipefail
 
+# Debian and Ubuntu keep useradd/usermod in /usr/sbin, which is not on a
+# regular user's PATH. `check` runs without sudo, so append the sbin dirs
+# (sudo's secure_path has them already) instead of reporting them missing.
+for sbin in /usr/sbin /sbin; do
+  case ":${PATH}:" in
+    *":${sbin}:"*) ;;
+    *) PATH="${PATH}:${sbin}" ;;
+  esac
+done
+
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 ROOT=
 if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
@@ -33,6 +43,7 @@ fi
 RELEASE="${ROOT:+$ROOT/}target/release"
 PROBE_TIMEOUT_SECONDS=2
 PROBE_ATTEMPTS=2
+HOST_READY_SECONDS=30
 DOWNLOAD_TIMEOUT_SECONDS=600
 RELEASE_BASE="${RUSSEL_RELEASE_BASE:-https://github.com/daschinmoy21/russel/releases/download}"
 RELEASE_ARCH=
@@ -76,7 +87,9 @@ run_podman() { podman "$@"; }
 run_nix() { nix "$@"; }
 run_df_avail_kib() { df -Pk -- "$1" | awk 'NR == 2 { print $4 }'; }
 run_ssh() { ssh "$@"; }
+run_pkill() { pkill "$@"; }
 run_with_timeout() { timeout "$@"; }
+run_sleep() { sleep "$@"; }
 run_curl() { run_with_timeout "${PROBE_TIMEOUT_SECONDS}s" curl "$@"; }
 run_openssl() { openssl "$@"; }
 run_ss() { ss -ltnp 'sport = :7878'; }
@@ -1166,7 +1179,14 @@ install_system_unit() {
     return 1
   fi
 
-  if [[ ! -e "$unit_file" ]] || { ! run_cmp -s -- "$unit_file" "$rendered" && (( FORCE_UNIT )); }; then
+  # Only the v0.1.0 unit had PrivateTmp=yes, and it breaks every container
+  # (#524), so replace it even without --force-unit. Drop-ins are untouched.
+  local replace_broken=0
+  if unit_pins_private_tmp "$unit_file" && ! run_cmp -s -- "$unit_file" "$rendered"; then
+    replace_broken=1
+    echo "replacing ${unit_file}: its PrivateTmp=yes breaks rootless Podman (#524)"
+  fi
+  if [[ ! -e "$unit_file" ]] || { ! run_cmp -s -- "$unit_file" "$rendered" && (( FORCE_UNIT || replace_broken )); }; then
     if ! tmp="$(run_mktemp -- "${unit_dir}/.russel-ctrl.service.XXXXXX")"; then
       run_rm -f -- "$rendered" 2>/dev/null || true
       echo "cannot create system unit temporary" >&2
@@ -1363,6 +1383,20 @@ probe_local_endpoint() {
   return 1
 }
 
+# A unit that was just started can take a few seconds to listen (its first
+# start sets up rootless Podman for the account). A refused connection
+# returns at once, so keep probing while the port is unreachable instead of
+# giving up within milliseconds.
+wait_for_local_endpoint() {
+  local waited=0
+  while ! probe_local_endpoint; do
+    [[ "$PROBE_RESULT" == unreachable ]] || return 1
+    (( waited < HOST_READY_SECONDS )) || return 1
+    run_sleep 1
+    waited=$(( waited + 1 ))
+  done
+}
+
 probe_is_compatible() {
   [[ "$PROBE_RESULT" == compatible || "$PROBE_RESULT" == unauthorized ]]
 }
@@ -1381,6 +1415,23 @@ probe_result_text() {
 
 system_unit_is_active() {
   run_systemctl_system is-active --quiet russel-ctrl >/dev/null 2>&1
+}
+
+# The v0.1.0 unit had PrivateTmp=yes. Rootless Podman's pause process
+# (`catatonit -P`) outlives the unit and keeps that first ctrl's private /tmp,
+# which systemd deleted, so every podman call fails until it is gone (#524).
+# v0.1.0 could not start containers, so none depend on it yet.
+unit_pins_private_tmp() {
+  local unit=$1
+  [[ -f "$unit" ]] && grep -Eq '^PrivateTmp=(yes|true|1)' -- "$unit"
+}
+
+reset_podman_pause_process() {
+  local user
+  user="$(service_user)"
+  run_systemctl_system stop russel-ctrl >/dev/null 2>&1 || true
+  run_pkill -u "$user" -x catatonit >/dev/null 2>&1 || true
+  echo "reset rootless Podman's pause process for ${user} (left over from the old unit)"
 }
 
 restart_host_unit() {
@@ -1470,7 +1521,7 @@ print_host_next_steps() {
 
 install_host() {
   local release_binary destination state_dir env_file source_binary
-  local active=0 unit_changed=0
+  local active=0 unit_changed=0 pinned_tmp=0
 
   check_host_topology || return $?
   if (( SKIP_CHECKS )); then
@@ -1500,6 +1551,9 @@ install_host() {
   ensure_state_directory "$state_dir" || return 1
   install_host_kernel "$state_dir" || return 1
 
+  if unit_pins_private_tmp "$(system_unit_path)"; then
+    pinned_tmp=1
+  fi
   # A failed upgrade must not leave a replacement kernel behind, so every error
   # path after the kernel step undoes it (restore_host_kernel is a no-op when
   # this run did not replace the pool kernel).
@@ -1528,15 +1582,22 @@ install_host() {
         return 0
       fi
     fi
+    if (( pinned_tmp && unit_changed )); then
+      reset_podman_pause_process
+    fi
     restart_host_unit "$destination" || return 1
   else
+    # The pause process outlives a stopped unit too (KillMode=process).
+    if (( pinned_tmp && unit_changed )); then
+      reset_podman_pause_process
+    fi
     enable_host_unit || {
       restore_host_kernel || true
       return 1
     }
   fi
 
-  if ! probe_local_endpoint || ! probe_is_compatible; then
+  if ! wait_for_local_endpoint || ! probe_is_compatible; then
     echo "local Russel endpoint is not healthy: $(probe_result_text)" >&2
     echo "see: journalctl -u russel-ctrl and $(state_dir_path)/ctrl.log" >&2
     restore_host_kernel || true

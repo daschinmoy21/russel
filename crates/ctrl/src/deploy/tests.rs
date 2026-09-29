@@ -1,6 +1,6 @@
 //! Unit tests for deploy helpers (generation ids, config path containment, podman args).
 
-use super::config::{MAX_CONFIG_BYTES, load_russelfile_under_repo};
+use super::config::{MAX_CONFIG_BYTES, load_russelfile_under_repo, resolve_build_dir};
 use super::pipeline::{DesiredExtras, build_desired_state, new_generation_id};
 use crate::metadata::build_microvm_metadata_with_gen;
 use std::io::Write;
@@ -106,6 +106,56 @@ fn load_russelfile_accepts_nested_relative() {
     write_config(repo.path(), "deploy/Russelfile.toml", MINIMAL);
     let cfg = load_russelfile_under_repo(repo.path(), "deploy/Russelfile.toml").unwrap();
     assert_eq!(cfg.service.name, "app");
+}
+
+#[test]
+fn build_dir_is_the_repo_root_for_a_root_russelfile() {
+    let repo = TempRepo::new();
+    assert_eq!(
+        resolve_build_dir(repo.path(), "Russelfile.toml", ".").unwrap(),
+        repo.path()
+    );
+}
+
+#[test]
+fn build_dir_follows_the_russelfile_folder_and_source() {
+    let repo = TempRepo::new();
+    std::fs::create_dir_all(repo.path().join("examples/basic-http/src")).unwrap();
+    // `--config examples/basic-http/Russelfile.toml` builds that folder (#525).
+    assert_eq!(
+        resolve_build_dir(repo.path(), "examples/basic-http/Russelfile.toml", ".").unwrap(),
+        repo.path().join("examples/basic-http")
+    );
+    assert_eq!(
+        resolve_build_dir(repo.path(), "examples/basic-http/Russelfile.toml", "./src").unwrap(),
+        repo.path().join("examples/basic-http/src")
+    );
+    std::fs::create_dir_all(repo.path().join("apps/api")).unwrap();
+    assert_eq!(
+        resolve_build_dir(repo.path(), "Russelfile.toml", "apps/api").unwrap(),
+        repo.path().join("apps/api")
+    );
+}
+
+#[test]
+fn build_dir_must_exist() {
+    let repo = TempRepo::new();
+    let err = resolve_build_dir(repo.path(), "Russelfile.toml", "missing")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("service.source 'missing'"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn build_dir_rejects_a_symlink_out_of_the_repo() {
+    let repo = TempRepo::new();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("app")).unwrap();
+    let err = resolve_build_dir(repo.path(), "Russelfile.toml", "app")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a directory in the repository"), "{err}");
 }
 
 #[test]

@@ -57,25 +57,6 @@ See [Concepts: Architecture](./concepts/architecture.md) for the full pipeline, 
 
 Control-plane API defaults to `http://127.0.0.1:7878`. Auth is `RUSSEL_API_TOKEN` (≥32 chars) or `russel login`. The control plane is HTTP-only; terminate TLS at Caddy/nginx/Traefik or use the installer-managed SSH tunnel.
 
-## Docs map
-
-This site follows Cloudflare/Tailscale conventions: **Getting started** (do this now), **Concepts** (how it works), **Guides** (do this task), **Reference** (exact flags/fields/codes), **Security**, **Operations**.
-
-```text
-docs/
-├── index.md                  # this page
-├── quickstart.md             # 5-minute local deploy
-├── getting-started/          # installation · first deploy · dashboard
-├── concepts/                 # architecture · runtimes · networking · lifecycle · builds
-├── guides/                   # vps checklist · tls · traefik · env/secrets · rollback · troubleshooting · benchmarks
-├── reference/                # cli · api · russelfile · environment · examples
-├── security/                 # overview · nix builds
-├── operations/               # systemd + nixos · upgrades + backups
-└── project/                  # development (contributing) · releases (changelog)
-```
-
-The live contract is `reference/` plus the code (`crates/core/src/config.rs`, `crates/cli`, `crates/ctrl/src/api/router.rs`).
-
 ## Next steps
 
 - [Quickstart: deploy `examples/basic-http` locally](./quickstart.md)

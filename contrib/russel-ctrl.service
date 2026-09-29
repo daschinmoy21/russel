@@ -40,8 +40,9 @@ Environment=HOME=/var/lib/russel
 # A system unit does not read /etc/profile.d, so name the Nix daemon profile
 # explicitly: builds run `nix` from here.
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/nix/var/nix/profiles/default/bin
-# Rootless Podman finds its runtime dir and the user bus (systemd cgroup
-# manager) through these.
+# Rootless Podman finds its runtime dir and the user bus through these. ctrl
+# still passes --cgroup-manager=cgroupfs: systemd won't move a process out of a
+# system unit into the user manager's scopes (#524).
 Environment=XDG_RUNTIME_DIR=/run/user/@RUSSEL_UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@RUSSEL_UID@/bus
 EnvironmentFile=/etc/russel/env
@@ -49,16 +50,12 @@ Restart=on-failure
 RestartSec=5s
 # Rootless Podman needs newuidmap (file caps or setuid).
 NoNewPrivileges=no
-ProtectSystem=strict
-# Absolute [[volumes]].host binds need their root here too, or containers see
-# it read-only. Add it with `sudo systemctl edit russel-ctrl`:
-#   [Service]
-#   ReadWritePaths=/srv/russel
-# and list it in RUSSEL_VOLUME_ROOTS in /etc/russel/env.
-ReadWritePaths=/var/lib/russel /run/user/@RUSSEL_UID@
-# read-only, not yes: yes hides /run/user, which rootless Podman needs.
-ProtectHome=read-only
-PrivateTmp=yes
+# No PrivateTmp, ProtectSystem, or ProtectHome. Rootless Podman keeps a pause
+# process that holds the account's namespaces and outlives this unit (see
+# KillMode). It captures the first ctrl's mount namespace, so a PrivateTmp /tmp
+# that systemd deletes on restart breaks every later podman call ("Failed to
+# mount empty tmpfs for pivot_root()"), and ProtectSystem pins a read-only view.
+# Isolation comes from the unprivileged `russel` account instead (#524).
 Delegate=yes
 # Workloads (pasta/conmon) are children of this unit. control-group would
 # kill them on restart even though ctrl detaches. process kills only ctrl.

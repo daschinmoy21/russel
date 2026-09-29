@@ -277,12 +277,10 @@ in
         RestartSec = "5s";
         # false when rootlessPodman: newuidmap needs file caps.
         NoNewPrivileges = !cfg.rootlessPodman;
-        ProtectSystem = "strict";
-        ReadWritePaths = [
-          "/var/lib/russel"
-          "/run/user"
-        ];
-        PrivateTmp = true;
+        # No PrivateTmp / ProtectSystem / ProtectHome: rootless Podman's pause
+        # process outlives this unit (KillMode below) and pins the first ctrl's
+        # mount namespace, so a PrivateTmp /tmp deleted on restart breaks
+        # every later podman call. Isolation is the unprivileged account (#524).
         # cgroup delegation for rootless Podman. Harmless if unused.
         Delegate = true;
         # Workloads (pasta/conmon) are children of this unit. control-group

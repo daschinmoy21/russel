@@ -7,6 +7,14 @@ keywords: [examples, basic-http, microvm-http, hello-rust, env-config, shortlink
 
 All examples live in `examples/` and deploy with the same verbs. VPS smoke tests should use `type = "container"` examples (`microvm-http` needs KVM).
 
+Deploy any of them straight from GitHub by pointing `--config` at its Russelfile; the build runs in that example's folder:
+
+```bash
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/vaultwarden/Russelfile.toml
+```
+
+The `Deploy` column below uses a local checkout instead (needs `RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1`, see [First deploy](../getting-started/first-deploy.md)).
+
 ## Index
 
 | Example | Runtime | What it proves | Deploy |

@@ -12,8 +12,12 @@
 /// - `_pool` — warm-pool snapshot state
 /// - `_checkouts` — git clones that deploys build from
 /// - `_microvms` — microVM marker dirs under a relocated data root
+/// - `.*` — dot-directories. `install.sh host` makes the data root the
+///   `russel` account's home, so Podman and systemd write `.config`,
+///   `.local`, and `.cache` there. Service ids never start with `.` (#526).
 pub fn is_reserved_service_dir(name: &str) -> bool {
-    name.ends_with(".bak")
+    name.starts_with('.')
+        || name.ends_with(".bak")
         || name.ends_with(".volumes-stash")
         || name == "traefik"
         || name == "secrets"
@@ -37,6 +41,9 @@ mod tests {
             "api.bak",
             "svc.bak",
             "api.volumes-stash",
+            ".config",
+            ".local",
+            ".cache",
         ] {
             assert!(is_reserved_service_dir(name), "{name:?} should be reserved");
         }

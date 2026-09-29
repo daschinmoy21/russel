@@ -3,7 +3,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::Read,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -162,6 +162,62 @@ pub(crate) fn load_russelfile_under_repo(
     }
 
     Russelfile::load_from_str(&contents)
+}
+
+/// Directory the build runs in: the Russelfile's folder joined with
+/// `service.source` (#525). A Russelfile at the repo root with `source = "."`
+/// builds the repo root, as before; `--config apps/api/Russelfile.toml` builds
+/// `apps/api`, so one repo can hold several services.
+///
+/// Both inputs are already free of `..` and absolute parts. Each component is
+/// then opened with `O_NOFOLLOW`, so a symlinked directory in the checkout
+/// can't point the build outside it.
+pub(crate) fn resolve_build_dir(
+    repo_path: &Path,
+    config_path: &str,
+    source: &str,
+) -> anyhow::Result<PathBuf> {
+    let cfg = validate_relative_config_path(config_path)?;
+    russel_core::config::validate_source_path(source)?;
+    let rel: PathBuf = cfg
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(source)
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+    let not_a_dir = |e: std::io::Error| {
+        anyhow::anyhow!(
+            "service.source '{source}' in {config_path} is not a directory in the repository: {e}"
+        )
+    };
+
+    #[cfg(unix)]
+    {
+        let mut dir_fd = open_directory_fd(repo_path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve repository path {}: {e}",
+                repo_path.display()
+            )
+        })?;
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                anyhow::bail!("service.source must stay inside the repository");
+            };
+            dir_fd = openat_directory_nofollow(dir_fd.as_raw_fd(), name).map_err(not_a_dir)?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let repo_canon = repo_path.canonicalize().map_err(not_a_dir)?;
+        let dir_canon = repo_canon.join(&rel).canonicalize().map_err(not_a_dir)?;
+        if !dir_canon.starts_with(&repo_canon) || !dir_canon.is_dir() {
+            anyhow::bail!("service.source must be a directory inside the repository");
+        }
+    }
+
+    Ok(repo_path.join(rel))
 }
 
 /// Open `path` as a directory (symlinks on the final component may be followed;

@@ -109,7 +109,7 @@ fn insecure_cleartext_allowed() -> bool {
 /// Scheme match is case-insensitive (`HTTP:` is cleartext; `HTTPS:` is not).
 /// - no RFC 3986 scheme → ok (unclassified URL)
 /// - `https` → ok
-/// - `http` + loopback → warn once, ok
+/// - `http` + loopback → ok (same host, or an SSH tunnel's local end)
 /// - `http` + non-loopback → error unless insecure escape hatch (then warn once)
 /// - any other scheme → error
 fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
@@ -134,13 +134,9 @@ fn ensure_cleartext_token_ok(control_plane: &str) -> Result<()> {
         .unwrap_or(rest);
     let host = control_plane_host(rest);
     if is_loopback_host(host) {
-        // Warn-only on loopback (local dev still cleartext, but not on-path WAN risk).
-        if !CLEARTEXT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "\x1b[1;33mwarning:\x1b[0m RUSSEL_API_TOKEN is sent in cleartext over \
-                 plain HTTP to loopback host \x1b[1m{host}\x1b[0m"
-            );
-        }
+        // Loopback never leaves the machine: the documented same-host setup, or
+        // the local end of an SSH tunnel. A warning here fired on every command
+        // and only taught people to ignore warnings (#527).
         return Ok(());
     }
     if insecure_cleartext_allowed() {

@@ -205,6 +205,57 @@ async fn podman_user_env() -> Option<&'static PodmanUserEnv> {
     .as_ref()
 }
 
+/// The unified (cgroup v2) path from `/proc/self/cgroup`: the `0::` line.
+pub(crate) fn unified_cgroup_path(proc_self_cgroup: &str) -> Option<&str> {
+    proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::trim)
+}
+
+/// Whether podman must manage cgroups itself instead of asking systemd.
+///
+/// `install.sh host` and the NixOS module run ctrl as an unprivileged account
+/// in a system unit (`/system.slice/…`) with `Delegate=yes`. Rootless podman's
+/// default systemd cgroup manager asks that account's user manager to create
+/// each container scope, and systemd refuses to move a process out of a system
+/// unit, so every container fails to start (#524). With the cgroupfs manager,
+/// podman creates the container cgroups inside the delegated subtree, where
+/// `--cpus` and `--memory` still apply. Only when that subtree is ours: a ctrl
+/// in a login session or a user unit keeps the systemd manager.
+pub(crate) fn needs_cgroupfs_manager(
+    cgroup_path: Option<&str>,
+    cgroup_owner: Option<u32>,
+    euid: u32,
+) -> bool {
+    euid != 0
+        && cgroup_owner == Some(euid)
+        && cgroup_path.is_some_and(|p| p.starts_with("/system.slice/"))
+}
+
+fn system_unit_cgroupfs() -> bool {
+    static CGROUPFS: OnceLock<bool> = OnceLock::new();
+    *CGROUPFS.get_or_init(|| {
+        use std::os::unix::fs::MetadataExt;
+        let proc_self = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let path = unified_cgroup_path(&proc_self);
+        let owner = path.and_then(|p| {
+            std::fs::metadata(format!("/sys/fs/cgroup{p}"))
+                .ok()
+                .map(|m| m.uid())
+        });
+        let euid = unsafe { libc::geteuid() };
+        let cgroupfs = needs_cgroupfs_manager(path, owner, euid);
+        if cgroupfs {
+            tracing::info!(
+                cgroup = path.unwrap_or_default(),
+                "ctrl runs in a delegated system unit; podman uses --cgroup-manager=cgroupfs"
+            );
+        }
+        cgroupfs
+    })
+}
+
 /// Build a `Command` that runs `podman <args>` as the configured user when
 /// ctrl is root and a non-root podman user was resolved (env or SUDO_USER).
 pub(crate) async fn podman_command() -> Command {
@@ -227,6 +278,8 @@ pub(crate) async fn podman_command() -> Command {
         if unsafe { libc::geteuid() } == 0 {
             cmd.env_remove("XDG_RUNTIME_DIR");
             cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
+        } else if system_unit_cgroupfs() {
+            cmd.arg("--cgroup-manager=cgroupfs");
         }
         cmd
     }

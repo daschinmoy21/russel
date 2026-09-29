@@ -9,34 +9,15 @@ You'll deploy `examples/basic-http`, a small Go web server, as a rootless contai
 
 ## Before you start
 
-- Finish [Installation](./getting-started/installation.md): `russel ps` should work.
-- Run these steps **on the server**. The quickstart deploys from a folder on the server. For deploying from a laptop, see [First deploy](./getting-started/first-deploy.md).
-- Get the examples into a folder the `russel` account owns. The control plane runs as `russel`, so it can't read your home directory:
+- Finish [Installation](./getting-started/installation.md): `russel ps` should work, from the server or from your laptop.
 
-  ```bash
-  sudo install -d -o russel -g russel /srv/russel-apps
-  sudo -u russel git clone https://github.com/daschinmoy21/russel /srv/russel-apps/russel
-  cd /srv/russel-apps/russel
-  ```
-
-## 1. Allow deploys from a local folder
-
-By default the control plane only builds from git URLs. Deploying from a folder on the server needs a one-line opt-in:
+## 1. Deploy
 
 ```bash
-echo 'RUSSEL_ALLOW_LOCAL_PATH_DEPLOY=1' | sudo tee -a /etc/russel/env
-sudo systemctl restart russel-ctrl
+russel deploy https://github.com/daschinmoy21/russel.git --config examples/basic-http/Russelfile.toml
 ```
 
-Only do this on a server you alone control.
-
-## 2. Deploy
-
-```bash
-russel deploy examples/basic-http
-```
-
-`russel` sends the folder's path to the control plane, which reads `Russelfile.toml`, builds the app with Nix, and starts it. The first build takes a minute or two while Nix fetches Go; later deploys take about a second.
+The control plane clones the repo, reads the Russelfile that `--config` points at, builds the folder it sits in (`examples/basic-http`) with Nix, and starts it. Nothing is cloned on your side, so this works the same from a laptop. The first build takes a minute or two while Nix fetches Go; later deploys take about a second.
 
 When it finishes you'll see something like:
 
@@ -48,7 +29,7 @@ When it finishes you'll see something like:
 
 The service is called `api` because that's the `name` in the example's Russelfile.
 
-## 3. Check it
+## 2. Check it
 
 ```bash
 russel ps
@@ -69,7 +50,7 @@ russel logs api
 
 > **Note:** Russel picks a free host port (3100 and up) unless the Russelfile pins one. It can change on the next deploy, so use `russel ps` to find it. To pin it, add `[ingress]` with `port = 8080` to the Russelfile. For a stable name instead of a port, see [Traefik ingress](./guides/traefik-ingress.md).
 
-## 4. Update and roll back
+## 3. Update and roll back
 
 After the first deploy, ship changes with `russel update`. Commit a change to the app or the Russelfile, then build the source's latest commit:
 
@@ -89,7 +70,7 @@ russel rollback api
 
 Russel keeps the last 20 deployments. `russel rollback api --version N` picks an older one. More: [Update and rollback](./guides/update-rollback.md).
 
-## 5. Clean up
+## 4. Clean up
 
 ```bash
 russel destroy api
