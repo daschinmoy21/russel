@@ -23,7 +23,7 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::auth::{
-    AGENT_TOKEN_ENV, AuthConfig, check_token_min_length, configured_agent_token, require_bearer,
+    AGENT_TOKEN_ENV, check_token_min_length, configured_agent_token, require_bearer,
 };
 use crate::capacity::data_root_from_env;
 use crate::node_id::resolve_node_id;
@@ -85,12 +85,9 @@ async fn main() -> Result<()> {
     }
 
     let state = Arc::new(AgentState::new(node_id.clone(), data_root.clone()));
-    let auth_cfg = AuthConfig {
-        expected: token.clone(),
-    };
-
+    let expected_token = token.clone();
     let app: Router = agent_router(state).layer(middleware::from_fn(move |req, next| {
-        let expected = auth_cfg.expected.clone();
+        let expected = expected_token.clone();
         async move { require_bearer(req, next, expected).await }
     }));
 

@@ -689,12 +689,7 @@ impl DeployPipeline {
         requested_id: Option<&str>,
         tx: &tokio::sync::mpsc::Sender<DeployEvent>,
     ) -> anyhow::Result<ResolvedSource> {
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "resolve".into(),
-                description: "Resolving source & Russelfile".into(),
-            })
-            .await;
+        super::progress(tx, "resolve", "Resolving source & Russelfile").await;
         let (repo_path, checkout) = match request.rev.as_deref() {
             // A pinned checkout's lease covers the clone root, which a local
             // subdir deploy's `repo_path` is below.

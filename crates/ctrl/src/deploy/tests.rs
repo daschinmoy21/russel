@@ -2,7 +2,7 @@
 
 use super::config::{MAX_CONFIG_BYTES, load_russelfile_under_repo, resolve_build_dir};
 use super::pipeline::{DesiredExtras, build_desired_state, new_generation_id};
-use crate::metadata::build_microvm_metadata_with_gen;
+use crate::metadata::build_microvm_metadata;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ fn generation_runtime_key_is_valid_service_id() {
 
 #[test]
 fn metadata_records_generation_and_tap() {
-    let meta = build_microvm_metadata_with_gen(
+    let meta = build_microvm_metadata(
         "api_gdeadbeef",
         3100,
         3000,

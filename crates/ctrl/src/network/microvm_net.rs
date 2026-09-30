@@ -169,6 +169,15 @@ impl MicrovmNet {
         }
     }
 
+    /// The forwarders followed by `others` (virtiofsd): the aux children the
+    /// supervisor owns next to the VM.
+    pub fn into_aux(self, others: Vec<tokio::process::Child>) -> Vec<tokio::process::Child> {
+        let mut aux = vec![self.forwarder];
+        aux.extend(self.extra_forwarders);
+        aux.extend(others);
+        aux
+    }
+
     /// Wait until the app answers. On a TAP the guest IP is routable from the
     /// host; under passt it is not, so probe through the published port.
     ///

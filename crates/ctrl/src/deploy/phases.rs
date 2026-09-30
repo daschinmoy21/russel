@@ -9,7 +9,7 @@ use std::{
 };
 
 use russel_core::{
-    api::{DeployEvent, DeployRequest, DeployTiming, PortMapping},
+    api::{DeployRequest, DeployTiming, PortMapping},
     config::{
         RuntimeKind, Russelfile, resolve_ingress_host, resolve_primary_publish, validate_env_map,
     },
@@ -34,127 +34,67 @@ use crate::{
     network::PortAllocator,
 };
 
-use super::WATCH_WINDOW;
 use super::pipeline::{
     DeployInnerResult, DeployOutput, DeployPipeline, DeployWorkload, DesiredExtras, ResolvedSource,
     build_desired_state, carry_history, new_generation_id, promote_generation,
     record_source_in_metadata, reject_live_listen_collision, validate_live_ingress_port,
 };
 use super::rollback::{
-    attempt_container_rollback, attempt_microvm_rollback, cleanup_failed_deploy,
-    destroy_prior_runtime, kill_and_wait_children, resolve_prior_runtime, restore_backup_dirs,
+    ServiceDirs, attempt_container_rollback, attempt_microvm_rollback, cleanup_failed_deploy,
+    destroy_prior_runtime, kill_and_wait_children, resolve_prior_runtime,
 };
-
-type Events = tokio::sync::mpsc::Sender<DeployEvent>;
+use super::{Events, WATCH_WINDOW};
 
 /// The Russelfile turned into the deploy's inputs. Every later phase reads it.
-struct Plan {
+pub(super) struct Plan {
     /// The Russelfile's folder joined with `service.source`: where Nix builds
     /// (#525). The repo root for a root Russelfile with `source = "."`.
     build_path: PathBuf,
     /// Keeps the checkout alive until the deploy ends.
     _checkout: CheckoutLease,
-    config: Russelfile,
+    pub(super) config: Russelfile,
     /// Commit the source builds; `None` outside git (#448).
     rev: Option<SourceRev>,
     runtime: RuntimeKind,
     /// `[service.env]` with `secret://` refs resolved: what the workload gets.
-    env: HashMap<String, String>,
+    pub(super) env: HashMap<String, String>,
     ingress_host: Option<String>,
     host_rules: Vec<HostRule>,
     /// The primary publish `[ingress].port` pins, if any.
     pin_mapping: Option<PortMapping>,
-    volumes: Vec<ResolvedVolume>,
+    pub(super) volumes: Vec<ResolvedVolume>,
     /// Replayed by rollback, health restart, and update (F-04/08/09).
-    desired_state: Option<serde_json::Value>,
+    pub(super) desired_state: Option<serde_json::Value>,
 }
 
-struct Built {
-    output: BuildOutput,
+pub(super) struct Built {
+    pub(super) output: BuildOutput,
     /// Resolved for the microVM runtime only.
-    kernel: Option<KernelInfo>,
+    pub(super) kernel: Option<KernelInfo>,
     build_ms: u128,
 }
 
 /// Where the new generation boots, and what to put back if it fails.
-struct Slot {
+pub(super) struct Slot {
     prior_runtime: Option<RuntimeKind>,
     /// Boot beside the live generation and swap ingress to it (zero
     /// downtime). Otherwise the live generation is stopped first (cold).
     dual_live: bool,
-    generation_id: String,
+    pub(super) generation_id: String,
     /// `{service_id}_g{generation_id}` when dual-live, else the service id.
-    runtime_key: String,
+    pub(super) runtime_key: String,
     dirs: ServiceDirs,
     /// Cold path moved the live service dir to `.bak`; rollback reads it.
     has_backup: bool,
 }
 
-struct ServiceDirs {
-    russel: String,
-    microvms: String,
-    russel_bak: String,
-    microvms_bak: String,
-    has_microvms: bool,
-}
-
-impl ServiceDirs {
-    fn of(service_id: &str) -> Self {
-        let russel = crate::paths::service_dir(service_id).display().to_string();
-        let microvms = crate::paths::microvm_dir(service_id).display().to_string();
-        Self {
-            russel_bak: format!("{russel}.bak"),
-            microvms_bak: format!("{microvms}.bak"),
-            has_microvms: Path::new(&microvms).exists(),
-            russel,
-            microvms,
-        }
-    }
-
-    async fn restore(&self) {
-        restore_backup_dirs(
-            &self.russel,
-            &self.microvms,
-            &self.russel_bak,
-            &self.microvms_bak,
-            self.has_microvms,
-        )
-        .await;
-    }
-
-    /// Best-effort cleanup of the pre-deploy backup dirs. Use remove_dir_all
-    /// rather than shelling out to `rm -rf` (F-46); only a keep-id rootfs
-    /// falls back to `podman unshare rm` (#464). A missing dir (already
-    /// cleaned) is not an error.
-    async fn remove_backups(&self) {
-        if let Err(e) = crate::container::remove_tree(Path::new(&self.russel_bak)).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                path = %self.russel_bak,
-                error = %e,
-                "failed to remove russel backup dir after deploy"
-            );
-        }
-        if self.has_microvms
-            && let Err(e) = std::fs::remove_dir_all(&self.microvms_bak)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                path = %self.microvms_bak,
-                error = %e,
-                "failed to remove microvms backup dir after deploy"
-            );
-        }
-    }
-}
-
-struct Booted {
-    workload: DeployWorkload,
-    create_ms: u128,
-    start_ms: u128,
-    network_ms: u128,
-    ready_ms: u128,
+/// A started generation that answered, with its phase timings.
+pub(super) struct Booted {
+    pub(super) workload: DeployWorkload,
+    pub(super) create_ms: u128,
+    pub(super) start_ms: u128,
+    pub(super) network_ms: u128,
+    pub(super) ready_ms: u128,
 }
 
 impl DeployPipeline {
@@ -238,12 +178,7 @@ impl DeployPipeline {
         } else {
             "Building package"
         };
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "build".into(),
-                description: description.into(),
-            })
-            .await;
+        super::progress(tx, "build", description).await;
         let output = self
             .builder
             .build(&plan.build_path, plan.config.service.package.as_deref())
@@ -319,14 +254,12 @@ impl DeployPipeline {
                 runtime_key = %runtime_key,
                 "dual-live redeploy: keeping active generation until candidate is ready"
             );
-            let _ = tx
-                .send(DeployEvent::Progress {
-                    phase: "candidate".into(),
-                    description: format!(
-                        "Booting generation {generation_id} alongside active service"
-                    ),
-                })
-                .await;
+            super::progress(
+                tx,
+                "candidate",
+                format!("Booting generation {generation_id} alongside active service"),
+            )
+            .await;
         } else {
             self.vacate(service_id, prior_runtime, &dirs, has_russel_dir)
                 .await?;
@@ -395,8 +328,7 @@ impl DeployPipeline {
         kill_and_wait_children(old_vm_proc, old_aux_procs).await;
 
         if let Some(prior_kind) = prior_runtime
-            && let Err(e) =
-                destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers).await
+            && let Err(e) = destroy_prior_runtime(prior_kind, service_id, &self.runner).await
         {
             if has_russel_dir {
                 dirs.restore().await;
@@ -433,7 +365,6 @@ impl DeployPipeline {
             PortAllocator::reserve(&extra_port_key(key, i), extra.host)?;
         }
 
-        let generation_id = Some(slot.generation_id.as_str());
         // A cold replace already stopped the live generation, so a crash right
         // after answering must fail in boot, where the .bak restore still
         // covers it. Dual-live watches in `hold` instead, with traffic already
@@ -443,52 +374,16 @@ impl DeployPipeline {
         } else {
             Duration::ZERO
         };
-        let (workload, create_ms, start_ms, network_ms, ready_ms) = match plan.runtime {
+        match plan.runtime {
             RuntimeKind::Microvm => {
-                self.deploy_microvm(
-                    key,
-                    &plan.config,
-                    &built.output.store_path,
-                    &port,
-                    built
-                        .kernel
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("kernel not resolved"))?,
-                    &plan.env,
-                    tx,
-                    generation_id,
-                    plan.desired_state.as_ref(),
-                    &plan.volumes,
-                    built.output.using_package,
-                    settle,
-                )
-                .await?
+                self.deploy_microvm(plan, built, slot, &port, settle, tx)
+                    .await
             }
             RuntimeKind::Container => {
-                self.deploy_container(
-                    key,
-                    &plan.config,
-                    &built.output.store_path,
-                    &port,
-                    &plan.config.service.podman_args,
-                    &plan.env,
-                    tx,
-                    generation_id,
-                    plan.desired_state.as_ref(),
-                    &plan.volumes,
-                    built.output.using_package,
-                    settle,
-                )
-                .await?
+                self.deploy_container(plan, built, slot, &port, settle, tx)
+                    .await
             }
-        };
-        Ok(Booted {
-            workload,
-            create_ms,
-            start_ms,
-            network_ms,
-            ready_ms,
-        })
+        }
     }
 
     /// The new generation did not come up. Destroy what it left, and on the
@@ -509,13 +404,7 @@ impl DeployPipeline {
             slot.prior_runtime
         );
         // Only destroy the candidate; dual-live leaves the active generation alone.
-        cleanup_failed_deploy(
-            plan.runtime,
-            &slot.runtime_key,
-            &self.runner,
-            &self.containers,
-        )
-        .await;
+        cleanup_failed_deploy(plan.runtime, &slot.runtime_key, &self.runner).await;
         if slot.dual_live {
             // Active generation never stopped — report hard failure without rollback.
             return Err(
@@ -530,28 +419,11 @@ impl DeployPipeline {
         let (prior, rollback) = match slot.prior_runtime {
             Some(RuntimeKind::Microvm) => (
                 RuntimeKind::Microvm,
-                attempt_microvm_rollback(
-                    service_id,
-                    &dirs.russel,
-                    &dirs.microvms,
-                    &dirs.russel_bak,
-                    &dirs.microvms_bak,
-                    dirs.has_microvms,
-                    &self.runner,
-                    &self.state,
-                )
-                .await,
+                attempt_microvm_rollback(service_id, dirs, &self.runner, &self.state).await,
             ),
             Some(RuntimeKind::Container) => (
                 RuntimeKind::Container,
-                attempt_container_rollback(
-                    service_id,
-                    &dirs.russel,
-                    &dirs.russel_bak,
-                    &self.containers,
-                    &self.state,
-                )
-                .await,
+                attempt_container_rollback(service_id, dirs, &self.containers, &self.state).await,
             ),
             None => {
                 dirs.restore().await;
@@ -674,15 +546,15 @@ impl DeployPipeline {
         if !slot.dual_live {
             return Ok(());
         }
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "switch".into(),
-                description: format!(
-                    "New version is live; keeping the previous one running for {}s in case it crashes",
-                    WATCH_WINDOW.as_secs()
-                ),
-            })
-            .await;
+        super::progress(
+            tx,
+            "switch",
+            format!(
+                "New version is live; keeping the previous one running for {}s in case it crashes",
+                WATCH_WINDOW.as_secs()
+            ),
+        )
+        .await;
         let Some(error) = watch_candidate(&slot.runtime_key, workload, WATCH_WINDOW).await else {
             return Ok(());
         };
@@ -742,12 +614,12 @@ impl DeployPipeline {
         }
 
         // Drain old generation only after successful swap.
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "cutover".into(),
-                description: "Draining previous generation after ingress swap".into(),
-            })
-            .await;
+        super::progress(
+            tx,
+            "cutover",
+            "Draining previous generation after ingress swap",
+        )
+        .await;
 
         let (old_vm_proc, old_aux_procs) = self
             .state
@@ -762,8 +634,7 @@ impl DeployPipeline {
         carry_history(service_id, key).await;
 
         if let Some(prior_kind) = slot.prior_runtime
-            && let Err(e) =
-                destroy_prior_runtime(prior_kind, service_id, &self.runner, &self.containers).await
+            && let Err(e) = destroy_prior_runtime(prior_kind, service_id, &self.runner).await
         {
             tracing::error!(
                 service_id,

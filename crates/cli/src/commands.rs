@@ -18,7 +18,9 @@ use crate::config::{self, Resolved};
 use crate::init::InitArgs;
 use crate::ui;
 
-/// Shared HTTP client that attaches Bearer auth when RUSSEL_API_TOKEN is set.
+/// Shared HTTP client that attaches Bearer auth: the token from
+/// `RUSSEL_API_TOKEN` (any origin) or the saved config token when the request
+/// URL matches the origin stored at login.
 ///
 /// Token handling matches ctrl `normalize_api_token`: trim whitespace; blank → no auth.
 ///
@@ -33,15 +35,9 @@ use crate::ui;
 ///
 /// Returns an error when the token value cannot be parsed into a valid HTTP
 /// header value (F-47).
-/// Token from `RUSSEL_API_TOKEN` (any origin) or the saved config token when
-/// the request URL matches the origin stored at login.
-fn bearer_token(control_plane: &str) -> Option<String> {
-    config::token_for(control_plane).map(|(token, _source)| token)
-}
-
 fn http_client(control_plane: &str) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
-    if let Some(token) = bearer_token(control_plane) {
+    if let Some((token, _source)) = config::token_for(control_plane) {
         let header_value = format!("Bearer {token}")
             .parse()
             .map_err(|_| anyhow!("API token contains characters invalid in an HTTP header"))?;
@@ -67,18 +63,45 @@ fn unauthorized_message(control_plane: &str) -> String {
     )
 }
 
-fn ok_status(resp: reqwest::Response, control_plane: &str) -> Result<reqwest::Response> {
-    if resp.status().as_u16() == 401 {
-        anyhow::bail!("{}", unauthorized_message(control_plane));
-    }
-    Ok(resp.error_for_status()?)
+/// Sending a request to the control plane: a transport error becomes a
+/// reachability hint and a 401 the `russel login` hint.
+trait ControlPlaneRequest {
+    /// Fail on any non-2xx status.
+    async fn send_ok(self, control_plane: &str) -> Result<reqwest::Response>;
+    /// Fail on any non-2xx status, quoting the response body: `{what} failed`.
+    async fn send_quoting_body(self, control_plane: &str, what: &str) -> Result<reqwest::Response>;
 }
 
-fn fail_if_unauthorized(status: reqwest::StatusCode, control_plane: &str) -> Result<()> {
-    if status.as_u16() == 401 {
+impl ControlPlaneRequest for reqwest::RequestBuilder {
+    async fn send_ok(self, control_plane: &str) -> Result<reqwest::Response> {
+        Ok(send_authorized(self, control_plane)
+            .await?
+            .error_for_status()?)
+    }
+
+    async fn send_quoting_body(self, control_plane: &str, what: &str) -> Result<reqwest::Response> {
+        let resp = send_authorized(self, control_plane).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{what} failed ({status}): {body}");
+        }
+        Ok(resp)
+    }
+}
+
+async fn send_authorized(
+    req: reqwest::RequestBuilder,
+    control_plane: &str,
+) -> Result<reqwest::Response> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| map_control_plane_error(e, control_plane))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         anyhow::bail!("{}", unauthorized_message(control_plane));
     }
-    Ok(())
+    Ok(resp)
 }
 
 static CLEARTEXT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -477,10 +500,8 @@ pub async fn deploy(args: DeployArgs, control_plane: &str) -> Result<()> {
             rev: None,
             force: args.force,
         })
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?;
+        .send_ok(control_plane)
+        .await?;
 
     let response = stream_deploy_events(&mut response, "deploy").await?;
 
@@ -571,7 +592,8 @@ fn is_terminal_control(c: char) -> bool {
 
 fn print_deploy_response(r: DeployResponse, wall: Duration) {
     let unchanged = r.status == "unchanged";
-    let ok = r.status == ServiceStatus::Deployed.as_str() || unchanged;
+    let ok = deploy_status_is_success(&r.status);
+    let is_container = r.runtime == Some(RuntimeKind::Container);
     let rolled_back = r.status == "rolled_back";
     let icon = if ok {
         "\x1b[1;32m✓\x1b[0m"
@@ -648,15 +670,7 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         );
     }
     if let Some(artifact) = &r.microvm_config_path {
-        let label = if r
-            .runtime
-            .as_ref()
-            .is_some_and(|rt| matches!(rt, RuntimeKind::Container))
-        {
-            "rootfs"
-        } else {
-            "initramfs"
-        };
+        let label = if is_container { "rootfs" } else { "initramfs" };
         step(
             label,
             &format!("\x1b[2m{}\x1b[0m", sanitize_terminal(artifact)),
@@ -671,10 +685,6 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
 
         timing_row("build", t.build_ms, "build (package)");
 
-        let is_container = r
-            .runtime
-            .as_ref()
-            .is_some_and(|rt| matches!(rt, RuntimeKind::Container));
         if is_container {
             timing_row("create", t.create_ms, "prepare container rootfs");
             timing_row("start", t.start_ms, "start rootless Podman container");
@@ -848,10 +858,8 @@ pub async fn origin(resolved: &Resolved) -> Result<()> {
 async fn probe_origin(control_plane: &str) -> Result<usize> {
     let r = http_client(control_plane)?
         .get(format!("{control_plane}/vms"))
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?
+        .send_ok(control_plane)
+        .await?
         .json::<VmsResponse>()
         .await?;
     Ok(r.vms.len())
@@ -968,10 +976,8 @@ pub async fn status(args: StatusArgs, control_plane: &str) -> Result<()> {
     };
     let r = http_client(control_plane)?
         .get(&url)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?
+        .send_ok(control_plane)
+        .await?
         .json::<StatusResponse>()
         .await?;
     print_status(&r);
@@ -1002,10 +1008,8 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
     };
     let r = http_client(control_plane)?
         .get(&url)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?
+        .send_ok(control_plane)
+        .await?
         .json::<LogsResponse>()
         .await?;
     let title = args.service_id.as_deref().unwrap_or("logs");
@@ -1022,10 +1026,8 @@ pub async fn logs(args: LogsArgs, control_plane: &str) -> Result<()> {
 pub async fn ps(control_plane: &str) -> Result<()> {
     let r = http_client(control_plane)?
         .get(format!("{control_plane}/vms"))
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?
+        .send_ok(control_plane)
+        .await?
         .json::<VmsResponse>()
         .await?;
     println!();
@@ -1101,10 +1103,8 @@ async fn fetch_status_row(control_plane: &str, id: &str) -> Result<StatusRespons
     let url = service_vm_url(control_plane, id, "/status")?;
     http_client(control_plane)?
         .get(url)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?
+        .send_ok(control_plane)
+        .await?
         .json::<StatusResponse>()
         .await
         .map_err(Into::into)
@@ -1114,10 +1114,8 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
     let url = service_vm_url(control_plane, id, "/stop")?;
     let r = http_client(control_plane)?
         .post(url)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?
+        .send_ok(control_plane)
+        .await?
         .json::<String>()
         .await?;
     ui::heading("stop");
@@ -1128,12 +1126,6 @@ pub async fn stop_vm(id: &str, control_plane: &str) -> Result<()> {
 }
 
 pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
-    let url = service_vm_url(control_plane, &args.id, "/update")?;
-    let wall = Instant::now();
-    println!();
-    println!("  \x1b[1;36mrussel update\x1b[0m  {}", args.id);
-    println!();
-
     let mut body = serde_json::Map::new();
     if let Some(repo) = args.repo {
         let repo_url = normalize_repo_arg(&repo)?;
@@ -1146,50 +1138,41 @@ pub async fn update(args: UpdateArgs, control_plane: &str) -> Result<()> {
     if args.refresh {
         body.insert("refresh".into(), serde_json::json!(true));
     }
-
-    let client = http_client(control_plane)?;
-    let mut response = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?;
-
-    let response = stream_deploy_events(&mut response, "update").await?;
-    let status = response.status.clone();
-    print_deploy_response(response, wall.elapsed());
-    if !deploy_status_is_success(&status) {
-        anyhow::bail!("update finished with status {status}");
-    }
-    Ok(())
+    redeploy("update", &args.id, body, control_plane).await
 }
 
 pub async fn rollback(args: RollbackArgs, control_plane: &str) -> Result<()> {
-    let url = service_vm_url(control_plane, &args.id, "/rollback")?;
-    let wall = Instant::now();
-    println!();
-    println!("  \x1b[1;36mrussel rollback\x1b[0m  {}", args.id);
-    println!();
-
     let mut body = serde_json::Map::new();
     if let Some(version) = args.version {
         body.insert("version".into(), serde_json::json!(version));
     }
-    let client = http_client(control_plane)?;
-    let mut response = client
+    redeploy("rollback", &args.id, body, control_plane).await
+}
+
+/// POST `body` to the service's streaming `/{operation}` endpoint, print the
+/// progress and outcome, and fail unless the service ends up deployed.
+async fn redeploy(
+    operation: &str,
+    id: &str,
+    body: serde_json::Map<String, serde_json::Value>,
+    control_plane: &str,
+) -> Result<()> {
+    let url = service_vm_url(control_plane, id, &format!("/{operation}"))?;
+    let wall = Instant::now();
+    println!();
+    println!("  \x1b[1;36mrussel {operation}\x1b[0m  {id}");
+    println!();
+
+    let mut response = http_client(control_plane)?
         .post(url)
         .json(&body)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))
-        .and_then(|r| ok_status(r, control_plane))?;
-
-    let response = stream_deploy_events(&mut response, "rollback").await?;
+        .send_ok(control_plane)
+        .await?;
+    let response = stream_deploy_events(&mut response, operation).await?;
     let status = response.status.clone();
     print_deploy_response(response, wall.elapsed());
     if !deploy_status_is_success(&status) {
-        anyhow::bail!("rollback finished with status {status}");
+        anyhow::bail!("{operation} finished with status {status}");
     }
     Ok(())
 }
@@ -1258,28 +1241,19 @@ async fn stream_deploy_events(
 ) -> Result<DeployResponse> {
     let mut buffer = Vec::new();
     let mut final_response = None;
-
-    while let Some(chunk) = response.chunk().await? {
-        consume_ndjson_chunk(&mut buffer, &chunk, MAX_NDJSON_LINE, &mut |line| {
-            let event: DeployEvent = serde_json::from_str(line).with_context(|| {
-                format!(
-                    "failed to parse event from control plane: {}",
-                    truncate_for_error(line)
-                )
-            })?;
-            handle_deploy_event(event, operation, &mut final_response)
-        })?;
-    }
-
-    consume_ndjson_final(&mut buffer, MAX_NDJSON_LINE, &mut |line| {
+    let mut on_line = |line: &str| {
         let event: DeployEvent = serde_json::from_str(line).with_context(|| {
             format!(
-                "failed to parse final event from control plane: {}",
+                "failed to parse event from control plane: {}",
                 truncate_for_error(line)
             )
         })?;
         handle_deploy_event(event, operation, &mut final_response)
-    })?;
+    };
+    while let Some(chunk) = response.chunk().await? {
+        consume_ndjson_chunk(&mut buffer, &chunk, MAX_NDJSON_LINE, &mut on_line)?;
+    }
+    consume_ndjson_final(&mut buffer, MAX_NDJSON_LINE, &mut on_line)?;
 
     final_response
         .map(|response| *response)
@@ -1383,21 +1357,15 @@ pub async fn destroy_vm(args: &DestroyArgs, control_plane: &str) -> Result<()> {
         args.keep_volumes,
         args.delete_volumes,
     )?;
-    let resp = http_client(control_plane)?
-        .delete(url)
-        .send()
-        .await
-        .map_err(|e| map_control_plane_error(e, control_plane))?;
     // Do not treat bare 404 as success: unmatched routes and "not in memory"
     // can 404 while runtime resources still exist. Server returns 200 with an
     // "already gone" body when destroy was intentionally idempotent.
-    fail_if_unauthorized(resp.status(), control_plane)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("destroy failed ({status}): {body}");
-    }
-    let r = resp.json::<String>().await?;
+    let r = http_client(control_plane)?
+        .delete(url)
+        .send_quoting_body(control_plane, "destroy")
+        .await?
+        .json::<String>()
+        .await?;
     ui::heading("destroy");
     ui::kv("id", &ui::sanitize(&args.id));
     ui::kv("result", &ui::sanitize(&r));
@@ -1424,30 +1392,22 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
             if value.is_empty() {
                 anyhow::bail!("secret value is empty (read value from stdin)");
             }
-            let resp = http_client(control_plane)?
+            http_client(control_plane)?
                 .post(url)
                 .json(&serde_json::json!({ "value": value }))
-                .send()
-                .await
-                .map_err(|e| map_control_plane_error(e, control_plane))?;
-            fail_if_unauthorized(resp.status(), control_plane)?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("secrets set failed ({status}): {body}");
-            }
+                .send_quoting_body(control_plane, "secrets set")
+                .await?;
             ui::heading("secrets");
             ui::kv("set", &ui::sanitize(&name));
             println!();
         }
         SecretsCommand::List => {
-            let resp = http_client(control_plane)?
+            let body: serde_json::Value = http_client(control_plane)?
                 .get(format!("{control_plane}/secrets"))
-                .send()
-                .await
-                .map_err(|e| map_control_plane_error(e, control_plane))
-                .and_then(|r| ok_status(r, control_plane))?;
-            let body: serde_json::Value = resp.json().await?;
+                .send_ok(control_plane)
+                .await?
+                .json()
+                .await?;
             ui::heading("secrets");
             if let Some(arr) = body.get("secrets").and_then(|v| v.as_array()) {
                 if arr.is_empty() {
@@ -1466,17 +1426,10 @@ pub async fn secrets(action: SecretsCommand, control_plane: &str) -> Result<()> 
         }
         SecretsCommand::Delete { name } => {
             let url = secret_url(control_plane, &name)?;
-            let resp = http_client(control_plane)?
+            http_client(control_plane)?
                 .delete(url)
-                .send()
-                .await
-                .map_err(|e| map_control_plane_error(e, control_plane))?;
-            fail_if_unauthorized(resp.status(), control_plane)?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("secrets delete failed ({status}): {body}");
-            }
+                .send_quoting_body(control_plane, "secrets delete")
+                .await?;
             ui::heading("secrets");
             ui::kv("deleted", &ui::sanitize(&name));
             println!();

@@ -698,12 +698,14 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     let name = ContainerRunner::container_name(&spec.service_id);
     let bind = crate::network::publish_bind_addr();
     // Podman -p: HOST:CONTAINER or IP:HOST:CONTAINER. Bracket IPv6 (contains ':').
-    let port_mapping = if bind == "0.0.0.0" || bind == "::" {
-        format!("{}:{}", spec.host_port, spec.guest_port)
-    } else if bind.contains(':') {
-        format!("[{}]:{}:{}", bind, spec.host_port, spec.guest_port)
-    } else {
-        format!("{}:{}:{}", bind, spec.host_port, spec.guest_port)
+    let publish = |host: u16, guest: u16| {
+        if bind == "0.0.0.0" || bind == "::" {
+            format!("{host}:{guest}")
+        } else if bind.contains(':') {
+            format!("[{bind}]:{host}:{guest}")
+        } else {
+            format!("{bind}:{host}:{guest}")
+        }
     };
     let log_path = log_path
         .to_str()
@@ -716,7 +718,7 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "run".to_string(),
         "-d".to_string(),
         "--name".to_string(),
-        name,
+        name.clone(),
         "--label".to_string(),
         format!("{LABEL_SERVICE}={}", spec.service_id),
         "--label".to_string(),
@@ -724,7 +726,7 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         "--mount".to_string(),
         NIX_STORE_MOUNT.to_string(),
         "-p".to_string(),
-        port_mapping,
+        publish(spec.host_port, spec.guest_port),
         "--memory".to_string(),
         format!("{}m", spec.memory_mb),
         "--workdir".to_string(),
@@ -756,8 +758,7 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     }
 
     if let Some(cpus) = spec.cpus {
-        args.push("--cpus".to_string());
-        args.push(cpus.to_string());
+        args.extend(["--cpus".to_string(), cpus.to_string()]);
     }
 
     for vol in &spec.volumes {
@@ -773,33 +774,28 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
         if !vol.rw {
             mount.push_str(",ro=true");
         }
-        args.push("--mount".to_string());
-        args.push(mount);
+        args.extend(["--mount".to_string(), mount]);
     }
 
-    for (host, guest) in &spec.extra_ports {
-        let extra = if bind == "0.0.0.0" || bind == "::" {
-            format!("{host}:{guest}")
-        } else if bind.contains(':') {
-            format!("[{bind}]:{host}:{guest}")
-        } else {
-            format!("{bind}:{host}:{guest}")
-        };
-        args.push("-p".to_string());
-        args.push(extra);
+    for &(host, guest) in &spec.extra_ports {
+        args.extend(["-p".to_string(), publish(host, guest)]);
     }
 
     if spec.userns_keep_id {
         // Unprivileged app (#466): run as the Podman user, who owns the
         // volumes, and let it bind ports below 1024 inside its own netns.
-        args.push("--userns".to_string());
-        args.push("keep-id".to_string());
-        args.push("--sysctl".to_string());
-        args.push("net.ipv4.ip_unprivileged_port_start=0".to_string());
+        args.extend(
+            [
+                "--userns",
+                "keep-id",
+                "--sysctl",
+                "net.ipv4.ip_unprivileged_port_start=0",
+            ]
+            .map(String::from),
+        );
     }
-    if let Some(restart) = spec.restart.as_deref() {
-        args.push("--restart".to_string());
-        args.push(restart.to_string());
+    if let Some(restart) = &spec.restart {
+        args.extend(["--restart".to_string(), restart.clone()]);
     }
 
     if !spec.podman_args.is_empty() {
@@ -810,32 +806,37 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
     // Re-assert isolation after extras: podman last-wins for boolean flags and
     // security-opt; cap-drop is cumulative but ALL here documents intent and
     // covers any attempt to re-order capability handling.
-    args.push("--cap-drop".to_string());
-    args.push("ALL".to_string());
-    args.push("--security-opt".to_string());
-    args.push("no-new-privileges".to_string());
-    args.push("--read-only".to_string());
+    args.extend(
+        [
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+        ]
+        .map(String::from),
+    );
 
     for (key, value) in &spec.env {
-        args.push("-e".to_string());
-        args.push(format!("{key}={value}"));
+        args.extend(["-e".to_string(), format!("{key}={value}")]);
     }
 
-    let container = ContainerRunner::container_name(&spec.service_id);
     for (key, _) in &spec.secret_env {
         // The key lands in a comma-separated option; core already enforces
         // [A-Za-z_][A-Za-z0-9_]*, so this only guards other callers.
         russel_core::validate_env_key(key)?;
-        args.push("--secret".to_string());
-        args.push(format!(
-            "{},type=env,target={key}",
-            podman_secret_name(&container, key)
-        ));
+        let secret = podman_secret_name(&name, key);
+        args.extend([
+            "--secret".to_string(),
+            format!("{secret},type=env,target={key}"),
+        ]);
     }
 
-    args.push("--rootfs".to_string());
-    args.push(spec.rootfs.rootfs_path.display().to_string());
-    args.push(spec.rootfs.entrypoint.display().to_string());
+    args.extend([
+        "--rootfs".to_string(),
+        spec.rootfs.rootfs_path.display().to_string(),
+        spec.rootfs.entrypoint.display().to_string(),
+    ]);
     args.extend(spec.service_args.iter().cloned());
     Ok(args)
 }

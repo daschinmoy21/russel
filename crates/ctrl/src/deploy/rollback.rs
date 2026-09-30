@@ -7,7 +7,7 @@ use std::{
 };
 
 use russel_core::config::RuntimeKind;
-use russel_core::volumes::extra_port_key;
+use russel_core::volumes::{ExtraPortSpec, ResolvedVolume, extra_port_key};
 
 use crate::{
     container::{
@@ -29,22 +29,29 @@ use crate::{
 /// (string values only). Shared by the microVM and container rollback paths.
 fn desired_state_env(old_meta: &serde_json::Value) -> HashMap<String, String> {
     old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("env"))
-        .and_then(|env_obj| {
-            if let serde_json::Value::Object(map) = env_obj {
-                let mut out = HashMap::new();
-                for (k, v) in map {
-                    if let Some(val) = v.as_str() {
-                        out.insert(k.clone(), val.to_string());
-                    }
-                }
-                Some(out)
-            } else {
-                None
-            }
-        })
+        .pointer("/desired_state/env")
+        .and_then(|env| env.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect()
+}
+
+/// `desired_state.<key>` from rollback metadata, or the default when it is
+/// absent or malformed.
+fn desired<T: serde::de::DeserializeOwned + Default>(meta: &serde_json::Value, key: &str) -> T {
+    meta.get("desired_state")
+        .and_then(|ds| ds.get(key))
+        .and_then(|v| T::deserialize(v).ok())
         .unwrap_or_default()
+}
+
+/// A required port or size field of recorded metadata.
+fn required_u16(meta: &serde_json::Value, key: &str) -> anyhow::Result<u16> {
+    let n = meta[key]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("metadata is missing {key}"))?;
+    u16::try_from(n).map_err(|_| anyhow::anyhow!("metadata {key} out of u16 range"))
 }
 
 /// Resolve the prior runtime for a service before redeploy.
@@ -135,7 +142,6 @@ pub(crate) async fn destroy_prior_runtime(
     prior: RuntimeKind,
     service_id: &str,
     microvm_runner: &MicrovmRunner,
-    _container_runner: &ContainerRunner,
 ) -> anyhow::Result<()> {
     match prior {
         RuntimeKind::Microvm => microvm_runner.destroy(service_id).await,
@@ -153,7 +159,6 @@ pub(crate) async fn cleanup_failed_deploy(
     runtime: RuntimeKind,
     service_id: &str,
     microvm_runner: &MicrovmRunner,
-    _container_runner: &ContainerRunner,
 ) {
     let _ = match runtime {
         RuntimeKind::Microvm => microvm_runner.destroy(service_id).await,
@@ -165,58 +170,107 @@ pub(crate) async fn cleanup_failed_deploy(
     };
 }
 
-pub(crate) async fn restore_backup_dirs(
-    russel_dir: &str,
-    microvms_dir: &str,
-    russel_bak: &str,
-    microvms_bak: &str,
-    has_microvms_backup: bool,
-) {
-    if let Err(e) = crate::container::restore_backed_up_service_dir(
-        Path::new(russel_dir),
-        Path::new(russel_bak),
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %e,
-            russel_dir,
-            russel_bak,
-            "failed to restore service dir from backup"
-        );
+/// A service's live dirs and the `.bak` names a cold deploy parks them at.
+pub(super) struct ServiceDirs {
+    pub(super) russel: String,
+    pub(super) microvms: String,
+    pub(super) russel_bak: String,
+    pub(super) microvms_bak: String,
+    pub(super) has_microvms: bool,
+}
+
+impl ServiceDirs {
+    pub(super) fn of(service_id: &str) -> Self {
+        let russel = crate::paths::service_dir(service_id).display().to_string();
+        let microvms = crate::paths::microvm_dir(service_id).display().to_string();
+        Self {
+            russel_bak: format!("{russel}.bak"),
+            microvms_bak: format!("{microvms}.bak"),
+            has_microvms: Path::new(&microvms).exists(),
+            russel,
+            microvms,
+        }
     }
-    if has_microvms_backup {
-        let _ = tokio::fs::rename(microvms_bak, microvms_dir).await;
+
+    /// Put the `.bak` dirs back after a failed cold deploy, best effort.
+    pub(super) async fn restore(&self) {
+        if let Err(e) = crate::container::restore_backed_up_service_dir(
+            Path::new(&self.russel),
+            Path::new(&self.russel_bak),
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                russel_dir = %self.russel,
+                russel_bak = %self.russel_bak,
+                "failed to restore service dir from backup"
+            );
+        }
+        if self.has_microvms {
+            let _ = tokio::fs::rename(&self.microvms_bak, &self.microvms).await;
+        }
+    }
+
+    /// Best-effort cleanup of the pre-deploy backup dirs. Use remove_dir_all
+    /// rather than shelling out to `rm -rf` (F-46); only a keep-id rootfs
+    /// falls back to `podman unshare rm` (#464). A missing dir (already
+    /// cleaned) is not an error.
+    pub(super) async fn remove_backups(&self) {
+        if let Err(e) = crate::container::remove_tree(Path::new(&self.russel_bak)).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.russel_bak,
+                error = %e,
+                "failed to remove russel backup dir after deploy"
+            );
+        }
+        if self.has_microvms
+            && let Err(e) = std::fs::remove_dir_all(&self.microvms_bak)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.microvms_bak,
+                error = %e,
+                "failed to remove microvms backup dir after deploy"
+            );
+        }
     }
 }
 
 pub(crate) async fn attempt_microvm_rollback(
     service_id: &str,
-    russel_dir: &str,
-    microvms_dir: &str,
-    russel_bak: &str,
-    microvms_bak: &str,
-    has_microvms_backup: bool,
+    dirs: &ServiceDirs,
     runner: &MicrovmRunner,
     state: &AppState,
 ) -> anyhow::Result<()> {
     // 0. Validate backup metadata BEFORE renaming (F-16: avoid unrecoverable
     //    half-restore when backup metadata is corrupt/missing).
-    let old_metadata_bak_path = format!("{}/metadata.json", russel_bak);
+    let old_metadata_bak_path = format!("{}/metadata.json", dirs.russel_bak);
     let content = std::fs::read_to_string(&old_metadata_bak_path)?;
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
     let recorded = RecordedMicrovm::from_metadata(service_id, old_meta, runner).await?;
 
     // All validations passed — now rename safely.
     // 1. Restore backup dirs, putting stashed volumes back on the live path.
-    crate::container::restore_backed_up_service_dir(Path::new(russel_dir), Path::new(russel_bak))
-        .await?;
-    if has_microvms_backup {
-        tokio::fs::rename(microvms_bak, microvms_dir).await?;
+    crate::container::restore_backed_up_service_dir(
+        Path::new(&dirs.russel),
+        Path::new(&dirs.russel_bak),
+    )
+    .await?;
+    if dirs.has_microvms {
+        tokio::fs::rename(&dirs.microvms_bak, &dirs.microvms).await?;
     }
 
     recorded
-        .launch(service_id, russel_dir, runner, state, FailedLaunch::Destroy)
+        .launch(
+            service_id,
+            &dirs.russel,
+            runner,
+            state,
+            FailedLaunch::Destroy,
+        )
         .await
 }
 
@@ -253,19 +307,8 @@ impl RecordedMicrovm {
         meta: serde_json::Value,
         runner: &MicrovmRunner,
     ) -> anyhow::Result<Self> {
-        let host_port = u16::try_from(
-            meta["host_port"]
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("missing host_port"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("host_port out of u16 range"))?;
-        let guest_port = u16::try_from(
-            meta["guest_port"]
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("missing guest_port"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("guest_port out of u16 range"))?;
-
+        let host_port = required_u16(&meta, "host_port")?;
+        let guest_port = required_u16(&meta, "guest_port")?;
         let kernel_path = PathBuf::from(
             meta["kernel_path"]
                 .as_str()
@@ -275,13 +318,7 @@ impl RecordedMicrovm {
             anyhow::bail!("kernel_path does not exist: {}", kernel_path.display());
         }
 
-        let mem_mb = u16::try_from(
-            meta["mem_mb"]
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("missing mem_mb"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("mem_mb out of u16 range"))?;
-
+        let mem_mb = required_u16(&meta, "mem_mb")?;
         let bin_name = meta["bin_name"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing bin_name"))?
@@ -315,10 +352,9 @@ impl RecordedMicrovm {
                 runner.build_agent_initramfs().await?
             }
         };
-        // Extract desired_state user env for deploy.env restoration (F-04).
-        let user_env: HashMap<String, String> = desired_state_env(&meta);
-        // Resolve secret:// refs in restored env
-        let mut user_env = crate::secrets::resolve_env_secrets(&user_env)?;
+        // Restore the desired_state user env for deploy.env (F-04), with
+        // secret:// refs resolved again.
+        let mut user_env = crate::secrets::resolve_env_secrets(&desired_state_env(&meta))?;
         let run_as = super::RunAs::from_desired_state(meta.get("desired_state"));
         run_as.apply_env_defaults(&mut user_env);
 
@@ -368,23 +404,13 @@ impl RecordedMicrovm {
         // may collide with another service after probe exhaustion.
         let alloc = subnet_for(service_id)?;
         let cfg_dir = format!("{}/cfg", russel_dir);
-        let recorded_args: Vec<String> = old_meta
-            .pointer("/desired_state/args")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let recorded_volumes: Vec<russel_core::volumes::ResolvedVolume> = old_meta
-            .pointer("/desired_state/volumes")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let recorded_extra_ports: Vec<(u16, u16)> = old_meta
-            .pointer("/desired_state/extra_ports")
-            .and_then(|v| {
-                serde_json::from_value::<Vec<russel_core::volumes::ExtraPortSpec>>(v.clone()).ok()
-            })
-            .unwrap_or_default()
-            .iter()
-            .map(|p| (p.host, p.guest))
-            .collect();
+        let recorded_args: Vec<String> = desired(&old_meta, "args");
+        let recorded_volumes: Vec<ResolvedVolume> = desired(&old_meta, "volumes");
+        let recorded_extra_ports: Vec<(u16, u16)> =
+            desired::<Vec<ExtraPortSpec>>(&old_meta, "extra_ports")
+                .iter()
+                .map(|p| (p.host, p.guest))
+                .collect();
         super::write_deploy_env(
             &cfg_dir,
             &alloc.vm_ip,
@@ -417,18 +443,17 @@ impl RecordedMicrovm {
             runner: &MicrovmRunner,
             on_failure: FailedLaunch,
             vm_child: Option<tokio::process::Child>,
-            aux: Option<Vec<tokio::process::Child>>,
+            aux: Vec<tokio::process::Child>,
         ) {
             match on_failure {
                 FailedLaunch::Destroy => {
-                    drop(vm_child);
-                    drop(aux);
+                    drop((vm_child, aux));
                     if let Err(e) = runner.destroy(service_id).await {
                         tracing::warn!(service_id, error = %e, "failed to destroy partially booted microVM");
                     }
                 }
                 FailedLaunch::Keep => {
-                    for mut child in vm_child.into_iter().chain(aux.into_iter().flatten()) {
+                    for mut child in vm_child.into_iter().chain(aux) {
                         let _ = child.kill().await;
                     }
                     if let Err(e) = runner.stop(service_id).await {
@@ -492,7 +517,13 @@ impl RecordedMicrovm {
             Ok(v) => v,
             Err(e) => {
                 cleanup_launch_resources(
-                    service_id, &alloc, net_mode, runner, on_failure, None, None,
+                    service_id,
+                    &alloc,
+                    net_mode,
+                    runner,
+                    on_failure,
+                    None,
+                    Vec::new(),
                 )
                 .await;
                 return Err(e.context("recorded microVM boot failed"));
@@ -535,9 +566,6 @@ impl RecordedMicrovm {
                     MICROVM_READY_TIMEOUT.as_secs()
                 ),
             };
-            let mut aux = vec![net.forwarder];
-            aux.extend(net.extra_forwarders);
-            aux.extend(virtiofsd_children);
             cleanup_launch_resources(
                 service_id,
                 &alloc,
@@ -545,7 +573,7 @@ impl RecordedMicrovm {
                 runner,
                 on_failure,
                 Some(vm_child),
-                Some(aux),
+                net.into_aux(virtiofsd_children),
             )
             .await;
             anyhow::bail!("{error}");
@@ -568,8 +596,11 @@ impl RecordedMicrovm {
             Some(&app_path),
             Some(&bin_name),
             Some(&initramfs_path.display().to_string()),
+            None,
+            None,
         );
         net.record(&mut meta);
+        let aux = net.into_aux(virtiofsd_children);
 
         // Keep the recorded generation's identity and desired_state (F-04) so
         // later rollbacks, updates, and restarts see the same deploy.
@@ -582,9 +613,6 @@ impl RecordedMicrovm {
         }
         let metadata_path = format!("{}/metadata.json", russel_dir);
         if let Err(e) = write_metadata(&metadata_path, &meta) {
-            let mut aux = vec![net.forwarder];
-            aux.extend(net.extra_forwarders);
-            aux.extend(virtiofsd_children);
             cleanup_launch_resources(
                 service_id,
                 &alloc,
@@ -592,15 +620,12 @@ impl RecordedMicrovm {
                 runner,
                 on_failure,
                 Some(vm_child),
-                Some(aux),
+                aux,
             )
             .await;
             return Err(e.context("recorded microVM metadata write failed"));
         }
 
-        let mut aux = vec![net.forwarder];
-        aux.extend(net.extra_forwarders);
-        aux.extend(virtiofsd_children);
         state.mark_deployed_with_aux(service_id, vm_child, aux, Some(host_port), Some(guest_port));
 
         Ok(())
@@ -652,28 +677,18 @@ fn path_while_backed_up(path: &str, live_dir: &str, bak_dir: &str) -> PathBuf {
 
 pub(crate) async fn attempt_container_rollback(
     service_id: &str,
-    russel_dir: &str,
-    russel_bak: &str,
+    dirs: &ServiceDirs,
     containers: &ContainerRunner,
     state: &AppState,
 ) -> anyhow::Result<()> {
+    let (russel_dir, russel_bak) = (dirs.russel.as_str(), dirs.russel_bak.as_str());
     // 0. Validate backup metadata BEFORE renaming (F-16).
     let old_metadata_bak_path = format!("{}/metadata.json", russel_bak);
     let content = std::fs::read_to_string(&old_metadata_bak_path)?;
     let old_meta: serde_json::Value = serde_json::from_str(&content)?;
 
-    let old_host_port = u16::try_from(
-        old_meta["host_port"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("missing host_port in container metadata"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("host_port out of u16 range in container metadata"))?;
-    let old_guest_port = u16::try_from(
-        old_meta["guest_port"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("missing guest_port in container metadata"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("guest_port out of u16 range in container metadata"))?;
+    let old_host_port = required_u16(&old_meta, "host_port")?;
+    let old_guest_port = required_u16(&old_meta, "guest_port")?;
     let old_mem_mb = u16::try_from(old_meta["mem_mb"].as_u64().unwrap_or(512))
         .map_err(|_| anyhow::anyhow!("mem_mb out of u16 range in container metadata"))?;
     let old_bin_name = old_meta["bin_name"].as_str().unwrap_or("app");
@@ -690,27 +705,17 @@ pub(crate) async fn attempt_container_rollback(
 
     // F-04: restore podman_args from desired_state when present, falling back
     // to the legacy top-level "podman_args" field for older metadata.
-    let mut old_podman_args: Vec<String> = old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("podman_args"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
+    let strings = |v: Option<&serde_json::Value>| -> Option<Vec<String>> {
+        Some(
+            v?.as_array()?
+                .iter()
                 .filter_map(|a| a.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            // Legacy: podman_args at top level
-            old_meta
-                .get("podman_args")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|a| a.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
+                .collect(),
+        )
+    };
+    let mut old_podman_args = strings(old_meta.pointer("/desired_state/podman_args"))
+        .or_else(|| strings(old_meta.get("podman_args")))
+        .unwrap_or_default();
     // Re-validate persisted podman_args; on failure drop them + warn.
     if !old_podman_args.is_empty()
         && let Err(e) = validate_podman_passthrough_args(&old_podman_args)
@@ -724,7 +729,7 @@ pub(crate) async fn attempt_container_rollback(
     }
 
     // F-04: restore user env from desired_state and re-resolve secret:// refs.
-    let declared_env: HashMap<String, String> = desired_state_env(&old_meta);
+    let declared_env = desired_state_env(&old_meta);
     let mut user_env = crate::secrets::resolve_env_secrets(&declared_env)?;
     let run_as = super::RunAs::from_desired_state(old_meta.get("desired_state"));
     run_as.apply_env_defaults(&mut user_env);
@@ -733,13 +738,7 @@ pub(crate) async fn attempt_container_rollback(
     crate::container::restore_backed_up_service_dir(Path::new(russel_dir), Path::new(russel_bak))
         .await?;
 
-    let old_extra_ports: Vec<russel_core::volumes::ExtraPortSpec> = old_meta
-        .get("desired_state")
-        .and_then(|ds| ds.get("extra_ports"))
-        .and_then(|v| {
-            serde_json::from_value::<Vec<russel_core::volumes::ExtraPortSpec>>(v.clone()).ok()
-        })
-        .unwrap_or_default();
+    let old_extra_ports: Vec<ExtraPortSpec> = desired(&old_meta, "extra_ports");
 
     PortAllocator::reserve(service_id, old_host_port)?;
     for (i, extra) in old_extra_ports.iter().enumerate() {
@@ -766,23 +765,12 @@ pub(crate) async fn attempt_container_rollback(
         cpus: old_meta["cpus"].as_u64().and_then(|n| u8::try_from(n).ok()),
         env,
         secret_env,
-        podman_args: old_podman_args.clone(),
-        volumes: old_meta
-            .get("desired_state")
-            .and_then(|ds| ds.get("volumes"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default(),
+        podman_args: old_podman_args,
+        volumes: desired(&old_meta, "volumes"),
         extra_ports: old_extra_ports.iter().map(|p| (p.host, p.guest)).collect(),
-        service_args: old_meta
-            .get("desired_state")
-            .and_then(|ds| ds.get("args"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default(),
+        service_args: desired(&old_meta, "args"),
         userns_keep_id: run_as == super::RunAs::App,
-        restart: old_meta
-            .pointer("/desired_state/restart")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        restart: desired(&old_meta, "restart"),
     };
     let running = containers.start(&start_spec).await?;
 
@@ -822,7 +810,8 @@ pub(crate) async fn attempt_container_rollback(
         &running.rootfs_path.to_string_lossy(),
         old_mem_mb,
         Some(old_bin_name),
-        &old_podman_args,
+        &start_spec.podman_args,
+        None,
     );
 
     if let Some(cpus) = start_spec.cpus {
@@ -938,170 +927,92 @@ mod tests {
 
     struct Fixture {
         _tmp: TempDir,
-        russel_dir: String,
-        microvms_dir: String,
-        russel_bak: String,
-        microvms_bak: String,
+        dirs: ServiceDirs,
     }
 
     fn fixture_with_metadata(metadata: Option<&str>) -> Fixture {
         let tmp = TempDir::new().unwrap();
-        let russel_dir = format!("{}/russel", tmp.path().display());
-        let microvms_dir = format!("{}/microvms", tmp.path().display());
-        let russel_bak = format!("{}/russel.bak", tmp.path().display());
-        let microvms_bak = format!("{}/microvms.bak", tmp.path().display());
-        std::fs::create_dir_all(&russel_bak).unwrap();
+        let root = tmp.path().display();
+        let dirs = ServiceDirs {
+            russel: format!("{root}/russel"),
+            microvms: format!("{root}/microvms"),
+            russel_bak: format!("{root}/russel.bak"),
+            microvms_bak: format!("{root}/microvms.bak"),
+            has_microvms: false,
+        };
+        std::fs::create_dir_all(&dirs.russel_bak).unwrap();
         if let Some(content) = metadata {
-            std::fs::write(format!("{russel_bak}/metadata.json"), content).unwrap();
+            std::fs::write(format!("{}/metadata.json", dirs.russel_bak), content).unwrap();
         }
-        Fixture {
-            _tmp: tmp,
-            russel_dir,
-            microvms_dir,
-            russel_bak,
-            microvms_bak,
-        }
+        Fixture { _tmp: tmp, dirs }
+    }
+
+    /// Error from a microVM rollback whose backup holds `metadata`.
+    async fn microvm_rollback_error(metadata: Option<&str>) -> String {
+        let fx = fixture_with_metadata(metadata);
+        attempt_microvm_rollback("svc", &fx.dirs, &MicrovmRunner::new(), &AppState::default())
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    async fn container_rollback_error(metadata: Option<&str>) -> String {
+        let fx = fixture_with_metadata(metadata);
+        attempt_container_rollback(
+            "svc",
+            &fx.dirs,
+            &ContainerRunner::new(),
+            &AppState::default(),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
     }
 
     #[tokio::test]
     async fn microvm_rollback_missing_metadata_fails_closed() {
-        let fx = fixture_with_metadata(None);
-        let err = attempt_microvm_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.microvms_dir,
-            &fx.russel_bak,
-            &fx.microvms_bak,
-            false,
-            &MicrovmRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
+        let err = microvm_rollback_error(None).await;
         assert!(
-            err.to_string().contains("metadata.json") || err.to_string().contains("No such file"),
+            err.contains("metadata.json") || err.contains("No such file"),
             "unexpected error: {err}"
         );
     }
 
     #[tokio::test]
     async fn microvm_rollback_malformed_metadata_fails_closed() {
-        let fx = fixture_with_metadata(Some("not-json"));
-        let err = attempt_microvm_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.microvms_dir,
-            &fx.russel_bak,
-            &fx.microvms_bak,
-            false,
-            &MicrovmRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
+        let err = microvm_rollback_error(Some("not-json")).await;
         // serde_json parse failure surfaces directly (no field was missing).
         assert!(
-            !err.to_string().contains("host_port") && !err.to_string().contains("kernel_path"),
+            !err.contains("host_port") && !err.contains("kernel_path"),
             "expected a JSON parse error, got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn microvm_rollback_missing_host_port_fails_closed() {
-        let fx = fixture_with_metadata(Some(r#"{}"#));
-        let err = attempt_microvm_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.microvms_dir,
-            &fx.russel_bak,
-            &fx.microvms_bak,
-            false,
-            &MicrovmRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("host_port"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn microvm_rollback_missing_guest_port_fails_closed() {
-        let fx = fixture_with_metadata(Some(r#"{"host_port": 8080}"#));
-        let err = attempt_microvm_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.microvms_dir,
-            &fx.russel_bak,
-            &fx.microvms_bak,
-            false,
-            &MicrovmRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("guest_port"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn microvm_rollback_missing_kernel_path_fails_closed() {
-        let fx = fixture_with_metadata(Some(r#"{"host_port": 8080, "guest_port": 3000}"#));
-        let err = attempt_microvm_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.microvms_dir,
-            &fx.russel_bak,
-            &fx.microvms_bak,
-            false,
-            &MicrovmRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("kernel_path"),
-            "unexpected error: {err}"
-        );
+    async fn microvm_rollback_missing_fields_fail_closed() {
+        for (metadata, field) in [
+            ("{}", "host_port"),
+            (r#"{"host_port": 8080}"#, "guest_port"),
+            (r#"{"host_port": 8080, "guest_port": 3000}"#, "kernel_path"),
+        ] {
+            let err = microvm_rollback_error(Some(metadata)).await;
+            assert!(err.contains(field), "{metadata}: unexpected error: {err}");
+        }
     }
 
     #[tokio::test]
     async fn container_rollback_missing_metadata_fails_closed() {
-        let fx = fixture_with_metadata(None);
-        let err = attempt_container_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.russel_bak,
-            &ContainerRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
+        let err = container_rollback_error(None).await;
         assert!(
-            err.to_string().contains("metadata.json") || err.to_string().contains("No such file"),
+            err.contains("metadata.json") || err.contains("No such file"),
             "unexpected error: {err}"
         );
     }
 
     #[tokio::test]
     async fn container_rollback_missing_rootfs_path_fails_closed() {
-        let fx = fixture_with_metadata(Some(r#"{"host_port": 8080, "guest_port": 3000}"#));
-        let err = attempt_container_rollback(
-            "svc",
-            &fx.russel_dir,
-            &fx.russel_bak,
-            &ContainerRunner::new(),
-            &AppState::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("rootfs_path"),
-            "unexpected error: {err}"
-        );
+        let err =
+            container_rollback_error(Some(r#"{"host_port": 8080, "guest_port": 3000}"#)).await;
+        assert!(err.contains("rootfs_path"), "unexpected error: {err}");
     }
 }

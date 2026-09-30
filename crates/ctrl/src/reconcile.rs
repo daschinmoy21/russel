@@ -95,10 +95,7 @@ pub async fn reconcile_startup_in(state: &AppState, base: &Path) -> ReconcileRep
         }
     }
 
-    // Write durable catalog after reconcile pass.
-    if let Err(e) = state.write_catalog() {
-        tracing::warn!(error = %e, "failed to write ctrl-catalog.json after reconcile");
-    }
+    state.persist_catalog();
 
     tracing::info!(
         adopted_running = report.adopted_running,

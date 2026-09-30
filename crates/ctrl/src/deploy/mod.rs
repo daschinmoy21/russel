@@ -25,6 +25,19 @@ pub(crate) use rollback::{FailedLaunch, RecordedMicrovm};
 /// ready".
 pub(crate) const WATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+type Events = tokio::sync::mpsc::Sender<russel_core::api::DeployEvent>;
+
+/// Stream one progress line to the client. A client that hung up does not
+/// stop the deploy.
+async fn progress(tx: &Events, phase: &str, description: impl Into<String>) {
+    let _ = tx
+        .send(russel_core::api::DeployEvent::Progress {
+            phase: phase.into(),
+            description: description.into(),
+        })
+        .await;
+}
+
 /// Who the app runs as inside its sandbox (#466).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunAs {

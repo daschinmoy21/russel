@@ -1,15 +1,11 @@
 //! Runtime-specific cold deploy paths (microVM and container).
 
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
-use russel_core::{
-    api::{DeployEvent, PortMapping},
-    config::Russelfile,
-};
+use russel_core::api::PortMapping;
 
 use crate::{
     container::{
@@ -17,10 +13,8 @@ use crate::{
         container_log_path, default_base_dir, inspect_state, log_tail, not_ready_error,
         wait_until_ready, watch_container,
     },
-    metadata::{
-        build_container_metadata_with_gen, build_microvm_metadata_with_gen, write_metadata,
-    },
-    microvm::{BootOutput, KernelInfo, ready},
+    metadata::{build_container_metadata, build_microvm_metadata, write_metadata},
+    microvm::{BootOutput, ready},
     network::{
         MICROVM_READY_TIMEOUT, MicrovmNet, MicrovmNetMode, SubnetAllocation, TapForwarder,
         subnet_for,
@@ -28,28 +22,43 @@ use crate::{
     warm_pool::shared_warm_pool,
 };
 
+use super::Events;
 use super::env::{build_container_env, split_secret_env, validate_bin_name};
+use super::phases::{Booted, Built, Plan, Slot};
 use super::pipeline::{DeployPipeline, DeployWorkload};
 
+/// Record the deploy's desired state in the new generation's metadata, for
+/// rollback and health restart (F-04).
+fn attach_desired_state(meta: &mut serde_json::Value, desired_state: Option<&serde_json::Value>) {
+    if let Some(ds) = desired_state
+        && let Some(obj) = meta.as_object_mut()
+    {
+        obj.insert("desired_state".into(), ds.clone());
+    }
+}
+
 impl DeployPipeline {
-    pub(crate) async fn deploy_microvm(
+    /// Boot the new generation as a microVM under `slot.runtime_key`.
+    /// `settle` is how long the guest must stay up after the app answers:
+    /// WATCH_WINDOW on a cold replace, which already stopped the live
+    /// generation; zero otherwise (a first deploy, or dual-live, which
+    /// watches at cutover).
+    pub(super) async fn deploy_microvm(
         &self,
-        service_id: &str,
-        config: &Russelfile,
-        store_path: &Path,
+        plan: &Plan,
+        built: &Built,
+        slot: &Slot,
         port: &PortMapping,
-        kernel_info: &KernelInfo,
-        env: &HashMap<String, String>,
-        tx: &tokio::sync::mpsc::Sender<DeployEvent>,
-        generation_id: Option<&str>,
-        desired_state: Option<&serde_json::Value>,
-        volumes: &[russel_core::volumes::ResolvedVolume],
-        using_package: bool,
-        // How long the guest must stay up after the app answers: WATCH_WINDOW
-        // on a cold replace, which already stopped the live generation; zero
-        // otherwise (a first deploy, or dual-live, which watches at cutover).
         settle: Duration,
-    ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
+        tx: &Events,
+    ) -> anyhow::Result<Booted> {
+        let service_id = slot.runtime_key.as_str();
+        let (config, env, volumes) = (&plan.config, &plan.env, plan.volumes.as_slice());
+        let store_path = &built.output.store_path;
+        let kernel_info = built
+            .kernel
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("kernel not resolved"))?;
         crate::microvm::check_volume_guest_paths(volumes)?;
         let run_as = super::RunAs::from_user(config.service.user.as_deref());
         let alloc: SubnetAllocation = subnet_for(service_id)?;
@@ -61,18 +70,16 @@ impl DeployPipeline {
             "allocated"
         );
 
-        let bin_name = config.service.bin_name_for_build(using_package).to_string();
+        let bin_name = config
+            .service
+            .bin_name_for_build(built.output.using_package)
+            .to_string();
         validate_bin_name(&bin_name)?;
         let mem_mb = config.service.memory.as_mebibytes();
         let app_path = format!("{}/bin/{bin_name}", store_path.display());
 
         let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "create".into(),
-                description: "Writing deploy config".into(),
-            })
-            .await;
+        super::progress(tx, "create", "Writing deploy config").await;
 
         let cfg_dir = crate::paths::service_dir(service_id)
             .join("cfg")
@@ -102,12 +109,7 @@ impl DeployPipeline {
             "deploy.env written, agent initramfs ready"
         );
 
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "start".into(),
-                description: "Setting up network + booting/restoring VM".into(),
-            })
-            .await;
+        super::progress(tx, "start", "Setting up network + booting/restoring VM").await;
         let net_mode = MicrovmNetMode::for_host()?;
         tracing::info!(
             service_id,
@@ -154,7 +156,7 @@ impl DeployPipeline {
             .display()
             .to_string();
         let v_pids: Vec<u32> = virtiofsd_children.iter().filter_map(|c| c.id()).collect();
-        let mut meta = build_microvm_metadata_with_gen(
+        let mut meta = build_microvm_metadata(
             service_id,
             port.host,
             port.guest,
@@ -170,17 +172,11 @@ impl DeployPipeline {
             Some(&app_path),
             Some(&bin_name),
             Some(&initramfs_path.display().to_string()),
-            generation_id,
+            Some(&slot.generation_id),
             net.tap_id(&alloc),
         );
         net.record(&mut meta);
-
-        // Merge desired_state for rollback + health restart (F-04).
-        if let Some(ds) = desired_state
-            && let Some(obj) = meta.as_object_mut()
-        {
-            obj.insert("desired_state".into(), ds.clone());
-        }
+        attach_desired_state(&mut meta, plan.desired_state.as_ref());
         write_metadata(&metadata_path, &meta)?;
 
         // Marker dir for legacy discovery. The service dir already lists the
@@ -205,12 +201,7 @@ impl DeployPipeline {
         );
 
         let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "ready".into(),
-                description: "Waiting for VM service to be reachable".into(),
-            })
-            .await;
+        super::progress(tx, "ready", "Waiting for VM service to be reachable").await;
         tracing::info!(
             service_id,
             vm_ip = %alloc.vm_ip,
@@ -242,34 +233,21 @@ impl DeployPipeline {
             );
         }
         if matches!(outcome, ready::ReadyOutcome::TimedOut) {
-            let console_log = console_path.display().to_string();
-            let cfg_env = format!("{cfg_dir}/deploy.env");
-            let mut detail = format!("VM not reachable in {}s", MICROVM_READY_TIMEOUT.as_secs());
-            detail.push_str(&format!(
-                "\nvm_ip={}:{} deploy.env_exists={} console={}",
+            let tail = ready::console_tail(&console_path, ready::CONSOLE_TAIL_LINES);
+            let console = if tail.is_empty() {
+                "(no console.log: guest may have failed before serial)".to_string()
+            } else {
+                format!("--- guest console tail ---\n{tail}\n--- end console ---")
+            };
+            anyhow::bail!(
+                "VM not reachable in {}s\nvm_ip={}:{} deploy.env_exists={} console={}\n\
+                 hint: snapshot warm pool is off unless RUSSEL_WARM_POOL=1 (experimental)\n{console}",
+                MICROVM_READY_TIMEOUT.as_secs(),
                 alloc.vm_ip,
                 port.guest,
-                Path::new(&cfg_env).exists(),
-                console_log
-            ));
-            detail.push_str(
-                "\nhint: snapshot warm pool is off unless RUSSEL_WARM_POOL=1 (experimental)",
+                cfg_dir_path.join("deploy.env").exists(),
+                console_path.display(),
             );
-            if let Ok(raw) = std::fs::read_to_string(&console_log) {
-                let lines: Vec<&str> = raw.lines().collect();
-                let start = lines.len().saturating_sub(80);
-                let tail = if start < lines.len() {
-                    lines[start..].join("\n")
-                } else {
-                    raw
-                };
-                detail.push_str("\n--- guest console tail ---\n");
-                detail.push_str(&tail);
-                detail.push_str("\n--- end console ---");
-            } else {
-                detail.push_str("\n(no console.log — guest may have failed before serial)");
-            }
-            anyhow::bail!("{detail}");
         }
         tracing::info!(service_id, ready_ms, "VM service reachable");
 
@@ -288,8 +266,8 @@ impl DeployPipeline {
             );
         }
 
-        Ok((
-            DeployWorkload::Microvm {
+        Ok(Booted {
+            workload: DeployWorkload::Microvm {
                 alloc,
                 vm_child: Box::new(vm_child),
                 virtiofsd_children,
@@ -303,25 +281,24 @@ impl DeployPipeline {
             start_ms,
             network_ms,
             ready_ms,
-        ))
+        })
     }
 
-    pub(crate) async fn deploy_container(
+    /// Boot the new generation as a rootless Podman container. `settle` as
+    /// in [`Self::deploy_microvm`].
+    pub(super) async fn deploy_container(
         &self,
-        service_id: &str,
-        config: &Russelfile,
-        store_path: &Path,
+        plan: &Plan,
+        built: &Built,
+        slot: &Slot,
         port: &PortMapping,
-        podman_args: &[String],
-        env: &HashMap<String, String>,
-        tx: &tokio::sync::mpsc::Sender<DeployEvent>,
-        generation_id: Option<&str>,
-        desired_state: Option<&serde_json::Value>,
-        volumes: &[russel_core::volumes::ResolvedVolume],
-        using_package: bool,
-        // Same as deploy_microvm: WATCH_WINDOW on a cold replace, else zero.
         settle: Duration,
-    ) -> anyhow::Result<(DeployWorkload, u128, u128, u128, u128)> {
+        tx: &Events,
+    ) -> anyhow::Result<Booted> {
+        let service_id = slot.runtime_key.as_str();
+        let config = &plan.config;
+        let store_path = &built.output.store_path;
+        let podman_args = &config.service.podman_args;
         tracing::info!(
             service_id,
             host = port.host,
@@ -329,18 +306,16 @@ impl DeployPipeline {
             "allocated container port"
         );
 
-        let bin_name = config.service.bin_name_for_build(using_package).to_string();
+        let bin_name = config
+            .service
+            .bin_name_for_build(built.output.using_package)
+            .to_string();
         validate_bin_name(&bin_name)?;
         let mem_mb = config.service.memory.as_mebibytes();
         let base_dir = default_base_dir(service_id);
 
         let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "create".into(),
-                description: "Preparing container rootfs".into(),
-            })
-            .await;
+        super::progress(tx, "create", "Preparing container rootfs").await;
         let rootfs_spec = RootfsSpec {
             service_id: service_id.to_string(),
             store_path: store_path.to_path_buf(),
@@ -354,15 +329,12 @@ impl DeployPipeline {
         let create_ms = t.elapsed().as_millis();
         tracing::info!(service_id, create_ms, "container rootfs ready");
 
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "start".into(),
-                description: "Starting rootless Podman container".into(),
-            })
-            .await;
+        super::progress(tx, "start", "Starting rootless Podman container").await;
         let t_start = Instant::now();
-        let (plain_env, secret_env) =
-            split_secret_env(build_container_env(port.guest, env), &config.service.env);
+        let (plain_env, secret_env) = split_secret_env(
+            build_container_env(port.guest, &plan.env),
+            &config.service.env,
+        );
         let start_spec = ContainerStartSpec {
             service_id: service_id.to_string(),
             rootfs: prepared.clone(),
@@ -373,7 +345,7 @@ impl DeployPipeline {
             env: plain_env,
             secret_env,
             podman_args: podman_args.to_vec(),
-            volumes: volumes.to_vec(),
+            volumes: plan.volumes.clone(),
             extra_ports: config.ports.iter().map(|p| (p.host, p.guest)).collect(),
             service_args: config.service.args.clone(),
             userns_keep_id: super::RunAs::from_user(config.service.user.as_deref())
@@ -382,11 +354,10 @@ impl DeployPipeline {
         };
         let running = self.containers.start(&start_spec).await?;
         let start_ms = t_start.elapsed().as_millis();
-        let network_ms = 0u128;
         tracing::info!(service_id, start_ms, "container started");
 
         let metadata_path = base_dir.join("metadata.json");
-        let mut metadata = build_container_metadata_with_gen(
+        let mut metadata = build_container_metadata(
             service_id,
             port.host,
             port.guest,
@@ -397,26 +368,14 @@ impl DeployPipeline {
             mem_mb,
             Some(&bin_name),
             podman_args,
-            generation_id,
+            Some(&slot.generation_id),
         );
-
         metadata["cpus"] = serde_json::json!(config.service.cpus);
-
-        // Merge desired_state for rollback + health restart (F-04).
-        if let Some(ds) = desired_state
-            && let Some(obj) = metadata.as_object_mut()
-        {
-            obj.insert("desired_state".into(), ds.clone());
-        }
+        attach_desired_state(&mut metadata, plan.desired_state.as_ref());
         write_metadata(&metadata_path, &metadata)?;
 
         let t = Instant::now();
-        let _ = tx
-            .send(DeployEvent::Progress {
-                phase: "ready".into(),
-                description: "Waiting for the app to accept connections".into(),
-            })
-            .await;
+        super::progress(tx, "ready", "Waiting for the app to accept connections").await;
         tracing::info!(
             service_id,
             host_port = port.host,
@@ -463,8 +422,8 @@ impl DeployPipeline {
         }
         tracing::info!(service_id, ready_ms, "container app accepting connections");
 
-        Ok((
-            DeployWorkload::Container {
+        Ok(Booted {
+            workload: DeployWorkload::Container {
                 container_id: running.container_id,
                 container_name: running.container_name,
                 rootfs_path: running.rootfs_path,
@@ -472,8 +431,8 @@ impl DeployPipeline {
             },
             create_ms,
             start_ms,
-            network_ms,
+            network_ms: 0,
             ready_ms,
-        ))
+        })
     }
 }

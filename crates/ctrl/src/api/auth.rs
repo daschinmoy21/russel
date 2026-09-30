@@ -6,34 +6,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// Minimum accepted length for `RUSSEL_API_TOKEN` after trim (when set).
-///
-/// Floor is 32 **ASCII** characters so weak tokens like `"a"` are rejected.
-/// Prefer `openssl rand -hex 32` (64 hex chars / 256 bits) for production.
-///
-/// Length is measured in bytes/`str::len`, which matches character count only
-/// because non-ASCII tokens are rejected (see [`check_api_token_min_length`]).
-pub const MIN_API_TOKEN_LEN: usize = russel_core::tokens::MIN_TOKEN_LEN;
-
-/// Pure token normalize: unset/blank/whitespace → None.
-///
-/// Does **not** enforce min length / charset — call [`check_api_token_min_length`]
-/// at startup when a token is present so short or non-header-safe secrets fail closed.
-pub fn normalize_api_token(raw: Option<&str>) -> Option<String> {
-    russel_core::tokens::normalize_token(raw)
-}
-
-/// Reject tokens that are too short or cannot be sent as a Bearer header value.
-///
-/// Call this at control-plane startup whenever `normalize_api_token` returns
-/// `Some`. Middleware still uses the env token as-is; startup is the gate.
-///
-/// Checks (in order):
-/// 1. HTTP header-safe charset (ASCII visible / HTAB) — same constraint as the CLI
-/// 2. Length ≥ [`MIN_API_TOKEN_LEN`] (byte length; equivalent to char count after 1)
-pub fn check_api_token_min_length(token: &str) -> Result<(), String> {
-    russel_core::tokens::check_token_min_length(token)
-}
+/// `RUSSEL_API_TOKEN` rules, shared with the CLI and agent: unset/blank means
+/// none, and a set token must be at least [`MIN_API_TOKEN_LEN`] (32)
+/// printable-ASCII chars. `main` runs the check at startup whenever a token
+/// is set, so a short or non-header-safe secret fails closed; the middleware
+/// uses the env token as-is. Prefer `openssl rand -hex 32` for production.
+pub use russel_core::tokens::{
+    MIN_TOKEN_LEN as MIN_API_TOKEN_LEN, check_token_min_length as check_api_token_min_length,
+    normalize_token as normalize_api_token,
+};
 
 /// Truthy parse for `RUSSEL_REQUIRE_AUTH`: `1`, `true`, `yes`, or `on`
 /// (case-insensitive).

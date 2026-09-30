@@ -11,26 +11,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// Minimum accepted length for agent / API tokens after trim.
-pub const MIN_TOKEN_LEN: usize = russel_core::tokens::MIN_TOKEN_LEN;
+/// Token rules shared with the control plane: unset/blank means none, and a
+/// set token must be at least [`MIN_TOKEN_LEN`] printable-ASCII chars.
+pub use russel_core::tokens::{MIN_TOKEN_LEN, check_token_min_length, normalize_token};
 
 /// Env name for the agent node token.
 pub const AGENT_TOKEN_ENV: &str = "RUSSEL_AGENT_TOKEN";
 
 /// Fallback shared with the control plane.
 pub const API_TOKEN_ENV: &str = "RUSSEL_API_TOKEN";
-
-/// Normalize: unset/blank → None.
-pub fn normalize_token(raw: Option<&str>) -> Option<String> {
-    russel_core::tokens::normalize_token(raw)
-}
-
-/// Reject tokens that are too short or cannot be sent as Bearer.
-///
-/// Shares one implementation with the control plane (`russel_core::tokens`).
-pub fn check_token_min_length(token: &str) -> Result<(), String> {
-    russel_core::tokens::check_token_min_length(token)
-}
 
 /// Resolve configured token: `RUSSEL_AGENT_TOKEN` then `RUSSEL_API_TOKEN`.
 pub fn configured_agent_token() -> Option<String> {
@@ -45,11 +34,6 @@ pub fn resolve_token(agent: Option<&str>, api_fallback: Option<&str>) -> Option<
     normalize_token(agent).or_else(|| normalize_token(api_fallback))
 }
 
-/// Constant-time token equality (shared `russel_core::tokens` implementation).
-fn tokens_equal(a: &str, b: &str) -> bool {
-    russel_core::tokens::constant_time_eq(a.as_bytes(), b.as_bytes())
-}
-
 /// Extract Bearer token from Authorization header (case-insensitive scheme).
 pub fn bearer_from_request(req: &Request) -> Option<&str> {
     let val = req.headers().get(axum::http::header::AUTHORIZATION)?;
@@ -57,18 +41,14 @@ pub fn bearer_from_request(req: &Request) -> Option<&str> {
     russel_core::tokens::bearer_token_from_header(s)
 }
 
-/// Axum middleware state: expected token when auth is enabled.
-#[derive(Clone, Debug)]
-pub struct AuthConfig {
-    /// When `Some`, require matching Bearer; when `None`, allow all (dev only).
-    pub expected: Option<String>,
-}
-
-/// Auth middleware: when `expected` is set, require matching Bearer token.
+/// Auth middleware: when `expected` is set, require a matching Bearer
+/// token; when `None`, allow all (dev only).
 pub async fn require_bearer(req: Request, next: Next, expected: Option<String>) -> Response {
     if let Some(ref want) = expected {
         match bearer_from_request(&req) {
-            Some(got) if tokens_equal(got, want) => next.run(req).await,
+            Some(got) if russel_core::tokens::constant_time_eq(got.as_bytes(), want.as_bytes()) => {
+                next.run(req).await
+            }
             Some(_) => (StatusCode::UNAUTHORIZED, "invalid agent token").into_response(),
             None => (
                 StatusCode::UNAUTHORIZED,
@@ -87,17 +67,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_token_rejected() {
-        assert!(check_token_min_length("short").is_err());
-    }
-
-    #[test]
-    fn long_token_ok() {
-        let t = "a".repeat(MIN_TOKEN_LEN);
-        assert!(check_token_min_length(&t).is_ok());
-    }
-
-    #[test]
     fn resolve_prefers_agent_token() {
         assert_eq!(
             resolve_token(
@@ -112,13 +81,6 @@ mod tests {
     fn resolve_falls_back_to_api() {
         let api = "a".repeat(MIN_TOKEN_LEN);
         assert_eq!(resolve_token(None, Some(&api)), Some(api));
-    }
-
-    #[test]
-    fn tokens_equal_matches() {
-        assert!(tokens_equal("abc", "abc"));
-        assert!(!tokens_equal("abc", "abd"));
-        assert!(!tokens_equal("abc", "ab"));
     }
 
     #[test]

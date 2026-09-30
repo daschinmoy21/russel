@@ -261,9 +261,7 @@ impl AppState {
                 "RESTARTED by Podman (restart = unless-stopped); container is up\n",
             );
         }
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after container recovery");
-        }
+        self.persist_catalog();
         true
     }
 }

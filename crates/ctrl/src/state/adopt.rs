@@ -147,8 +147,6 @@ impl AppState {
             s.vm_process = None;
             s.aux_processes.clear();
         }
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after mark_stopped_from_disk");
-        }
+        self.persist_catalog();
     }
 }

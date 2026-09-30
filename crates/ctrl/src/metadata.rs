@@ -138,14 +138,20 @@ pub struct ServiceDiskRecord {
 /// absent from valid JSON (callers should warn about legacy metadata missing
 /// the runtime field).
 pub fn prior_runtime_from_metadata(content: &str) -> Option<RuntimeKind> {
-    let value: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    value
-        .get("runtime")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
+    runtime_field(&serde_json::from_str(content).ok()?)
+}
+
+fn runtime_field(value: &serde_json::Value) -> Option<RuntimeKind> {
+    value.get("runtime")?.as_str()?.parse().ok()
+}
+
+fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    Some(value.get(key)?.as_str()?.to_string())
+}
+
+/// An integer field, `None` when absent, not a number, or out of `T`'s range.
+fn int_field<T: TryFrom<u64>>(value: &serde_json::Value, key: &str) -> Option<T> {
+    T::try_from(value.get(key)?.as_u64()?).ok()
 }
 
 /// Outcome of reading `runtime` from on-disk metadata.
@@ -221,27 +227,11 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
     let content = std::fs::read_to_string(metadata_path(service_id)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     Some(LoadedMetadata {
-        runtime: value
-            .get("runtime")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok()),
-        host_port: value
-            .get("host_port")
-            .and_then(|v| v.as_u64())
-            .and_then(|p| u16::try_from(p).ok()),
-        guest_port: value
-            .get("guest_port")
-            .and_then(|v| v.as_u64())
-            .and_then(|p| u16::try_from(p).ok()),
-        container_id: value
-            .get("container_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        vm_ip: value
-            .get("vm_ip")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        runtime: runtime_field(&value),
+        host_port: int_field(&value, "host_port"),
+        guest_port: int_field(&value, "guest_port"),
+        container_id: str_field(&value, "container_id"),
+        vm_ip: str_field(&value, "vm_ip").filter(|s| !s.is_empty()),
         ingress_host: crate::deployments::DesiredStateSnapshot::from_metadata_desired_state(&value)
             .ingress_host,
     })
@@ -252,70 +242,28 @@ pub fn load_service_disk_record_from(path: &Path) -> Option<ServiceDiskRecord> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-    let virtiofsd_pids = value
-        .get("virtiofsd_pids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            // Legacy: singular virtiofsd_pid
-            value
-                .get("virtiofsd_pid")
-                .and_then(|v| v.as_u64())
-                .and_then(|n| u32::try_from(n).ok())
-                .map(|n| vec![n])
-                .unwrap_or_default()
-        });
+    let virtiofsd_pids = match value.get("virtiofsd_pids").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| u32::try_from(v.as_u64()?).ok())
+            .collect(),
+        // Legacy: singular virtiofsd_pid
+        None => int_field(&value, "virtiofsd_pid").into_iter().collect(),
+    };
 
     Some(ServiceDiskRecord {
-        service_id: value
-            .get("service_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        runtime: value
-            .get("runtime")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok()),
-        host_port: value
-            .get("host_port")
-            .and_then(|v| v.as_u64())
-            .and_then(|p| u16::try_from(p).ok()),
-        guest_port: value
-            .get("guest_port")
-            .and_then(|v| v.as_u64())
-            .and_then(|p| u16::try_from(p).ok()),
-        container_id: value
-            .get("container_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        container_name: value
-            .get("container_name")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        vm_pid: value
-            .get("vm_pid")
-            .and_then(|v| v.as_u64())
-            .and_then(|p| u32::try_from(p).ok()),
-        socat_pid: value
-            .get("socat_pid")
-            .and_then(|v| v.as_u64())
-            .and_then(|p| u32::try_from(p).ok()),
+        service_id: str_field(&value, "service_id"),
+        runtime: runtime_field(&value),
+        host_port: int_field(&value, "host_port"),
+        guest_port: int_field(&value, "guest_port"),
+        container_id: str_field(&value, "container_id"),
+        container_name: str_field(&value, "container_name"),
+        vm_pid: int_field(&value, "vm_pid"),
+        socat_pid: int_field(&value, "socat_pid"),
         virtiofsd_pids,
-        tap_id: value
-            .get("tap_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        host_ip: value
-            .get("host_ip")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        deployed_at: value
-            .get("deployed_at")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        tap_id: str_field(&value, "tap_id"),
+        host_ip: str_field(&value, "host_ip"),
+        deployed_at: str_field(&value, "deployed_at"),
     })
 }
 
@@ -329,9 +277,7 @@ pub fn write_ctrl_catalog(catalog: &serde_json::Value) -> anyhow::Result<()> {
 
 /// Atomic write of the control plane catalog JSON to an arbitrary path.
 pub fn write_ctrl_catalog_to(path: &Path, catalog: &serde_json::Value) -> anyhow::Result<()> {
-    let content = serde_json::to_string_pretty(catalog)
-        .map_err(|e| anyhow::anyhow!("failed to serialize catalog: {}", e))?;
-    atomic_write(path, content.as_bytes())
+    write_metadata(path, catalog)
 }
 
 /// Shared nonce for sibling temp-file names across atomic writers (metadata,
@@ -444,50 +390,10 @@ pub fn resolve_lifecycle_runtime(
     }
 }
 
-/// Build versioned metadata JSON for a microVM deployment.
-#[allow(clippy::too_many_arguments)]
+/// Build versioned metadata JSON for a microVM deployment. Generation + TAP
+/// identity are for zero-downtime cutover (a candidate may keep a gen-scoped
+/// TAP after promote).
 pub fn build_microvm_metadata(
-    service_id: &str,
-    host_port: u16,
-    guest_port: u16,
-    vm_ip: &str,
-    host_ip: &str,
-    vm_pid: Option<u32>,
-    virtiofsd_pids: &[u32],
-    socat_pid: Option<u32>,
-    kernel_path: &str,
-    store_path: &str,
-    mem_mb: u16,
-    cpus: u8,
-    app_path: Option<&str>,
-    bin_name: Option<&str>,
-    initramfs_path: Option<&str>,
-) -> serde_json::Value {
-    build_microvm_metadata_with_gen(
-        service_id,
-        host_port,
-        guest_port,
-        vm_ip,
-        host_ip,
-        vm_pid,
-        virtiofsd_pids,
-        socat_pid,
-        kernel_path,
-        store_path,
-        mem_mb,
-        cpus,
-        app_path,
-        bin_name,
-        initramfs_path,
-        None,
-        None,
-    )
-}
-
-/// Like [`build_microvm_metadata`] but records generation + TAP identity for
-/// zero-downtime cutover (candidate may keep a gen-scoped TAP after promote).
-#[allow(clippy::too_many_arguments)]
-pub fn build_microvm_metadata_with_gen(
     service_id: &str,
     host_port: u16,
     guest_port: u16,
@@ -560,34 +466,6 @@ pub fn build_container_metadata(
     mem_mb: u16,
     bin_name: Option<&str>,
     podman_args: &[String],
-) -> serde_json::Value {
-    build_container_metadata_with_gen(
-        service_id,
-        host_port,
-        guest_port,
-        store_path,
-        container_id,
-        container_name,
-        rootfs_path,
-        mem_mb,
-        bin_name,
-        podman_args,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_container_metadata_with_gen(
-    service_id: &str,
-    host_port: u16,
-    guest_port: u16,
-    store_path: &str,
-    container_id: &str,
-    container_name: &str,
-    rootfs_path: &str,
-    mem_mb: u16,
-    bin_name: Option<&str>,
-    podman_args: &[String],
     generation_id: Option<&str>,
 ) -> serde_json::Value {
     let mut meta = serde_json::json!({
@@ -620,10 +498,7 @@ pub fn build_container_metadata_with_gen(
 /// Rewrite `service_id` in an existing metadata file after generation promote.
 pub fn rewrite_metadata_service_id(path: impl AsRef<Path>, service_id: &str) -> anyhow::Result<()> {
     let path = path.as_ref();
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read metadata {}: {e}", path.display()))?;
-    let mut value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("parse metadata {}: {e}", path.display()))?;
+    let mut value = read_json(path)?;
     value["service_id"] = serde_json::json!(service_id);
     write_metadata(path, &value)
 }
@@ -642,10 +517,7 @@ pub fn set_container_running(service_id: &str, running: bool) -> anyhow::Result<
 }
 
 pub fn set_container_running_at(path: &Path, running: bool) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read metadata {}: {e}", path.display()))?;
-    let mut value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("parse metadata {}: {e}", path.display()))?;
+    let mut value = read_json(path)?;
     // Heartbeat treats a leftover container_id with no runtime as running.
     // Skip only explicit microVMs so stop still flips the flag on legacy files.
     if value.get("runtime").and_then(|v| v.as_str()) == Some("microvm") {
@@ -653,6 +525,13 @@ pub fn set_container_running_at(path: &Path, running: bool) -> anyhow::Result<()
     }
     value["container_running"] = serde_json::json!(running);
     write_metadata(path, &value)
+}
+
+fn read_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read metadata {}: {e}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("parse metadata {}: {e}", path.display()))
 }
 
 pub fn write_metadata(path: impl AsRef<Path>, metadata: &serde_json::Value) -> anyhow::Result<()> {
@@ -697,6 +576,7 @@ mod tests {
             256,
             None,
             &[],
+            None,
         );
         assert_eq!(meta["container_running"], serde_json::json!(true));
         write_metadata(&path, &meta).unwrap();
@@ -781,6 +661,8 @@ mod tests {
             Some("/nix/store/app/bin/myapp"),
             Some("myapp"),
             Some("/var/lib/russel/api/initramfs.cpio"),
+            None,
+            None,
         );
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
         assert_eq!(meta["node_id"], expected_node);
@@ -805,6 +687,7 @@ mod tests {
             512,
             Some("myapp"),
             &[],
+            None,
         );
         assert_eq!(container["schema_version"], SCHEMA_VERSION);
         assert_eq!(container["node_id"], expected_node);
@@ -816,7 +699,7 @@ mod tests {
         // Builders call resolve_node_id(); env→value mapping is covered by
         // resolve_node_id_with unit tests above (no process env mutation here).
         let expected_node = resolve_node_id();
-        let micro = build_microvm_metadata_with_gen(
+        let micro = build_microvm_metadata(
             "api",
             3100,
             3000,
@@ -838,7 +721,7 @@ mod tests {
         assert_eq!(micro["node_id"], expected_node);
         assert_eq!(micro["generation_id"], "gen1");
 
-        let container = build_container_metadata_with_gen(
+        let container = build_container_metadata(
             "api",
             3100,
             3000,
@@ -958,6 +841,7 @@ mod tests {
             512,
             None,
             &["-v".into(), "/data:/data:ro".into()],
+            None,
         );
         assert_eq!(
             meta["podman_args"],
@@ -978,6 +862,7 @@ mod tests {
             512,
             None,
             &[],
+            None,
         );
         assert!(meta.get("podman_args").is_none());
     }
@@ -995,6 +880,7 @@ mod tests {
             512,
             None,
             &[],
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -1024,6 +910,8 @@ mod tests {
             1,
             Some("/nix/store/app/bin/myapp"),
             Some("myapp"),
+            None,
+            None,
             None,
         );
         let tmp = tempfile::tempdir().unwrap();

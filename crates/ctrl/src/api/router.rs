@@ -244,8 +244,7 @@ async fn vm_status(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/status", service_id);
 
     // Agent mode (#214): the worker's view of local process state is
@@ -282,8 +281,7 @@ async fn vm_logs(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<LogsResponse>, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
     tracing::debug!(service_id = %service_id, "GET /vm/{}/logs", service_id);
     let mut resp = state.logs(&service_id).ok_or((
         StatusCode::NOT_FOUND,
@@ -549,27 +547,20 @@ async fn vm_stop(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
     tracing::info!(service_id = %service_id, "POST /vm/{}/stop", service_id);
 
-    let (runtime, handle) =
-        claim_lifecycle_operation(&state, &service_id, ServiceStatus::Stopping)?;
+    let handle = claim_lifecycle_operation(&state, &service_id, ServiceStatus::Stopping)?;
     let result = handle.lifecycle.stop(&service_id).await;
-
-    let label = runtime_label(runtime);
+    let runtime = handle.runtime;
 
     match result {
         Ok(_) => {
             // Reap only after successful stop — handles stayed in state during the op.
-            if handle.runtime == RuntimeKind::Microvm
-                && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
-            {
-                reap_children(vm, aux).await;
-            }
+            handle.reap(&state, &service_id).await;
             // restart = "unless-stopped" must leave an operator stop alone,
             // including across a ctrl restart.
-            if handle.runtime == RuntimeKind::Microvm {
+            if runtime == RuntimeKind::Microvm {
                 crate::restart::note_user_stop(&service_id);
             }
             // Deregister from ingress so the proxy stops routing to this backend.
@@ -577,12 +568,12 @@ async fn vm_stop(
             if let Err(e) = ingress.deregister(&service_id).await {
                 tracing::warn!(service_id = %service_id, error = %e, "failed to deregister from ingress during stop");
             }
-            tracing::info!(service_id = %service_id, runtime = %label, "stopped service");
+            tracing::info!(service_id = %service_id, %runtime, "stopped service");
             state.set_status(&service_id, ServiceStatus::Stopped, VmState::None);
-            Ok(Json(format!("stopped {label} {service_id}")))
+            Ok(Json(format!("stopped {runtime} {service_id}")))
         }
         Err(e) => {
-            tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to stop service");
+            tracing::error!(service_id = %service_id, %runtime, error = %e, "failed to stop service");
             // Keep process ownership; restore prior status and re-supervise
             // only if this claim still owns the lifecycle generation.
             state.abort_lifecycle_operation(
@@ -616,8 +607,7 @@ struct UpdateBody {
 async fn vm_deployments(
     Path(service_id): Path<String>,
 ) -> Result<Json<DeploymentsResponse>, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
     tracing::info!(service_id = %service_id, "GET /vm/{}/deployments", service_id);
     deployments::list(&service_id)
         .map(Json)
@@ -634,8 +624,7 @@ async fn vm_rollback(
     Path(service_id): Path<String>,
     body: Option<Json<RollbackRequest>>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
 
     let body = body.map(|j| j.0).unwrap_or_default();
     tracing::info!(
@@ -695,8 +684,7 @@ async fn vm_update(
     Path(service_id): Path<String>,
     body: Option<Json<UpdateBody>>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
 
     let body = body.map(|j| j.0).unwrap_or_default();
     let path = crate::metadata::metadata_path(&service_id);
@@ -752,8 +740,7 @@ async fn vm_destroy(
     Path(service_id): Path<String>,
     Query(query): Query<DestroyQuery>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    russel_core::ids::validate_service_id(&service_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    check_service_id(&service_id)?;
     let policy = russel_core::VolumeDestroyPolicy::from_keep_override(query.keep_volumes);
     tracing::info!(service_id = %service_id, "DELETE /vm/{}", service_id);
 
@@ -773,8 +760,8 @@ async fn vm_destroy(
         ));
     }
 
-    let (runtime, handle) =
-        claim_lifecycle_operation(&state, &service_id, ServiceStatus::Destroying)?;
+    let handle = claim_lifecycle_operation(&state, &service_id, ServiceStatus::Destroying)?;
+    let runtime = handle.runtime;
     let result = match runtime {
         _ if crate::agent_client::agent_mode_enabled() => {
             handle.lifecycle.destroy(&service_id).await
@@ -789,8 +776,6 @@ async fn vm_destroy(
         }
     };
 
-    let label = runtime_label(runtime);
-
     // Control-plane inventory ownership: always release port/subnet after a
     // destroy attempt (idempotent), including partial-failure / TAP teardown
     // error paths. Runner also releases for in-process callers; the API path
@@ -804,11 +789,7 @@ async fn vm_destroy(
     match result {
         Ok(_) => {
             // Reap child handles after successful destroy.
-            if handle.runtime == RuntimeKind::Microvm
-                && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
-            {
-                reap_children(vm, aux).await;
-            }
+            handle.reap(&state, &service_id).await;
             // Container service-dir cleanup is owned by
             // destroy_with_policy (FollowFile / KeepAll / DeleteAll).
             // No extra remove_dir_all here: it would delete kept volumes.
@@ -821,21 +802,17 @@ async fn vm_destroy(
             if let Err(e) = crate::gcroots::remove(&service_id) {
                 tracing::warn!(service_id = %service_id, error = %e, "failed to remove gcroots during destroy");
             }
-            tracing::info!(service_id = %service_id, runtime = %label, "destroyed service");
+            tracing::info!(service_id = %service_id, %runtime, "destroyed service");
             state.remove_service(&service_id);
-            Ok(Json(format!("destroyed {label} {service_id}")))
+            Ok(Json(format!("destroyed {runtime} {service_id}")))
         }
         Err(e) => {
-            tracing::error!(service_id = %service_id, runtime = %label, error = %e, "failed to destroy service");
+            tracing::error!(service_id = %service_id, %runtime, error = %e, "failed to destroy service");
             // Inventory already released above. Partial destroy may have
             // already killed processes — reap remaining handles; do not
             // restore deployed. Leave failed so the operator can retry
             // residual runtime/TAP cleanup.
-            if handle.runtime == RuntimeKind::Microvm
-                && let Some((vm, aux)) = state.take_processes_for_reap(&service_id)
-            {
-                reap_children(vm, aux).await;
-            }
+            handle.reap(&state, &service_id).await;
             state.set_status(&service_id, ServiceStatus::Failed, VmState::Failed);
             Err((StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)))
         }
@@ -855,6 +832,23 @@ struct LifecycleClaimHandle {
     prior_vm_state: VmState,
 }
 
+impl LifecycleClaimHandle {
+    /// Wait for (or kill) the microVM's process handles once the operation
+    /// ended. Containers have none: Podman owns their processes.
+    async fn reap(&self, state: &AppState, service_id: &str) {
+        if self.runtime == RuntimeKind::Microvm
+            && let Some((vm, aux)) = state.take_processes_for_reap(service_id)
+        {
+            reap_children(vm, aux).await;
+        }
+    }
+}
+
+fn check_service_id(service_id: &str) -> Result<(), (StatusCode, String)> {
+    russel_core::ids::validate_service_id(service_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
 fn require_lifecycle_runtime(
     state: &AppState,
     service_id: &str,
@@ -867,18 +861,11 @@ fn require_lifecycle_runtime(
     })
 }
 
-pub(crate) fn runtime_label(runtime: RuntimeKind) -> &'static str {
-    match runtime {
-        RuntimeKind::Microvm => "microvm",
-        RuntimeKind::Container => "container",
-    }
-}
-
 fn claim_lifecycle_operation(
     state: &AppState,
     service_id: &str,
     target_status: ServiceStatus,
-) -> Result<(RuntimeKind, LifecycleClaimHandle), (StatusCode, String)> {
+) -> Result<LifecycleClaimHandle, (StatusCode, String)> {
     let runtime = require_lifecycle_runtime(state, service_id)?;
 
     let (prior_status, prior_vm_state, claim_generation) =
@@ -902,16 +889,14 @@ fn claim_lifecycle_operation(
             }
         };
 
-    let handle = LifecycleClaimHandle {
+    Ok(LifecycleClaimHandle {
         runtime,
         lifecycle: runtime::lifecycle_for(runtime),
         claim_generation,
         expected_status: target_status,
         prior_status,
         prior_vm_state,
-    };
-
-    Ok((runtime, handle))
+    })
 }
 
 async fn reap_children(vm_child: Option<Child>, aux_processes: Vec<Child>) {

@@ -63,32 +63,15 @@ impl AppState {
         let generation = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-            s.status = ServiceStatus::Deployed;
-            s.vm_state = VmState::Running;
-            s.started_at = Instant::now();
             s.vm_pid = vm_child.id();
             s.vm_process = Some(vm_child);
             s.container_id = None;
-            s.runtime = Some(RuntimeKind::Microvm);
             s.aux_processes = aux_children;
-            if let Some(p) = host_port.filter(|p| *p > 0) {
-                s.host_port = Some(p);
-            }
-            if let Some(p) = guest_port.filter(|p| *p > 0) {
-                s.guest_port = Some(p);
-            }
-            // Deploy succeeded — clear prebuild snapshot.
-            s.prebuild_status = None;
-            s.prebuild_vm_state = None;
-            s.process_generation = s.process_generation.wrapping_add(1);
-            s.process_generation
+            Self::apply_deployed_transition(s, RuntimeKind::Microvm, host_port, guest_port)
         };
         self.spawn_process_supervisor(service_id.to_string(), generation);
 
-        // Best-effort catalog update.
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after mark_deployed_with_aux");
-        }
+        self.persist_catalog();
     }
 
     /// Start the liveness supervisor for a workload that stays in place
@@ -270,11 +253,7 @@ impl AppState {
             (vm, aux)
         };
 
-        if let Some(mut child) = vm {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        for mut child in aux {
+        for mut child in vm.into_iter().chain(aux) {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -296,28 +275,15 @@ impl AppState {
         let generation = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
-            s.status = ServiceStatus::Deployed;
-            s.vm_state = VmState::Running;
-            s.started_at = Instant::now();
             s.vm_pid = None;
             s.vm_process = None;
             s.container_id = Some(container_id.to_string());
-            s.runtime = Some(RuntimeKind::Container);
             s.aux_processes.clear();
-            if let Some(p) = host_port.filter(|p| *p > 0) {
-                s.host_port = Some(p);
-            }
-            if let Some(p) = guest_port.filter(|p| *p > 0) {
-                s.guest_port = Some(p);
-            }
             push_capped(
                 &mut s.logs,
                 &format!("container running (id: {container_id})\n"),
             );
-            s.prebuild_status = None;
-            s.prebuild_vm_state = None;
-            s.process_generation = s.process_generation.wrapping_add(1);
-            s.process_generation
+            Self::apply_deployed_transition(s, RuntimeKind::Container, host_port, guest_port)
         };
         self.spawn_container_supervisor(
             service_id.to_string(),
@@ -327,10 +293,7 @@ impl AppState {
             Some(0),
         );
 
-        // Best-effort catalog update.
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after mark_deployed_container");
-        }
+        self.persist_catalog();
     }
 
     pub fn mark_failed(&self, service_id: &str, error: String) {
@@ -344,10 +307,7 @@ impl AppState {
             self.spawn_supervisor(service_id, generation, supervision);
         }
 
-        // Best-effort catalog update.
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after mark_failed");
-        }
+        self.persist_catalog();
     }
 
     /// Atomically mark a service failed only if the current generation matches
@@ -382,11 +342,34 @@ impl AppState {
             self.spawn_supervisor(service_id, generation, supervision);
         }
 
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after mark_failed_if_generation");
-        }
+        self.persist_catalog();
 
         true
+    }
+
+    /// The part of a successful deploy both runtimes share: running now,
+    /// known ports kept, prebuild snapshot cleared. Returns the new process
+    /// generation for the supervisor.
+    fn apply_deployed_transition(
+        s: &mut ServiceState,
+        runtime: RuntimeKind,
+        host_port: Option<u16>,
+        guest_port: Option<u16>,
+    ) -> u64 {
+        s.status = ServiceStatus::Deployed;
+        s.vm_state = VmState::Running;
+        s.started_at = Instant::now();
+        s.runtime = Some(runtime);
+        if let Some(p) = host_port.filter(|p| *p > 0) {
+            s.host_port = Some(p);
+        }
+        if let Some(p) = guest_port.filter(|p| *p > 0) {
+            s.guest_port = Some(p);
+        }
+        s.prebuild_status = None;
+        s.prebuild_vm_state = None;
+        s.process_generation = s.process_generation.wrapping_add(1);
+        s.process_generation
     }
 
     /// Apply the failure state transition to a ServiceState in-place.
@@ -605,9 +588,7 @@ impl AppState {
         if let Some((generation, supervision)) = needs_supervisor {
             self.spawn_supervisor(service_id, generation, supervision);
         }
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after abort_lifecycle_operation");
-        }
+        self.persist_catalog();
     }
 
     pub fn set_status(&self, service_id: &str, status: ServiceStatus, vm_state: VmState) {
@@ -618,10 +599,7 @@ impl AppState {
                 s.vm_state = vm_state;
             }
         }
-        // Catalog write after releasing the state lock (Mutex is not reentrant).
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after set_status");
-        }
+        self.persist_catalog();
     }
 
     pub fn remove_service(&self, service_id: &str) {
@@ -629,10 +607,7 @@ impl AppState {
             let mut inner = self.lock_inner();
             inner.services.remove(service_id);
         }
-        // Catalog write after releasing the state lock (Mutex is not reentrant).
-        if let Err(e) = self.write_catalog() {
-            tracing::warn!(error = %e, "failed to write catalog after remove_service");
-        }
+        self.persist_catalog();
     }
 
     /// Move in-memory process ownership from a generation runtime key to the
@@ -871,6 +846,14 @@ impl AppState {
     /// `metadata.json` remains the source of truth for runtime details.
     pub fn write_catalog(&self) -> anyhow::Result<()> {
         crate::metadata::write_ctrl_catalog(&self.build_catalog())
+    }
+
+    /// [`Self::write_catalog`], best effort: a failure is only logged. Call
+    /// it after releasing the state lock (the mutex is not reentrant).
+    pub fn persist_catalog(&self) {
+        if let Err(e) = self.write_catalog() {
+            tracing::warn!(error = %e, "failed to write ctrl-catalog.json");
+        }
     }
 }
 
