@@ -115,6 +115,23 @@ pub(super) struct Slot {
     dirs: ServiceDirs,
     /// Cold path moved the live service dir to `.bak`; rollback reads it.
     has_backup: bool,
+    /// Whether the generation recorded for the service was running when this
+    /// deploy began. A stopped service, or one whose container is gone, has
+    /// nothing to protect or drain (#575).
+    prior_live: bool,
+    /// The host port the stopped generation published, to start in place on
+    /// (#575). `None` when the prior one was live: it still holds its port.
+    recorded_port: Option<u16>,
+}
+
+/// What a dual-live cutover spent on the previous generation (#575). Both are
+/// zero for a cold replace, which stops it before boot instead.
+#[derive(Debug, Default)]
+pub(super) struct Retired {
+    /// From the proxy switch until the drain window and watch ended.
+    drain_ms: u128,
+    /// Stopping and removing the previous generation, and promoting the new.
+    retire_ms: u128,
 }
 
 /// A started generation that answered, with its phase timings.
@@ -156,7 +173,15 @@ impl DeployPipeline {
         // The live generation's route, to point back at if this deploy does
         // not take it over (`hold`, `recover_failed_switch`).
         let previous_route = self.live_route(service_id, &plan);
+        // Dual-live boots beside the live generation and stops nothing here.
+        // A cold replace stops it first: that wait is the retire phase.
+        let vacating = Instant::now();
         let slot = self.prepare_slot(service_id, &plan, &tx).await?;
+        let vacate_ms = if slot.prior_runtime.is_some() && !slot.dual_live {
+            vacating.elapsed().as_millis()
+        } else {
+            0
+        };
 
         // Armed once boot reserves ports, so dropping it releases them.
         let mut reservation = None;
@@ -187,7 +212,7 @@ impl DeployPipeline {
                     .await;
             }
         };
-        if let Err(error) = self
+        let retired = match self
             .cutover(
                 service_id,
                 &plan,
@@ -198,17 +223,20 @@ impl DeployPipeline {
             )
             .await
         {
-            return self
-                .recover_failed_switch(
-                    service_id,
-                    &slot,
-                    booted.workload,
-                    error,
-                    previous_route,
-                    reservation,
-                )
-                .await;
-        }
+            Ok(retired) => retired,
+            Err(error) => {
+                return self
+                    .recover_failed_switch(
+                        service_id,
+                        &slot,
+                        booted.workload,
+                        error,
+                        previous_route,
+                        reservation,
+                    )
+                    .await;
+            }
+        };
         self.record(
             service_id,
             &request,
@@ -236,6 +264,8 @@ impl DeployPipeline {
                 start_ms: booted.start_ms,
                 network_ms: booted.network_ms,
                 ready_ms: booted.ready_ms,
+                drain_ms: retired.drain_ms,
+                retire_ms: vacate_ms + retired.retire_ms,
             },
             route_host: plan.ingress_host,
             workload: booted.workload,
@@ -341,8 +371,18 @@ impl DeployPipeline {
         tx: &Events,
     ) -> anyhow::Result<Slot> {
         let prior_runtime = resolve_prior_runtime(service_id).await?;
+        let prior_live = match prior_runtime {
+            Some(kind) => self.is_generation_live(service_id, kind).await,
+            None => false,
+        };
+        // Stopped or gone: nothing serves traffic, so there is nothing to keep
+        // up or to drain. Start in place, on the port it published (#575).
+        let recorded_port = (prior_runtime.is_some() && !prior_live)
+            .then(|| self.live_route(service_id, plan).map(|(port, _)| port))
+            .flatten();
         let dual_live = is_dual_live(
             prior_runtime,
+            prior_live,
             plan.pin_mapping.as_ref(),
             &plan.config.ports,
             &plan.volumes,
@@ -397,6 +437,8 @@ impl DeployPipeline {
             runtime_key,
             dirs,
             has_backup: has_russel_dir && !dual_live,
+            prior_live,
+            recorded_port,
         };
 
         // Cold redeploy stashed volumes before the .bak rename. Put them back
@@ -409,6 +451,23 @@ impl DeployPipeline {
             return Err(e);
         }
         Ok(slot)
+    }
+
+    /// Whether the generation recorded for `service_id` is running now. A
+    /// stopped service (`russel stop`), or a container removed since (a host
+    /// reboot), is not: replacing it needs no drain and no side-by-side boot
+    /// (#575). When the answer is unknown, it counts as running.
+    async fn is_generation_live(&self, service_id: &str, kind: RuntimeKind) -> bool {
+        match kind {
+            RuntimeKind::Container => {
+                let name = crate::container::resolve_container_name(service_id);
+                container_is_live(&crate::container::observe(&name).await)
+            }
+            RuntimeKind::Microvm => self
+                .state
+                .status(service_id)
+                .is_none_or(|s| s.status != "stopped"),
+        }
     }
 
     /// Cold path: stop the live generation so the new one can boot in its
@@ -499,11 +558,13 @@ impl DeployPipeline {
         // releasing the old service's port on early allocation failure).
         let ports = self.ports.clone();
         let owned_key = key.clone();
+        let recorded = slot.recorded_port;
         let pin = plan.pin_mapping.clone();
         let guest = plan.config.service.port;
-        let port =
-            tokio::task::spawn_blocking(move || reserve_primary(&ports, &owned_key, pin, guest))
-                .await??;
+        let port = tokio::task::spawn_blocking(move || {
+            reserve_recorded_or_primary(&ports, &owned_key, pin, recorded, guest)
+        })
+        .await??;
         // Arm before extras so a failed extra reserve releases primary + prior extras.
         *reservation = Some(PortReservation::new(key));
         for (i, extra) in plan.config.ports.iter().enumerate() {
@@ -515,7 +576,8 @@ impl DeployPipeline {
         // after answering must fail in boot, where the .bak restore still
         // covers it. Dual-live watches in `hold` instead, with traffic already
         // switched; a first deploy has nothing to protect and does not wait.
-        let settle = if slot.prior_runtime.is_some() && !slot.dual_live {
+        // Nothing to protect when the prior generation was not running (#575).
+        let settle = if slot.prior_live && !slot.dual_live {
             WATCH_WINDOW
         } else {
             Duration::ZERO
@@ -879,7 +941,7 @@ impl DeployPipeline {
         workload: &mut DeployWorkload,
         switched_at: Instant,
         tx: &Events,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Retired> {
         if !slot.dual_live {
             if slot.has_backup {
                 // `vacate` moved the history into the `.bak` dir with the rest
@@ -917,7 +979,7 @@ impl DeployPipeline {
                 }
             }
             self.attach_build_path(service_id, plan);
-            return Ok(());
+            return Ok(Retired::default());
         }
 
         // Drain (#562): the proxy sends the previous generation nothing new
@@ -942,6 +1004,12 @@ impl DeployPipeline {
             tx,
         )
         .await?;
+        let drain_ms = switched_at.elapsed().as_millis();
+        let retiring = Instant::now();
+        let retired = || Retired {
+            drain_ms,
+            retire_ms: retiring.elapsed().as_millis(),
+        };
         self.retire_processes(
             service_id,
             slot.prior_runtime,
@@ -990,7 +1058,7 @@ impl DeployPipeline {
                 )
                 .await;
                 self.attach_build_path(key, plan);
-                return Ok(());
+                return Ok(retired());
             }
         }
 
@@ -1015,7 +1083,7 @@ impl DeployPipeline {
             );
             // Keep state under runtime_key so stop/destroy can find it.
             self.attach_build_path(key, plan);
-            return Ok(());
+            return Ok(retired());
         }
 
         // Re-key port + in-memory state to the stable service id. Dual-live
@@ -1026,7 +1094,7 @@ impl DeployPipeline {
         }
         self.state.rekey_service(key, service_id);
         self.attach_build_path(service_id, plan);
-        Ok(())
+        Ok(retired())
     }
 
     /// Note the built checkout in the service log. A relaunch built nothing.
@@ -1211,17 +1279,23 @@ fn read_flake_lock(build_path: &Path) -> Option<String> {
 /// is watched for [`WATCH_WINDOW`] in `boot`, and a crash restores the
 /// previous generation from its `.bak` dirs.
 ///
+/// A service with no running generation (stopped, or its container gone) is
+/// replaced cold too (#575): nothing serves traffic, so there is nothing to
+/// keep up and no drain to wait for.
+///
 /// A writable volume (`rw = true`, managed or bind) is replaced cold too. The
 /// candidate resolves the same host path as the live generation, so dual-live
 /// would run two writers on it at once. Read-only volumes are safe to share
 /// and stay dual-live.
 fn is_dual_live(
     prior_runtime: Option<RuntimeKind>,
+    prior_live: bool,
     pin: Option<&PortMapping>,
     extra_ports: &[ExtraPortSpec],
     volumes: &[ResolvedVolume],
 ) -> bool {
     prior_runtime.is_some()
+        && prior_live
         && pin.is_none()
         && extra_ports.is_empty()
         && !volumes.iter().any(|v| v.rw)
@@ -1245,6 +1319,36 @@ fn reserve_primary(
             guest,
         }),
     }
+}
+
+/// What `podman inspect` says about a prior container: running, or at least
+/// possibly so. Removed, exited, and never-started containers serve nothing.
+fn container_is_live(observed: &crate::container::Observed) -> bool {
+    use crate::container::Observed;
+    match observed {
+        Observed::Gone => false,
+        Observed::State(s) => !s.has_exited() && s.status != "created",
+        Observed::Unknown => true,
+    }
+}
+
+/// [`reserve_primary`], but a service that was stopped starts again on the
+/// host port it published (#575) while that port is still free. Otherwise
+/// the allocator would hand out the lowest free one, which can differ.
+fn reserve_recorded_or_primary(
+    ports: &PortAllocator,
+    key: &str,
+    pin: Option<PortMapping>,
+    recorded: Option<u16>,
+    guest: u16,
+) -> anyhow::Result<PortMapping> {
+    if pin.is_none()
+        && let Some(host) = recorded
+        && PortAllocator::reserve(key, host).is_ok()
+    {
+        return Ok(PortMapping { host, guest });
+    }
+    reserve_primary(ports, key, pin, guest)
 }
 
 pub(crate) struct PortReservation {
@@ -1386,25 +1490,44 @@ GREETING = "from the recorded file"
     #[test]
     fn pinned_update_is_replaced_cold_on_every_runtime() {
         for runtime in [RuntimeKind::Container, RuntimeKind::Microvm] {
-            assert!(!is_dual_live(Some(runtime), Some(&pin(8081)), &[], &[]));
+            assert!(!is_dual_live(
+                Some(runtime),
+                true,
+                Some(&pin(8081)),
+                &[],
+                &[]
+            ));
         }
     }
 
     #[test]
     fn unpinned_update_is_dual_live() {
-        assert!(is_dual_live(Some(RuntimeKind::Container), None, &[], &[]));
-        assert!(is_dual_live(Some(RuntimeKind::Microvm), None, &[], &[]));
+        assert!(is_dual_live(
+            Some(RuntimeKind::Container),
+            true,
+            None,
+            &[],
+            &[]
+        ));
+        assert!(is_dual_live(
+            Some(RuntimeKind::Microvm),
+            true,
+            None,
+            &[],
+            &[]
+        ));
     }
 
     #[test]
     fn first_deploy_and_extra_ports_are_cold() {
-        assert!(!is_dual_live(None, None, &[], &[]));
+        assert!(!is_dual_live(None, true, None, &[], &[]));
         let extra = [ExtraPortSpec {
             host: 5432,
             guest: 5432,
         }];
         assert!(!is_dual_live(
             Some(RuntimeKind::Container),
+            true,
             None,
             &extra,
             &[]
@@ -1426,7 +1549,7 @@ GREETING = "from the recorded file"
             volumes_of("[[volumes]]\nname = \"data\"\nguest = \"/data\"\nrw = true\nkeep = true\n");
         assert!(volumes[0].rw);
         for runtime in [RuntimeKind::Container, RuntimeKind::Microvm] {
-            assert!(!is_dual_live(Some(runtime), None, &[], &volumes));
+            assert!(!is_dual_live(Some(runtime), true, None, &[], &volumes));
         }
         // One writable row among read-only ones is enough.
         let mixed = volumes_of(
@@ -1434,6 +1557,7 @@ GREETING = "from the recorded file"
         );
         assert!(!is_dual_live(
             Some(RuntimeKind::Container),
+            true,
             None,
             &[],
             &mixed
@@ -1447,14 +1571,21 @@ GREETING = "from the recorded file"
         assert!(!read_only[0].rw);
         assert!(is_dual_live(
             Some(RuntimeKind::Container),
+            true,
             None,
             &[],
             &read_only
         ));
-        assert!(is_dual_live(Some(RuntimeKind::Container), None, &[], &[]));
+        assert!(is_dual_live(
+            Some(RuntimeKind::Container),
+            true,
+            None,
+            &[],
+            &[]
+        ));
         // A first deploy has nothing to run beside, whatever the volumes.
         let writable = volumes_of("[[volumes]]\nname = \"d\"\nguest = \"/d\"\nrw = true\n");
-        assert!(!is_dual_live(None, None, &[], &writable));
+        assert!(!is_dual_live(None, true, None, &[], &writable));
     }
 
     /// The port side of two `russel update`s of a container with
@@ -1477,6 +1608,7 @@ GREETING = "from the recorded file"
         for _update in 0..2 {
             assert!(!is_dual_live(
                 Some(RuntimeKind::Container),
+                true,
                 Some(&pinned),
                 &[],
                 &[]
@@ -1532,6 +1664,8 @@ GREETING = "from the recorded file"
             runtime_key: id.into(),
             dirs,
             has_backup: true,
+            prior_live: true,
+            recorded_port: None,
         }
     }
 
@@ -1592,6 +1726,8 @@ GREETING = "from the recorded file"
             runtime_key: key.clone(),
             dirs: ServiceDirs::of(id),
             has_backup: false,
+            prior_live: true,
+            recorded_port: None,
         };
         let plan = cold_plan(id, &crate::paths::service_dir(&key).display().to_string());
         let mut workload = DeployWorkload::Container {
@@ -1872,6 +2008,8 @@ GREETING = "from the recorded file"
             runtime_key: format!("{id}_gbeef1234"),
             dirs: ServiceDirs::of(id),
             has_backup: false,
+            prior_live: true,
+            recorded_port: None,
         };
         let mut plan = cold_plan(id, "/nonexistent/russel-562");
         plan.pin_mapping = None;
@@ -1976,6 +2114,8 @@ GREETING = "from the recorded file"
             runtime_key: format!("{id}_gdeadbeef"),
             dirs: ServiceDirs::of(id),
             has_backup: false,
+            prior_live: true,
+            recorded_port: None,
         }
     }
 
@@ -2014,6 +2154,127 @@ GREETING = "from the recorded file"
         assert!(!deployments::deployments_path(id).exists());
         let (old, aux) = pipeline.state.take_processes(id).unwrap();
         kill_and_wait_children(old, aux).await;
+    }
+
+    /// #575: a service with nothing running has nothing to keep up or drain,
+    /// so it is replaced in place, not beside a generation that is not there.
+    #[test]
+    fn a_service_with_nothing_running_is_replaced_cold() {
+        for runtime in [RuntimeKind::Container, RuntimeKind::Microvm] {
+            assert!(!is_dual_live(Some(runtime), false, None, &[], &[]));
+            assert!(is_dual_live(Some(runtime), true, None, &[], &[]));
+        }
+    }
+
+    #[test]
+    fn only_a_running_container_counts_as_live() {
+        use crate::container::{ContainerState, Observed};
+        let state = |status: &str| {
+            Observed::State(ContainerState {
+                status: status.into(),
+                exit_code: 0,
+                restarts: 0,
+            })
+        };
+        assert!(container_is_live(&state("running")));
+        assert!(container_is_live(&Observed::Unknown));
+        for idle in ["exited", "stopped", "dead", "created"] {
+            assert!(!container_is_live(&state(idle)), "{idle}");
+        }
+        // After a host reboot the container is gone.
+        assert!(!container_is_live(&Observed::Gone));
+    }
+
+    /// #575: a stopped service starts again on the port it published, even
+    /// when a lower port is free; a taken one falls back to the allocator.
+    #[test]
+    fn a_stopped_service_restarts_on_its_recorded_port() {
+        let _lock = port_test_lock();
+        let id = "recorded-port";
+        let recorded = reserve_test_port(id);
+        PortAllocator::release_service(id);
+
+        let got =
+            reserve_recorded_or_primary(&PortAllocator, id, None, Some(recorded), 3000).unwrap();
+        assert_eq!(got.host, recorded);
+        PortAllocator::release_service(id);
+
+        // Held by something else now: the service still starts, elsewhere.
+        let other = "recorded-port-other";
+        PortAllocator::reserve(other, recorded).unwrap();
+        let moved =
+            reserve_recorded_or_primary(&PortAllocator, id, None, Some(recorded), 3000).unwrap();
+        assert_ne!(moved.host, recorded);
+        PortAllocator::release_service(id);
+        PortAllocator::release_service(other);
+
+        // A pinned port wins over the recorded one.
+        let pinned_port = reserve_test_port(id);
+        PortAllocator::release_service(id);
+        let got = reserve_recorded_or_primary(
+            &PortAllocator,
+            id,
+            Some(pin(pinned_port)),
+            Some(recorded),
+            3000,
+        )
+        .unwrap();
+        assert_eq!(got.host, pinned_port);
+        PortAllocator::release_service(id);
+    }
+
+    /// #575: the wait for the previous generation shows up in the timing as
+    /// its own drain phase, covering the time since the switch.
+    #[tokio::test]
+    async fn dual_live_cutover_reports_the_drain() {
+        let id = "drain-timing";
+        let slot = dual_slot(id);
+        let pipeline = DeployPipeline::new(crate::state::AppState::default());
+        let mut workload = test_vm("exec sleep 60", 9102);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        // Switched 3s ago: the watch window (2s) is what is left to wait for.
+        let switched_at = Instant::now().checked_sub(Duration::from_secs(3)).unwrap();
+        let retired = pipeline
+            .cutover(
+                id,
+                &cold_plan(id, "/nonexistent"),
+                &slot,
+                &mut workload,
+                switched_at,
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(retired.drain_ms >= 4900, "drain_ms {}", retired.drain_ms);
+
+        let _ = std::fs::remove_dir_all(crate::paths::service_dir(id));
+    }
+
+    /// A cold replace stops the previous generation before boot, so cutover
+    /// reports no drain.
+    #[tokio::test]
+    async fn cold_cutover_reports_no_drain() {
+        let id = "cold-timing";
+        let slot = Slot {
+            dual_live: false,
+            has_backup: false,
+            ..dual_slot(id)
+        };
+        let pipeline = DeployPipeline::new(crate::state::AppState::default());
+        let mut workload = test_vm("exec sleep 60", 9103);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let retired = pipeline
+            .cutover(
+                id,
+                &cold_plan(id, "/nonexistent"),
+                &slot,
+                &mut workload,
+                Instant::now(),
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!((retired.drain_ms, retired.retire_ms), (0, 0));
     }
 
     #[tokio::test]

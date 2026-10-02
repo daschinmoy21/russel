@@ -29,7 +29,7 @@ pub use runner::{
 };
 pub(crate) use runner::{
     prepare_managed_volume_dirs, remove_service_payload_keep_volumes, remove_tree,
-    volumes_recorded_for,
+    resolve_container_name, volumes_recorded_for,
 };
 
 #[cfg(test)]

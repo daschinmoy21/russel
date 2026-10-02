@@ -716,6 +716,20 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
                 "guest app network socket ready (VM is live)",
             );
         }
+        if t.drain_ms > 0 {
+            timing_row(
+                "drain",
+                t.drain_ms,
+                "previous generation finishes requests in flight",
+            );
+        }
+        if t.retire_ms > 0 {
+            timing_row(
+                "retire",
+                t.retire_ms,
+                "stop and remove the previous generation",
+            );
+        }
     }
 
     println!();

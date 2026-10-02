@@ -59,6 +59,14 @@ pub struct DeployTiming {
     pub start_ms: u128,
     pub network_ms: u128,
     pub ready_ms: u128,
+    /// Dual-live only: how long the previous generation kept running after
+    /// the proxy switched to the new one, so requests in flight could finish.
+    #[serde(default)]
+    pub drain_ms: u128,
+    /// Stopping and removing the previous generation: the cold replace before
+    /// boot, or the stop and cleanup after the drain.
+    #[serde(default)]
+    pub retire_ms: u128,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -583,6 +591,15 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             let _parsed: DeployEvent = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    /// A response from a ctrl that predates the drain and retire phases
+    /// (#575) still parses; the new phases read as zero.
+    #[test]
+    fn deploy_timing_without_drain_and_retire_parses() {
+        let old = r#"{"resolve_ms":1,"build_ms":2,"create_ms":3,"start_ms":4,"network_ms":0,"ready_ms":5}"#;
+        let t: DeployTiming = serde_json::from_str(old).unwrap();
+        assert_eq!((t.drain_ms, t.retire_ms), (0, 0));
     }
 
     #[test]
