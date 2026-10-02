@@ -111,9 +111,82 @@ pub(crate) fn on_unexpected_exit(state: &AppState, service_id: &str) {
 /// restartable, so `schedule` leaves them alone.
 pub fn relaunch_at_startup(state: &AppState) {
     for service_id in state.list_services() {
-        if read_metadata(&service_id).is_some_and(|meta| wants_start_at_boot(&meta)) {
+        let Some(meta) = read_metadata(&service_id) else {
+            continue;
+        };
+        let running = state
+            .status(&service_id)
+            .is_some_and(|s| s.status == "deployed");
+        if running && is_container(&meta) {
+            // Adopted as running: Podman still holds the policy it was
+            // created with, which predates the default for older services.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    sync_restart_policy(&service_id, &meta).await;
+                });
+            }
+        } else if wants_start_at_boot(&meta) {
             schedule_after(state, &service_id, Some(Duration::ZERO));
         }
+    }
+}
+
+/// What Podman calls the policy: `no` and an empty name both mean none.
+fn podman_policy_name(name: &str) -> &str {
+    if name.is_empty() {
+        RestartPolicy::NO
+    } else {
+        name
+    }
+}
+
+/// Give an existing container the recorded `service.restart` (#450).
+/// Containers created before `unless-stopped` became the default have no
+/// policy, so Podman would leave them down after a crash. Podman releases
+/// without `podman update --restart` keep the old policy until the next
+/// deploy, and the log says so.
+async fn sync_restart_policy(service_id: &str, meta: &Value) {
+    let want = match policy(meta) {
+        RestartPolicy::UnlessStopped => RestartPolicy::UNLESS_STOPPED,
+        RestartPolicy::No => RestartPolicy::NO,
+    };
+    let name = resolve_container_name(service_id);
+    let mut inspect = podman_command().await;
+    let Ok(out) = inspect
+        .args([
+            "inspect",
+            "--format",
+            "{{.HostConfig.RestartPolicy.Name}}",
+            &name,
+        ])
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let have = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if podman_policy_name(&have) == want {
+        return;
+    }
+    let mut update = podman_command().await;
+    match update
+        .args(["update", "--restart", want, &name])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!(service_id, from = %have, to = want, "container restart policy updated");
+        }
+        Ok(out) => tracing::warn!(
+            service_id,
+            want,
+            error = %String::from_utf8_lossy(&out.stderr).trim(),
+            "cannot change the container restart policy; `russel update` applies it"
+        ),
+        Err(e) => tracing::warn!(service_id, error = %e, "podman update failed to run"),
     }
 }
 
@@ -230,6 +303,7 @@ async fn start_container(state: &AppState, service_id: &str, meta: &Value) -> an
         anyhow::bail!("metadata.json records no host port for {service_id}");
     }
     PortAllocator::claim_existing(service_id, host_port)?;
+    sync_restart_policy(service_id, meta).await;
 
     let mut cmd = podman_command().await;
     let output = cmd.args(["start", &name]).output().await?;
@@ -247,30 +321,46 @@ async fn start_container(state: &AppState, service_id: &str, meta: &Value) -> an
         CONTAINER_READY_TIMEOUT,
     )
     .await;
-    if outcome != ReadyOutcome::Ready {
-        let tail = log_tail(&container_log_path(service_id), LOG_TAIL_LINES);
-        anyhow::bail!(
-            "{}",
-            not_ready_error(
-                &outcome,
-                host_port,
-                guest_port,
-                CONTAINER_READY_TIMEOUT,
-                &tail
-            )
-        );
-    }
-
-    if let Err(e) = crate::metadata::set_container_running(service_id, true) {
-        tracing::warn!(service_id, error = %e, "could not record container_running=true");
-    }
     let container_id = meta
         .get("container_id")
         .and_then(Value::as_str)
         .unwrap_or(&name)
         .to_string();
+    if outcome != ReadyOutcome::Ready {
+        let tail = log_tail(&container_log_path(service_id), LOG_TAIL_LINES);
+        let error = not_ready_error(
+            &outcome,
+            host_port,
+            guest_port,
+            CONTAINER_READY_TIMEOUT,
+            &tail,
+        );
+        // It crashed, and its restart policy has Podman bring it back: keep
+        // watching, so it reads `deployed` once it stays up (#450).
+        if matches!(outcome, ReadyOutcome::Died(_)) && policy(meta) == RestartPolicy::UnlessStopped
+        {
+            mark_running(service_id);
+            state.adopt_recovering_container(
+                service_id,
+                &container_id,
+                host_port,
+                guest_port,
+                &format!("START CRASHED, Podman is restarting it: {error}"),
+            );
+            return Ok(());
+        }
+        anyhow::bail!("{error}");
+    }
+
+    mark_running(service_id);
     state.adopt_running_container(service_id, &container_id, host_port, guest_port, None);
     Ok(())
+}
+
+fn mark_running(service_id: &str) {
+    if let Err(e) = crate::metadata::set_container_running(service_id, true) {
+        tracing::warn!(service_id, error = %e, "could not record container_running=true");
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +431,12 @@ mod tests {
         assert_eq!(port_field(&meta, "host_port"), 3100);
         assert_eq!(port_field(&meta, "guest_port"), 0);
         assert_eq!(port_field(&meta, "missing"), 0);
+    }
+
+    #[test]
+    fn podman_reports_no_policy_as_no() {
+        assert_eq!(podman_policy_name(""), "no");
+        assert_eq!(podman_policy_name("no"), "no");
+        assert_eq!(podman_policy_name("unless-stopped"), "unless-stopped");
     }
 }

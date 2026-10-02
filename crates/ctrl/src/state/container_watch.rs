@@ -69,17 +69,48 @@ impl AppState {
         generation: u64,
         baseline: Option<u32>,
     ) {
+        self.spawn_container_watch(service_id, container_id, generation, baseline, None);
+    }
+
+    /// [`Self::spawn_container_supervisor`] for a container that crashed while
+    /// ctrl started it and that Podman is restarting (#450): it reads
+    /// `failed` now and `deployed` once it stays up for
+    /// [`WatchTiming::stable_after`].
+    pub(super) fn spawn_recovering_container_supervisor(
+        &self,
+        service_id: String,
+        container_id: String,
+        generation: u64,
+    ) {
+        self.spawn_container_watch(
+            service_id,
+            container_id,
+            generation,
+            None,
+            Some(Instant::now()),
+        );
+    }
+
+    fn spawn_container_watch(
+        &self,
+        service_id: String,
+        container_id: String,
+        generation: u64,
+        baseline: Option<u32>,
+        restarted_at: Option<Instant>,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         let state = self.clone();
         tokio::spawn(async move {
             state
-                .watch_container(
+                .watch_container_from(
                     &service_id,
                     &container_id,
                     generation,
                     baseline,
+                    restarted_at,
                     || crate::container::observe(&container_id),
                     WATCH_TIMING,
                 )
@@ -87,12 +118,41 @@ impl AppState {
         });
     }
 
+    #[cfg(test)]
     async fn watch_container<O, OF>(
         &self,
         service_id: &str,
         container_id: &str,
         generation: u64,
+        baseline: Option<u32>,
+        observe: O,
+        timing: WatchTiming,
+    ) where
+        O: FnMut() -> OF,
+        OF: Future<Output = Observed>,
+    {
+        self.watch_container_from(
+            service_id,
+            container_id,
+            generation,
+            baseline,
+            None,
+            observe,
+            timing,
+        )
+        .await;
+    }
+
+    /// `restarted_at`: Podman relaunched the container after it failed, at
+    /// this time; the service may read `deployed` again once it stays up.
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_container_from<O, OF>(
+        &self,
+        service_id: &str,
+        container_id: &str,
+        generation: u64,
         mut baseline: Option<u32>,
+        mut restarted_at: Option<Instant>,
         mut observe: O,
         timing: WatchTiming,
     ) where
@@ -101,9 +161,6 @@ impl AppState {
     {
         let mut seen = baseline;
         let mut fast_until = Instant::now() + timing.fast_for;
-        // Set when Podman relaunched the container after it failed; the
-        // service may read `deployed` again once it stays up.
-        let mut restarted_at: Option<Instant> = None;
         let mut down_since: Option<Instant> = None;
         let mut gone_polls = 0u32;
         loop {
@@ -548,6 +605,70 @@ mod tests {
         };
         tokio::time::sleep(TIMING.stable_after * 3).await;
         assert_eq!(status(&state, "svc").0, "failed");
+        watcher.abort();
+    }
+
+    fn failed(state: &AppState, id: &str) -> u64 {
+        let g = deployed(state, id);
+        let mut inner = state.lock_inner();
+        let s = inner.services.get_mut(id).unwrap();
+        s.status = ServiceStatus::Failed;
+        s.vm_state = VmState::Failed;
+        g
+    }
+
+    /// #450: a container ctrl started at boot crashed before it answered and
+    /// Podman restarted it. The watcher starts in recovery, so the service
+    /// reads `deployed` once the container stays up, with no new restart.
+    #[tokio::test]
+    async fn recovering_start_turns_deployed_once_the_restart_holds() {
+        let state = AppState::default();
+        let g = failed(&state, "svc");
+        let watcher = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .watch_container_from(
+                        "svc",
+                        "c1",
+                        g,
+                        None,
+                        Some(Instant::now()),
+                        script(vec![st("running 0 1")]),
+                        TIMING,
+                    )
+                    .await
+            })
+        };
+        wait_for(&state, "svc", "deployed").await;
+        watcher.abort();
+    }
+
+    /// The same start in a crash loop stays `failed`: each restart pushes
+    /// recovery back.
+    #[tokio::test]
+    async fn recovering_start_in_a_crash_loop_stays_failed() {
+        let state = AppState::default();
+        let g = failed(&state, "svc");
+        let looping: Vec<Observed> = (1..=40).map(|n| st(&format!("running 0 {n}"))).collect();
+        let watcher = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .watch_container_from(
+                        "svc",
+                        "c1",
+                        g,
+                        None,
+                        Some(Instant::now()),
+                        script(looping),
+                        TIMING,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(state.status("svc").unwrap().status, "failed");
         watcher.abort();
     }
 }

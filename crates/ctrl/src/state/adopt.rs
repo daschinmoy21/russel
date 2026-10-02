@@ -77,6 +77,60 @@ impl AppState {
         guest_port: u16,
         deployed_at: Option<&str>,
     ) {
+        if let Some(generation) =
+            self.adopt_container(service_id, container_id, host_port, guest_port, deployed_at)
+        {
+            self.spawn_container_supervisor(
+                service_id.to_string(),
+                container_id.to_string(),
+                generation,
+                None,
+            );
+        }
+    }
+
+    /// Adopt a container ctrl started that crashed before it answered and that
+    /// Podman's restart policy is bringing back (#450). It reads `failed` with
+    /// `reason` and turns `deployed` once it stays up, as after any crash.
+    pub(crate) fn adopt_recovering_container(
+        &self,
+        service_id: &str,
+        container_id: &str,
+        host_port: u16,
+        guest_port: u16,
+        reason: &str,
+    ) {
+        let Some(generation) =
+            self.adopt_container(service_id, container_id, host_port, guest_port, None)
+        else {
+            return;
+        };
+        {
+            let mut inner = self.lock_inner();
+            if let Some(s) = inner.services.get_mut(service_id) {
+                s.status = ServiceStatus::Failed;
+                s.vm_state = VmState::Failed;
+                push_capped(&mut s.logs, &format!("{reason}\n"));
+            }
+        }
+        self.persist_catalog();
+        self.spawn_recovering_container_supervisor(
+            service_id.to_string(),
+            container_id.to_string(),
+            generation,
+        );
+    }
+
+    /// The state side of adopting a container: `None` when the service
+    /// already has a live Child handle.
+    fn adopt_container(
+        &self,
+        service_id: &str,
+        container_id: &str,
+        host_port: u16,
+        guest_port: u16,
+        deployed_at: Option<&str>,
+    ) -> Option<u64> {
         let generation = {
             let mut inner = self.lock_inner();
             let s = inner.services.entry(service_id.to_string()).or_default();
@@ -85,7 +139,7 @@ impl AppState {
                     service_id = %service_id,
                     "skipping container adoption — already has live Child handle"
                 );
-                return;
+                return None;
             }
             s.status = ServiceStatus::Deployed;
             s.vm_state = VmState::Running;
@@ -110,12 +164,7 @@ impl AppState {
             s.process_generation = s.process_generation.wrapping_add(1);
             s.process_generation
         };
-        self.spawn_container_supervisor(
-            service_id.to_string(),
-            container_id.to_string(),
-            generation,
-            None,
-        );
+        Some(generation)
     }
 
     /// Mark a service stopped from on-disk metadata (no live processes).
