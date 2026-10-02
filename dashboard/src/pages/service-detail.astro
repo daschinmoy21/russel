@@ -116,7 +116,7 @@ import DestroyDialog from '../components/DestroyDialog.astro';
       <h3 class="modal-title" style="color: var(--accent-amber);">Confirm Rollback</h3>
       <p class="modal-description">
         <span id="rollbackMsg"></span>
-        Rollback redeploys the selected generation's recorded repo and config path through the normal pipeline. Commits are not recorded yet, so it builds what that source points to now.
+        Rollback redeploys the selected generation's recorded repo and config path through the normal pipeline. Clean generations rebuild from their recorded commit. Dirty generations rebuild the source's current contents.
       </p>
       <div class="modal-actions">
         <button id="btnCancelRollback" class="btn btn-secondary">Cancel</button>

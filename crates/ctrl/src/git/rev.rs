@@ -15,8 +15,8 @@ use super::lease::CheckoutLease;
 pub struct SourceRev {
     /// Full commit id of HEAD.
     pub rev: String,
-    /// Tracked files under the deployed dir differ from `rev`, or the
-    /// Russelfile is untracked, so `rev` alone does not reproduce the deploy.
+    /// Files under the deployed dir differ from `rev`, including untracked
+    /// files, so `rev` alone does not reproduce the deploy.
     pub dirty: bool,
 }
 
@@ -49,7 +49,7 @@ pub async fn source_rev(dir: &Path, config_path: &str) -> Option<SourceRev> {
     let rev = git_stdout(dir, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).await?;
     let status = git_stdout(
         dir,
-        &["status", "--porcelain", "--untracked-files=no", "--", "."],
+        &["status", "--porcelain", "--untracked-files=all", "--", "."],
     )
     .await?;
     let tracked = git_stdout(dir, &["ls-files", "--error-unmatch", "--", config_path])

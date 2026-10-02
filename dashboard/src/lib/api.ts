@@ -1477,7 +1477,6 @@ export class RusselClient {
 					method: "POST",
 					headers: this.getHeaders(),
 					body,
-					signal: AbortSignal.timeout(10_000),
 				},
 			);
 			if (res.status === 404) {
@@ -1491,10 +1490,28 @@ export class RusselClient {
 					supported: true,
 				};
 			}
-			let msg = `Service ${id} rollback initiated.`;
-			const json = await res.json().catch(() => null);
-			if (json?.message) msg = json.message;
-			return { success: true, message: msg, supported: true };
+			if (!res.body) {
+				return {
+					success: false,
+					message: `Rollback failed: empty response body for service ${id}.`,
+					supported: true,
+				};
+			}
+			const lines: string[] = [];
+			await consumeNdjsonStream(res.body, (line) => lines.push(line));
+			const outcome = reduceDeployEvents(lines);
+			if (outcome.success) {
+				return {
+					success: true,
+					message: outcome.complete?.message || `Service ${id} rolled back.`,
+					supported: true,
+				};
+			}
+			const detail = outcome.errorMessage
+				|| (outcome.complete
+					? outcome.complete.message || `finished with status ${outcome.complete.status}`
+					: "control plane closed stream before Complete");
+			return { success: false, message: `Rollback failed: ${detail}`, supported: true };
 		} catch (e: any) {
 			return {
 				success: false,
