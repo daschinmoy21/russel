@@ -2134,7 +2134,9 @@ GREETING = "from the recorded file"
         assert!(result.is_err());
         assert!(pipeline.state.status(&slot.runtime_key).is_none());
         assert_eq!(ingress.registered.lock().unwrap()[0].1, 9101);
-        PortAllocator::reserve("review-freed", port).unwrap();
-        PortAllocator::release_service("review-freed");
+        // Assert ownership cleanup directly. Another process can bind this
+        // released port before a rebind, even with the in-process test lock.
+        assert_eq!(PortAllocator::allocated_port(&slot.runtime_key), None);
+        assert!(!PortAllocator::has_hold(&slot.runtime_key));
     }
 }
