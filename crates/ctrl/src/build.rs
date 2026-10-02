@@ -71,6 +71,9 @@ pub fn current_system() -> &'static str {
 /// DeployPipeline holds an `Arc<dyn BuildBackend>` so future providers
 /// (container-first, remote build farm, Bazel) can be swapped in without
 /// touching the deploy orchestration.
+// Clippy 1.99 reports double_must_use inside the async_trait expansion of
+// this trait (CI only; the expansion is not ours to change).
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait BuildBackend: Send + Sync {
     async fn build(&self, repo_path: &Path, package: Option<&str>) -> Result<BuildOutput>;

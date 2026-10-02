@@ -9,6 +9,9 @@ use russel_core::config::RuntimeKind;
 /// (microVM uses Cloud Hypervisor, container uses podman) and asymmetric
 /// with teardown. Future work may extract a full `RuntimeDeploy` trait
 /// once boot is restructured into swappable stages.
+// Clippy 1.99 reports double_must_use inside the async_trait expansion of
+// this trait (CI only; the expansion is not ours to change).
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait RuntimeLifecycle: Send + Sync {
     async fn stop(&self, service_id: &str) -> anyhow::Result<()>;

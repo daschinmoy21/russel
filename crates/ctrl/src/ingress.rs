@@ -179,6 +179,9 @@ pub struct HostRule {
 /// Deploy, stop, destroy talk only to this trait — never Traefik types.
 /// `TraefikFileIngress` is the default implementation. Future proxies
 /// (Caddy, Envoy, NGINX) implement the same trait.
+// Clippy 1.99 reports double_must_use inside the async_trait expansion of
+// this trait (CI only; the expansion is not ours to change).
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait Ingress: Send + Sync {
     /// Advertise a service backend with host rules.
