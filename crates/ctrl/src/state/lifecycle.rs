@@ -27,6 +27,12 @@ impl AppState {
             );
         }
         let s = inner.services.entry(service_id.to_string()).or_default();
+        Self::begin_building(s);
+        Ok(())
+    }
+
+    /// The `building` transition shared by every claim.
+    fn begin_building(s: &mut ServiceState) {
         // Capture prior state for failure recovery during redeployment.
         s.prebuild_status = Some(s.status);
         s.prebuild_vm_state = Some(s.vm_state);
@@ -40,7 +46,6 @@ impl AppState {
             VmState::Running if s.vm_process.is_none() => s.vm_state = VmState::Pending,
             _ => {}
         }
-        Ok(())
     }
 
     /// Atomically register the VM and its auxiliary children.
@@ -308,6 +313,42 @@ impl AppState {
         }
 
         self.persist_catalog();
+    }
+
+    /// [`Self::mark_building`] for a health restart: claims the service only
+    /// while it is still `failed` at the process generation whose probe
+    /// failed. A stop, destroy or deploy since then changed the status (or,
+    /// through `take_processes` and a new deployment, the generation), and
+    /// the restart must not override it (#556).
+    pub fn mark_building_if_failed(
+        &self,
+        service_id: &str,
+        failed_generation: u64,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.lock_inner();
+        match inner.services.get_mut(service_id) {
+            Some(s)
+                if s.status == ServiceStatus::Failed
+                    && s.process_generation == failed_generation =>
+            {
+                Self::begin_building(s);
+                Ok(())
+            }
+            _ => anyhow::bail!(
+                "service {service_id} changed since its health check failed; restart skipped"
+            ),
+        }
+    }
+
+    /// The process generation of a service that is currently deployed and
+    /// running, or `None` for any other state. A health probe captures this
+    /// when it samples the service and hands it back to
+    /// [`Self::mark_failed_if_generation`] with its result.
+    pub fn deployed_generation(&self, service_id: &str) -> Option<u64> {
+        let inner = self.lock_inner();
+        let s = inner.services.get(service_id)?;
+        (s.status == ServiceStatus::Deployed && s.vm_state == VmState::Running)
+            .then_some(s.process_generation)
     }
 
     /// Atomically mark a service failed only if the current generation matches
@@ -729,6 +770,8 @@ impl AppState {
             guest_port: guest_port.or_else(|| disk.as_ref().and_then(|m| m.guest_port)),
             route_host,
             restarts,
+            requested: disk.as_ref().and_then(|m| m.requested),
+            effective: disk.as_ref().and_then(|m| m.effective),
         })
     }
 

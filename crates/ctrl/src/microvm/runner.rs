@@ -524,7 +524,7 @@ impl MicrovmRunner {
                 }
             }
         }
-        let mem_mb = spec.memory_mb.max(256);
+        let mem_mb = super::spec::effective_memory_mb(spec.memory_mb);
 
         // A VM that died leaves its API socket behind, and cloud-hypervisor
         // refuses to start on it (EADDRINUSE). Relaunches in place hit this.

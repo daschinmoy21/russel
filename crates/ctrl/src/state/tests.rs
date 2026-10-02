@@ -972,3 +972,157 @@ async fn aborted_stop_restores_process_supervisor_that_detects_exit() {
     let logs = state.logs("svc-abort-exit").unwrap();
     assert!(logs.output.contains("PROCESS EXIT"), "{}", logs.output);
 }
+
+/// A deployed, running service as the health loop samples it.
+fn deployed_service(state: &AppState, id: &str) {
+    state.ensure_service(id);
+    state.set_status(id, ServiceStatus::Deployed, VmState::Running);
+}
+
+/// #556: a probe result that lands after a deploy started must not release
+/// the deploy's claim on the service.
+#[test]
+fn late_health_failure_must_not_release_active_deploy_claim() {
+    let state = AppState::default();
+    let id = "health-race-deploy";
+    deployed_service(&state, id);
+    let probed = state.deployed_generation(id).unwrap();
+
+    state.mark_building(id).unwrap();
+    assert!(!state.mark_failed_if_generation(id, probed, "late probe".into()));
+
+    assert!(
+        state.mark_building(id).is_err(),
+        "second deployment admitted while the first is still running"
+    );
+    assert_eq!(
+        state.status(id).unwrap().status,
+        ServiceStatus::Building.as_str()
+    );
+}
+
+/// #556: a probe held across a finished deploy cannot fail the new generation.
+#[test]
+fn late_health_failure_cannot_fail_the_next_generation() {
+    let state = AppState::default();
+    let id = "health-race-generation";
+    deployed_service(&state, id);
+    let probed = state.deployed_generation(id).unwrap();
+
+    state.mark_building(id).unwrap();
+    // The pipeline finished: running again under a new process generation.
+    {
+        let mut inner = state.lock_inner();
+        let s = inner.services.get_mut(id).unwrap();
+        s.status = ServiceStatus::Deployed;
+        s.vm_state = VmState::Running;
+        s.process_generation += 1;
+    }
+
+    assert_ne!(state.deployed_generation(id), Some(probed));
+    assert!(!state.mark_failed_if_generation(id, probed, "late probe".into()));
+    assert_eq!(
+        state.status(id).unwrap().status,
+        ServiceStatus::Deployed.as_str()
+    );
+}
+
+/// #556: a probe held across stop or destroy cannot change the service or
+/// admit another operation.
+#[test]
+fn late_health_failure_cannot_touch_stop_or_destroy() {
+    let state = AppState::default();
+    let id = "health-race-stop";
+    deployed_service(&state, id);
+    let probed = state.deployed_generation(id).unwrap();
+
+    let claim = state.begin_lifecycle_operation(id, ServiceStatus::Stopping, VmState::Pending);
+    assert!(matches!(claim, LifecycleClaim::Claimed { .. }));
+    assert!(!state.mark_failed_if_generation(id, probed, "late probe".into()));
+    assert!(matches!(
+        state.begin_lifecycle_operation(id, ServiceStatus::Stopping, VmState::Pending),
+        LifecycleClaim::Busy
+    ));
+
+    let id = "health-race-destroy";
+    deployed_service(&state, id);
+    let probed = state.deployed_generation(id).unwrap();
+    state.remove_service(id);
+    assert!(!state.mark_failed_if_generation(id, probed, "late probe".into()));
+    assert!(
+        state.status(id).is_none(),
+        "late probe recreated a destroyed service"
+    );
+    state.mark_building(id).unwrap();
+    assert!(state.mark_building(id).is_err());
+}
+
+/// A service the health loop marked failed after probing generation `G`;
+/// returns `G`.
+fn health_failed_service(state: &AppState, id: &str) -> u64 {
+    deployed_service(state, id);
+    let probed = state.deployed_generation(id).unwrap();
+    assert!(state.mark_failed_if_generation(id, probed, "3 failed probes".into()));
+    probed
+}
+
+/// #556 review: a queued health restart claims the service only while it is
+/// still failed at the probed generation.
+#[test]
+fn health_restart_claims_a_service_still_failed_at_the_probed_generation() {
+    let state = AppState::default();
+    let id = "health-restart-claim";
+    let failed = health_failed_service(&state, id);
+    state.mark_building_if_failed(id, failed).unwrap();
+    assert_eq!(
+        state.status(id).unwrap().status,
+        ServiceStatus::Building.as_str()
+    );
+    assert!(state.mark_building(id).is_err());
+}
+
+/// #556 review: an operator stop after the failed probe wins over the
+/// restart, whenever the restart gets to its claim.
+#[test]
+fn health_restart_cannot_override_an_operator_stop() {
+    let state = AppState::default();
+    let id = "health-restart-stop";
+    let failed = health_failed_service(&state, id);
+
+    let claim = state.begin_lifecycle_operation(id, ServiceStatus::Stopping, VmState::Pending);
+    assert!(matches!(claim, LifecycleClaim::Claimed { .. }));
+    assert!(state.mark_building_if_failed(id, failed).is_err());
+    state.set_status(id, ServiceStatus::Stopped, VmState::None);
+    assert!(state.mark_building_if_failed(id, failed).is_err());
+    assert_eq!(
+        state.status(id).unwrap().status,
+        ServiceStatus::Stopped.as_str()
+    );
+}
+
+/// #556 review: a restart queued for one failure cannot claim the service
+/// after a newer deployment failed again, or after a destroy.
+#[test]
+fn health_restart_is_tied_to_its_failure() {
+    let state = AppState::default();
+    let id = "health-restart-newer";
+    let failed = health_failed_service(&state, id);
+    // An operator redeploy ran, came up under a new generation and failed.
+    state.mark_building(id).unwrap();
+    {
+        let mut inner = state.lock_inner();
+        let s = inner.services.get_mut(id).unwrap();
+        s.status = ServiceStatus::Deployed;
+        s.vm_state = VmState::Running;
+        s.process_generation += 1;
+    }
+    let newer = state.deployed_generation(id).unwrap();
+    assert!(state.mark_failed_if_generation(id, newer, "crashed".into()));
+    assert!(state.mark_building_if_failed(id, failed).is_err());
+
+    let id = "health-restart-destroyed";
+    let failed = health_failed_service(&state, id);
+    state.remove_service(id);
+    assert!(state.mark_building_if_failed(id, failed).is_err());
+    assert!(state.status(id).is_none());
+}

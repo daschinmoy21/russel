@@ -425,6 +425,8 @@ pub struct DeployPipeline {
     pub(crate) ports: PortAllocator,
     pub(crate) ingress: Arc<dyn Ingress>,
     claimed_id: Arc<OnceLock<String>>,
+    /// Set for a health restart: the process generation whose probe failed.
+    restart_of: Option<u64>,
 }
 
 impl std::fmt::Debug for DeployPipeline {
@@ -438,6 +440,7 @@ impl std::fmt::Debug for DeployPipeline {
             .field("ports", &self.ports)
             .field("ingress", &"Arc<dyn Ingress>")
             .field("claimed_id", &self.claimed_id.get())
+            .field("restart_of", &self.restart_of)
             .finish()
     }
 }
@@ -457,7 +460,17 @@ impl DeployPipeline {
             ports: PortAllocator,
             ingress: ingress::default_ingress(),
             claimed_id: Arc::default(),
+            restart_of: None,
         }
+    }
+
+    /// Run as a health restart of the service that failed at
+    /// `failed_generation`. The deploy claims the service only while it is
+    /// still failed there, so a stop, destroy or deploy since the failed
+    /// probe wins (#556).
+    pub fn for_health_restart(mut self, failed_generation: u64) -> Self {
+        self.restart_of = Some(failed_generation);
+        self
     }
 
     /// Slot that holds the service id once this pipeline has claimed it
@@ -514,7 +527,11 @@ impl DeployPipeline {
             return response;
         }
 
-        if let Err(e) = self.state.mark_building(&service_id) {
+        let claim = match self.restart_of {
+            Some(generation) => self.state.mark_building_if_failed(&service_id, generation),
+            None => self.state.mark_building(&service_id),
+        };
+        if let Err(e) = claim {
             tracing::error!(service_id = %service_id, error = %e, "deploy rejected: service busy");
             return rejected_response(service_id, started, runtime, e);
         }

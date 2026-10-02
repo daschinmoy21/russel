@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use russel_core::api::ResourceLimits;
 use russel_core::config::RuntimeKind;
 
 #[cfg(unix)]
@@ -107,6 +108,10 @@ pub struct LoadedMetadata {
     pub vm_ip: Option<String>,
     /// Ingress host from the `desired_state` blob (`ingress_host`), if any.
     pub ingress_host: Option<String>,
+    /// Limits asked for by the last deploy.
+    pub requested: Option<ResourceLimits>,
+    /// Limits the runtime applied (absent in older metadata).
+    pub effective: Option<ResourceLimits>,
 }
 
 /// Full on-disk record for a service, used by startup reconcile to rehydrate
@@ -150,6 +155,32 @@ fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 /// An integer field, `None` when absent, not a number, or out of `T`'s range.
+/// Record the limits the runtime applied, next to the requested `mem_mb` and
+/// `cpus`. `cpus: None` means no CPU limit is enforced.
+pub fn record_effective_resources(meta: &mut serde_json::Value, mem_mb: u16, cpus: Option<u8>) {
+    meta["effective"] = serde_json::json!({ "mem_mb": mem_mb, "cpus": cpus });
+}
+
+/// Requested and effective limits from a metadata document. Metadata written
+/// before `effective` existed yields only the requested side.
+fn resources_from_metadata(
+    value: &serde_json::Value,
+) -> (Option<ResourceLimits>, Option<ResourceLimits>) {
+    let requested = ResourceLimits {
+        memory_mb: int_field(value, "mem_mb"),
+        cpus: int_field(value, "cpus"),
+    };
+    let requested = (requested != ResourceLimits::default()).then_some(requested);
+    let effective = value
+        .get("effective")
+        .map(|e| ResourceLimits {
+            memory_mb: int_field(e, "mem_mb"),
+            cpus: int_field(e, "cpus"),
+        })
+        .filter(|e| *e != ResourceLimits::default());
+    (requested, effective)
+}
+
 fn int_field<T: TryFrom<u64>>(value: &serde_json::Value, key: &str) -> Option<T> {
     T::try_from(value.get(key)?.as_u64()?).ok()
 }
@@ -226,6 +257,7 @@ pub fn prior_runtime_from_disk(service_id: &str) -> Result<Option<RuntimeKind>, 
 pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
     let content = std::fs::read_to_string(metadata_path(service_id)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let (requested, effective) = resources_from_metadata(&value);
     Some(LoadedMetadata {
         runtime: runtime_field(&value),
         host_port: int_field(&value, "host_port"),
@@ -234,6 +266,8 @@ pub fn load_metadata_from_disk(service_id: &str) -> Option<LoadedMetadata> {
         vm_ip: str_field(&value, "vm_ip").filter(|s| !s.is_empty()),
         ingress_host: crate::deployments::DesiredStateSnapshot::from_metadata_desired_state(&value)
             .ingress_host,
+        requested,
+        effective,
     })
 }
 
@@ -865,6 +899,50 @@ mod tests {
             None,
         );
         assert!(meta.get("podman_args").is_none());
+    }
+
+    #[test]
+    fn resources_record_requested_and_effective_separately() {
+        let mut meta = build_container_metadata(
+            "api",
+            3100,
+            3000,
+            "/nix/store/app",
+            "abc",
+            "russel-api",
+            "/r",
+            512,
+            None,
+            &[],
+            None,
+        );
+        meta["cpus"] = serde_json::json!(2);
+        record_effective_resources(&mut meta, 512, None);
+        let (requested, effective) = resources_from_metadata(&meta);
+        assert_eq!(
+            requested,
+            Some(ResourceLimits {
+                memory_mb: Some(512),
+                cpus: Some(2)
+            })
+        );
+        assert_eq!(
+            effective,
+            Some(ResourceLimits {
+                memory_mb: Some(512),
+                cpus: None
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_effective_still_reads() {
+        let legacy = serde_json::json!({ "runtime": "container", "mem_mb": 256, "cpus": 1 });
+        let (requested, effective) = resources_from_metadata(&legacy);
+        assert_eq!(requested.and_then(|r| r.cpus), Some(1));
+        assert!(effective.is_none());
+        let empty = serde_json::json!({ "runtime": "container", "effective": {} });
+        assert!(resources_from_metadata(&empty).1.is_none());
     }
 
     #[test]

@@ -599,6 +599,11 @@ impl RecordedMicrovm {
             None,
             None,
         );
+        crate::metadata::record_effective_resources(
+            &mut meta,
+            crate::microvm::effective_memory_mb(mem_mb),
+            Some(cpus),
+        );
         net.record(&mut meta);
         let aux = net.into_aux(virtiofsd_children);
 
@@ -817,6 +822,11 @@ pub(crate) async fn attempt_container_rollback(
     if let Some(cpus) = start_spec.cpus {
         new_metadata["cpus"] = serde_json::json!(cpus);
     }
+    crate::metadata::record_effective_resources(
+        &mut new_metadata,
+        old_mem_mb,
+        running.effective_cpus,
+    );
     // Preserve desired_state from old metadata for future rollbacks (F-04).
     if let Some(ds) = old_meta.get("desired_state")
         && let Some(obj) = new_metadata.as_object_mut()

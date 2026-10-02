@@ -51,6 +51,10 @@ import DestroyDialog from '../components/DestroyDialog.astro';
             <span class="stat-label">Uptime</span>
             <span class="stat-value" id="statUptime">Loading…</span>
           </div>
+          <div class="stat-item hidden" id="statLimitsItem">
+            <span class="stat-label">Limits not applied</span>
+            <span class="stat-value" id="statLimits"></span>
+          </div>
         </div>
 
         <div class="action-bar">
@@ -187,6 +191,11 @@ import DestroyDialog from '../components/DestroyDialog.astro';
     if (statRoute) statRoute.textContent = service.route_host || '—';
     if (statVmState) statVmState.textContent = service.vm_state || 'unknown';
     if (statUptime) statUptime.textContent = formatUptime(service.uptime_seconds);
+    const limitsItem = document.getElementById('statLimitsItem');
+    const statLimits = document.getElementById('statLimits');
+    const unapplied = service.unapplied_limits ?? [];
+    if (limitsItem) limitsItem.classList.toggle('hidden', unapplied.length === 0);
+    if (statLimits) statLimits.textContent = unapplied.join('; ');
     serviceLabel = service.name || service.id;
   }
 

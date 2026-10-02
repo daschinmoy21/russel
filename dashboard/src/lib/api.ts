@@ -53,6 +53,37 @@ export interface VmsResponse {
 	services: ServiceSummary[];
 }
 
+export interface ResourceLimits {
+	memory_mb?: number | null;
+	cpus?: number | null;
+}
+
+/** Notes for each limit the runtime did not apply as requested (mirrors the CLI). */
+export function unappliedLimits(
+	requested?: ResourceLimits | null,
+	effective?: ResourceLimits | null,
+): string[] {
+	if (!requested || !effective) return [];
+	const notes: string[] = [];
+	if (requested.cpus != null && (effective.cpus ?? null) !== requested.cpus) {
+		notes.push(
+			effective.cpus == null
+				? `cpus: requested ${requested.cpus}, not applied (no cpu limit)`
+				: `cpus: requested ${requested.cpus}, applied ${effective.cpus}`,
+		);
+	}
+	if (
+		requested.memory_mb != null &&
+		effective.memory_mb != null &&
+		requested.memory_mb !== effective.memory_mb
+	) {
+		notes.push(
+			`memory: requested ${requested.memory_mb} MiB, applied ${effective.memory_mb} MiB`,
+		);
+	}
+	return notes;
+}
+
 export interface StatusResponse {
 	service_id: string;
 	status: string;
@@ -62,6 +93,8 @@ export interface StatusResponse {
 	host_port?: number;
 	guest_port?: number;
 	route_host?: string | null;
+	requested?: ResourceLimits | null;
+	effective?: ResourceLimits | null;
 }
 
 export interface LogsResponse {
@@ -102,6 +135,8 @@ export interface ServiceVM {
 	guest_port?: number;
 	ports?: string; // "host:guest" display string
 	route_host?: string | null;
+	/** Limits the runtime did not apply as requested; empty when all applied. */
+	unapplied_limits?: string[];
 }
 
 export interface FleetStatus {
@@ -1408,6 +1443,7 @@ export class RusselClient {
 				guest_port: data.guest_port,
 				ports: portDisplay(data.host_port, data.guest_port),
 				route_host: data.route_host ?? null,
+				unapplied_limits: unappliedLimits(data.requested, data.effective),
 			};
 			return { service: svc, connection: "live", isDemo: false };
 		} catch {

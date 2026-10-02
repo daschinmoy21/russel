@@ -998,6 +998,9 @@ fn print_status(r: &StatusResponse) {
         (None, None) => {}
     }
     ui::kv("uptime", &ui::format_uptime(r.uptime_seconds));
+    for note in r.unapplied_limits() {
+        ui::kv("limit", &note);
+    }
     println!();
 }
 

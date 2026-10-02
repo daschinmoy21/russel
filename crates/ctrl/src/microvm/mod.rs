@@ -12,7 +12,7 @@ pub use process::{
     BootOutput, cloud_hypervisor_cmdline_matches, cloud_hypervisor_cmdline_matches_under,
 };
 pub use runner::MicrovmRunner;
-pub use spec::{FsCache, FsMount, KernelInfo, VmSpec};
+pub use spec::{FsCache, FsMount, KernelInfo, MIN_MEMORY_MB, VmSpec, effective_memory_mb};
 pub(crate) use spec::{
     check_volume_guest_paths, ensure_private_dir, render_guest_mounts, service_fs_mounts,
     volume_fs_mounts,

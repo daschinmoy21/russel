@@ -461,7 +461,7 @@ impl WarmPool {
             cmdline: "console=ttyS0 panic=-1 random.trust_cpu=on net.ifnames=0".into(),
             cpus_boot: 1,
             cpus_max: env_cpu_max(),
-            memory_mb: memory_mb.max(256),
+            memory_mb: crate::microvm::effective_memory_mb(memory_mb),
             memory_hotplug_mb: env_mem_hotplug_mb(),
             net: VmNet::Tap(alloc.tap_id.clone()),
             mac: alloc.mac.clone(),

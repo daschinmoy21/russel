@@ -114,6 +114,8 @@ pub struct RunningContainer {
     pub container_name: String,
     pub container_id: String,
     pub rootfs_path: PathBuf,
+    /// The `--cpus` limit podman was started with; `None` when none applies.
+    pub effective_cpus: Option<u8>,
 }
 
 impl ContainerRunner {
@@ -180,6 +182,7 @@ impl ContainerRunner {
         let log_path = container_log_path(&spec.service_id);
         let mut args = build_run_args(spec, &log_path)?;
         let info = Self::rootless_info().await?;
+        let mut effective_cpus = spec.cpus;
         // Rootless `--cpus` needs the cpu controller delegated to the podman
         // user; without it `podman run` refuses to start. Run unlimited and
         // say so rather than fail every deploy (cpus defaults to 1).
@@ -194,6 +197,7 @@ impl ContainerRunner {
                 ..spec.clone()
             };
             args = build_run_args(&unlimited, &log_path)?;
+            effective_cpus = None;
         }
 
         let name = Self::container_name(&spec.service_id);
@@ -274,6 +278,7 @@ impl ContainerRunner {
             container_name: name,
             container_id,
             rootfs_path: spec.rootfs.rootfs_path.clone(),
+            effective_cpus,
         })
     }
 
@@ -651,6 +656,7 @@ impl ContainerRunner {
             container_name: name,
             container_id,
             rootfs_path,
+            effective_cpus: None,
         }))
     }
 }

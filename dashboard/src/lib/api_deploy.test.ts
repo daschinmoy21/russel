@@ -10,6 +10,7 @@ import {
 	reduceDeployEvents,
 	type DeployResponse,
 	type StatusResponse,
+	unappliedLimits,
 } from "./api";
 
 const deployed: DeployResponse = {
@@ -225,5 +226,25 @@ describe("route_host", () => {
 			'{"service_id":"a","status":"deployed","vm_state":"running","uptime_seconds":1}',
 		) as StatusResponse;
 		expect(legacy.route_host).toBeUndefined();
+	});
+});
+
+describe("unappliedLimits", () => {
+	test("reports a dropped cpu limit and a raised memory floor", () => {
+		const notes = unappliedLimits(
+			{ memory_mb: 128, cpus: 2 },
+			{ memory_mb: 256, cpus: null },
+		);
+		expect(notes).toEqual([
+			"cpus: requested 2, not applied (no cpu limit)",
+			"memory: requested 128 MiB, applied 256 MiB",
+		]);
+	});
+
+	test("is empty when limits match or effective values were not recorded", () => {
+		const same = { memory_mb: 256, cpus: 1 };
+		expect(unappliedLimits(same, same)).toEqual([]);
+		expect(unappliedLimits(same, undefined)).toEqual([]);
+		expect(unappliedLimits(undefined, undefined)).toEqual([]);
 	});
 });

@@ -92,13 +92,25 @@ fn apply_restart_response(status: &str) -> RestartApply {
     }
 }
 
+/// Count one more failed probe of `id` at `generation` and return the
+/// consecutive count. A probe of a different generation starts over: failures
+/// of a replaced deployment never count toward its successor (#556).
+fn record_failure(failures: &mut HashMap<String, (u64, u32)>, id: &str, generation: u64) -> u32 {
+    let entry = failures.entry(id.to_string()).or_insert((generation, 0));
+    if entry.0 != generation {
+        *entry = (generation, 0);
+    }
+    entry.1 += 1;
+    entry.1
+}
+
 /// Spawn the background health loop. Failures never take down the control plane.
 pub fn spawn_health_loop(state: AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
     tokio::spawn(async move {
-        let mut failures: HashMap<String, u32> = HashMap::new();
+        let mut failures: HashMap<String, (u64, u32)> = HashMap::new();
         // Track services we already warned about (no probe target) to avoid spam;
         // re-warn after the set is cleared when the service leaves deployed/running.
         let mut no_probe_warned: HashSet<String> = HashSet::new();
@@ -114,11 +126,19 @@ pub fn spawn_health_loop(state: AppState) {
             let ids = state.list_services();
             let mut checks = tokio::task::JoinSet::new();
             for id in ids {
+                // Capture the generation before reading ports so a result can
+                // only apply to the deployment that was sampled (#556).
+                let Some(generation) = state.deployed_generation(&id) else {
+                    failures.remove(&id);
+                    no_probe_warned.remove(&id);
+                    continue;
+                };
                 let Some(status) = state.status(&id) else {
                     continue;
                 };
                 if status.status != ServiceStatus::Deployed.as_str()
                     || status.vm_state != VmState::Running.as_str()
+                    || state.deployed_generation(&id) != Some(generation)
                 {
                     failures.remove(&id);
                     no_probe_warned.remove(&id);
@@ -148,12 +168,12 @@ pub fn spawn_health_loop(state: AppState) {
                 // Bracket IPv6 literals so `TcpStream::connect` parses correctly.
                 checks.spawn(async move {
                     let reachable = check(&addr).await;
-                    (id, addr, reachable)
+                    (id, addr, generation, reachable)
                 });
             }
 
             while let Some(result) = checks.join_next().await {
-                let (id, addr, reachable) = match result {
+                let (id, addr, generation, reachable) = match result {
                     Ok(result) => result,
                     Err(error) => {
                         tracing::error!(%error, "health probe task failed");
@@ -164,22 +184,31 @@ pub fn spawn_health_loop(state: AppState) {
                     failures.remove(&id);
                     continue;
                 }
-                let count = failures.entry(id.clone()).or_insert(0);
-                *count += 1;
+                let count = record_failure(&mut failures, &id, generation);
                 tracing::warn!(
                     service_id = %id,
                     %addr,
-                    consecutive_failures = *count,
+                    consecutive_failures = count,
                     "health check failed"
                 );
-                if *count < 3 {
+                if count < 3 {
                     continue;
                 }
                 failures.remove(&id);
-                state.mark_failed(
+                // Apply only to the generation that was probed. A deploy,
+                // stop or destroy that ran during the probe changed it, and
+                // its claim on the service must stay intact.
+                if !state.mark_failed_if_generation(
                     &id,
+                    generation,
                     format!("health check failed for {addr} (3 consecutive probes)"),
-                );
+                ) {
+                    tracing::info!(
+                        service_id = %id,
+                        "health: dropped stale probe result (service changed during probe)"
+                    );
+                    continue;
+                }
                 if restart_enabled() {
                     let restart_state = state.clone();
                     let restart_id = id.clone();
@@ -187,7 +216,7 @@ pub fn spawn_health_loop(state: AppState) {
                     // so a concurrent deploy wave does not permanently drop the intent.
                     tokio::spawn(async move {
                         for attempt in 0u32..6 {
-                            match try_auto_restart(&restart_state, &restart_id).await {
+                            match try_auto_restart(&restart_state, &restart_id, generation).await {
                                 RestartOutcome::SkippedSemaphore if attempt + 1 < 6 => {
                                     tokio::time::sleep(Duration::from_secs(10)).await;
                                 }
@@ -212,9 +241,31 @@ enum RestartOutcome {
     SkippedNoSource,
     /// Deploy concurrency limit hit; caller may retry later.
     SkippedSemaphore,
+    /// The service is no longer in the `failed` state this restart was queued
+    /// for (stopped, destroyed or redeployed meanwhile), or the restart was
+    /// rejected before it claimed the service.
+    SkippedStale,
 }
 
-async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome {
+async fn try_auto_restart(
+    state: &AppState,
+    service_id: &str,
+    failed_generation: u64,
+) -> RestartOutcome {
+    // The restart was queued after a failed probe and may retry for a minute.
+    // Only act while the service is still failed, so a stop, destroy or a
+    // newer deploy in between is never overridden. This check is only an
+    // early exit: the pipeline claims the service with
+    // `mark_building_if_failed`, which makes the same check atomically.
+    if state.status(service_id).map(|s| s.status)
+        != Some(ServiceStatus::Failed.as_str().to_string())
+    {
+        tracing::info!(
+            service_id,
+            "health restart skipped: service is no longer failed"
+        );
+        return RestartOutcome::SkippedStale;
+    }
     let Some(request) = load_restart_request(service_id).await else {
         tracing::warn!(
             service_id,
@@ -240,11 +291,23 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
         repo = %crate::git::redact_repo_url(&request.repo_url),
         "health restart: redeploying from recorded source"
     );
-    let pipeline = DeployPipeline::new(state.clone());
+    let pipeline = DeployPipeline::new(state.clone()).for_health_restart(failed_generation);
+    let claimed = pipeline.claimed_service_id();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     // Drain events so the channel never fills.
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let response = pipeline.deploy(request, tx).await;
+    if claimed.get().is_none() {
+        // Rejected before the claim: the service changed since the failed
+        // probe, or the source could not be loaded. Nothing ran, so leave the
+        // service as it is now.
+        tracing::info!(
+            service_id,
+            message = %response.message,
+            "health restart did not run"
+        );
+        return RestartOutcome::SkippedStale;
+    }
 
     match apply_restart_response(&response.status) {
         RestartApply::Succeeded => {
@@ -273,15 +336,8 @@ async fn try_auto_restart(state: &AppState, service_id: &str) -> RestartOutcome 
                 message = %response.message,
                 "health restart failed"
             );
-            // Hard failures: pipeline already mark_failed; re-append with a clear
-            // restart prefix.
-            state.mark_failed(
-                service_id,
-                format!(
-                    "health restart failed (status={}): {}",
-                    response.status, response.message
-                ),
-            );
+            // The pipeline marked the service failed while it held the claim.
+            // Marking it again here could override a stop that came after.
             RestartOutcome::Failed
         }
     }
@@ -321,6 +377,18 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn failure_counts_start_over_for_a_new_generation() {
+        let mut failures = HashMap::new();
+        assert_eq!(record_failure(&mut failures, "api", 7), 1);
+        assert_eq!(record_failure(&mut failures, "api", 7), 2);
+        // Redeployed between probes: the old generation's failures are gone.
+        assert_eq!(record_failure(&mut failures, "api", 8), 1);
+        assert_eq!(record_failure(&mut failures, "api", 8), 2);
+        assert_eq!(record_failure(&mut failures, "other", 8), 1);
+        assert_eq!(record_failure(&mut failures, "api", 8), 3);
     }
 
     #[test]

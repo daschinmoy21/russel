@@ -268,6 +268,8 @@ async fn vm_status(
             guest_port: agent_status.guest_port,
             route_host: None,
             restarts: None,
+            requested: None,
+            effective: None,
         }));
     }
 

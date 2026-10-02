@@ -175,6 +175,11 @@ impl DeployPipeline {
             Some(&slot.generation_id),
             net.tap_id(&alloc),
         );
+        crate::metadata::record_effective_resources(
+            &mut meta,
+            crate::microvm::effective_memory_mb(mem_mb),
+            Some(config.service.cpus),
+        );
         net.record(&mut meta);
         attach_desired_state(&mut meta, plan.desired_state.as_ref());
         write_metadata(&metadata_path, &meta)?;
@@ -371,6 +376,7 @@ impl DeployPipeline {
             Some(&slot.generation_id),
         );
         metadata["cpus"] = serde_json::json!(config.service.cpus);
+        crate::metadata::record_effective_resources(&mut metadata, mem_mb, running.effective_cpus);
         attach_desired_state(&mut metadata, plan.desired_state.as_ref());
         write_metadata(&metadata_path, &metadata)?;
 

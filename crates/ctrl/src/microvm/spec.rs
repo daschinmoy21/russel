@@ -2,6 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// Smallest boot memory the guest kernel and initramfs need. The runner
+/// raises a smaller `service.memory` to this (documented in the Russelfile
+/// reference), so deploy metadata records both values.
+pub const MIN_MEMORY_MB: u16 = 256;
+
+/// Boot memory a microVM really gets for a requested `service.memory`.
+pub fn effective_memory_mb(requested_mb: u16) -> u16 {
+    requested_mb.max(MIN_MEMORY_MB)
+}
+
 /// Filesystem mount for Cloud Hypervisor `--fs` arguments.
 #[derive(Debug, Clone)]
 pub struct FsMount {
@@ -217,4 +227,16 @@ pub(crate) fn render_guest_mounts(volumes: &[russel_core::volumes::ResolvedVolum
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod memory_floor_tests {
+    use super::*;
+
+    #[test]
+    fn memory_below_the_floor_is_raised() {
+        assert_eq!(effective_memory_mb(128), MIN_MEMORY_MB);
+        assert_eq!(effective_memory_mb(256), 256);
+        assert_eq!(effective_memory_mb(1024), 1024);
+    }
 }

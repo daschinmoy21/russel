@@ -251,6 +251,50 @@ pub struct StatusResponse {
     /// since its last deploy. Omitted when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restarts: Option<u32>,
+    /// Limits the Russelfile asked for, from the last deploy's metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<ResourceLimits>,
+    /// Limits the runtime applied. Absent for deploys recorded before this
+    /// field existed; `cpus: None` there means no CPU limit is enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<ResourceLimits>,
+}
+
+/// Resource limits for a service. `None` means unset (requested) or not
+/// enforced (effective).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ResourceLimits {
+    /// Memory in MiB.
+    #[serde(default)]
+    pub memory_mb: Option<u16>,
+    /// vCPUs (microVM) or the `--cpus` limit (container).
+    #[serde(default)]
+    pub cpus: Option<u8>,
+}
+
+impl StatusResponse {
+    /// Human-readable notes for each limit the runtime did not apply as
+    /// requested. Empty when nothing was recorded or everything matched.
+    pub fn unapplied_limits(&self) -> Vec<String> {
+        let (Some(req), Some(eff)) = (self.requested, self.effective) else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        if let Some(want) = req.cpus
+            && eff.cpus != Some(want)
+        {
+            notes.push(match eff.cpus {
+                None => format!("cpus: requested {want}, not applied (no cpu limit)"),
+                Some(got) => format!("cpus: requested {want}, applied {got}"),
+            });
+        }
+        if let (Some(want), Some(got)) = (req.memory_mb, eff.memory_mb)
+            && want != got
+        {
+            notes.push(format!("memory: requested {want} MiB, applied {got} MiB"));
+        }
+        notes
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -593,6 +637,8 @@ mod tests {
             guest_port: None,
             route_host: None,
             restarts: None,
+            requested: None,
+            effective: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -612,6 +658,8 @@ mod tests {
             guest_port: Some(3000),
             route_host: Some("api.example.com".into()),
             restarts: None,
+            requested: None,
+            effective: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"runtime\":\"container\""));
@@ -895,5 +943,59 @@ mod tests {
         assert!("".parse::<VmState>().is_err());
         assert!("NONE".parse::<VmState>().is_err());
         assert!(VmState::try_from("orphaned").is_ok());
+    }
+
+    fn status_with(
+        requested: Option<ResourceLimits>,
+        effective: Option<ResourceLimits>,
+    ) -> StatusResponse {
+        StatusResponse {
+            service_id: "svc".into(),
+            status: "deployed".into(),
+            vm_state: "running".into(),
+            uptime_seconds: 0,
+            runtime: None,
+            host_port: None,
+            guest_port: None,
+            route_host: None,
+            restarts: None,
+            requested,
+            effective,
+        }
+    }
+
+    #[test]
+    fn unapplied_limits_reports_dropped_cpus_and_raised_memory() {
+        let req = ResourceLimits {
+            memory_mb: Some(128),
+            cpus: Some(2),
+        };
+        let eff = ResourceLimits {
+            memory_mb: Some(256),
+            cpus: None,
+        };
+        let notes = status_with(Some(req), Some(eff)).unapplied_limits();
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("not applied"));
+        assert!(notes[1].contains("256 MiB"));
+    }
+
+    #[test]
+    fn unapplied_limits_empty_when_matching_or_unrecorded() {
+        let same = ResourceLimits {
+            memory_mb: Some(256),
+            cpus: Some(1),
+        };
+        assert!(
+            status_with(Some(same), Some(same))
+                .unapplied_limits()
+                .is_empty()
+        );
+        assert!(status_with(Some(same), None).unapplied_limits().is_empty());
+        let legacy: StatusResponse = serde_json::from_str(
+            r#"{"service_id":"a","status":"idle","vm_state":"none","uptime_seconds":0}"#,
+        )
+        .unwrap();
+        assert!(legacy.requested.is_none() && legacy.effective.is_none());
     }
 }

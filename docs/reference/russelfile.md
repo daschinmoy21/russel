@@ -50,10 +50,10 @@ port = 4000
 | `name` | string | required | The service's id, used by every command. Letters, digits, `_`, and `-`, 1 to 128 characters. `secrets`, `traefik`, `_pool`, and `_checkouts` are reserved. |
 | `source` | string | required | Folder to build, relative to the Russelfile. Usually `"."`. Must stay inside the repo: no `..`, no absolute path. |
 | `port` | integer | required | The port the app listens on. Russel passes it to the app as `PORT`. |
-| `memory` | string | required | Memory limit in megabytes: `"256mb"` or `"256mib"`. At least `16mb`, at most `65535mb`. `gb` isn't accepted. |
+| `memory` | string | required | Memory limit in megabytes: `"256mb"` or `"256mib"`. At least `16mb`, at most `65535mb`. `gb` isn't accepted. A microVM boots with at least `256mb`: a smaller value is raised to 256 and `russel status` shows both numbers. |
 | `type` | string | `"container"` | `"container"` or `"microvm"`. MicroVMs are experimental and need `/dev/kvm`, `cloud-hypervisor` v52+, `virtiofsd`, and `passt`; without them the deploy fails before building. See [Runtimes](../concepts/runtimes.md). |
 | `bin` | string | `name` | The binary the build produces, run as `$out/bin/<bin>`. Letters, digits, `.`, `_`, `+`, and `-`, up to 256 characters. |
-| `cpus` | integer | `1` | 1 to 32. The vCPU count for a microVM, or a CPU-time limit (`podman run --cpus`) for a container. A container limit needs the `cpu` cgroup controller delegated to the `russel` account; without it the container runs unlimited and Russel logs a warning. |
+| `cpus` | integer | `1` | 1 to 32. The vCPU count for a microVM, or a CPU-time limit (`podman run --cpus`) for a container. A container limit needs the `cpu` cgroup controller delegated to the `russel` account; without it the container runs unlimited and Russel logs a warning. `russel status` and the dashboard list the limit as not applied in that case. |
 | `package` | string | none | A nixpkgs attribute to run when the repo has no `flake.nix`, such as `"navidrome"`. A committed flake wins. If `bin` is unset, it defaults to the attribute's last part. |
 | `args` | list of strings | `[]` | Arguments passed to the app after its name. Up to 32, each up to 256 bytes, one line each. |
 | `podman_args` | list of strings | `[]` | Extra `podman run` flags, one flag or value per entry. Containers only. Up to 32. Flags that Russel sets itself or that weaken isolation are rejected. |
