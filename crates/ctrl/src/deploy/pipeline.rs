@@ -17,7 +17,7 @@ use russel_core::{
 use crate::{
     build::{self, BuildBackend},
     container::{ContainerRunner, attach_managed_volumes, detach_managed_volumes},
-    deployments::{self, DesiredStateSnapshot},
+    deployments::{self, DesiredStateSnapshot, GenerationArtifact},
     git::{GitClient, redact_repo_url},
     ingress::{self, Ingress},
     metadata::{rewrite_metadata_service_id, write_metadata},
@@ -26,7 +26,7 @@ use crate::{
     state::AppState,
 };
 
-use super::config::load_russelfile_under_repo;
+use super::config::load_russelfile_text_under_repo;
 
 /// Short random generation id (8 lowercase hex chars).
 pub(crate) fn new_generation_id() -> String {
@@ -368,14 +368,49 @@ pub(crate) enum DeployInnerResult {
     RolledBack { runtime: RuntimeKind, error: String },
 }
 
-/// Source checkout and Russelfile for one deploy, loaded before the service
-/// id is known. The lease keeps the checkout alive until the deploy ends.
+/// Source and Russelfile for one deploy, loaded before the service id is
+/// known.
 pub(super) struct ResolvedSource {
-    pub(super) repo_path: PathBuf,
-    pub(super) _checkout: crate::git::CheckoutLease,
+    pub(super) origin: SourceOrigin,
     pub(super) config: Russelfile,
+    /// The Russelfile's text, recorded with the generation (#558).
+    pub(super) russelfile: String,
     /// Commit the source builds; `None` outside git (#448).
     pub(super) rev: Option<crate::git::SourceRev>,
+}
+
+/// Where a deploy's build output comes from.
+pub(super) enum SourceOrigin {
+    /// A checkout to build. The lease keeps it alive until the deploy ends.
+    Checkout {
+        repo_path: PathBuf,
+        checkout: crate::git::CheckoutLease,
+    },
+    /// A recorded generation, launched again without a rebuild (#558).
+    Artifact(GenerationArtifact),
+}
+
+/// One job for a deploy stream: build a source, or relaunch a recorded
+/// generation.
+pub(crate) enum DeployJob {
+    Source(DeployRequest),
+    Relaunch(Relaunch),
+}
+
+impl From<DeployRequest> for DeployJob {
+    fn from(request: DeployRequest) -> Self {
+        Self::Source(request)
+    }
+}
+
+/// A recorded generation to launch again: explicit rollback (#558).
+pub(crate) struct Relaunch {
+    pub service_id: String,
+    pub artifact: GenerationArtifact,
+    /// Recorded repo and config path. Written back to metadata so `update`
+    /// and health restart keep working from the relaunched generation.
+    pub repo_url: Option<String>,
+    pub config_path: Option<String>,
 }
 
 /// The service id is the Russelfile `service.name` (#446). A requested id
@@ -510,6 +545,81 @@ impl DeployPipeline {
                 return rejected_response(requested_id.unwrap_or_default(), started, None, e);
             }
         };
+        self.run(request, source, started, tx).await
+    }
+
+    /// Run one deploy stream job.
+    pub(crate) async fn run_job(
+        &self,
+        job: DeployJob,
+        tx: tokio::sync::mpsc::Sender<DeployEvent>,
+    ) -> DeployResponse {
+        match job {
+            DeployJob::Source(request) => self.deploy(request, tx).await,
+            DeployJob::Relaunch(relaunch) => self.relaunch(relaunch, tx).await,
+        }
+    }
+
+    /// Launch a recorded generation again from its build output and the
+    /// Russelfile it ran with (#558). Nothing is fetched or built, so this
+    /// works with the source repo and the network gone. It goes through the
+    /// same phases as a deploy from `plan` on: dual-live or cold, watch
+    /// window, cutover, and a new history row.
+    async fn relaunch(
+        &self,
+        relaunch: Relaunch,
+        tx: tokio::sync::mpsc::Sender<DeployEvent>,
+    ) -> DeployResponse {
+        let started = Instant::now();
+        let Relaunch {
+            service_id,
+            artifact,
+            repo_url,
+            config_path,
+        } = relaunch;
+        tracing::info!(
+            service_id = %service_id,
+            store_path = %artifact.store_path,
+            "relaunch of a recorded generation started"
+        );
+        super::progress(&tx, "resolve", "Loading the recorded generation").await;
+        let config = match Russelfile::load_from_str(&artifact.russelfile).and_then(|config| {
+            check_requested_id(Some(&service_id), &config.service.name)?;
+            Ok(config)
+        }) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!(service_id = %service_id, error = %e, "relaunch rejected: recorded Russelfile");
+                return rejected_response(service_id, started, None, e);
+            }
+        };
+        let request = DeployRequest {
+            repo_url: repo_url.unwrap_or_default(),
+            config_path: config_path.unwrap_or_else(|| "Russelfile.toml".into()),
+            vm_id: Some(service_id),
+            rev: artifact.rev.clone(),
+            force: true,
+        };
+        let source = ResolvedSource {
+            rev: artifact.rev.clone().map(|rev| crate::git::SourceRev {
+                rev,
+                dirty: artifact.dirty,
+            }),
+            russelfile: artifact.russelfile.clone(),
+            config,
+            origin: SourceOrigin::Artifact(artifact),
+        };
+        self.run(request, source, started, tx).await
+    }
+
+    /// Claim the service and run the deploy phases on a resolved source.
+    async fn run(
+        &self,
+        request: DeployRequest,
+        source: ResolvedSource,
+        started: Instant,
+        tx: tokio::sync::mpsc::Sender<DeployEvent>,
+    ) -> DeployResponse {
         let service_id = source.config.service.name.clone();
         let vm_id = service_id.clone();
         let runtime = Some(source.config.service.runtime);
@@ -769,7 +879,8 @@ impl DeployPipeline {
                 (repo_path, checkout)
             }
         };
-        let config = load_russelfile_under_repo(&repo_path, &request.config_path)?;
+        let (config, russelfile) =
+            load_russelfile_text_under_repo(&repo_path, &request.config_path)?;
         check_requested_id(requested_id, &config.service.name)?;
         let rev = crate::git::source_rev(&repo_path, &request.config_path).await;
         if let Some(pinned) = request.rev.as_deref()
@@ -778,9 +889,12 @@ impl DeployPipeline {
             anyhow::bail!("checkout of {pinned} resolved to {rev:?}");
         }
         Ok(ResolvedSource {
-            repo_path,
-            _checkout: checkout,
+            origin: SourceOrigin::Checkout {
+                repo_path,
+                checkout,
+            },
             config,
+            russelfile,
             rev,
         })
     }

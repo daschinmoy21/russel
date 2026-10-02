@@ -20,7 +20,7 @@ russel ps                                        # also: russel list
 russel status [ID]
 russel logs [ID]
 russel update ID [--refresh] [--repo REPO] [--config PATH]
-russel rollback ID [--version N]
+russel rollback ID [--version N] [--rebuild]
 russel stop ID
 russel destroy ID [--keep-volumes | --delete-volumes]
 russel secrets set NAME                          # reads the value from stdin
@@ -95,7 +95,7 @@ See [Update and rollback](../guides/update-rollback.md).
 
 ## `russel rollback`
 
-Rebuilds an earlier deployment's exact commit, even if the branch has moved since. Without `--version`, it picks the previous deployment. A deployment made from uncommitted changes is rebuilt from what its folder holds now.
+Starts an earlier deployment's recorded build again, with the Russelfile it ran. Without `--version`, it picks the previous deployment. `--rebuild` builds that deployment's commit from source instead; use it when Nix has collected an old build. With `--rebuild`, a deployment made from uncommitted changes is rebuilt from what its folder holds now.
 
 ## `russel stop` and `destroy`
 

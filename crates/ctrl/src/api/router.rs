@@ -154,7 +154,7 @@ fn text_response(
 /// busy. Shared by `deploy` and `vm_update` (issue #54-lite).
 fn spawn_deploy_stream(
     state: AppState,
-    request: DeployRequest,
+    job: crate::deploy::DeployJob,
     service_id: String,
     task_label: &'static str,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -176,7 +176,7 @@ fn spawn_deploy_stream(
     let deploy_handle = tokio::spawn(async move {
         let _permit = permit;
         let _guard = deploy_guard;
-        let response = pipeline.deploy(request, deploy_tx.clone()).await;
+        let response = pipeline.run_job(job, deploy_tx.clone()).await;
         let status = response.status.clone();
         let elapsed_ms = response.elapsed_ms;
         tracing::info!(
@@ -234,7 +234,7 @@ async fn deploy(
         "POST /deploy"
     );
 
-    match spawn_deploy_stream(state, request, requested_id, "deploy") {
+    match spawn_deploy_stream(state, request.into(), requested_id, "deploy") {
         Ok(response) => response,
         Err((status, message)) => text_response(status, message),
     }
@@ -618,9 +618,9 @@ async fn vm_deployments(
 
 /// `POST /vm/{service_id}/rollback` — explicit operator rollback to a prior version.
 ///
-/// MVP strategy: redeploy from the journal entry's recorded `desired_state`
-/// (repo_url / config_path / runtime / env / port / podman_args). Instant
-/// dual-live retain-N=2 cutover is a follow-up.
+/// Relaunches the journal entry's recorded build output with the Russelfile
+/// it ran (#558). `rebuild`, or a row from before artifacts were recorded,
+/// builds the entry's recorded commit from source instead.
 async fn vm_rollback(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
@@ -645,16 +645,28 @@ async fn vm_rollback(
         (status, e.to_string())
     })?;
 
-    let request = target
-        .recorded_source()
-        .redeploy_request(&service_id)
-        .ok_or_else(|| {
-            (
+    let job = match target.rollback_job(&service_id, body.rebuild) {
+        Some(deployments::RollbackJob::Relaunch {
+            artifact,
+            repo_url,
+            config_path,
+        }) => crate::deploy::DeployJob::Relaunch(crate::deploy::Relaunch {
+            service_id: service_id.clone(),
+            artifact,
+            repo_url,
+            config_path,
+        }),
+        Some(deployments::RollbackJob::Rebuild(request)) => request.into(),
+        None => {
+            return Err((
                 StatusCode::CONFLICT,
-                "previous generation not retained; redeploy required — full retain-N=2 cutover TBD"
-                    .to_string(),
-            )
-        })?;
+                format!(
+                    "version {} has no recorded build or source to roll back to; deploy instead",
+                    target.version
+                ),
+            ));
+        }
+    };
 
     // On the next successful deploy append, demote current active → rolled_back.
     // Marker is only consumed after success so a failed rollback redeploy leaves
@@ -675,10 +687,11 @@ async fn vm_rollback(
     tracing::info!(
         service_id = %service_id,
         target_version = target.version,
-        "rolling back via redeploy-from-history"
+        rebuild = body.rebuild,
+        "rolling back to a recorded generation"
     );
 
-    spawn_deploy_stream(state, request, service_id, "rollback")
+    spawn_deploy_stream(state, job, service_id, "rollback")
 }
 
 async fn vm_update(
@@ -728,7 +741,7 @@ async fn vm_update(
 
     tracing::info!(service_id = %service_id, "POST /vm/{}/update", service_id);
 
-    spawn_deploy_stream(state, request, service_id, "update")
+    spawn_deploy_stream(state, request.into(), service_id, "update")
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

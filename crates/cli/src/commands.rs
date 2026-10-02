@@ -410,9 +410,14 @@ pub struct RollbackArgs {
     #[arg(value_name = "ID")]
     pub id: String,
 
-    /// History version to redeploy (default: the previous generation).
+    /// History version to roll back to (default: the previous generation).
     #[arg(long)]
     pub version: Option<u32>,
+
+    /// Build the version's recorded commit from source instead of
+    /// relaunching its recorded build. Needs the source repo and the network.
+    #[arg(long)]
+    pub rebuild: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1148,6 +1153,9 @@ pub async fn rollback(args: RollbackArgs, control_plane: &str) -> Result<()> {
     let mut body = serde_json::Map::new();
     if let Some(version) = args.version {
         body.insert("version".into(), serde_json::json!(version));
+    }
+    if args.rebuild {
+        body.insert("rebuild".into(), serde_json::json!(true));
     }
     redeploy("rollback", &args.id, body, control_plane).await
 }

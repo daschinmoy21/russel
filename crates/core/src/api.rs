@@ -374,6 +374,10 @@ pub struct DeploymentsResponse {
 pub struct RollbackRequest {
     #[serde(default)]
     pub version: Option<u32>,
+    /// Build the version's recorded commit from source instead of
+    /// relaunching its recorded build output (#558).
+    #[serde(default)]
+    pub rebuild: bool,
 }
 
 /// Worker readiness reported on heartbeat.
@@ -756,6 +760,9 @@ mod tests {
         assert!(req.version.is_none());
         let req: RollbackRequest = serde_json::from_str(r#"{"version":3}"#).unwrap();
         assert_eq!(req.version, Some(3));
+        assert!(!req.rebuild);
+        let req: RollbackRequest = serde_json::from_str(r#"{"rebuild":true}"#).unwrap();
+        assert!(req.rebuild);
     }
 
     #[test]

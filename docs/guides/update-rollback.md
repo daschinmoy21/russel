@@ -12,7 +12,7 @@ Use `russel deploy` once per service. After that, `russel update` ships changes 
 Each deployment records the commit it was built from. When the working tree was clean, that commit also pins the Russelfile. So:
 
 - Running `russel deploy` again with the commit and Russelfile the service already runs does nothing and reports `unchanged`. Pass `--force` to redeploy anyway.
-- `update` (without `--refresh`) and `rollback` rebuild a recorded commit exactly, even after the branch has moved on.
+- `update` (without `--refresh`) rebuilds a recorded commit exactly, even after the branch has moved on.
 - A deployment made from a folder with uncommitted changes isn't pinned. Rebuilding it uses whatever the folder holds at that time.
 
 ## Update
@@ -60,7 +60,15 @@ russel rollback my-app              # the previous deployment
 russel rollback my-app --version 3  # a specific one
 ```
 
-A rollback rebuilds that deployment's commit through the normal pipeline, so it takes as long as a deploy and streams the same progress. A deployment with no recorded source can't be rolled back, and the command says so.
+A rollback starts that deployment's recorded build again, with the Russelfile it ran. Nothing is fetched or built, so it works when the repo or the network is gone, and an old commit can't pick up different dependencies. It still goes through the normal checks: the version must answer, and a side-by-side rollback keeps the current version until it does. `secret://` values are read from the secret store as it is at rollback time.
+
+The previous deployment's build is always kept (see [Builds](../concepts/builds.md)). Older builds can be garbage-collected by Nix; rolling back to one of those fails with a message to rebuild instead:
+
+```bash
+russel rollback my-app --version 3 --rebuild  # build that deployment's commit from source
+```
+
+`--rebuild` builds the recorded commit through the normal pipeline, so it needs the repo and the network and takes as long as a deploy. Deployments recorded before Russel kept builds (v0.1.0 and earlier) are always rebuilt this way. A deployment with neither a recorded build nor a recorded source can't be rolled back, and the command says so.
 
 Russel also rolls back on its own: if an update fails after an earlier version worked, it restores that version, waits for it to answer, and reports `rolled_back`. The CLI exits non-zero so scripts still see the failure.
 

@@ -34,7 +34,7 @@ Over the network, reach the API through HTTPS or an SSH tunnel ([TLS reverse pro
 | `GET` | `/vm/{id}/logs` | One service's recent output |
 | `GET` | `/vm/{id}/deployments` | Deployment history, newest first (up to 20) |
 | `POST` | `/vm/{id}/update` | Rebuild and redeploy. Streams progress. |
-| `POST` | `/vm/{id}/rollback` | Redeploy an earlier deployment. Streams progress. |
+| `POST` | `/vm/{id}/rollback` | Start an earlier deployment again. Streams progress. |
 | `POST` | `/vm/{id}/stop` | Stop the app, keep its history |
 | `DELETE` | `/vm/{id}` | Destroy the service. Add `?keep_volumes=true` to keep every managed volume or `false` to delete them all; leave it out to follow each volume's `keep` setting. |
 | `GET` | `/secrets` | List secret names (never values) |
@@ -70,7 +70,7 @@ Any other field is rejected with `422`. Ports, env, and runtime come from the Ru
 
 **`POST /vm/{id}/update`**: `{"refresh": true}` builds the latest commit; `{}` rebuilds the running one. `repo_url` and `config_path` switch to another source and imply `refresh`. All fields are optional.
 
-**`POST /vm/{id}/rollback`**: `{"version": 3}` for a specific deployment, or `{}` for the previous one. Returns `409` when that deployment has no recorded source.
+**`POST /vm/{id}/rollback`**: `{"version": 3}` for a specific deployment, or `{}` for the previous one. Starts the deployment's recorded build again; add `"rebuild": true` to build its commit from source instead. Returns `409` when that deployment has neither.
 
 ## Progress stream
 

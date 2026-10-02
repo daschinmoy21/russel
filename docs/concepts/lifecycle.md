@@ -56,10 +56,10 @@ Why it works this way:
 
 ## Rollback
 
-Each successful deploy is recorded in `/var/lib/russel/<id>/deployments.json`, newest first, up to 20 entries. Each entry keeps the repo, Russelfile path, and commit, so any of them can be rebuilt.
+Each successful deploy is recorded in `/var/lib/russel/<id>/deployments.json`, newest first, up to 20 entries. Each entry keeps the repo, Russelfile path, and commit, plus the build output and the exact Russelfile it ran.
 
 - **Automatic:** if an update fails and an earlier version worked, Russel restores the earlier version, starts it, waits for it to answer, and reports `rolled_back`. The CLI still exits non-zero so scripts notice the failure.
-- **By hand:** `russel rollback <id>` rebuilds the previous version. `--version N` picks an older one. The rebuild goes through the normal pipeline, so it takes as long as a deploy.
+- **By hand:** `russel rollback <id>` starts the previous version's recorded build again, without fetching or building. `--version N` picks an older one, and `--rebuild` builds its commit from source instead.
 
 Guide: [Update and rollback](../guides/update-rollback.md).
 

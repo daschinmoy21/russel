@@ -57,10 +57,20 @@ pub(crate) fn validate_relative_config_path(config_path: &str) -> anyhow::Result
 ///
 /// Callers must load configuration only through this helper (or an equivalent
 /// descriptor-relative open) so deploy never reopens a validated path string.
+#[cfg(test)]
 pub(crate) fn load_russelfile_under_repo(
     repo_path: &Path,
     config_path: &str,
 ) -> anyhow::Result<Russelfile> {
+    load_russelfile_text_under_repo(repo_path, config_path).map(|(config, _)| config)
+}
+
+/// [`load_russelfile_under_repo`], plus the file's text: a generation
+/// records the exact Russelfile it ran (#558).
+pub(crate) fn load_russelfile_text_under_repo(
+    repo_path: &Path,
+    config_path: &str,
+) -> anyhow::Result<(Russelfile, String)> {
     let cfg = validate_relative_config_path(config_path)?;
 
     let file_name = cfg
@@ -161,7 +171,8 @@ pub(crate) fn load_russelfile_under_repo(
         );
     }
 
-    Russelfile::load_from_str(&contents)
+    let config = Russelfile::load_from_str(&contents)?;
+    Ok((config, contents))
 }
 
 /// Directory the build runs in: the Russelfile's folder joined with

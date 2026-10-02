@@ -136,15 +136,51 @@ pub fn sync(service_id: &str) -> anyhow::Result<()> {
     sync_dir(&service_roots_dir(service_id), &desired, nix_add_root)
 }
 
+/// [`sync`] on the blocking pool.
+pub async fn sync_blocking(service_id: &str) -> anyhow::Result<()> {
+    let id = service_id.to_string();
+    tokio::task::spawn_blocking(move || sync(&id))
+        .await
+        .map_err(|e| anyhow::anyhow!("gcroots sync task failed: {e}"))?
+}
+
 /// [`sync`] on the blocking pool; failures are logged, never fatal: a missing
 /// root must not fail a deploy that already succeeded.
 pub async fn sync_logged(service_id: &str) {
-    let id = service_id.to_string();
-    match tokio::task::spawn_blocking(move || sync(&id)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(service_id, error = %e, "gcroots sync failed"),
-        Err(e) => tracing::warn!(service_id, error = %e, "gcroots sync task failed"),
+    if let Err(e) = sync_blocking(service_id).await {
+        tracing::warn!(service_id, error = %e, "gcroots sync failed");
     }
+}
+
+/// Root a store path a deploy is about to launch, before anything else
+/// roots it (#558). The next [`sync`] keeps it if the deploy recorded it and
+/// drops it otherwise. Fails when the path is not in the store any more.
+pub async fn root_in_flight(service_id: &str, store_path: &Path) -> anyhow::Result<()> {
+    let dir = service_roots_dir(service_id);
+    let path = store_path.to_path_buf();
+    tokio::task::spawn_blocking(move || root_in_dir(&dir, &path, nix_add_root))
+        .await
+        .map_err(|e| anyhow::anyhow!("gcroot task failed: {e}"))?
+}
+
+/// Add one root for `store_path` under `dir`, keeping the roots already there.
+fn root_in_dir(
+    dir: &Path,
+    store_path: &Path,
+    add: impl Fn(&Path, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let root = store_root_of(&store_path.to_string_lossy())
+        .ok_or_else(|| anyhow::anyhow!("{} is not a Nix store path", store_path.display()))?;
+    let name = root
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no store name", root.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("create gcroots dir {}: {e}", dir.display()))?;
+    let link = dir.join(name);
+    if std::fs::read_link(&link).is_ok_and(|target| target == root) {
+        return Ok(());
+    }
+    add(&link, &root)
 }
 
 /// Drop every root for a destroyed service.
@@ -279,5 +315,30 @@ mod tests {
         remove("gcroots-remove-test").unwrap();
         assert!(!dir.exists());
         remove("gcroots-remove-test").unwrap();
+    }
+
+    #[test]
+    fn root_in_dir_adds_one_root_and_keeps_the_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("gcroots/api");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/nix/store/old-app", dir.join("old-app")).unwrap();
+        let added = RefCell::new(Vec::new());
+        let add = |link: &Path, target: &Path| {
+            added.borrow_mut().push(target.to_path_buf());
+            std::os::unix::fs::symlink(target, link)?;
+            Ok(())
+        };
+
+        root_in_dir(&dir, Path::new("/nix/store/new-app/bin/app"), add).unwrap();
+        root_in_dir(&dir, Path::new("/nix/store/new-app"), add).unwrap();
+        assert_eq!(*added.borrow(), [PathBuf::from("/nix/store/new-app")]);
+        assert!(dir.join("old-app").symlink_metadata().is_ok());
+        assert!(dir.join("new-app").symlink_metadata().is_ok());
+
+        let gone = |_: &Path, _: &Path| anyhow::bail!("path is not valid");
+        let err = root_in_dir(&dir, Path::new("/nix/store/gone-app"), gone).unwrap_err();
+        assert!(err.to_string().contains("not valid"));
+        assert!(root_in_dir(&dir, Path::new("/tmp/app"), add).is_err());
     }
 }

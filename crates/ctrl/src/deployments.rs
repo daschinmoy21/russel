@@ -17,7 +17,9 @@
 //! - history capped at [`MAX_HISTORY`] entries
 //!
 //! Explicit operator rollback marks the current `active` as `rolled_back`, then
-//! redeploys from a prior entry's `desired_state` (which appends a new active).
+//! relaunches a prior entry's recorded [`GenerationArtifact`] (#558), which
+//! appends a new active. Rows recorded before artifacts existed, and an
+//! explicit `rebuild`, redeploy from the entry's `desired_state` instead.
 
 use std::path::{Path, PathBuf};
 
@@ -259,6 +261,54 @@ impl DesiredStateSnapshot {
     }
 }
 
+/// How `secret://` refs in a generation's `[service.env]` get their values.
+/// The Russelfile keeps the refs only, so every launch of a recorded
+/// generation reads the secret store as it is then.
+pub const SECRETS_RESOLVED_AT_LAUNCH: &str = "resolved_at_launch";
+
+/// Largest `flake.lock` kept with a generation. A bigger lock is left out of
+/// the record: the generation still relaunches, only the lock text for an
+/// exact rebuild is missing.
+pub const MAX_RECORDED_LOCK_BYTES: usize = 64 * 1024;
+
+/// What one successful deploy ran, kept so rollback can launch the same
+/// thing again without the source repo or the network (#558).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationArtifact {
+    /// Build output: `/nix/store/<hash>-<name>`.
+    pub store_path: String,
+    /// The build wrapped `service.package` (no committed flake).
+    #[serde(default)]
+    pub using_package: bool,
+    /// The Russelfile exactly as it was deployed. Rollback parses this, so
+    /// later edits to the file in the repo leave an old generation as it was.
+    pub russelfile: String,
+    /// Source identity: the commit, and whether the tree had changes beyond it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dirty: bool,
+    /// Lock identity: the build dir's `flake.lock` after the build, when it
+    /// had one and it fit in [`MAX_RECORDED_LOCK_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flake_lock: Option<String>,
+    /// Secret-resolution policy, see [`SECRETS_RESOLVED_AT_LAUNCH`].
+    pub secrets: String,
+}
+
+/// See [`JournalEntry::rollback_job`].
+#[derive(Debug)]
+pub enum RollbackJob {
+    /// Launch the recorded build output again; nothing is fetched or built.
+    Relaunch {
+        artifact: GenerationArtifact,
+        repo_url: Option<String>,
+        config_path: Option<String>,
+    },
+    /// Build the recorded commit from source.
+    Rebuild(DeployRequest),
+}
+
 /// Full on-disk journal entry (API record + desired_state blob).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -285,6 +335,9 @@ pub struct JournalEntry {
     pub rollback_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_state: Option<DesiredStateSnapshot>,
+    /// Recorded build output and inputs; `None` on rows from before #558.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<GenerationArtifact>,
 }
 
 impl JournalEntry {
@@ -298,6 +351,24 @@ impl JournalEntry {
         snap.host_port = snap.host_port.or(self.host_port);
         snap.guest_port = snap.guest_port.or(self.guest_port);
         snap
+    }
+
+    /// What an explicit rollback to this entry runs (#558): its recorded
+    /// build output, or with `rebuild` (or on a row from before artifacts
+    /// were recorded) a build of its recorded source. `None` when the entry
+    /// has neither.
+    pub fn rollback_job(&self, service_id: &str, rebuild: bool) -> Option<RollbackJob> {
+        let source = self.recorded_source();
+        match &self.artifact {
+            Some(artifact) if !rebuild => Some(RollbackJob::Relaunch {
+                artifact: artifact.clone(),
+                repo_url: source.repo_url,
+                config_path: source.config_path,
+            }),
+            _ => source
+                .redeploy_request(service_id)
+                .map(RollbackJob::Rebuild),
+        }
     }
 
     pub fn to_record(&self) -> DeploymentRecord {
@@ -347,6 +418,7 @@ pub struct AppendSuccess {
     pub guest_port: Option<u16>,
     pub message: Option<String>,
     pub desired_state: Option<DesiredStateSnapshot>,
+    pub artifact: Option<GenerationArtifact>,
 }
 
 fn load_journal(path: &Path) -> anyhow::Result<JournalFile> {
@@ -417,10 +489,11 @@ fn cap_history(entries: &mut Vec<JournalEntry>) {
 }
 
 fn recompute_rollback_ready(entry: &mut JournalEntry) {
-    let ready = entry
-        .desired_state
-        .as_ref()
-        .is_some_and(DesiredStateSnapshot::is_rollback_ready)
+    let ready = entry.artifact.is_some()
+        || entry
+            .desired_state
+            .as_ref()
+            .is_some_and(DesiredStateSnapshot::is_rollback_ready)
         || entry
             .repo_url
             .as_deref()
@@ -428,17 +501,27 @@ fn recompute_rollback_ready(entry: &mut JournalEntry) {
     entry.rollback_ready = ready && entry.status != STATUS_ACTIVE;
 }
 
-/// Store paths of the journal's `active` and `previous` generations: the
-/// retention window that [`crate::gcroots`] keeps rooted.
+/// Store paths of the journal's `active` and `previous` generations, and of
+/// the newest `rolled_back` one, so rolling forward again after a rollback
+/// finds its build (#558): the retention window that [`crate::gcroots`]
+/// keeps rooted.
 pub fn retained_store_paths(service_id: &str) -> anyhow::Result<Vec<String>> {
     retained_store_paths_at(&deployments_path(service_id))
 }
 
 pub fn retained_store_paths_at(path: &Path) -> anyhow::Result<Vec<String>> {
-    Ok(load_journal(path)?
-        .entries
+    let entries = load_journal(path)?.entries;
+    let newest_rolled_back = entries
+        .iter()
+        .find(|e| e.status == STATUS_ROLLED_BACK)
+        .map(|e| e.version);
+    Ok(entries
         .into_iter()
-        .filter(|e| e.status == STATUS_ACTIVE || e.status == STATUS_PREVIOUS)
+        .filter(|e| {
+            e.status == STATUS_ACTIVE
+                || e.status == STATUS_PREVIOUS
+                || Some(e.version) == newest_rolled_back
+        })
         .filter_map(|e| e.store_path)
         .collect())
 }
@@ -501,6 +584,7 @@ pub fn append_success_at(path: &Path, info: AppendSuccess) -> anyhow::Result<u32
         message,
         rollback_ready: false,
         desired_state: desired,
+        artifact: info.artifact,
     };
     recompute_rollback_ready(&mut entry);
 
@@ -644,6 +728,7 @@ pub fn select_rollback_target_at(
 
 fn entry_is_rollbackable(entry: &JournalEntry) -> bool {
     entry.rollback_ready
+        || entry.artifact.is_some()
         || entry
             .desired_state
             .as_ref()
@@ -673,6 +758,130 @@ mod tests {
         }
     }
 
+    fn sample_artifact(generation: &str) -> GenerationArtifact {
+        GenerationArtifact {
+            store_path: format!("/nix/store/{generation}"),
+            using_package: false,
+            russelfile: "[service]\nname = \"api\"\n".into(),
+            rev: Some("1111111111111111111111111111111111111111".into()),
+            dirty: false,
+            flake_lock: None,
+            secrets: SECRETS_RESOLVED_AT_LAUNCH.into(),
+        }
+    }
+
+    #[test]
+    fn rollback_relaunches_the_recorded_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        append(&path, "https://example.com/r.git", "aaaa1111");
+        append(&path, "https://example.com/r.git", "bbbb2222");
+
+        let target = select_rollback_target_at(&path, None).unwrap();
+        assert_eq!(target.version, 1);
+        match target.rollback_job("api", false).unwrap() {
+            RollbackJob::Relaunch {
+                artifact,
+                repo_url,
+                config_path,
+            } => {
+                assert_eq!(artifact, sample_artifact("aaaa1111"));
+                assert_eq!(repo_url.as_deref(), Some("https://example.com/r.git"));
+                assert_eq!(config_path.as_deref(), Some("Russelfile.toml"));
+            }
+            other => panic!("expected a relaunch, got {other:?}"),
+        }
+        // An explicit rebuild builds the recorded source instead.
+        match target.rollback_job("api", true).unwrap() {
+            RollbackJob::Rebuild(request) => {
+                assert_eq!(request.repo_url, "https://example.com/r.git");
+                assert!(request.force);
+            }
+            other => panic!("expected a rebuild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relaunch_records_the_same_artifact_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        append(&path, "https://example.com/r.git", "aaaa1111");
+        append(&path, "https://example.com/r.git", "bbbb2222");
+        let target = select_rollback_target_at(&path, None).unwrap();
+        let Some(RollbackJob::Relaunch { artifact, .. }) = target.rollback_job("api", false) else {
+            panic!("expected a relaunch");
+        };
+        note_pending_rollback_at(&path, target.version).unwrap();
+        // What `record` appends after a relaunch: the recorded artifact.
+        let v3 = append_success_at(
+            &path,
+            AppendSuccess {
+                generation_id: Some("cccc3333".into()),
+                runtime: Some(RuntimeKind::Container),
+                store_path: Some(artifact.store_path.clone()),
+                repo_url: Some("https://example.com/r.git".into()),
+                config_path: Some("Russelfile.toml".into()),
+                host_port: Some(8080),
+                guest_port: Some(3000),
+                message: Some("relaunched the recorded build".into()),
+                desired_state: Some(sample_desired("https://example.com/r.git")),
+                artifact: Some(artifact.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(v3, 3);
+
+        let listed = list_at(&path, "api").unwrap();
+        let statuses: Vec<_> = listed
+            .deployments
+            .iter()
+            .map(|d| (d.version, d.status.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [(3, "active"), (2, "rolled_back"), (1, "previous")]
+        );
+        // Rolling forward again relaunches version 2's own build.
+        let back = select_rollback_target_at(&path, Some(2)).unwrap();
+        let Some(RollbackJob::Relaunch { artifact: v2, .. }) = back.rollback_job("api", false)
+        else {
+            panic!("expected a relaunch");
+        };
+        assert_eq!(v2.store_path, "/nix/store/bbbb2222");
+        // The build rolled away from stays rooted next to the active one.
+        let retained = retained_store_paths_at(&path).unwrap();
+        assert!(retained.contains(&"/nix/store/aaaa1111".to_string()));
+        assert!(retained.contains(&"/nix/store/bbbb2222".to_string()));
+    }
+
+    #[test]
+    fn rows_from_before_artifacts_rebuild_from_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deployments_path_in(tmp.path(), "api");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"next_version":3,"entries":[
+              {"version":2,"status":"active","deployed_at":"2026-09-30T10:00:00Z",
+               "store_path":"/nix/store/bbbb","repo_url":"https://example.com/r.git",
+               "config_path":"Russelfile.toml","rollback_ready":false},
+              {"version":1,"status":"previous","deployed_at":"2026-09-29T10:00:00Z",
+               "store_path":"/nix/store/aaaa","repo_url":"https://example.com/r.git",
+               "config_path":"Russelfile.toml","rollback_ready":true,
+               "desired_state":{"rev":"1111111111111111111111111111111111111111"}}]}"#,
+        )
+        .unwrap();
+        let target = select_rollback_target_at(&path, None).unwrap();
+        assert!(target.artifact.is_none());
+        match target.rollback_job("api", false).unwrap() {
+            RollbackJob::Rebuild(request) => assert_eq!(
+                request.rev.as_deref(),
+                Some("1111111111111111111111111111111111111111")
+            ),
+            other => panic!("expected a rebuild, got {other:?}"),
+        }
+    }
+
     fn append(path: &Path, repo: &str, generation: &str) -> u32 {
         append_success_at(
             path,
@@ -686,6 +895,7 @@ mod tests {
                 guest_port: Some(3000),
                 message: Some("deploy complete".into()),
                 desired_state: Some(sample_desired(repo)),
+                artifact: Some(sample_artifact(generation)),
             },
         )
         .unwrap()
@@ -879,6 +1089,7 @@ mod tests {
                         Some(8081),
                         Some(3000),
                     )),
+                    artifact: None,
                 },
             )
             .unwrap();
@@ -1094,6 +1305,7 @@ mod tests {
             message: None,
             rollback_ready: true,
             desired_state: None,
+            artifact: None,
         };
         let req = entry.recorded_source().redeploy_request("api").unwrap();
         assert_eq!(req.repo_url, "https://example.com/app.git");

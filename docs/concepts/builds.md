@@ -52,7 +52,7 @@ That forces Nix's sandbox and turns off flake generation. [Nix build security](.
 
 ## Garbage collection
 
-Russel registers a Nix garbage-collection root for everything a service might need to start again: the running version, the previous version, and (for microVMs) the kernel and boot image. So `nix-collect-garbage`, or NixOS's `nix.gc.automatic`, never deletes what a restart, a reboot, or a rollback to the previous version needs. Older versions lose their roots, and rolling back further than one version rebuilds from source. `russel destroy` removes the service's roots.
+Russel registers a Nix garbage-collection root for everything a service might need to start again: the running version, the previous version, the version the last rollback moved away from, and (for microVMs) the kernel and boot image. So `nix-collect-garbage`, or NixOS's `nix.gc.automatic`, never deletes what a restart, a reboot, or a rollback to the previous version needs. Older versions lose their roots. Rolling back to one that Nix has since collected fails with a hint to use `russel rollback --rebuild`, which builds it from source. `russel destroy` removes the service's roots.
 
 The roots live in `/var/lib/russel/_pool/gcroots/<id>/`.
 

@@ -26,7 +26,10 @@ use crate::{
         not_ready_error, restore_backed_up_service_dir, validate_podman_args_for_runtime,
         watch_container,
     },
-    deployments::{self, AppendSuccess, DesiredStateSnapshot},
+    deployments::{
+        self, AppendSuccess, DesiredStateSnapshot, GenerationArtifact, MAX_RECORDED_LOCK_BYTES,
+        SECRETS_RESOLVED_AT_LAUNCH,
+    },
     git::{CheckoutLease, SourceRev, redact_repo_url},
     ingress::{Backend, HostRule},
     metadata::load_metadata_from_disk,
@@ -36,9 +39,9 @@ use crate::{
 
 use super::pipeline::{
     DeployInnerResult, DeployOutput, DeployPipeline, DeployWorkload, DesiredExtras, HistoryMove,
-    ResolvedSource, build_desired_state, carry_history, kept_history_dir, new_generation_id,
-    preserve_history, promote_generation, record_source_in_metadata, reject_live_listen_collision,
-    validate_live_ingress_port,
+    ResolvedSource, SourceOrigin, build_desired_state, carry_history, kept_history_dir,
+    new_generation_id, preserve_history, promote_generation, record_source_in_metadata,
+    reject_live_listen_collision, validate_live_ingress_port,
 };
 use super::rollback::{
     ServiceDirs, attempt_container_rollback, attempt_microvm_rollback, cleanup_failed_deploy,
@@ -48,12 +51,10 @@ use super::{Events, WATCH_WINDOW};
 
 /// The Russelfile turned into the deploy's inputs. Every later phase reads it.
 pub(super) struct Plan {
-    /// The Russelfile's folder joined with `service.source`: where Nix builds
-    /// (#525). The repo root for a root Russelfile with `source = "."`.
-    build_path: PathBuf,
-    /// Keeps the checkout alive until the deploy ends.
-    _checkout: CheckoutLease,
+    origin: PlanOrigin,
     pub(super) config: Russelfile,
+    /// The Russelfile's text, recorded with the generation (#558).
+    russelfile: String,
     /// Commit the source builds; `None` outside git (#448).
     rev: Option<SourceRev>,
     runtime: RuntimeKind,
@@ -68,8 +69,35 @@ pub(super) struct Plan {
     pub(super) desired_state: Option<serde_json::Value>,
 }
 
+/// Where the plan's build output comes from.
+enum PlanOrigin {
+    Build {
+        /// The Russelfile's folder joined with `service.source`: where Nix
+        /// builds (#525). The repo root for a root Russelfile with
+        /// `source = "."`.
+        build_path: PathBuf,
+        /// Keeps the checkout alive until the deploy ends.
+        _checkout: CheckoutLease,
+    },
+    /// A recorded generation's output, launched as is (#558).
+    Artifact(GenerationArtifact),
+}
+
+impl Plan {
+    /// The checkout dir that was built; `None` when relaunching a recorded
+    /// generation.
+    fn build_path(&self) -> Option<&Path> {
+        match &self.origin {
+            PlanOrigin::Build { build_path, .. } => Some(build_path),
+            PlanOrigin::Artifact(_) => None,
+        }
+    }
+}
+
 pub(super) struct Built {
     pub(super) output: BuildOutput,
+    /// What gets recorded with the generation for rollback (#558).
+    artifact: GenerationArtifact,
     /// Resolved for the microVM runtime only.
     pub(super) kernel: Option<KernelInfo>,
     build_ms: u128,
@@ -160,8 +188,16 @@ impl DeployPipeline {
             .await?;
         self.cutover(service_id, &plan, &slot, &booted.workload, &tx)
             .await;
-        self.record(service_id, &request, &plan, &built, &slot, &booted.workload)
-            .await;
+        self.record(
+            service_id,
+            &request,
+            &plan,
+            &built,
+            &slot,
+            &booted.workload,
+            &tx,
+        )
+        .await;
 
         reservation
             .as_mut()
@@ -189,16 +225,62 @@ impl DeployPipeline {
     async fn build(&self, service_id: &str, plan: &Plan, tx: &Events) -> anyhow::Result<Built> {
         let t = Instant::now();
         let microvm = plan.runtime == RuntimeKind::Microvm;
-        let description = if microvm {
-            "Building package + ensuring kernel/busybox"
-        } else {
-            "Building package"
+        let (output, artifact) = match &plan.origin {
+            PlanOrigin::Build { build_path, .. } => {
+                let description = if microvm {
+                    "Building package + ensuring kernel/busybox"
+                } else {
+                    "Building package"
+                };
+                super::progress(tx, "build", description).await;
+                let output = self
+                    .builder
+                    .build(build_path, plan.config.service.package.as_deref())
+                    .await?;
+                let artifact = GenerationArtifact {
+                    store_path: output.store_path.display().to_string(),
+                    using_package: output.using_package,
+                    russelfile: plan.russelfile.clone(),
+                    rev: plan.rev.as_ref().map(|r| r.rev.clone()),
+                    dirty: plan.rev.as_ref().is_some_and(|r| r.dirty),
+                    flake_lock: read_flake_lock(build_path),
+                    secrets: SECRETS_RESOLVED_AT_LAUNCH.into(),
+                };
+                (output, artifact)
+            }
+            PlanOrigin::Artifact(artifact) => {
+                super::progress(
+                    tx,
+                    "build",
+                    format!("Using the recorded build {}", artifact.store_path),
+                )
+                .await;
+                let output = BuildOutput {
+                    store_path: PathBuf::from(&artifact.store_path),
+                    using_package: artifact.using_package,
+                };
+                (output, artifact.clone())
+            }
         };
-        super::progress(tx, "build", description).await;
-        let output = self
-            .builder
-            .build(&plan.build_path, plan.config.service.package.as_deref())
-            .await?;
+        // Nothing roots the output until `record`, so a garbage collection
+        // during boot could delete it. For a recorded generation this is also
+        // the check that its output still exists.
+        if let Err(e) = crate::gcroots::root_in_flight(service_id, &output.store_path).await {
+            if matches!(plan.origin, PlanOrigin::Artifact(_)) {
+                anyhow::bail!(
+                    "the recorded build {} cannot be used ({e:#}); \
+                     roll back with --rebuild to build this version from source",
+                    artifact.store_path
+                );
+            }
+            tracing::warn!(service_id, error = %e, "cannot root the new build");
+            super::progress(
+                tx,
+                "build",
+                format!("warning: cannot add a Nix GC root for the new build: {e:#}"),
+            )
+            .await;
+        }
         let kernel = if microvm {
             let kernel = self.runner.ensure_kernel().await?;
             self.runner.ensure_busybox().await?;
@@ -224,6 +306,7 @@ impl DeployPipeline {
         }
         Ok(Built {
             output,
+            artifact,
             kernel,
             build_ms,
         })
@@ -720,8 +803,7 @@ impl DeployPipeline {
                     }
                 }
             }
-            self.state
-                .attach_flake_path(service_id, plan.build_path.clone());
+            self.attach_build_path(service_id, plan);
             return;
         }
 
@@ -779,7 +861,7 @@ impl DeployPipeline {
                     ),
                 )
                 .await;
-                self.state.attach_flake_path(key, plan.build_path.clone());
+                self.attach_build_path(key, plan);
                 return;
             }
         }
@@ -804,7 +886,7 @@ impl DeployPipeline {
                 "CRITICAL: failed to promote generation dirs; candidate still running under runtime key"
             );
             // Keep state under runtime_key so stop/destroy can find it.
-            self.state.attach_flake_path(key, plan.build_path.clone());
+            self.attach_build_path(key, plan);
             return;
         }
 
@@ -815,8 +897,14 @@ impl DeployPipeline {
             tracing::warn!(service_id, error = %e, "failed to claim port under service_id after promote");
         }
         self.state.rekey_service(key, service_id);
-        self.state
-            .attach_flake_path(service_id, plan.build_path.clone());
+        self.attach_build_path(service_id, plan);
+    }
+
+    /// Note the built checkout in the service log. A relaunch built nothing.
+    fn attach_build_path(&self, key: &str, plan: &Plan) {
+        if let Some(path) = plan.build_path() {
+            self.state.attach_flake_path(key, path.to_path_buf());
+        }
     }
 
     /// Record the source, the deployment history row, and GC roots.
@@ -828,6 +916,7 @@ impl DeployPipeline {
         built: &Built,
         slot: &Slot,
         workload: &DeployWorkload,
+        tx: &Events,
     ) {
         let repo_url = redact_repo_url(&request.repo_url);
         // Record source so `russel update` / health restart can redeploy.
@@ -852,30 +941,55 @@ impl DeployPipeline {
                 config_path: Some(request.config_path.clone()),
                 host_port: Some(port.host),
                 guest_port: Some(port.guest),
-                message: Some("deploy complete".into()),
+                message: Some(match plan.origin {
+                    PlanOrigin::Build { .. } => "deploy complete".into(),
+                    PlanOrigin::Artifact(_) => "relaunched the recorded build".into(),
+                }),
                 desired_state: Some(desired_snap),
+                artifact: Some(built.artifact.clone()),
             },
         ) {
             tracing::warn!(service_id, error = %e, "failed to append deployment history");
         }
         // Root this generation and the previous one; drop older roots (#411).
-        crate::gcroots::sync_logged(service_id).await;
+        // A failure here leaves rollback targets collectable, so say so.
+        if let Err(e) = crate::gcroots::sync_blocking(service_id).await {
+            tracing::warn!(service_id, error = %e, "gcroots sync failed");
+            super::progress(
+                tx,
+                "record",
+                format!("warning: Nix GC roots for this service are incomplete: {e:#}"),
+            )
+            .await;
+        }
     }
 }
 
 /// Turn the Russelfile into the deploy's inputs. Touches no state.
 fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> anyhow::Result<Plan> {
     let ResolvedSource {
-        repo_path,
-        _checkout,
+        origin,
         config,
+        russelfile,
         rev,
     } = source;
     let runtime = config.service.runtime;
     let podman_args = &config.service.podman_args;
     validate_podman_args_for_runtime(runtime, podman_args)?;
-    let build_path =
-        super::config::resolve_build_dir(&repo_path, &request.config_path, &config.service.source)?;
+    let origin = match origin {
+        SourceOrigin::Checkout {
+            repo_path,
+            checkout,
+        } => PlanOrigin::Build {
+            build_path: super::config::resolve_build_dir(
+                &repo_path,
+                &request.config_path,
+                &config.service.source,
+            )?,
+            _checkout: checkout,
+        },
+        SourceOrigin::Artifact(artifact) => PlanOrigin::Artifact(artifact),
+    };
     if runtime == RuntimeKind::Microvm {
         crate::microvm::preflight::check_host_privileges()?;
     }
@@ -926,9 +1040,9 @@ fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> an
     ));
 
     Ok(Plan {
-        build_path,
-        _checkout,
+        origin,
         config,
+        russelfile,
         rev,
         runtime,
         env,
@@ -938,6 +1052,22 @@ fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> an
         volumes,
         desired_state,
     })
+}
+
+/// The build dir's `flake.lock` after a build, for the generation record.
+/// Nix writes one for a path flake that had none, so a generated flake has
+/// one too. `None` when missing, unreadable, or over
+/// [`MAX_RECORDED_LOCK_BYTES`].
+fn read_flake_lock(build_path: &Path) -> Option<String> {
+    use std::io::Read;
+    // Read at most one byte past the cap: a huge lock is never loaded whole.
+    let mut lock = String::new();
+    std::fs::File::open(build_path.join("flake.lock"))
+        .ok()?
+        .take(MAX_RECORDED_LOCK_BYTES as u64 + 1)
+        .read_to_string(&mut lock)
+        .ok()?;
+    (lock.len() <= MAX_RECORDED_LOCK_BYTES).then_some(lock)
 }
 
 /// Whether a replace boots the new generation beside the live one
@@ -1058,6 +1188,70 @@ mod tests {
 
     fn pin(host: u16) -> PortMapping {
         PortMapping { host, guest: 3000 }
+    }
+
+    const RECORDED_RUSSELFILE: &str = r#"
+[service]
+name = "api"
+source = "."
+port = 3000
+memory = "256mb"
+bin = "basic-http"
+type = "container"
+
+[service.env]
+GREETING = "from the recorded file"
+"#;
+
+    fn recorded_artifact() -> GenerationArtifact {
+        GenerationArtifact {
+            store_path: "/nix/store/aaaa-basic-http".into(),
+            using_package: false,
+            russelfile: RECORDED_RUSSELFILE.into(),
+            rev: Some("1111111111111111111111111111111111111111".into()),
+            dirty: false,
+            flake_lock: Some("{\"version\": 7}".into()),
+            secrets: SECRETS_RESOLVED_AT_LAUNCH.into(),
+        }
+    }
+
+    #[test]
+    fn a_recorded_generation_plans_without_a_checkout() {
+        // The repo URL points nowhere: planning a relaunch must not touch it.
+        let request = DeployRequest {
+            repo_url: "/nonexistent/russel-558-repo".into(),
+            config_path: "Russelfile.toml".into(),
+            vm_id: Some("api".into()),
+            rev: None,
+            force: true,
+        };
+        let artifact = recorded_artifact();
+        let source = ResolvedSource {
+            config: Russelfile::load_from_str(&artifact.russelfile).unwrap(),
+            russelfile: artifact.russelfile.clone(),
+            rev: None,
+            origin: SourceOrigin::Artifact(artifact.clone()),
+        };
+        let plan = plan("api", &request, source).unwrap();
+        assert!(plan.build_path().is_none());
+        assert!(matches!(&plan.origin, PlanOrigin::Artifact(a) if *a == artifact));
+        assert_eq!(plan.russelfile, RECORDED_RUSSELFILE);
+        assert_eq!(plan.env["GREETING"], "from the recorded file");
+        assert_eq!(plan.runtime, RuntimeKind::Container);
+    }
+
+    #[test]
+    fn flake_lock_is_recorded_up_to_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_flake_lock(dir.path()), None);
+        std::fs::write(dir.path().join("flake.lock"), "{\"version\": 7}").unwrap();
+        assert_eq!(
+            read_flake_lock(dir.path()).as_deref(),
+            Some("{\"version\": 7}")
+        );
+        let big = "x".repeat(MAX_RECORDED_LOCK_BYTES + 1);
+        std::fs::write(dir.path().join("flake.lock"), big).unwrap();
+        assert_eq!(read_flake_lock(dir.path()), None);
     }
 
     #[test]
@@ -1187,6 +1381,7 @@ mod tests {
             guest_port: Some(3000),
             message: None,
             desired_state: None,
+            artifact: None,
         }
     }
 
@@ -1212,14 +1407,17 @@ mod tests {
     }
 
     fn cold_plan(id: &str, dir: &str) -> Plan {
-        let config = Russelfile::load_from_str(&format!(
+        let russelfile = format!(
             "[service]\nname = \"{id}\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n"
-        ))
-        .unwrap();
+        );
+        let config = Russelfile::load_from_str(&russelfile).unwrap();
         Plan {
-            build_path: PathBuf::from(dir),
-            _checkout: crate::git::GitClient.hold_checkout(Path::new(dir)),
+            origin: PlanOrigin::Build {
+                build_path: PathBuf::from(dir),
+                _checkout: crate::git::GitClient.hold_checkout(Path::new(dir)),
+            },
             config,
+            russelfile,
             rev: None,
             runtime: RuntimeKind::Container,
             env: HashMap::new(),

@@ -13,6 +13,7 @@ mod runtime;
 pub use crate::metadata::prior_runtime_from_disk;
 pub use env::{build_container_env, shell_quote, validate_bin_name};
 pub use pipeline::DeployPipeline;
+pub(crate) use pipeline::{DeployJob, Relaunch};
 pub(crate) use rollback::{FailedLaunch, RecordedMicrovm};
 
 /// How long a new generation that replaces a live one must keep running after
