@@ -62,10 +62,10 @@ Some apps listen and then crash a moment later. Postgres without `/dev/shm`, for
 
 | Deploy | What Russel waits for | If the app crashes right after answering |
 |---|---|---|
-| **First deploy** (nothing running yet) | The first answer. | `deploy` has already reported `deployed`. The service reads `failed` within about a second. With `restart = "unless-stopped"` it is restarted ([Restart on exit](#restart-on-exit)). |
+| **First deploy** (nothing running yet) | The first answer. | `deploy` has already reported `deployed`. The service reads `failed` within about a second, and is restarted unless it sets `restart = "no"` ([Restart on exit](#restart-on-exit)). |
 | **Update or rollback, side by side** | The first answer. Traffic switches as soon as Traefik serves the new version, and the previous version keeps running for the **5 s drain**, with the new version watched throughout. | Traffic goes back to the previous version, which never stopped. The new one is removed, and `update` fails with a candidate crash error plus the app's last output. |
 | **Update with `[[ports]]`, `[ingress].port`, or a writable volume** | The first answer, then **2 s** in which the new version must stay up. The previous version is already stopped. | The previous version is restored from its backup, and `update` fails with `rolled_back`. |
-| **Relaunch** (`restart = "unless-stopped"`) | The first answer. | Russel waits a little longer before the next try ([Restart on exit](#restart-on-exit)). |
+| **Relaunch** (restart on exit) | The first answer. | Russel waits a little longer before the next try ([Restart on exit](#restart-on-exit)). |
 
 Why it works this way:
 
@@ -86,7 +86,7 @@ Guide: [Update and rollback](../guides/update-rollback.md).
 
 ## Restart on exit
 
-`restart = "unless-stopped"` keeps a service running after it exits.
+A service is restarted when it exits. This is `restart = "unless-stopped"`, the default; `restart = "no"` turns it off.
 
 - **Containers:** Podman restarts the container at once. The service reads `failed` until the restarted container has been up for 10 s, then `deployed` again. A crash loop keeps it `failed`. `russel status` shows the restart count since the last deploy.
 - **MicroVMs:** Russel starts the same build again, with the same config, env, volumes, and ports. Nothing is rebuilt. This happens when the app exits without a `stop` or `destroy`.
@@ -96,7 +96,7 @@ Guide: [Update and rollback](../guides/update-rollback.md).
 
 ## After a reboot
 
-When the control plane starts (after a server reboot, or after `systemctl restart russel-ctrl`), it starts every service it finds down again, with or without `restart`:
+When the control plane starts (after a server reboot, or after `systemctl restart russel-ctrl`), it starts every service it finds down again, unless the service sets `restart = "no"`:
 
 - **Containers:** Russel starts the container the service last ran, with the same build, ports, volumes, and secrets. The service answers a second or two after the control plane is up.
 - **MicroVMs:** Russel boots the recorded build again, the same way as [Restart on exit](#restart-on-exit).

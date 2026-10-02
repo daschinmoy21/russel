@@ -321,8 +321,10 @@ pub struct ServiceConfig {
     /// to `user`. Kept only to give that message.
     #[serde(default)]
     pub userns: Option<String>,
-    /// Only `"unless-stopped"` is accepted. Containers get Podman's restart
-    /// policy; microVMs are relaunched by ctrl.
+    /// `"unless-stopped"` (the default when omitted) or `"no"` (#450). See
+    /// [`crate::volumes::RestartPolicy`]. Containers get Podman's restart
+    /// policy; microVMs are relaunched by ctrl; both are started again at
+    /// ctrl start unless the policy is `"no"`.
     #[serde(default)]
     pub restart: Option<String>,
 }

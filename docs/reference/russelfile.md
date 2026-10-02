@@ -21,7 +21,7 @@ cpus = 1                     # optional, 1 to 32
 # package = "navidrome"      # run a nixpkgs package when the repo has no flake
 # args = ["--loglevel", "info"]
 # user = "root"
-# restart = "unless-stopped"
+# restart = "no"           # default "unless-stopped"
 # debug = false
 
 [service.env]
@@ -58,7 +58,7 @@ port = 4000
 | `args` | list of strings | `[]` | Arguments passed to the app after its name. Up to 32, each up to 256 bytes, one line each. |
 | `podman_args` | list of strings | `[]` | Extra `podman run` flags, one flag or value per entry. Containers only. Up to 32. Flags that Russel sets itself or that weaken isolation are rejected. |
 | `user` | string | none | Only `"root"` is accepted. Without it the app runs as an unprivileged user that owns its volumes (and can still bind ports below 1024). |
-| `restart` | string | none | Only `"unless-stopped"` is accepted. Restarts the app when it exits; see [Restart on exit](../concepts/lifecycle.md#restart-on-exit). `russel stop` keeps it down until the next deploy. |
+| `restart` | string | `"unless-stopped"` | `"unless-stopped"` restarts the app when it exits and starts it again when the server reboots. `"no"` leaves it down in both cases. See [Restart on exit](../concepts/lifecycle.md#restart-on-exit) and [After a reboot](../concepts/lifecycle.md#after-a-reboot). `russel stop` keeps it down until the next deploy either way. |
 | `debug` | boolean | `false` | Containers only: adds a shell, curl, and `/usr/bin/env` for troubleshooting. Don't leave it on. |
 | `guest` | string | `"busybox"` | What runs inside the sandbox. `"linux"` (a full NixOS userspace) is planned and is rejected for now. |
 

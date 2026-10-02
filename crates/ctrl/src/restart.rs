@@ -1,5 +1,5 @@
-//! Bringing services back: `restart = "unless-stopped"` for microVMs (#467),
-//! and every service at ctrl start (#450).
+//! Bringing services back under `service.restart` (#467, #450). The default
+//! is `"unless-stopped"`; `"no"` leaves a service down.
 //!
 //! Containers get restart-on-exit from Podman's restart policy. A microVM is
 //! relaunched by ctrl from its recorded generation (same build and config,
@@ -7,7 +7,7 @@
 //! loops back off (1s, 2s, 4s, … 30s) and read `failed` in status meanwhile.
 //!
 //! At ctrl start (after a host reboot, for example) every service that
-//! reconcile found down is started again, whatever its restart policy,
+//! reconcile found down and whose policy restarts it is started again,
 //! unless an operator stopped it: a container with `podman start` of the
 //! container it last ran, a microVM from its recorded generation. Neither
 //! rebuilds or adds a deployment. An operator `stop` is recorded in metadata
@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use russel_core::volumes::RestartPolicy;
 use serde_json::Value;
 
 use crate::container::{
@@ -47,24 +48,31 @@ fn is_container(meta: &Value) -> bool {
     meta.get("runtime").and_then(Value::as_str) == Some("container")
 }
 
-/// A microVM whose recorded deploy asks for `restart = "unless-stopped"` and
-/// that no one stopped on purpose.
+/// The recorded `service.restart`. Omitted, including on services deployed
+/// before it had a default, means `unless-stopped` (#450).
+fn policy(meta: &Value) -> RestartPolicy {
+    RestartPolicy::of(
+        meta.pointer("/desired_state/restart")
+            .and_then(Value::as_str),
+    )
+}
+
+/// A microVM whose recorded policy restarts it and that no one stopped on
+/// purpose. Podman restarts containers itself.
 fn wants_restart(meta: &Value) -> bool {
     meta.get("runtime").and_then(Value::as_str) == Some("microvm")
-        && meta
-            .pointer("/desired_state/restart")
-            .and_then(Value::as_str)
-            == Some("unless-stopped")
+        && policy(meta) == RestartPolicy::UnlessStopped
         && !user_stopped(meta)
 }
 
-/// A service ctrl starts again at ctrl start: one with a recorded runtime
-/// that no one stopped on purpose (#450).
+/// A service ctrl starts again at ctrl start (#450): one with a recorded
+/// runtime, a policy that restarts it, and no operator stop.
 fn wants_start_at_boot(meta: &Value) -> bool {
     matches!(
         meta.get("runtime").and_then(Value::as_str),
         Some("container" | "microvm")
-    ) && !user_stopped(meta)
+    ) && policy(meta) == RestartPolicy::UnlessStopped
+        && !user_stopped(meta)
 }
 
 fn service_wants_restart(service_id: &str) -> bool {
@@ -272,7 +280,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn wants_restart_needs_microvm_policy_and_no_operator_stop() {
+    fn microvm_crash_restart_follows_the_policy_and_operator_stop() {
         let base = json!({
             "runtime": "microvm",
             "desired_state": { "restart": "unless-stopped" }
@@ -287,17 +295,20 @@ mod tests {
         container["runtime"] = json!("container");
         assert!(!wants_restart(&container), "Podman restarts containers");
 
-        let no_policy = json!({ "runtime": "microvm", "desired_state": {} });
-        assert!(!wants_restart(&no_policy));
+        let omitted = json!({ "runtime": "microvm", "desired_state": {} });
+        assert!(wants_restart(&omitted), "unless-stopped is the default");
+
+        let opted_out = json!({ "runtime": "microvm", "desired_state": { "restart": "no" } });
+        assert!(!wants_restart(&opted_out));
     }
 
     #[test]
-    fn boot_start_takes_any_runtime_unless_an_operator_stopped_it() {
+    fn boot_start_follows_the_policy_and_operator_stop() {
         for runtime in ["container", "microvm"] {
             let meta = json!({ "runtime": runtime, "desired_state": {} });
             assert!(
                 wants_start_at_boot(&meta),
-                "{runtime} without a restart policy"
+                "{runtime} with restart omitted (the default)"
             );
 
             let mut stopped = meta.clone();
@@ -308,6 +319,14 @@ mod tests {
             );
         }
         assert!(!wants_start_at_boot(&json!({})), "no recorded runtime");
+
+        for runtime in ["container", "microvm"] {
+            let opted_out = json!({ "runtime": runtime, "desired_state": { "restart": "no" } });
+            assert!(
+                !wants_start_at_boot(&opted_out),
+                "{runtime} with restart = no"
+            );
+        }
 
         let legacy_stop = json!({ "runtime": "container", "container_running": false });
         assert!(

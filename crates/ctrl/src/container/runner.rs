@@ -800,8 +800,17 @@ pub fn build_run_args(spec: &ContainerStartSpec, log_path: &Path) -> anyhow::Res
             .map(String::from),
         );
     }
-    if let Some(restart) = &spec.restart {
-        args.extend(["--restart".to_string(), restart.clone()]);
+    // Restart on exit is the default (#450); `restart = "no"` opts out.
+    if russel_core::volumes::RestartPolicy::of(spec.restart.as_deref())
+        == russel_core::volumes::RestartPolicy::UnlessStopped
+    {
+        args.extend(
+            [
+                "--restart",
+                russel_core::volumes::RestartPolicy::UNLESS_STOPPED,
+            ]
+            .map(String::from),
+        );
     }
 
     if !spec.podman_args.is_empty() {

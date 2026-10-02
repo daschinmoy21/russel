@@ -458,12 +458,40 @@ pub fn reject_userns(userns: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `service.restart` (#450). Omitted means [`RestartPolicy::UnlessStopped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPolicy {
+    /// Restart the app when it exits, and start it again when the control
+    /// plane starts, until an operator `russel stop`.
+    UnlessStopped,
+    /// Leave the app down when it exits or the server reboots.
+    No,
+}
+
+impl RestartPolicy {
+    pub const UNLESS_STOPPED: &str = "unless-stopped";
+    pub const NO: &str = "no";
+
+    /// The policy a recorded or loaded `restart` value means. Anything but
+    /// `"no"` restarts: load rejects other values, and a service recorded
+    /// before the field had a default has none.
+    pub fn of(restart: Option<&str>) -> Self {
+        if restart == Some(Self::NO) {
+            Self::No
+        } else {
+            Self::UnlessStopped
+        }
+    }
+}
+
 pub fn validate_restart(restart: Option<&str>) -> anyhow::Result<()> {
     let Some(restart) = restart else {
         return Ok(());
     };
-    if restart != "unless-stopped" {
-        anyhow::bail!("service.restart must be \"unless-stopped\" (got {restart:?})");
+    if restart != RestartPolicy::UNLESS_STOPPED && restart != RestartPolicy::NO {
+        anyhow::bail!(
+            "service.restart must be \"unless-stopped\" (the default) or \"no\" (got {restart:?})"
+        );
     }
     Ok(())
 }
@@ -870,7 +898,15 @@ keep = true
         reject_userns(None).unwrap();
         let err = reject_userns(Some("keep-id")).unwrap_err().to_string();
         assert!(err.contains("service.user"), "{err}");
+        validate_restart(None).unwrap();
         validate_restart(Some("unless-stopped")).unwrap();
+        validate_restart(Some("no")).unwrap();
         assert!(validate_restart(Some("always")).is_err());
+        assert_eq!(RestartPolicy::of(None), RestartPolicy::UnlessStopped);
+        assert_eq!(
+            RestartPolicy::of(Some("unless-stopped")),
+            RestartPolicy::UnlessStopped
+        );
+        assert_eq!(RestartPolicy::of(Some("no")), RestartPolicy::No);
     }
 }

@@ -2214,3 +2214,24 @@ fn missing_init_binary_matches_podman_4_and_5() {
     ));
     assert!(!missing_init_stderr("Error: port 8080 is already in use"));
 }
+
+/// #450: containers restart on exit unless the Russelfile says `restart = "no"`.
+#[test]
+fn restart_unless_stopped_is_the_default_and_no_opts_out() {
+    let restart_args = |restart: Option<&str>| {
+        let spec = ContainerStartSpec {
+            restart: restart.map(String::from),
+            ..cpus_spec(None)
+        };
+        let args = build_run_args(&spec, &PathBuf::from("/tmp/c.log")).unwrap();
+        args.iter()
+            .position(|a| a == "--restart")
+            .map(|i| args[i + 1].clone())
+    };
+    assert_eq!(restart_args(None).as_deref(), Some("unless-stopped"));
+    assert_eq!(
+        restart_args(Some("unless-stopped")).as_deref(),
+        Some("unless-stopped")
+    );
+    assert_eq!(restart_args(Some("no")), None);
+}
