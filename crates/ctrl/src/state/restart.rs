@@ -85,7 +85,7 @@ impl AppState {
         let mut inner = self.lock_inner();
         if let Some(s) = inner.services.get_mut(service_id) {
             s.restarts = s.restarts.saturating_add(1);
-            push_capped(&mut s.logs, "RESTARTED (restart = unless-stopped)\n");
+            push_capped(&mut s.logs, "RESTARTED by ctrl\n");
         }
     }
 }

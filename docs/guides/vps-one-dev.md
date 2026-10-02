@@ -106,4 +106,3 @@ All of them: [Examples](../reference/examples.md).
 - More than one server
 - Managed databases: run Postgres or Redis as ordinary services instead
 - TLS in the control plane itself: use SSH or a reverse proxy
-- Guaranteed restart after a server reboot. The control plane comes back by itself, but containers may not. Check `russel ps` after a reboot, and run `russel update <id>` for anything that is down. Bringing services back after a reboot is planned for v0.2.

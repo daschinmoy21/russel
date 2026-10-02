@@ -560,11 +560,9 @@ async fn vm_stop(
         Ok(_) => {
             // Reap only after successful stop — handles stayed in state during the op.
             handle.reap(&state, &service_id).await;
-            // restart = "unless-stopped" must leave an operator stop alone,
-            // including across a ctrl restart.
-            if runtime == RuntimeKind::Microvm {
-                crate::restart::note_user_stop(&service_id);
-            }
+            // An operator stop keeps the service down: restart = "unless-stopped"
+            // and the ctrl-start pass (#450) both leave it alone.
+            crate::restart::note_user_stop(&service_id);
             // Deregister from ingress so the proxy stops routing to this backend.
             let ingress = default_ingress();
             if let Err(e) = ingress.deregister(&service_id).await {

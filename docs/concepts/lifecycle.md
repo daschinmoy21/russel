@@ -89,10 +89,22 @@ Guide: [Update and rollback](../guides/update-rollback.md).
 `restart = "unless-stopped"` keeps a service running after it exits.
 
 - **Containers:** Podman restarts the container at once. The service reads `failed` until the restarted container has been up for 10 s, then `deployed` again. A crash loop keeps it `failed`. `russel status` shows the restart count since the last deploy.
-- **MicroVMs:** Russel starts the same build again, with the same config, env, volumes, and ports. Nothing is rebuilt. This happens when the app exits without a `stop` or `destroy`, and when the control plane starts and finds the VM down (after a reboot, for example).
+- **MicroVMs:** Russel starts the same build again, with the same config, env, volumes, and ports. Nothing is rebuilt. This happens when the app exits without a `stop` or `destroy`.
 - **MicroVM crash loops** wait 1 s, 2 s, 4 s, and so on, up to 30 s, between attempts. A run of 60 s resets the wait. The previous run's output is kept as `console.log.1`.
 - **`russel stop`** is remembered: the service stays down, even across control-plane restarts, until the next deploy.
 - A deploy, stop, or destroy during a wait cancels the pending restart.
+
+## After a reboot
+
+When the control plane starts (after a server reboot, or after `systemctl restart russel-ctrl`), it starts every service it finds down again, with or without `restart`:
+
+- **Containers:** Russel starts the container the service last ran, with the same build, ports, volumes, and secrets. The service answers a second or two after the control plane is up.
+- **MicroVMs:** Russel boots the recorded build again, the same way as [Restart on exit](#restart-on-exit).
+- Nothing is rebuilt, and no deployment is added to the history.
+- **`russel stop`** is remembered here too: a stopped service stays down until the next deploy.
+- A service still running when the control plane starts (the control plane restarted, the server did not) is adopted as it is.
+
+If a service can't start (for example, its container was removed outside Russel), it reads `failed`, and `russel logs` says why. `russel update <id>` deploys it again.
 
 ## Health
 
