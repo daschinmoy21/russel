@@ -82,7 +82,9 @@ How the app is reached from outside. Optional; an empty table is the same as non
 | `host` | string | `<name>.<RUSSEL_TRAEFIK_DOMAIN>` | The exact host name Traefik routes to this service, such as `api.example.com` or `example.com`. Lowercased. Up to 253 characters, in labels of up to 63 letters, digits, and hyphens. No wildcards. For international names, use the `xn--` form. |
 | `port` | integer | picked from 3100 up | Pins the host port the app is published on. At least 1024, and not 7878 or 7946. |
 
-Pin `port` when a script, firewall rule, or non-HTTP client needs a fixed port. The pin holds across updates, rollbacks, and restarts. Two versions can't share it, so updates stop the old version first and have a short gap, as with `[[ports]]`. Apps reached through Traefik don't need it. HTTPS is set on the control plane with `RUSSEL_TRAEFIK_TLS=1`; see [Traefik ingress](../guides/traefik-ingress.md).
+Pin `port` when a script, firewall rule, non-HTTP client, or manually configured reverse proxy needs a fixed port. The pin holds across updates, rollbacks, and restarts. Two versions can't share it, so updates stop the old version first and have a short gap, as with `[[ports]]`. Apps reached through Traefik don't need it. HTTPS is set on the control plane with `RUSSEL_TRAEFIK_TLS=1`; see [Traefik ingress](../guides/traefik-ingress.md).
+
+Omitting `[ingress]` or `host` does not disable automatic route-file creation: Russel generates a default Traefik hostname. There is currently no full ingress-off setting. For direct Caddy, Nginx, or manually configured Traefik routing, see [Manual routing](../guides/traefik-ingress.md#manual-routing).
 
 ## `[[volumes]]`
 

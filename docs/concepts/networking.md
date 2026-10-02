@@ -5,7 +5,7 @@ sidebar_position: 3
 keywords: [networking, ports, traefik, ingress, passt, pasta, host port]
 ---
 
-Every app is published on a port on the server's loopback address, `127.0.0.1`. Nothing is reachable from the internet until you put a proxy in front. Traefik is the supported way to do that: Russel writes its routes for you.
+Every app is published on a port on the server's loopback address, `127.0.0.1`. With the default loopback bind, HTTP apps need a proxy in front to be reachable from the internet. You own that proxy: Russel does not start Traefik or take over ports 80 and 443. Traefik is the current automatic ingress adapter; Russel writes routes that an externally managed instance reads. That instance can be shared with other VPS apps, or run behind an existing proxy. You can also configure Caddy, Nginx, or Traefik manually to route directly to a pinned app port. See [Choose how traffic reaches Russel apps](../guides/traefik-ingress.md#choose-how-traffic-reaches-russel-apps).
 
 ```mermaid
 flowchart LR
@@ -18,7 +18,7 @@ flowchart LR
 
 - Each app's `service.port` (the port it listens on inside its sandbox) is published on a host port.
 - Unless you pin one, Russel picks the first free port from `3100` up. It can change on the next update, so check `russel ps`.
-- To pin it, set `[ingress].port` in the Russelfile, for a script, firewall rule, or non-HTTP client that needs a fixed port. The pin holds across updates, rollbacks, and restarts. Apps reached through Traefik don't need a pin.
+- To pin it, set `[ingress].port` in the Russelfile, for a script, firewall rule, non-HTTP client, or manually configured reverse proxy that needs a fixed port. The pin holds across updates, rollbacks, and restarts. Apps reached through Traefik don't need a pin.
 - `[[ports]]` publishes extra ports next to the main one, such as a second protocol.
 - Ports bind to `127.0.0.1` by default. `RUSSEL_PUBLISH_BIND` changes that: `0.0.0.0` for every interface, or a Tailscale address to reach apps only over your tailnet.
 
@@ -35,19 +35,17 @@ Russel writes one small route file per service, `<service>.yaml`, into `/var/lib
 | `[ingress]` with `host = "api.example.com"` | ``Host(`api.example.com`)`` → the app |
 | No `host` | ``Host(`<service name>.<RUSSEL_TRAEFIK_DOMAIN>`)``, for example `api.russel.local` |
 
-A custom `host` replaces the default name. Two services can't claim the same name; the second deploy is rejected.
+A custom `host` replaces the default name. Russel rejects two service files in its configured route directory that claim the same hostname. It does not check every other Traefik provider or your Caddy/Nginx configuration for conflicts.
 
 Stopping or destroying a service deletes its file, and Traefik stops routing to it. `RUSSEL_TRAEFIK_TLS=1` adds HTTPS and a certificate resolver to every route. Setup, including DNS and Let's Encrypt: [Traefik ingress](../guides/traefik-ingress.md).
 
 ## During an update
 
-An update starts the new version on a fresh host port while the old one keeps serving. Once the new one answers, Russel rewrites the route file to point at it and waits until Traefik serves it. The old one then keeps running for 5 s to finish its requests (the first 2 s also catch a new version that crashes), gets a stop request, and is killed if it is still up 5 s later. The host name never changes. [What zero downtime covers](./lifecycle.md#what-zero-downtime-covers) has the details.
+An update starts the new version on a fresh host port while the old one keeps serving. Once the new one answers, Russel rewrites the route file to point at it and waits until Traefik serves it. The old one then keeps running for 5 s to finish its requests (the candidate is watched throughout the drain and checked again before retirement), gets a stop request, and is killed if it is still up 5 s later. The host name never changes. [What zero downtime covers](./lifecycle.md#what-zero-downtime-covers) has the details.
 
 A service with a pinned `[ingress].port` or with `[[ports]]` updates differently, because two versions can't hold the same host port. Russel stops the old version, starts the new one on the same ports, and restores the old one if the new one fails or crashes within 2 s. The ports stay the same, at the cost of a short gap. See [Deploy and redeploy](./lifecycle.md#deploy-and-redeploy).
 
-A pinned `[ingress].port` doesn't survive this switch: the app stays on the fresh port after the update, and every later update picks another one. Traefik always follows, so reach apps by name. (A microVM under a root control plane is the exception and gets its pin back.)
-
-A service with `[[ports]]` can't run two versions at once, because both would need the same port. It stops the old version first and has a short gap. See [Lifecycle](./lifecycle.md#deploy-and-redeploy).
+For manual proxy configuration, pin the host port so the proxy's backend address stays the same. This uses the stop-first update path with a short gap; automatic dual-live cutover requires a route adapter that follows the candidate's new port. [Manual routing](../guides/traefik-ingress.md#manual-routing) covers the configuration and the current absence of a full ingress-off switch.
 
 ## MicroVMs as root
 
