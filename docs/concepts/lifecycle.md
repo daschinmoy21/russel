@@ -88,7 +88,7 @@ Guide: [Update and rollback](../guides/update-rollback.md).
 
 A service is restarted when it exits. This is `restart = "unless-stopped"`, the default; `restart = "no"` turns it off.
 
-Containers deployed before `unless-stopped` became the default were created without a restart policy. The control plane gives them the recorded policy when it starts, with `podman update --restart`. A Podman that can't change it keeps the old policy until the next `russel update`, and `ctrl.log` says so.
+Containers deployed before `unless-stopped` became the default were created without a restart policy. The control plane gives them the recorded policy when it starts, with `podman update --restart`. If the recorded container ID is unavailable or Podman can't change the policy, the container keeps the old policy until the next `russel update`, and `ctrl.log` says so.
 
 - **Containers:** Podman restarts the container at once. The service reads `failed` until the restarted container has been up for 10 s, then `deployed` again. A crash loop keeps it `failed`. `russel status` shows the restart count since the last deploy.
 - **MicroVMs:** Russel starts the same build again, with the same config, env, volumes, and ports. Nothing is rebuilt. This happens when the app exits without a `stop` or `destroy`.

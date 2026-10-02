@@ -146,18 +146,39 @@ fn podman_policy_name(name: &str) -> &str {
 /// without `podman update --restart` keep the old policy until the next
 /// deploy, and the log says so.
 async fn sync_restart_policy(service_id: &str, meta: &Value) {
+    sync_restart_policy_with(service_id, meta, podman_command).await;
+}
+
+async fn sync_restart_policy_with<F, Fut>(service_id: &str, meta: &Value, mut command: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = tokio::process::Command>,
+{
+    // The metadata snapshot belongs to this exact container. Its name can
+    // be reused by a deploy while this background migration awaits Podman.
+    // Never fall back to that name, even when the old container is gone.
+    let Some(container_id) = meta
+        .get("container_id")
+        .and_then(Value::as_str)
+        .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        tracing::warn!(
+            service_id,
+            "no full container ID recorded; `russel update` applies the restart policy"
+        );
+        return;
+    };
     let want = match policy(meta) {
         RestartPolicy::UnlessStopped => RestartPolicy::UNLESS_STOPPED,
         RestartPolicy::No => RestartPolicy::NO,
     };
-    let name = resolve_container_name(service_id);
-    let mut inspect = podman_command().await;
+    let mut inspect = command().await;
     let Ok(out) = inspect
         .args([
             "inspect",
             "--format",
             "{{.HostConfig.RestartPolicy.Name}}",
-            &name,
+            container_id,
         ])
         .output()
         .await
@@ -171,9 +192,9 @@ async fn sync_restart_policy(service_id: &str, meta: &Value) {
     if podman_policy_name(&have) == want {
         return;
     }
-    let mut update = podman_command().await;
+    let mut update = command().await;
     match update
-        .args(["update", "--restart", want, &name])
+        .args(["update", "--restart", want, container_id])
         .output()
         .await
     {
@@ -438,5 +459,164 @@ mod tests {
         assert_eq!(podman_policy_name(""), "no");
         assert_eq!(podman_policy_name("no"), "no");
         assert_eq!(podman_policy_name("unless-stopped"), "unless-stopped");
+    }
+
+    struct PolicyFixture {
+        dir: tempfile::TempDir,
+        container_id: String,
+    }
+
+    impl PolicyFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("podman");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> commands
+target=$4
+case "$1" in
+inspect)
+    if [ "$target" = "$OLD_CONTAINER_ID" ]; then
+        [ -e old-present ] || exit 1
+        have=$(cat old-policy)
+    elif [ "$target" = russel-policy-test ]; then
+        if [ -e old-present ]; then have=$(cat old-policy); else have=$(cat new-policy); fi
+    else
+        exit 1
+    fi
+    if [ -e block-inspect ]; then
+        touch entered
+        while [ ! -e release ]; do sleep 0.01; done
+    fi
+    printf '%s\n' "$have"
+    ;;
+update)
+    if [ "$target" = "$OLD_CONTAINER_ID" ]; then
+        [ -e old-present ] || exit 1
+        printf '%s' "$3" > old-policy
+    elif [ "$target" = russel-policy-test ]; then
+        if [ -e old-present ]; then printf '%s' "$3" > old-policy; else printf '%s' "$3" > new-policy; fi
+    else
+        exit 1
+    fi
+    ;;
+*) exit 1 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for (file, value) in [
+                ("old-present", ""),
+                ("old-policy", "no"),
+                ("new-policy", "no"),
+            ] {
+                std::fs::write(dir.path().join(file), value).unwrap();
+            }
+            Self {
+                dir,
+                container_id: "a".repeat(64),
+            }
+        }
+
+        fn command(&self) -> std::future::Ready<tokio::process::Command> {
+            let mut command = tokio::process::Command::new(self.dir.path().join("podman"));
+            command
+                .current_dir(self.dir.path())
+                .env("OLD_CONTAINER_ID", &self.container_id);
+            std::future::ready(command)
+        }
+
+        fn metadata(&self) -> Value {
+            json!({ "runtime": "container", "container_id": self.container_id })
+        }
+
+        fn read(&self, file: &str) -> String {
+            std::fs::read_to_string(self.dir.path().join(file)).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_migration_updates_only_the_recorded_container() {
+        let fixture = PolicyFixture::new();
+        let mut meta = fixture.metadata();
+        sync_restart_policy_with("policy-test", &meta, || fixture.command()).await;
+        assert_eq!(fixture.read("old-policy"), "unless-stopped");
+        assert_eq!(fixture.read("new-policy"), "no");
+        let commands = fixture.read("commands");
+        assert!(commands.contains(&format!(
+            "update --restart unless-stopped {}",
+            fixture.container_id
+        )));
+        assert!(!commands.contains("russel-policy-test"));
+
+        meta["desired_state"] = json!({ "restart": "no" });
+        sync_restart_policy_with("policy-test", &meta, || fixture.command()).await;
+        assert_eq!(fixture.read("old-policy"), "no");
+    }
+
+    #[tokio::test]
+    async fn policy_migration_cannot_update_a_replacement_during_inspect() {
+        let fixture = PolicyFixture::new();
+        std::fs::write(fixture.dir.path().join("block-inspect"), "").unwrap();
+        let migration = async {
+            sync_restart_policy_with("policy-test", &fixture.metadata(), || fixture.command())
+                .await;
+        };
+        let replace = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !fixture.dir.path().join("entered").exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "inspection never started"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Cold deploy removes the old ID and reuses the service name.
+            std::fs::remove_file(fixture.dir.path().join("old-present")).unwrap();
+            std::fs::write(fixture.dir.path().join("release"), "").unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(6), async {
+            tokio::join!(migration, replace);
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.read("new-policy"), "no");
+        assert!(fixture.read("commands").contains(&format!(
+            "update --restart unless-stopped {}",
+            fixture.container_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn policy_migration_cannot_update_a_replacement_before_inspect() {
+        let fixture = PolicyFixture::new();
+        std::fs::remove_file(fixture.dir.path().join("old-present")).unwrap();
+        sync_restart_policy_with("policy-test", &fixture.metadata(), || fixture.command()).await;
+        assert_eq!(fixture.read("new-policy"), "no");
+        assert!(!fixture.read("commands").contains("update --restart"));
+    }
+
+    #[tokio::test]
+    async fn policy_migration_refuses_missing_or_reusable_container_ids() {
+        for container_id in [
+            Value::Null,
+            json!("russel-policy-test"),
+            json!("a".repeat(12)),
+            json!("z".repeat(64)),
+        ] {
+            let meta = json!({ "container_id": container_id });
+            sync_restart_policy_with(
+                "policy-test",
+                &meta,
+                || -> std::future::Ready<tokio::process::Command> {
+                    panic!("unsafe container identity must not reach Podman")
+                },
+            )
+            .await;
+        }
     }
 }
