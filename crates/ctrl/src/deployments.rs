@@ -56,15 +56,18 @@ const STATUS_PREVIOUS: &str = "previous";
 const STATUS_SUPERSEDED: &str = "superseded";
 const STATUS_ROLLED_BACK: &str = "rolled_back";
 
+/// File name of the deployments journal inside a service dir.
+pub(crate) const JOURNAL_FILE: &str = "deployments.json";
+
 /// On-disk path for a service's deployments journal.
 pub fn deployments_path(service_id: &str) -> PathBuf {
-    crate::paths::service_dir(service_id).join("deployments.json")
+    crate::paths::service_dir(service_id).join(JOURNAL_FILE)
 }
 
 /// Journal path under an arbitrary base dir (tests).
 #[cfg(test)]
 pub fn deployments_path_in(base: &Path, service_id: &str) -> PathBuf {
-    base.join(service_id).join("deployments.json")
+    base.join(service_id).join(JOURNAL_FILE)
 }
 
 /// Snapshot of desired deploy inputs stored alongside each history row so

@@ -115,28 +115,78 @@ pub(crate) async fn promote_generation(runtime_key: &str, service_id: &str) -> a
 }
 
 /// Move the deployment history (`deployments.json`, `rollback.pending`) from
-/// one service dir to another. Best effort: a missing file is fine.
-pub(crate) async fn carry_history(from_id: &str, to_id: &str) {
-    let from = crate::paths::service_dir(from_id);
-    let to = crate::paths::service_dir(to_id);
-    let journal = deployments::deployments_path(from_id);
-    let names = [
-        journal.file_name().map(|n| n.to_os_string()),
-        Some("rollback.pending".into()),
-    ];
-    for name in names.into_iter().flatten() {
-        let src = from.join(&name);
-        if !src.exists() {
-            continue;
-        }
-        if let Err(e) = tokio::fs::create_dir_all(&to).await {
-            tracing::warn!(dir = %to.display(), error = %e, "cannot keep deployment history");
-            return;
-        }
-        if let Err(e) = tokio::fs::rename(&src, to.join(&name)).await {
-            tracing::warn!(file = %src.display(), error = %e, "cannot keep deployment history");
+/// one service dir to another. A missing file is fine. A rename that fails
+/// (another filesystem, say) falls back to copy and delete. `Err` means a
+/// file that existed did not arrive. The files already moved are put back
+/// then, so `from` holds the whole history and it is never split.
+pub(crate) async fn carry_history(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut moved = Vec::new();
+    for name in [deployments::JOURNAL_FILE, "rollback.pending"] {
+        match move_file(&from.join(name), to, name).await {
+            Ok(true) => moved.push(name),
+            Ok(false) => {}
+            Err(e) => {
+                for name in moved {
+                    let _ = move_file(&to.join(name), from, name).await;
+                }
+                return Err(e);
+            }
         }
     }
+    Ok(())
+}
+
+/// Move `src` to `dir/name`: rename, or copy and delete when the rename
+/// fails. `Ok(false)` when `src` does not exist (or vanished meanwhile).
+async fn move_file(src: &Path, dir: &Path, name: &str) -> std::io::Result<bool> {
+    if !tokio::fs::try_exists(src).await? {
+        return Ok(false);
+    }
+    tokio::fs::create_dir_all(dir).await?;
+    let dst = dir.join(name);
+    if tokio::fs::rename(src, &dst).await.is_ok() {
+        return Ok(true);
+    }
+    match tokio::fs::copy(src, &dst).await {
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(src).await;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Where [`preserve_history`] put the history.
+#[derive(Debug)]
+pub(crate) enum HistoryMove {
+    /// In the destination service dir, as intended.
+    Carried,
+    /// In the kept dir, because the destination refused it (that error).
+    Kept(std::io::Error),
+}
+
+/// Move the history out of `from` before something deletes `from`: into
+/// `to`, or failing that into `kept`. `Err` when neither took it; the
+/// history is still in `from` then, and `from` must not be deleted.
+pub(crate) async fn preserve_history(
+    from: &Path,
+    to: &Path,
+    kept: &Path,
+) -> std::io::Result<HistoryMove> {
+    match carry_history(from, to).await {
+        Ok(()) => Ok(HistoryMove::Carried),
+        Err(e) => carry_history(from, kept)
+            .await
+            .map(|()| HistoryMove::Kept(e)),
+    }
+}
+
+/// Where history that could not be carried over is kept: next to the
+/// service dir, under a `.bak` name that service inventory skips and that a
+/// later cold replace (`<id>.bak`) does not collide with.
+pub(crate) fn kept_history_dir(service_id: &str, generation_id: &str) -> std::path::PathBuf {
+    crate::paths::data_root().join(format!("{service_id}.history-{generation_id}.bak"))
 }
 
 /// Persist repo/config so update + health restart can rebuild desired state.

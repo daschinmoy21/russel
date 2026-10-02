@@ -29,7 +29,7 @@ An update normally runs the old and new versions side by side:
 2. Once the new version answers, Traefik's route switches to it.
 3. The old version keeps running for 2 s in case the new one crashes, then stops.
 
-A service with `[[ports]]` or a pinned `[ingress].port` can't do that, because both versions would need the same fixed host ports. For those services Russel backs up the old version's files, stops it (waiting up to 5 s before killing it), and then starts the new one. There is a short gap in service.
+A service with `[[ports]]` or a pinned `[ingress].port` can't do that, because both versions would need the same fixed host ports. A service with a writable volume (`rw = true`) doesn't do it either: two versions would write to the same data. For those services Russel backs up the old version's files, stops it (waiting up to 5 s before killing it), and then starts the new one. There is a short gap in service.
 
 For containers, the old container is only stopped after the new one's Podman command has been checked, so a bad flag never takes the running version down.
 
@@ -43,7 +43,7 @@ Some apps listen and then crash a moment later. Postgres without `/dev/shm`, for
 |---|---|---|
 | **First deploy** (nothing running yet) | The first answer. | `deploy` has already reported `deployed`. The service reads `failed` within about a second. With `restart = "unless-stopped"` it is restarted ([Restart on exit](#restart-on-exit)). |
 | **Update or rollback, side by side** | The first answer. Traffic switches at once, and the previous version keeps running for **2 s**. | Traffic goes back to the previous version, which never stopped. The new one is removed, and `update` fails with `new version crashed within 2s of answering` plus the app's last output. |
-| **Update with `[[ports]]` or `[ingress].port`** | The first answer, then **2 s** in which the new version must stay up. The previous version is already stopped. | The previous version is restored from its backup, and `update` fails with `rolled_back`. |
+| **Update with `[[ports]]`, `[ingress].port`, or a writable volume** | The first answer, then **2 s** in which the new version must stay up. The previous version is already stopped. | The previous version is restored from its backup, and `update` fails with `rolled_back`. |
 | **Relaunch** (`restart = "unless-stopped"`) | The first answer. | Russel waits a little longer before the next try ([Restart on exit](#restart-on-exit)). |
 
 Why it works this way:

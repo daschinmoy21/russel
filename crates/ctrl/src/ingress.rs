@@ -195,6 +195,14 @@ pub trait Ingress: Send + Sync {
         host_rules: &[HostRule],
     ) -> anyhow::Result<()>;
 
+    /// Whether `register` would accept these host rules, without writing
+    /// anything. Deploy calls it before it stops the running generation, so a
+    /// route that cannot be registered fails the deploy with nothing touched.
+    /// `register` still checks for itself. The default accepts everything.
+    async fn check_route(&self, _service_id: &str, _host_rules: &[HostRule]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Remove all routes for the service.
     async fn deregister(&self, service_id: &str) -> anyhow::Result<()>;
 

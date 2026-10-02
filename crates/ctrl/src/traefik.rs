@@ -85,6 +85,25 @@ impl TraefikFileIngress {
         }
     }
 
+    /// The Host a route for `service_id` would be served under, validated.
+    fn route_host(&self, service_id: &str, host_rules: &[HostRule]) -> anyhow::Result<String> {
+        if host_rules.len() > 1 {
+            anyhow::bail!(
+                "v1 ingress supports one Host rule (got {})",
+                host_rules.len()
+            );
+        }
+        let host = if let Some(rule) = host_rules.first() {
+            rule.host.clone()
+        } else {
+            self.public_host(service_id)
+        };
+        if !is_valid_dns_name(&host) {
+            anyhow::bail!("ingress.host {host:?} is not a valid DNS name");
+        }
+        Ok(host)
+    }
+
     /// Always true — writing config files is harmless even without Traefik.
     #[allow(dead_code)]
     pub fn enabled(&self) -> bool {
@@ -223,21 +242,7 @@ impl Ingress for TraefikFileIngress {
         backend: &Backend,
         host_rules: &[HostRule],
     ) -> anyhow::Result<()> {
-        if host_rules.len() > 1 {
-            anyhow::bail!(
-                "v1 ingress supports one Host rule (got {})",
-                host_rules.len()
-            );
-        }
-
-        let host = if let Some(rule) = host_rules.first() {
-            rule.host.clone()
-        } else {
-            self.public_host(service_id)
-        };
-        if !is_valid_dns_name(&host) {
-            anyhow::bail!("ingress.host {host:?} is not a valid DNS name");
-        }
+        let host = self.route_host(service_id, host_rules)?;
 
         let router_key = router_name(service_id);
         let service_name = router_name(service_id);
@@ -301,6 +306,11 @@ impl Ingress for TraefikFileIngress {
         );
 
         Ok(())
+    }
+
+    async fn check_route(&self, service_id: &str, host_rules: &[HostRule]) -> anyhow::Result<()> {
+        let host = self.route_host(service_id, host_rules)?;
+        self.ensure_host_is_unique(service_id, &host).await
     }
 
     async fn deregister(&self, service_id: &str) -> anyhow::Result<()> {
@@ -730,6 +740,37 @@ mod tests {
             error.to_string(),
             "ingress host \"abc.EXAMPLE.com\" is already routed by service \"first\""
         );
+    }
+
+    /// #557: deploy asks before it stops the running generation. A host
+    /// another service owns is refused without touching the route files.
+    #[tokio::test]
+    async fn check_route_refuses_a_taken_host_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dynamic");
+        let ing = test_ingress(dir.clone(), "russel.local");
+        let rules = vec![HostRule {
+            host: "shared.example.com".to_string(),
+        }];
+        Ingress::register(&ing, "owner", &Backend::localhost(3100), &rules)
+            .await
+            .unwrap();
+
+        let error = Ingress::check_route(&ing, "newcomer", &rules)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ingress host \"shared.example.com\" is already routed by service \"owner\""
+        );
+        assert!(!dir.join("newcomer.json").exists());
+
+        // The owner updating its own route, or a free host, is fine.
+        Ingress::check_route(&ing, "owner", &rules).await.unwrap();
+        Ingress::check_route(&ing, "newcomer", &[]).await.unwrap();
+        // Same validation as `register`.
+        let two = vec![rules[0].clone(), rules[0].clone()];
+        assert!(Ingress::check_route(&ing, "newcomer", &two).await.is_err());
     }
 
     #[tokio::test]

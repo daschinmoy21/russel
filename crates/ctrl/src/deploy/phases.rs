@@ -35,9 +35,10 @@ use crate::{
 };
 
 use super::pipeline::{
-    DeployInnerResult, DeployOutput, DeployPipeline, DeployWorkload, DesiredExtras, ResolvedSource,
-    build_desired_state, carry_history, new_generation_id, promote_generation,
-    record_source_in_metadata, reject_live_listen_collision, validate_live_ingress_port,
+    DeployInnerResult, DeployOutput, DeployPipeline, DeployWorkload, DesiredExtras, HistoryMove,
+    ResolvedSource, build_desired_state, carry_history, kept_history_dir, new_generation_id,
+    preserve_history, promote_generation, record_source_in_metadata, reject_live_listen_collision,
+    validate_live_ingress_port,
 };
 use super::rollback::{
     ServiceDirs, attempt_container_rollback, attempt_microvm_rollback, cleanup_failed_deploy,
@@ -119,6 +120,14 @@ impl DeployPipeline {
         );
 
         let built = self.build(service_id, &plan, &tx).await?;
+        // A route that cannot be registered fails here, while the live
+        // generation is still running. `register` checks again after boot.
+        self.ingress
+            .check_route(service_id, &plan.host_rules)
+            .await?;
+        // The live generation's route, to point back at if this deploy does
+        // not take it over (`hold`, `recover_failed_ingress`).
+        let previous_route = self.live_route(service_id, &plan);
         let slot = self.prepare_slot(service_id, &plan, &tx).await?;
 
         // Armed once boot reserves ports, so dropping it releases them.
@@ -132,14 +141,21 @@ impl DeployPipeline {
             }
         };
 
-        // The live generation's route, to point back at from `hold`.
-        let previous_route = if slot.dual_live {
-            self.live_route(service_id, &plan)
-        } else {
-            None
-        };
-        self.swap_ingress(service_id, &plan, &slot, &booted.workload)
-            .await?;
+        if let Err(error) = self
+            .swap_ingress(service_id, &plan, &slot, &booted.workload)
+            .await
+        {
+            return self
+                .recover_failed_ingress(
+                    service_id,
+                    &slot,
+                    &booted.workload,
+                    error,
+                    previous_route,
+                    reservation,
+                )
+                .await;
+        }
         self.hold(service_id, &slot, &mut booted.workload, previous_route, &tx)
             .await?;
         self.cutover(service_id, &plan, &slot, &booted.workload, &tx)
@@ -221,7 +237,12 @@ impl DeployPipeline {
         tx: &Events,
     ) -> anyhow::Result<Slot> {
         let prior_runtime = resolve_prior_runtime(service_id).await?;
-        let dual_live = is_dual_live(prior_runtime, plan.pin_mapping.as_ref(), &plan.config.ports);
+        let dual_live = is_dual_live(
+            prior_runtime,
+            plan.pin_mapping.as_ref(),
+            &plan.config.ports,
+            &plan.volumes,
+        );
 
         // Generation identity: when replacing a live service, boot the candidate
         // under `{service_id}_g{gen}` so the active generation keeps its TAP/port
@@ -394,7 +415,7 @@ impl DeployPipeline {
         plan: &Plan,
         slot: &Slot,
         error: anyhow::Error,
-        mut reservation: Option<PortReservation>,
+        reservation: Option<PortReservation>,
     ) -> anyhow::Result<DeployInnerResult> {
         tracing::error!(
             service_id,
@@ -405,6 +426,71 @@ impl DeployPipeline {
         );
         // Only destroy the candidate; dual-live leaves the active generation alone.
         cleanup_failed_deploy(plan.runtime, &slot.runtime_key, &self.runner).await;
+        self.restore_previous(service_id, slot, error, reservation)
+            .await
+    }
+
+    /// The ingress refused the new generation after it booted. Tear the
+    /// candidate down. On the cold path the previous generation is already
+    /// stopped, so put it back as after a failed boot and point its route at
+    /// it again. Dual-live never stopped it, so there is nothing to restore.
+    async fn recover_failed_ingress(
+        &self,
+        service_id: &str,
+        slot: &Slot,
+        workload: &DeployWorkload,
+        error: anyhow::Error,
+        previous_route: Option<(u16, Vec<HostRule>)>,
+        reservation: Option<PortReservation>,
+    ) -> anyhow::Result<DeployInnerResult> {
+        tracing::error!(
+            service_id,
+            runtime_key = %slot.runtime_key,
+            error = %error,
+            "ingress failed after the new generation booted; tearing it down"
+        );
+        self.destroy_candidate(slot, workload, "ingress failure")
+            .await;
+        let result = self
+            .restore_previous(service_id, slot, error, reservation)
+            .await?;
+        let DeployInnerResult::RolledBack { runtime, error } = result else {
+            return Ok(result);
+        };
+        let error = match self.restore_route(service_id, previous_route).await {
+            Ok(()) => error,
+            Err(route_error) => format!(
+                "{error}; the previous version is running again, but its ingress route \
+                 could not be restored: {route_error:#}"
+            ),
+        };
+        Ok(DeployInnerResult::RolledBack { runtime, error })
+    }
+
+    /// Register the previous generation's route again. Nothing to do when it
+    /// is unknown.
+    async fn restore_route(
+        &self,
+        service_id: &str,
+        previous_route: Option<(u16, Vec<HostRule>)>,
+    ) -> anyhow::Result<()> {
+        let Some((port, host_rules)) = previous_route else {
+            return Ok(());
+        };
+        self.ingress
+            .register(service_id, &Backend::from_publish(port), &host_rules)
+            .await
+    }
+
+    /// The candidate is gone. Dual-live reports the failure. The cold path
+    /// puts the previous generation back from its `.bak` dirs.
+    async fn restore_previous(
+        &self,
+        service_id: &str,
+        slot: &Slot,
+        error: anyhow::Error,
+        mut reservation: Option<PortReservation>,
+    ) -> anyhow::Result<DeployInnerResult> {
         if slot.dual_live {
             // Active generation never stopped — report hard failure without rollback.
             return Err(
@@ -455,8 +541,8 @@ impl DeployPipeline {
         }
     }
 
-    /// Point the stable route at the new generation. On failure the candidate
-    /// is torn down in full (#116); a dual-live active generation stays.
+    /// Point the stable route at the new generation. The caller tears the
+    /// candidate down in full (#116) when this fails.
     async fn swap_ingress(
         &self,
         service_id: &str,
@@ -465,7 +551,7 @@ impl DeployPipeline {
         workload: &DeployWorkload,
     ) -> anyhow::Result<()> {
         let backend = Backend::from_publish(workload.port().host);
-        let result = if slot.dual_live {
+        if slot.dual_live {
             // Zero-downtime cutover: rewrite Traefik backend for the stable service id.
             tracing::info!(
                 service_id,
@@ -480,13 +566,7 @@ impl DeployPipeline {
             self.ingress
                 .register(service_id, &backend, &plan.host_rules)
                 .await
-        };
-        let Err(error) = result else {
-            return Ok(());
-        };
-        self.destroy_candidate(slot, workload, "ingress failure")
-            .await;
-        Err(error)
+        }
     }
 
     /// Tear down the new generation in full: its network, its VM or
@@ -606,7 +686,39 @@ impl DeployPipeline {
     ) {
         if !slot.dual_live {
             if slot.has_backup {
-                slot.dirs.remove_backups().await;
+                // `vacate` moved the history into the `.bak` dir with the rest
+                // of the service dir. Bring it back before the backup goes.
+                match carry_history(
+                    Path::new(&slot.dirs.russel_bak),
+                    Path::new(&slot.dirs.russel),
+                )
+                .await
+                {
+                    Ok(()) => slot.dirs.remove_backups().await,
+                    Err(e) => {
+                        // Removing the backup now would delete the history.
+                        // Keep it aside instead, out of the way of the next
+                        // cold replace.
+                        let kept = kept_history_dir(service_id, &slot.generation_id);
+                        let outcome = match tokio::fs::rename(&slot.dirs.russel_bak, &kept).await {
+                            Ok(()) => {
+                                format!("kept the previous service dir at {}", kept.display())
+                            }
+                            Err(_) => {
+                                format!("left the previous service dir at {}", slot.dirs.russel_bak)
+                            }
+                        };
+                        tracing::error!(service_id, error = %e, "{outcome}: deployment history could not be moved");
+                        super::progress(
+                            tx,
+                            "cutover",
+                            format!(
+                                "warning: deployment history could not be moved ({e}); {outcome}"
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
             self.state
                 .attach_flake_path(service_id, plan.build_path.clone());
@@ -631,7 +743,46 @@ impl DeployPipeline {
         // The history journal lives in the stable service dir, which the
         // old generation's destroy removes and promotion replaces. Move it
         // into the candidate's dir so it survives: rollback reads it.
-        carry_history(service_id, key).await;
+        let live_dir = crate::paths::service_dir(service_id);
+        let kept = kept_history_dir(service_id, &slot.generation_id);
+        match preserve_history(&live_dir, &crate::paths::service_dir(key), &kept).await {
+            Ok(HistoryMove::Carried) => {}
+            Ok(HistoryMove::Kept(e)) => {
+                tracing::error!(service_id, error = %e, kept = %kept.display(), "deployment history kept aside");
+                super::progress(
+                    tx,
+                    "cutover",
+                    format!(
+                        "warning: deployment history could not be moved ({e}); kept it at {}",
+                        kept.display()
+                    ),
+                )
+                .await;
+            }
+            Err(e) => {
+                // Nothing else holds the history, and the destroy below
+                // would delete it. Leave the previous service dir alone and
+                // keep the candidate under its runtime key, as a failed
+                // promote does. Its processes are already stopped.
+                tracing::error!(
+                    service_id,
+                    runtime_key = %key,
+                    error = %e,
+                    "CRITICAL: deployment history could not be preserved; previous service dir left in place"
+                );
+                super::progress(
+                    tx,
+                    "cutover",
+                    format!(
+                        "warning: deployment history could not be preserved ({e}); \
+                         the previous service dir stays in place and the new version runs as {key}"
+                    ),
+                )
+                .await;
+                self.state.attach_flake_path(key, plan.build_path.clone());
+                return;
+            }
+        }
 
         if let Some(prior_kind) = slot.prior_runtime
             && let Err(e) = destroy_prior_runtime(prior_kind, service_id, &self.runner).await
@@ -800,12 +951,21 @@ fn plan(service_id: &str, request: &DeployRequest, source: ResolvedSource) -> an
 /// afterwards. The cold path still refuses a crashing version: the new one
 /// is watched for [`WATCH_WINDOW`] in `boot`, and a crash restores the
 /// previous generation from its `.bak` dirs.
+///
+/// A writable volume (`rw = true`, managed or bind) is replaced cold too. The
+/// candidate resolves the same host path as the live generation, so dual-live
+/// would run two writers on it at once. Read-only volumes are safe to share
+/// and stay dual-live.
 fn is_dual_live(
     prior_runtime: Option<RuntimeKind>,
     pin: Option<&PortMapping>,
     extra_ports: &[ExtraPortSpec],
+    volumes: &[ResolvedVolume],
 ) -> bool {
-    prior_runtime.is_some() && pin.is_none() && extra_ports.is_empty()
+    prior_runtime.is_some()
+        && pin.is_none()
+        && extra_ports.is_empty()
+        && !volumes.iter().any(|v| v.rw)
 }
 
 /// The new generation's primary publish under `key`: the pinned host port
@@ -894,6 +1054,7 @@ async fn watch_candidate(
 mod tests {
     use super::*;
     use crate::network::{port_test_lock, reserve_test_port};
+    use std::sync::Arc;
 
     fn pin(host: u16) -> PortMapping {
         PortMapping { host, guest: 3000 }
@@ -902,24 +1063,75 @@ mod tests {
     #[test]
     fn pinned_update_is_replaced_cold_on_every_runtime() {
         for runtime in [RuntimeKind::Container, RuntimeKind::Microvm] {
-            assert!(!is_dual_live(Some(runtime), Some(&pin(8081)), &[]));
+            assert!(!is_dual_live(Some(runtime), Some(&pin(8081)), &[], &[]));
         }
     }
 
     #[test]
     fn unpinned_update_is_dual_live() {
-        assert!(is_dual_live(Some(RuntimeKind::Container), None, &[]));
-        assert!(is_dual_live(Some(RuntimeKind::Microvm), None, &[]));
+        assert!(is_dual_live(Some(RuntimeKind::Container), None, &[], &[]));
+        assert!(is_dual_live(Some(RuntimeKind::Microvm), None, &[], &[]));
     }
 
     #[test]
     fn first_deploy_and_extra_ports_are_cold() {
-        assert!(!is_dual_live(None, None, &[]));
+        assert!(!is_dual_live(None, None, &[], &[]));
         let extra = [ExtraPortSpec {
             host: 5432,
             guest: 5432,
         }];
-        assert!(!is_dual_live(Some(RuntimeKind::Container), None, &extra));
+        assert!(!is_dual_live(
+            Some(RuntimeKind::Container),
+            None,
+            &extra,
+            &[]
+        ));
+    }
+
+    fn volumes_of(toml: &str) -> Vec<ResolvedVolume> {
+        let config = Russelfile::load_from_str(&format!(
+            "[service]\nname = \"vol\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n{toml}"
+        ))
+        .unwrap();
+        resolve_volumes("vol", &config.volumes, &[]).unwrap()
+    }
+
+    /// #555: two generations on one writable volume are two writers.
+    #[test]
+    fn writable_volume_is_replaced_cold() {
+        let volumes =
+            volumes_of("[[volumes]]\nname = \"data\"\nguest = \"/data\"\nrw = true\nkeep = true\n");
+        assert!(volumes[0].rw);
+        for runtime in [RuntimeKind::Container, RuntimeKind::Microvm] {
+            assert!(!is_dual_live(Some(runtime), None, &[], &volumes));
+        }
+        // One writable row among read-only ones is enough.
+        let mixed = volumes_of(
+            "[[volumes]]\nname = \"ro\"\nguest = \"/ro\"\n[[volumes]]\nname = \"rw\"\nguest = \"/rw\"\nrw = true\n",
+        );
+        assert!(!is_dual_live(
+            Some(RuntimeKind::Container),
+            None,
+            &[],
+            &mixed
+        ));
+    }
+
+    #[test]
+    fn read_only_or_no_volume_stays_dual_live() {
+        let read_only = volumes_of("[[volumes]]\nname = \"cfg\"\nguest = \"/cfg\"\n");
+        assert_eq!(read_only.len(), 1);
+        assert!(!read_only[0].rw);
+        assert!(is_dual_live(
+            Some(RuntimeKind::Container),
+            None,
+            &[],
+            &read_only
+        ));
+        assert!(is_dual_live(Some(RuntimeKind::Container), None, &[], &[]));
+        // A first deploy has nothing to run beside, whatever the volumes.
+        let writable = volumes_of("[[volumes]]\nname = \"d\"\nguest = \"/d\"\nrw = true\n");
+        assert!(!is_dual_live(None, None, &[], &writable));
     }
 
     /// The port side of two `russel update`s of a container with
@@ -943,6 +1155,7 @@ mod tests {
             assert!(!is_dual_live(
                 Some(RuntimeKind::Container),
                 Some(&pinned),
+                &[],
                 &[]
             ));
             PortAllocator::release_service(id);
@@ -961,5 +1174,368 @@ mod tests {
         assert_eq!(port.guest, 3000);
         assert_eq!(PortAllocator::allocated_port(key), Some(port.host));
         PortAllocator::release_service(key);
+    }
+
+    fn history_entry() -> AppendSuccess {
+        AppendSuccess {
+            generation_id: Some("abcd1234".into()),
+            runtime: Some(RuntimeKind::Container),
+            store_path: None,
+            repo_url: Some("https://example.com/repo.git".into()),
+            config_path: Some("Russelfile.toml".into()),
+            host_port: Some(8081),
+            guest_port: Some(3000),
+            message: None,
+            desired_state: None,
+        }
+    }
+
+    /// A service with one recorded deployment and a pending rollback marker,
+    /// its dir already moved to `.bak` the way `vacate` leaves it.
+    fn vacated_service(id: &str) -> Slot {
+        let dirs = ServiceDirs::of(id);
+        let journal = deployments::deployments_path(id);
+        assert_eq!(
+            deployments::append_success_at(&journal, history_entry()).unwrap(),
+            1
+        );
+        std::fs::write(journal.with_file_name("rollback.pending"), "1").unwrap();
+        std::fs::rename(&dirs.russel, &dirs.russel_bak).unwrap();
+        Slot {
+            prior_runtime: Some(RuntimeKind::Container),
+            dual_live: false,
+            generation_id: "dcba4321".into(),
+            runtime_key: id.into(),
+            dirs,
+            has_backup: true,
+        }
+    }
+
+    fn cold_plan(id: &str, dir: &str) -> Plan {
+        let config = Russelfile::load_from_str(&format!(
+            "[service]\nname = \"{id}\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n"
+        ))
+        .unwrap();
+        Plan {
+            build_path: PathBuf::from(dir),
+            _checkout: crate::git::GitClient.hold_checkout(Path::new(dir)),
+            config,
+            rev: None,
+            runtime: RuntimeKind::Container,
+            env: HashMap::new(),
+            ingress_host: None,
+            host_rules: vec![],
+            pin_mapping: Some(pin(8081)),
+            volumes: vec![],
+            desired_state: None,
+        }
+    }
+
+    /// Review of #564: when the history can go neither to the candidate nor
+    /// to the kept dir, a dual-live cutover must not destroy or replace the
+    /// previous service dir that still holds it.
+    #[tokio::test]
+    async fn dual_live_cutover_leaves_the_history_when_it_cannot_be_preserved() {
+        let id = "dual-history-stuck";
+        let live = deployments::deployments_path(id);
+        deployments::append_success_at(&live, history_entry()).unwrap();
+        std::fs::write(live.with_file_name("rollback.pending"), "1").unwrap();
+        let generation = "feed4321";
+        let key = format!("{id}_g{generation}");
+        // Both destinations refuse: a directory where the candidate's
+        // journal goes, and a file where the kept dir goes.
+        std::fs::create_dir_all(
+            crate::paths::service_dir(&key)
+                .join(deployments::JOURNAL_FILE)
+                .join("blocker"),
+        )
+        .unwrap();
+        let kept = kept_history_dir(id, generation);
+        std::fs::write(&kept, "not a dir").unwrap();
+
+        let slot = Slot {
+            prior_runtime: Some(RuntimeKind::Container),
+            dual_live: true,
+            generation_id: generation.into(),
+            runtime_key: key.clone(),
+            dirs: ServiceDirs::of(id),
+            has_backup: false,
+        };
+        let plan = cold_plan(id, &crate::paths::service_dir(&key).display().to_string());
+        let workload = DeployWorkload::Container {
+            container_id: "fake".into(),
+            container_name: "fake".into(),
+            rootfs_path: PathBuf::new(),
+            port: PortMapping {
+                host: 0,
+                guest: 3000,
+            },
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        DeployPipeline::new(crate::state::AppState::default())
+            .cutover(id, &plan, &slot, &workload, &tx)
+            .await;
+
+        // The previous service dir and its history are untouched, and the
+        // candidate was not promoted over them.
+        assert!(live.is_file());
+        assert!(live.with_file_name("rollback.pending").exists());
+        assert!(crate::paths::service_dir(&key).is_dir());
+        let mut warned = false;
+        while let Ok(event) = rx.try_recv() {
+            if let russel_core::api::DeployEvent::Progress { description, .. } = event {
+                warned |= description.contains("could not be preserved");
+            }
+        }
+        assert!(warned, "cutover must report the unpreserved history");
+        std::fs::remove_file(&kept).unwrap();
+        std::fs::remove_dir_all(crate::paths::service_dir(&key)).unwrap();
+        std::fs::remove_dir_all(crate::paths::service_dir(id)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_falls_back_to_the_kept_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to, kept) = (
+            tmp.path().join("api"),
+            tmp.path().join("api_gfeed"),
+            tmp.path().join("api.history-feed.bak"),
+        );
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join(deployments::JOURNAL_FILE), "{}").unwrap();
+        std::fs::create_dir_all(to.join(deployments::JOURNAL_FILE).join("blocker")).unwrap();
+        let moved = preserve_history(&from, &to, &kept).await.unwrap();
+        assert!(matches!(moved, HistoryMove::Kept(_)));
+        assert!(kept.join(deployments::JOURNAL_FILE).is_file());
+        assert!(!from.join(deployments::JOURNAL_FILE).exists());
+    }
+
+    /// The journal moves, then the marker cannot: the journal goes back, so
+    /// the history is never split between the two dirs.
+    #[tokio::test]
+    async fn history_move_is_all_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("api"), tmp.path().join("api_gfeed"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join(deployments::JOURNAL_FILE), "{}").unwrap();
+        std::fs::write(from.join("rollback.pending"), "").unwrap();
+        std::fs::create_dir_all(to.join("rollback.pending").join("blocker")).unwrap();
+        assert!(carry_history(&from, &to).await.is_err());
+        assert!(from.join(deployments::JOURNAL_FILE).is_file());
+        assert!(from.join("rollback.pending").is_file());
+        assert!(!to.join(deployments::JOURNAL_FILE).exists());
+    }
+
+    /// A failed history move must not delete the backup that still holds
+    /// the history: cutover keeps it aside and says so.
+    #[tokio::test]
+    async fn cold_cutover_keeps_the_backup_when_history_cannot_move() {
+        let id = "cold-history-stuck";
+        let slot = vacated_service(id);
+        // A directory where the journal should land: rename and copy fail.
+        let journal = deployments::deployments_path(id);
+        std::fs::create_dir_all(journal.join("blocker")).unwrap();
+        let plan = cold_plan(id, &slot.dirs.russel);
+        let workload = DeployWorkload::Container {
+            container_id: "fake".into(),
+            container_name: "fake".into(),
+            rootfs_path: PathBuf::new(),
+            port: pin(8081),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        DeployPipeline::new(crate::state::AppState::default())
+            .cutover(id, &plan, &slot, &workload, &tx)
+            .await;
+
+        let kept = kept_history_dir(id, &slot.generation_id);
+        assert!(!Path::new(&slot.dirs.russel_bak).exists());
+        assert!(kept.join(deployments::JOURNAL_FILE).is_file());
+        assert!(kept.join("rollback.pending").exists());
+        let mut warned = false;
+        while let Ok(event) = rx.try_recv() {
+            if let russel_core::api::DeployEvent::Progress { description, .. } = event {
+                warned |= description.contains("history could not be moved");
+            }
+        }
+        assert!(warned, "cutover must report the failed move");
+        assert!(russel_core::reserved::is_reserved_service_dir(
+            kept.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::remove_dir_all(&kept).unwrap();
+    }
+
+    /// #554: the real cold `cutover` drops the `.bak` dir, which held the
+    /// journal. The next `record` must continue the numbering.
+    #[tokio::test]
+    async fn cold_cutover_keeps_deployment_history() {
+        let id = "cold-history";
+        let slot = vacated_service(id);
+        std::fs::create_dir_all(&slot.dirs.russel).unwrap();
+        let plan = cold_plan(id, &slot.dirs.russel);
+        let workload = DeployWorkload::Container {
+            container_id: "fake".into(),
+            container_name: "fake".into(),
+            rootfs_path: PathBuf::new(),
+            port: pin(8081),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        DeployPipeline::new(crate::state::AppState::default())
+            .cutover(id, &plan, &slot, &workload, &tx)
+            .await;
+
+        assert!(!Path::new(&slot.dirs.russel_bak).exists());
+        let journal = deployments::deployments_path(id);
+        assert!(journal.with_file_name("rollback.pending").exists());
+        assert_eq!(
+            deployments::append_success_at(&journal, history_entry()).unwrap(),
+            2
+        );
+    }
+
+    /// A failed cold boot puts the `.bak` dir back: the history is there once,
+    /// untouched.
+    #[tokio::test]
+    async fn restoring_the_backup_brings_the_history_back() {
+        let id = "cold-restore";
+        let slot = vacated_service(id);
+        std::fs::create_dir_all(&slot.dirs.russel).unwrap();
+        slot.dirs.restore().await;
+
+        let journal = deployments::deployments_path(id);
+        assert!(journal.with_file_name("rollback.pending").exists());
+        assert_eq!(
+            deployments::append_success_at(&journal, history_entry()).unwrap(),
+            2
+        );
+    }
+
+    /// An ingress that records `register` calls and can be told to refuse them.
+    #[derive(Default)]
+    struct FakeIngress {
+        registered: std::sync::Mutex<Vec<(String, u16, Vec<HostRule>)>>,
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ingress::Ingress for FakeIngress {
+        async fn register(
+            &self,
+            service_id: &str,
+            backend: &Backend,
+            host_rules: &[HostRule],
+        ) -> anyhow::Result<()> {
+            if self.refuse {
+                anyhow::bail!(
+                    "ingress host \"taken.example.com\" is already routed by service \"other\""
+                );
+            }
+            self.registered.lock().unwrap().push((
+                service_id.to_string(),
+                backend.port,
+                host_rules.to_vec(),
+            ));
+            Ok(())
+        }
+
+        async fn deregister(&self, _service_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn swap(
+            &self,
+            service_id: &str,
+            backend: &Backend,
+            host_rules: &[HostRule],
+        ) -> anyhow::Result<()> {
+            self.register(service_id, backend, host_rules).await
+        }
+
+        fn primary_host(&self, _service_id: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn pipeline_with(ingress: FakeIngress) -> (DeployPipeline, Arc<FakeIngress>) {
+        let ingress = Arc::new(ingress);
+        let mut pipeline = DeployPipeline::new(crate::state::AppState::default());
+        pipeline.ingress = ingress.clone();
+        (pipeline, ingress)
+    }
+
+    /// #557: after a cold boot the old generation is stopped and its dirs are
+    /// in `.bak`. An ingress failure goes through the same restore as a failed
+    /// boot, so the `.bak` dirs (and the history in them) come back.
+    #[tokio::test]
+    async fn cold_ingress_failure_restores_the_backup() {
+        let id = "cold-ingress-fail";
+        let mut slot = vacated_service(id);
+        // Stopped before the deploy: nothing to relaunch, the dirs come back.
+        slot.prior_runtime = None;
+        std::fs::create_dir_all(&slot.dirs.russel).unwrap();
+        let (pipeline, _) = pipeline_with(FakeIngress::default());
+
+        let Err(error) = pipeline
+            .restore_previous(id, &slot, anyhow::anyhow!("host taken"), None)
+            .await
+        else {
+            panic!("a restore that relaunches nothing must report the error");
+        };
+        assert_eq!(error.to_string(), "host taken");
+
+        assert!(!Path::new(&slot.dirs.russel_bak).exists());
+        let journal = deployments::deployments_path(id);
+        assert!(journal.exists());
+        assert_eq!(
+            deployments::append_success_at(&journal, history_entry()).unwrap(),
+            2
+        );
+    }
+
+    /// Dual-live never stopped the live generation: the failure is reported
+    /// and nothing on disk moves.
+    #[tokio::test]
+    async fn dual_live_ingress_failure_leaves_the_live_dirs_alone() {
+        let id = "dual-ingress-fail";
+        let mut slot = vacated_service(id);
+        slot.dual_live = true;
+        slot.has_backup = false;
+        let (pipeline, _) = pipeline_with(FakeIngress::default());
+
+        let Err(error) = pipeline
+            .restore_previous(id, &slot, anyhow::anyhow!("host taken"), None)
+            .await
+        else {
+            panic!("a restore that relaunches nothing must report the error");
+        };
+        assert!(format!("{error:#}").contains("active generation left untouched"));
+        assert!(Path::new(&slot.dirs.russel_bak).exists());
+    }
+
+    #[tokio::test]
+    async fn restoring_the_route_registers_the_previous_backend() {
+        let (pipeline, ingress) = pipeline_with(FakeIngress::default());
+        let rules = vec![HostRule {
+            host: "api.example.com".into(),
+        }];
+        pipeline
+            .restore_route("api", Some((8081, rules.clone())))
+            .await
+            .unwrap();
+        pipeline.restore_route("api", None).await.unwrap();
+        assert_eq!(
+            *ingress.registered.lock().unwrap(),
+            vec![("api".to_string(), 8081, rules)]
+        );
+
+        let (pipeline, _) = pipeline_with(FakeIngress {
+            refuse: true,
+            ..FakeIngress::default()
+        });
+        assert!(
+            pipeline
+                .restore_route("api", Some((8081, vec![])))
+                .await
+                .is_err()
+        );
     }
 }

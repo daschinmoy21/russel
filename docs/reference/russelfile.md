@@ -93,7 +93,7 @@ Folders that keep data across restarts and updates. Up to 16. They work on both 
 | `name` | string | | A folder Russel manages, at `/var/lib/russel/<service>/volumes/<name>`. Letters, digits, `.`, `_`, and `-`, starting with a letter or digit, up to 64 characters. Use either `name` or `host`. |
 | `host` | string | | An absolute folder on the server. Allowed only under a prefix listed in `RUSSEL_VOLUME_ROOTS`, and it must be owned by the `russel` account. Russel never deletes it. |
 | `guest` | string | required | Where the folder appears inside the app. Absolute, not `/`, no `..`, unique. MicroVMs also reject `/nix/store`, `/config`, `/run/russel`, `/proc`, `/sys`, and `/dev`. |
-| `rw` | boolean | `false` | Mount it writable |
+| `rw` | boolean | `false` | Mount it writable. A service with a writable volume is replaced cold on update: the old version stops before the new one starts, so two versions never write to it at once. Rolling back the code does not undo schema or data changes the new version made. |
 | `keep` | boolean | `false` | Keep a managed folder when the service is destroyed. `russel destroy --delete-volumes` deletes it anyway. |
 
 ## `[[ports]]`
