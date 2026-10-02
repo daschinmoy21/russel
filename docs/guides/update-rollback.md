@@ -35,7 +35,7 @@ Deploy from a different repo or Russelfile path (this implies `--refresh`). The 
 russel update my-app --repo https://github.com/you/fork.git --config Russelfile.toml
 ```
 
-The new version starts next to the old one and traffic switches once it answers. If the new version fails, or crashes within 2 s, the old one keeps serving and `update` exits non-zero. Services with `[[ports]]` or a pinned `[ingress].port` stop first and have a short gap, and keep their ports. [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers each case.
+The new version starts next to the old one, and traffic switches once it answers and Traefik serves it. The old version then gets 5 s to finish the requests it has, and a stop request (SIGTERM) with 5 s more before it is killed. If the new version fails, or crashes during the 5 s drain, the old one keeps serving and `update` exits non-zero. Services with `[[ports]]`, a pinned `[ingress].port`, or a writable volume stop first and have a short gap; pinned ports stay the same. [What zero downtime covers](../concepts/lifecycle.md#what-zero-downtime-covers) lists each case, and [When a deploy counts as ready](../concepts/lifecycle.md#when-a-deploy-counts-as-ready) covers crashes.
 
 ## See past deployments
 

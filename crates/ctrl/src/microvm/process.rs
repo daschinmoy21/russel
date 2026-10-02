@@ -391,7 +391,7 @@ pub(super) fn process_is_alive(pid: u32) -> bool {
         .is_some_and(|state| state != 'Z')
 }
 
-pub(super) async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+pub(crate) async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while process_is_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;

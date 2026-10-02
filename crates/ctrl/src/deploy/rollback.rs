@@ -121,8 +121,58 @@ pub(crate) async fn resolve_prior_runtime(service_id: &str) -> anyhow::Result<Op
     Ok(None)
 }
 
+/// Retire a microVM generation's processes (#562). Write [`STOP_FILE`] into
+/// its config dir: the guest init sends the app SIGTERM, and the guest
+/// powers off once the app has exited. Wait up to `grace` for the VM to go
+/// down, then SIGKILL whatever is left.
+///
+/// `service_dir` is where the generation's files are now (the `.bak` name
+/// on the cold path). A VM this ctrl did not start (it restarted since) is
+/// waited on through its recorded pid. A VM booted from an older initramfs
+/// does not watch for the file and is killed when `grace` runs out.
+pub(crate) async fn retire_microvm(
+    service_dir: &Path,
+    mut vm: Option<tokio::process::Child>,
+    aux: Vec<tokio::process::Child>,
+    grace: Duration,
+) {
+    let pid = vm.as_ref().and_then(tokio::process::Child::id).or_else(|| {
+        crate::metadata::load_service_disk_record_from(&service_dir.join("metadata.json"))
+            .and_then(|record| record.vm_pid)
+    });
+    if let Some(pid) = pid {
+        let stop = service_dir.join("cfg").join(STOP_FILE);
+        match std::fs::write(&stop, b"") {
+            Ok(()) => {
+                let exited = match vm.as_mut() {
+                    Some(child) => tokio::time::timeout(grace, child.wait()).await.is_ok(),
+                    None => crate::microvm::wait_for_process_exit(pid, grace).await,
+                };
+                if exited {
+                    tracing::info!(pid, "retired microVM stopped after its app exited");
+                } else {
+                    tracing::warn!(
+                        pid,
+                        grace_secs = grace.as_secs(),
+                        "retired microVM still running after the grace period; killing it"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %stop.display(), error = %e, "cannot ask the retired microVM to stop; killing it");
+            }
+        }
+    }
+    kill_and_wait_children(vm, aux).await;
+}
+
+/// Name of the file [`retire_microvm`] writes into a generation's config
+/// dir, which the guest sees as `/config/stop`.
+pub(crate) const STOP_FILE: &str = "stop";
+
 /// Kill + wait (with timeout) all old children so ports are free.
 /// tokio `kill()` sends SIGKILL directly on Unix; there is no graceful phase.
+/// [`retire_microvm`] gives the app its grace period first.
 pub(crate) async fn kill_and_wait_children(
     old_vm_proc: Option<tokio::process::Child>,
     old_aux_procs: Vec<tokio::process::Child>,

@@ -40,7 +40,7 @@ Services packaged in nixpkgs need no code at all: `package = "redis"` is a whole
 
 - **Nix builds.** Uses your `flake.nix`, or generates one for Rust, Go, and static sites. Builds are pinned to a commit, and old generations are GC-rooted, so rollback always has something to roll back to.
 - **Two runtimes, one Russelfile.** Rootless Podman on any VPS; Cloud Hypervisor microVMs where there's KVM. Both run unprivileged, and apps run as a non-root user by default.
-- **Zero-downtime redeploys.** The new generation must answer before traffic moves; the old one is held briefly, then stopped. Services with pinned ports or writable volumes are replaced in place with a short gap. A deploy whose app crashes on start is reported as failed.
+- **Zero-downtime redeploys.** The new generation must answer, and Traefik must serve it, before the old one is retired; the old one gets time to finish its requests and a SIGTERM before it stops. Services with pinned ports or writable volumes are replaced in place with a short gap. A deploy whose app crashes on start is reported as failed. [The exact contract](https://russel.mintlify.site/concepts/lifecycle#what-zero-downtime-covers).
 - **Ports, volumes, secrets, restart policy.** `[[ports]]`, `[[volumes]]` with kept data, `secret://` references delivered as Podman secrets, `restart = "unless-stopped"`.
 - **Ingress.** Traefik file provider out of the box (`<name>.russel.local`), or put Caddy/nginx in front.
 - **Dashboard.** Services, logs, deploys, and destroy from the browser, served by the control plane.

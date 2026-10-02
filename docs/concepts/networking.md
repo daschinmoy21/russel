@@ -28,7 +28,7 @@ flowchart LR
 
 ## Traefik routes
 
-Russel writes one small JSON file per service into `/var/lib/russel/traefik/dynamic/`. Traefik's file provider watches that folder and picks up changes within a second. Russel never calls Traefik's API or reloads it.
+Russel writes one small route file per service, `<service>.yaml`, into `/var/lib/russel/traefik/dynamic/`. Traefik's file provider watches that folder and applies changes within about 2 s. Russel never calls Traefik's API or reloads it; during an update it sends a request through Traefik to check which version answers.
 
 | Russelfile | Route |
 |---|---|
@@ -41,7 +41,7 @@ Stopping or destroying a service deletes its file, and Traefik stops routing to 
 
 ## During an update
 
-An update starts the new version on a fresh host port while the old one keeps serving. Once the new one answers, Russel rewrites the route file to point at it, keeps the old one running for 2 s in case the new one crashes, and then stops it. The host name never changes.
+An update starts the new version on a fresh host port while the old one keeps serving. Once the new one answers, Russel rewrites the route file to point at it and waits until Traefik serves it. The old one then keeps running for 5 s to finish its requests (the first 2 s also catch a new version that crashes), gets a stop request, and is killed if it is still up 5 s later. The host name never changes. [What zero downtime covers](./lifecycle.md#what-zero-downtime-covers) has the details.
 
 A service with a pinned `[ingress].port` or with `[[ports]]` updates differently, because two versions can't hold the same host port. Russel stops the old version, starts the new one on the same ports, and restores the old one if the new one fails or crashes within 2 s. The ports stay the same, at the cost of a short gap. See [Deploy and redeploy](./lifecycle.md#deploy-and-redeploy).
 

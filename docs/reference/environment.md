@@ -54,6 +54,7 @@ Yes/no settings accept `1`, `true`, or `yes` (any case) unless the table says ot
 | `RUSSEL_TRAEFIK_TLS` | off | Add HTTPS and a certificate resolver to every route. |
 | `RUSSEL_TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Must match the resolver name in Traefik's config. |
 | `RUSSEL_TRAEFIK_BACKEND` | `RUSSEL_PUBLISH_BIND` | Address Traefik uses to reach apps. Only needed when Traefik runs in its own network namespace. |
+| `RUSSEL_TRAEFIK_ENTRYPOINT` | `http://127.0.0.1:80` (best effort) | Traefik entry point an update sends requests through to check that Traefik serves the new version before the old one is retired. A set value makes the check strict; `off` skips it. See [What zero downtime covers](../concepts/lifecycle.md#what-zero-downtime-covers). |
 
 See [Traefik ingress](../guides/traefik-ingress.md).
 

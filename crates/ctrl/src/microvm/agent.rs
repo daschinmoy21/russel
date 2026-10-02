@@ -4,12 +4,12 @@ use std::path::Path;
 
 /// Basename for the agent initramfs CPIO file. Bump when `AGENT_INIT_SCRIPT` changes
 /// so stale disk caches cannot serve an old init.
-pub(super) const AGENT_INITRAMFS_BASENAME: &str = "agent-initramfs-v10.cpio";
+pub(super) const AGENT_INITRAMFS_BASENAME: &str = "agent-initramfs-v11.cpio";
 
 /// Busybox applets symlinked into the agent initramfs.
 pub(super) const AGENT_BUSYBOX_APPLETS: &[&str] = &[
     "sh", "mount", "ip", "mkdir", "insmod", "xzcat", "cat", "sleep", "usleep", "ls", "poweroff",
-    "chpst",
+    "chpst", "kill",
 ];
 
 pub(super) const AGENT_INIT_SCRIPT: &str = r#"#!/bin/sh
@@ -207,7 +207,19 @@ fi
 # crash would erase its own output. Log the exit status and power off
 # instead: cloud-hypervisor exits and ctrl sees the VM go down.
 echo "starting $APP ($# args)"
-$RUN_AS "$APP" "$@"
+$RUN_AS "$APP" "$@" &
+APP_PID=$!
+# When a deploy retires this generation, the host writes /config/stop (#562).
+# Pass it on as SIGTERM so the app can finish the requests it is serving; the
+# host kills the VM if it is still up after its grace period.
+(
+  while [ ! -f /config/stop ]; do
+    /bin/usleep 200000
+  done
+  echo "stop requested; sending SIGTERM to the app"
+  /bin/kill -TERM "$APP_PID"
+) &
+wait "$APP_PID"
 echo "app exited with status $?; powering off"
 /bin/poweroff -f
 "#;

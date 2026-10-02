@@ -1,6 +1,6 @@
 //! The phases of one deploy (#415), in order: plan → build → prepare_slot →
-//! boot → swap_ingress → hold → cutover → record. Each phase is one function that
-//! takes what the earlier phases produced; `deploy_inner` only sequences them.
+//! boot → swap_ingress → cutover (hold and drain) → record. Each phase takes
+//! what the earlier phases produced; `deploy_inner` only sequences them.
 
 use std::{
     collections::HashMap,
@@ -31,7 +31,7 @@ use crate::{
         SECRETS_RESOLVED_AT_LAUNCH,
     },
     git::{CheckoutLease, SourceRev, redact_repo_url},
-    ingress::{Backend, HostRule},
+    ingress::{Backend, HostRule, Served},
     metadata::load_metadata_from_disk,
     microvm::{KernelInfo, ready},
     network::PortAllocator,
@@ -45,9 +45,9 @@ use super::pipeline::{
 };
 use super::rollback::{
     ServiceDirs, attempt_container_rollback, attempt_microvm_rollback, cleanup_failed_deploy,
-    destroy_prior_runtime, kill_and_wait_children, resolve_prior_runtime,
+    destroy_prior_runtime, kill_and_wait_children, resolve_prior_runtime, retire_microvm,
 };
-use super::{Events, WATCH_WINDOW};
+use super::{DRAIN_WINDOW, Events, RETIRE_GRACE, WATCH_WINDOW};
 
 /// The Russelfile turned into the deploy's inputs. Every later phase reads it.
 pub(super) struct Plan {
@@ -154,7 +154,7 @@ impl DeployPipeline {
             .check_route(service_id, &plan.host_rules)
             .await?;
         // The live generation's route, to point back at if this deploy does
-        // not take it over (`hold`, `recover_failed_ingress`).
+        // not take it over (`hold`, `recover_failed_switch`).
         let previous_route = self.live_route(service_id, &plan);
         let slot = self.prepare_slot(service_id, &plan, &tx).await?;
 
@@ -169,25 +169,46 @@ impl DeployPipeline {
             }
         };
 
+        let switched_at = match self
+            .swap_ingress(service_id, &plan, &slot, &booted.workload, &tx)
+            .await
+        {
+            Ok(switched_at) => switched_at,
+            Err(error) => {
+                return self
+                    .recover_failed_switch(
+                        service_id,
+                        &slot,
+                        booted.workload,
+                        error,
+                        previous_route,
+                        reservation,
+                    )
+                    .await;
+            }
+        };
         if let Err(error) = self
-            .swap_ingress(service_id, &plan, &slot, &booted.workload)
+            .cutover(
+                service_id,
+                &plan,
+                &slot,
+                &mut booted.workload,
+                switched_at,
+                &tx,
+            )
             .await
         {
             return self
-                .recover_failed_ingress(
+                .recover_failed_switch(
                     service_id,
                     &slot,
-                    &booted.workload,
+                    booted.workload,
                     error,
                     previous_route,
                     reservation,
                 )
                 .await;
         }
-        self.hold(service_id, &slot, &mut booted.workload, previous_route, &tx)
-            .await?;
-        self.cutover(service_id, &plan, &slot, &booted.workload, &tx)
-            .await;
         self.record(
             service_id,
             &request,
@@ -425,11 +446,15 @@ impl DeployPipeline {
             }
         }
 
-        let (old_vm_proc, old_aux_procs) = self
-            .state
-            .take_processes(service_id)
-            .unwrap_or((None, Vec::new()));
-        kill_and_wait_children(old_vm_proc, old_aux_procs).await;
+        // Graceful even here (#562): the app can finish what it is serving,
+        // which is all a cold replace can do for requests in flight.
+        let files = if has_russel_dir {
+            &dirs.russel_bak
+        } else {
+            &dirs.russel
+        };
+        self.retire_processes(service_id, prior_runtime, Path::new(files))
+            .await;
 
         if let Some(prior_kind) = prior_runtime
             && let Err(e) = destroy_prior_runtime(prior_kind, service_id, &self.runner).await
@@ -440,6 +465,23 @@ impl DeployPipeline {
             anyhow::bail!("failed to teardown prior {}: {}", prior_kind, e);
         }
         Ok(())
+    }
+
+    /// Disarm the supervisor of the generation running as `service_id` and
+    /// stop its processes gracefully (#562). A microVM's app gets a stop
+    /// request and [`RETIRE_GRACE`] before the VM is killed; `files` is where
+    /// its service dir is now. A container has no processes here:
+    /// `destroy_prior_runtime` stops it with the same grace.
+    async fn retire_processes(&self, service_id: &str, runtime: Option<RuntimeKind>, files: &Path) {
+        let (vm, aux) = self
+            .state
+            .take_processes(service_id)
+            .unwrap_or((None, Vec::new()));
+        if runtime == Some(RuntimeKind::Microvm) {
+            retire_microvm(files, vm, aux, RETIRE_GRACE).await;
+        } else {
+            kill_and_wait_children(vm, aux).await;
+        }
     }
 
     /// Reserve ports and start the new generation under `slot.runtime_key`.
@@ -513,26 +555,39 @@ impl DeployPipeline {
             .await
     }
 
-    /// The ingress refused the new generation after it booted. Tear the
-    /// candidate down. On the cold path the previous generation is already
-    /// stopped, so put it back as after a failed boot and point its route at
-    /// it again. Dual-live never stopped it, so there is nothing to restore.
-    async fn recover_failed_ingress(
+    /// Ingress or the candidate failed before retirement. On dual-live,
+    /// confirm rollback before removing the candidate; retain it under its
+    /// generation key if confirmation fails. Cold already stopped the old
+    /// generation, so restore it and its route as after a failed boot.
+    async fn recover_failed_switch(
         &self,
         service_id: &str,
         slot: &Slot,
-        workload: &DeployWorkload,
+        workload: DeployWorkload,
         error: anyhow::Error,
         previous_route: Option<(u16, Vec<HostRule>)>,
-        reservation: Option<PortReservation>,
+        mut reservation: Option<PortReservation>,
     ) -> anyhow::Result<DeployInnerResult> {
+        if slot.dual_live
+            && let Err(back) = self.switch_back(service_id, previous_route.as_ref()).await
+        {
+            if let Some(reservation) = reservation.as_mut() {
+                reservation.disarm();
+            }
+            self.retain_candidate(slot, workload);
+            crate::gcroots::sync_logged(&slot.runtime_key).await;
+            anyhow::bail!(
+                "{error:#}; rollback was not confirmed: {back:#}; both generations retained, candidate managed as {}",
+                slot.runtime_key
+            );
+        }
         tracing::error!(
             service_id,
             runtime_key = %slot.runtime_key,
             error = %error,
-            "ingress failed after the new generation booted; tearing it down"
+            "candidate cutover failed after boot; tearing it down"
         );
-        self.destroy_candidate(slot, workload, "ingress failure")
+        self.destroy_candidate(slot, &workload, "cutover failure")
             .await;
         let result = self
             .restore_previous(service_id, slot, error, reservation)
@@ -624,31 +679,111 @@ impl DeployPipeline {
         }
     }
 
-    /// Point the stable route at the new generation. The caller tears the
-    /// candidate down in full (#116) when this fails.
+    /// Point the stable route at the new generation. Dual-live also waits
+    /// until the proxy serves it (#562), and returns when that happened: the
+    /// previous generation gets no new requests from then on. When the proxy
+    /// does not take the new route, the caller restores and confirms the
+    /// previous route before deciding whether candidate cleanup is safe.
     async fn swap_ingress(
         &self,
         service_id: &str,
         plan: &Plan,
         slot: &Slot,
         workload: &DeployWorkload,
-    ) -> anyhow::Result<()> {
+        tx: &Events,
+    ) -> anyhow::Result<Instant> {
         let backend = Backend::from_publish(workload.port().host);
-        if slot.dual_live {
-            // Zero-downtime cutover: rewrite Traefik backend for the stable service id.
-            tracing::info!(
-                service_id,
-                backend = %backend.url(),
-                generation_id = %slot.generation_id,
-                "Ingress::swap — pointing stable route at candidate generation"
-            );
-            self.ingress
-                .swap(service_id, &backend, &plan.host_rules)
-                .await
-        } else {
+        if !slot.dual_live {
             self.ingress
                 .register(service_id, &backend, &plan.host_rules)
-                .await
+                .await?;
+            return Ok(Instant::now());
+        }
+        // Zero-downtime cutover: rewrite Traefik backend for the stable service id.
+        tracing::info!(
+            service_id,
+            backend = %backend.url(),
+            generation_id = %slot.generation_id,
+            "Ingress::swap — pointing stable route at candidate generation"
+        );
+        self.ingress
+            .swap(service_id, &backend, &plan.host_rules)
+            .await?;
+        match self
+            .ingress
+            .wait_served(service_id, &backend, &plan.host_rules)
+            .await
+        {
+            Ok(Served::Confirmed) => {}
+            Ok(Served::Unchecked(why)) => {
+                tracing::warn!(service_id, why = %why, "cannot confirm the proxy serves the new generation");
+                super::progress(
+                    tx,
+                    "switch",
+                    format!("warning: cannot confirm the proxy serves the new version: {why}"),
+                )
+                .await;
+            }
+            Err(e) => {
+                anyhow::bail!("the proxy did not take the new version: {e:#}");
+            }
+        }
+        Ok(Instant::now())
+    }
+
+    /// Point the stable route back at the previous generation, which is
+    /// still running. A failed confirmation must prevent candidate cleanup:
+    /// the proxy may still send traffic to it.
+    async fn switch_back(
+        &self,
+        service_id: &str,
+        previous_route: Option<&(u16, Vec<HostRule>)>,
+    ) -> anyhow::Result<()> {
+        let Some((port, host_rules)) = previous_route else {
+            anyhow::bail!("the previous generation's port is unknown");
+        };
+        let backend = Backend::from_publish(*port);
+        self.ingress.swap(service_id, &backend, host_rules).await?;
+        self.ingress
+            .wait_served(service_id, &backend, host_rules)
+            .await?;
+        Ok(())
+    }
+
+    /// Keep an ambiguously routed candidate under its generation key so
+    /// stop/destroy and the process watchers still own it.
+    fn retain_candidate(&self, slot: &Slot, workload: DeployWorkload) {
+        let key = &slot.runtime_key;
+        match workload {
+            DeployWorkload::Microvm {
+                vm_child,
+                socat_child,
+                extra_forwarders,
+                virtiofsd_children,
+                port,
+                ..
+            } => {
+                let mut aux = vec![*socat_child];
+                aux.extend(extra_forwarders);
+                aux.extend(virtiofsd_children);
+                self.state.mark_deployed_with_aux(
+                    key,
+                    *vm_child,
+                    aux,
+                    Some(port.host),
+                    Some(port.guest),
+                );
+            }
+            DeployWorkload::Container {
+                container_id, port, ..
+            } => {
+                self.state.mark_deployed_container(
+                    key,
+                    &container_id,
+                    Some(port.host),
+                    Some(port.guest),
+                );
+            }
         }
     }
 
@@ -694,16 +829,15 @@ impl DeployPipeline {
     }
 
     /// Dual-live only. Traffic is on the new generation now, but the previous
-    /// one is still running. Keep it for [`WATCH_WINDOW`]: if the new one dies
-    /// meanwhile (#493), point traffic back, tear the new one down, and fail
-    /// the deploy. The previous generation was never stopped, so nothing has
-    /// to be restored.
+    /// one is still running. Watch throughout the drain: if the new one dies
+    /// meanwhile (#493), fail before retirement. The caller confirms rollback
+    /// before cleanup, or retains the candidate if traffic is ambiguous.
     async fn hold(
         &self,
         service_id: &str,
         slot: &Slot,
         workload: &mut DeployWorkload,
-        previous_route: Option<(u16, Vec<HostRule>)>,
+        window: Duration,
         tx: &Events,
     ) -> anyhow::Result<()> {
         if !slot.dual_live {
@@ -712,13 +846,15 @@ impl DeployPipeline {
         super::progress(
             tx,
             "switch",
-            format!(
-                "New version is live; keeping the previous one running for {}s in case it crashes",
-                WATCH_WINDOW.as_secs()
-            ),
+            "New version is live; watching it while the previous generation drains",
         )
         .await;
-        let Some(error) = watch_candidate(&slot.runtime_key, workload, WATCH_WINDOW).await else {
+        // Recheck at the retirement boundary, including a zero remaining drain.
+        let error = match watch_candidate(&slot.runtime_key, workload, window).await {
+            Some(error) => Some(error),
+            None => watch_candidate(&slot.runtime_key, workload, Duration::ZERO).await,
+        };
+        let Some(error) = error else {
             return Ok(());
         };
         tracing::warn!(
@@ -728,45 +864,22 @@ impl DeployPipeline {
             "new generation died inside the watch window; switching traffic back"
         );
 
-        let switched_back = match previous_route {
-            Some((port, host_rules)) => match self
-                .ingress
-                .swap(service_id, &Backend::from_publish(port), &host_rules)
-                .await
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!(service_id, error = %e, "could not point the route back at the previous generation");
-                    false
-                }
-            },
-            None => false,
-        };
-        self.destroy_candidate(slot, workload, "crashed inside the watch window")
-            .await;
-        let outcome = if switched_back {
-            "traffic is back on the previous version, which kept running"
-        } else {
-            "the previous version kept running, but its ingress route could not be restored; \
-             run `russel apply --force` with a working build"
-        };
-        anyhow::bail!(
-            "new version crashed within {}s of answering; {outcome}: {error}",
-            WATCH_WINDOW.as_secs()
-        )
+        anyhow::bail!("new version crashed before retiring the previous version: {error}")
     }
 
     /// Retire what the new generation replaced. Cold: drop the `.bak` dirs.
     /// Dual-live: drain and destroy the old generation, then promote the
-    /// candidate to the stable service id.
+    /// candidate to the stable service id. `switched_at` is when the proxy
+    /// started serving the new generation.
     async fn cutover(
         &self,
         service_id: &str,
         plan: &Plan,
         slot: &Slot,
-        workload: &DeployWorkload,
+        workload: &mut DeployWorkload,
+        switched_at: Instant,
         tx: &Events,
-    ) {
+    ) -> anyhow::Result<()> {
         if !slot.dual_live {
             if slot.has_backup {
                 // `vacate` moved the history into the `.bak` dir with the rest
@@ -804,22 +917,37 @@ impl DeployPipeline {
                 }
             }
             self.attach_build_path(service_id, plan);
-            return;
+            return Ok(());
         }
 
-        // Drain old generation only after successful swap.
+        // Drain (#562): the proxy sends the previous generation nothing new
+        // since `switched_at`. Give the requests it still has the rest of
+        // the drain window, then ask it to stop, with a grace period.
         super::progress(
             tx,
             "cutover",
-            "Draining previous generation after ingress swap",
+            format!(
+                "Draining the previous generation: {}s for requests in flight, then a stop \
+                 request with {}s to finish",
+                DRAIN_WINDOW.as_secs(),
+                RETIRE_GRACE.as_secs()
+            ),
         )
         .await;
-
-        let (old_vm_proc, old_aux_procs) = self
-            .state
-            .take_processes(service_id)
-            .unwrap_or((None, Vec::new()));
-        kill_and_wait_children(old_vm_proc, old_aux_procs).await;
+        self.hold(
+            service_id,
+            slot,
+            workload,
+            WATCH_WINDOW.max(DRAIN_WINDOW.saturating_sub(switched_at.elapsed())),
+            tx,
+        )
+        .await?;
+        self.retire_processes(
+            service_id,
+            slot.prior_runtime,
+            &crate::paths::service_dir(service_id),
+        )
+        .await;
 
         let key = &slot.runtime_key;
         // The history journal lives in the stable service dir, which the
@@ -862,7 +990,7 @@ impl DeployPipeline {
                 )
                 .await;
                 self.attach_build_path(key, plan);
-                return;
+                return Ok(());
             }
         }
 
@@ -887,7 +1015,7 @@ impl DeployPipeline {
             );
             // Keep state under runtime_key so stop/destroy can find it.
             self.attach_build_path(key, plan);
-            return;
+            return Ok(());
         }
 
         // Re-key port + in-memory state to the stable service id. Dual-live
@@ -898,6 +1026,7 @@ impl DeployPipeline {
         }
         self.state.rekey_service(key, service_id);
         self.attach_build_path(service_id, plan);
+        Ok(())
     }
 
     /// Note the built checkout in the service log. A relaunch built nothing.
@@ -1406,6 +1535,11 @@ GREETING = "from the recorded file"
         }
     }
 
+    /// A switch that happened a drain window ago: cutover does not wait.
+    fn drained() -> Instant {
+        Instant::now().checked_sub(DRAIN_WINDOW).unwrap()
+    }
+
     fn cold_plan(id: &str, dir: &str) -> Plan {
         let russelfile = format!(
             "[service]\nname = \"{id}\"\nsource = \".\"\nport = 3000\nmemory = \"256mb\"\n"
@@ -1460,7 +1594,7 @@ GREETING = "from the recorded file"
             has_backup: false,
         };
         let plan = cold_plan(id, &crate::paths::service_dir(&key).display().to_string());
-        let workload = DeployWorkload::Container {
+        let mut workload = DeployWorkload::Container {
             container_id: "fake".into(),
             container_name: "fake".into(),
             rootfs_path: PathBuf::new(),
@@ -1471,8 +1605,9 @@ GREETING = "from the recorded file"
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         DeployPipeline::new(crate::state::AppState::default())
-            .cutover(id, &plan, &slot, &workload, &tx)
-            .await;
+            .cutover(id, &plan, &slot, &mut workload, drained(), &tx)
+            .await
+            .unwrap();
 
         // The previous service dir and its history are untouched, and the
         // candidate was not promoted over them.
@@ -1534,7 +1669,7 @@ GREETING = "from the recorded file"
         let journal = deployments::deployments_path(id);
         std::fs::create_dir_all(journal.join("blocker")).unwrap();
         let plan = cold_plan(id, &slot.dirs.russel);
-        let workload = DeployWorkload::Container {
+        let mut workload = DeployWorkload::Container {
             container_id: "fake".into(),
             container_name: "fake".into(),
             rootfs_path: PathBuf::new(),
@@ -1542,8 +1677,9 @@ GREETING = "from the recorded file"
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         DeployPipeline::new(crate::state::AppState::default())
-            .cutover(id, &plan, &slot, &workload, &tx)
-            .await;
+            .cutover(id, &plan, &slot, &mut workload, drained(), &tx)
+            .await
+            .unwrap();
 
         let kept = kept_history_dir(id, &slot.generation_id);
         assert!(!Path::new(&slot.dirs.russel_bak).exists());
@@ -1570,7 +1706,7 @@ GREETING = "from the recorded file"
         let slot = vacated_service(id);
         std::fs::create_dir_all(&slot.dirs.russel).unwrap();
         let plan = cold_plan(id, &slot.dirs.russel);
-        let workload = DeployWorkload::Container {
+        let mut workload = DeployWorkload::Container {
             container_id: "fake".into(),
             container_name: "fake".into(),
             rootfs_path: PathBuf::new(),
@@ -1578,8 +1714,9 @@ GREETING = "from the recorded file"
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         DeployPipeline::new(crate::state::AppState::default())
-            .cutover(id, &plan, &slot, &workload, &tx)
-            .await;
+            .cutover(id, &plan, &slot, &mut workload, drained(), &tx)
+            .await
+            .unwrap();
 
         assert!(!Path::new(&slot.dirs.russel_bak).exists());
         let journal = deployments::deployments_path(id);
@@ -1607,11 +1744,13 @@ GREETING = "from the recorded file"
         );
     }
 
-    /// An ingress that records `register` calls and can be told to refuse them.
+    /// An ingress that records `register` calls and can be told to refuse
+    /// them, or to never serve what it registered (`stuck`).
     #[derive(Default)]
     struct FakeIngress {
         registered: std::sync::Mutex<Vec<(String, u16, Vec<HostRule>)>>,
         refuse: bool,
+        stuck: bool,
     }
 
     #[async_trait::async_trait]
@@ -1646,6 +1785,18 @@ GREETING = "from the recorded file"
             host_rules: &[HostRule],
         ) -> anyhow::Result<()> {
             self.register(service_id, backend, host_rules).await
+        }
+
+        async fn wait_served(
+            &self,
+            _service_id: &str,
+            _backend: &Backend,
+            _host_rules: &[HostRule],
+        ) -> anyhow::Result<Served> {
+            if self.stuck {
+                anyhow::bail!("Traefik still serves the old backend");
+            }
+            Ok(Served::Confirmed)
         }
 
         fn primary_host(&self, _service_id: &str) -> Option<String> {
@@ -1709,6 +1860,61 @@ GREETING = "from the recorded file"
         assert!(Path::new(&slot.dirs.russel_bak).exists());
     }
 
+    /// #562: a proxy that never serves the new generation fails the switch;
+    /// recovery, rather than the swap itself, handles the previous route.
+    #[tokio::test]
+    async fn dual_live_switch_points_back_when_the_proxy_does_not_take_it() {
+        let id = "dual-stuck";
+        let slot = Slot {
+            prior_runtime: Some(RuntimeKind::Container),
+            dual_live: true,
+            generation_id: "beef1234".into(),
+            runtime_key: format!("{id}_gbeef1234"),
+            dirs: ServiceDirs::of(id),
+            has_backup: false,
+        };
+        let mut plan = cold_plan(id, "/nonexistent/russel-562");
+        plan.pin_mapping = None;
+        let workload = DeployWorkload::Container {
+            container_id: "fake".into(),
+            container_name: "fake".into(),
+            rootfs_path: PathBuf::new(),
+            port: PortMapping {
+                host: 9100,
+                guest: 3000,
+            },
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let (pipeline, ingress) = pipeline_with(FakeIngress {
+            stuck: true,
+            ..FakeIngress::default()
+        });
+        let error = pipeline
+            .swap_ingress(id, &plan, &slot, &workload, &tx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not take the new version"), "{error}");
+
+        let ports: Vec<u16> = ingress
+            .registered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, port, _)| *port)
+            .collect();
+        assert_eq!(ports, vec![9100]);
+
+        // A proxy that serves it: one swap, and the switch time comes back.
+        let (pipeline, ingress) = pipeline_with(FakeIngress::default());
+        pipeline
+            .swap_ingress(id, &plan, &slot, &workload, &tx)
+            .await
+            .unwrap();
+        assert_eq!(ingress.registered.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn restoring_the_route_registers_the_previous_backend() {
         let (pipeline, ingress) = pipeline_with(FakeIngress::default());
@@ -1735,5 +1941,200 @@ GREETING = "from the recorded file"
                 .await
                 .is_err()
         );
+    }
+    fn test_child(script: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    fn test_vm(script: &str, host: u16) -> DeployWorkload {
+        DeployWorkload::Microvm {
+            alloc: crate::network::SubnetAllocation {
+                host_ip: "172.16.0.1".into(),
+                vm_ip: "172.16.0.2".into(),
+                mac: "02:00:00:00:00:01".into(),
+                tap_id: "review-tap".into(),
+            },
+            vm_child: Box::new(test_child(script)),
+            virtiofsd_children: vec![],
+            socat_child: Box::new(test_child("exec sleep 60")),
+            extra_forwarders: vec![],
+            net_mode: crate::network::MicrovmNetMode::Passt,
+            initramfs_path: PathBuf::new(),
+            port: pin(host),
+        }
+    }
+
+    fn dual_slot(id: &str) -> Slot {
+        Slot {
+            prior_runtime: None,
+            dual_live: true,
+            generation_id: "deadbeef".into(),
+            runtime_key: format!("{id}_gdeadbeef"),
+            dirs: ServiceDirs::of(id),
+            has_backup: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_crash_after_watch_window_keeps_old_generation_alive() {
+        let id = "review-drain";
+        let slot = dual_slot(id);
+        let (pipeline, ingress) = pipeline_with(FakeIngress::default());
+        let old = test_child("exec sleep 60");
+        let old_pid = old.id().unwrap();
+        pipeline
+            .state
+            .mark_deployed_with_aux(id, old, vec![], Some(9101), Some(3000));
+        let mut workload = test_vm("sleep 2.5; exit 42", 9102);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let result = pipeline
+            .cutover(
+                id,
+                &cold_plan(id, "/nonexistent"),
+                &slot,
+                &mut workload,
+                Instant::now(),
+                &tx,
+            )
+            .await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("new version crashed"));
+        assert!(
+            pipeline
+                .recover_failed_switch(id, &slot, workload, error, Some((9101, vec![])), None)
+                .await
+                .is_err()
+        );
+        assert!(!crate::microvm::wait_for_process_exit(old_pid, Duration::ZERO).await);
+        assert_eq!(ingress.registered.lock().unwrap()[0].1, 9101);
+        assert!(!deployments::deployments_path(id).exists());
+        let (old, aux) = pipeline.state.take_processes(id).unwrap();
+        kill_and_wait_children(old, aux).await;
+    }
+
+    #[tokio::test]
+    async fn already_dead_candidate_is_rechecked_before_retirement() {
+        let id = "review-dead-boundary";
+        let slot = dual_slot(id);
+        let (pipeline, _) = pipeline_with(FakeIngress::default());
+        let old = test_child("exec sleep 60");
+        let old_pid = old.id().unwrap();
+        pipeline
+            .state
+            .mark_deployed_with_aux(id, old, vec![], Some(9101), Some(3000));
+        let mut workload = test_vm("exit 42", 9102);
+        if let DeployWorkload::Microvm { vm_child, .. } = &mut workload {
+            vm_child.wait().await.unwrap();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        assert!(
+            pipeline
+                .cutover(
+                    id,
+                    &cold_plan(id, "/nonexistent"),
+                    &slot,
+                    &mut workload,
+                    drained(),
+                    &tx,
+                )
+                .await
+                .is_err()
+        );
+        assert!(!crate::microvm::wait_for_process_exit(old_pid, Duration::ZERO).await);
+        let (old, aux) = pipeline.state.take_processes(id).unwrap();
+        kill_and_wait_children(old, aux).await;
+    }
+
+    // Serialize the global port registry through async recovery and cleanup.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn failed_rollback_confirmation_retains_managed_candidate_and_ports() {
+        let _lock = port_test_lock();
+        let id = "review-back";
+        let slot = dual_slot(id);
+        let (pipeline, ingress) = pipeline_with(FakeIngress {
+            stuck: true,
+            ..FakeIngress::default()
+        });
+        let old = test_child("exec sleep 60");
+        let old_pid = old.id().unwrap();
+        pipeline
+            .state
+            .mark_deployed_with_aux(id, old, vec![], Some(9101), Some(3000));
+        let port = reserve_test_port(&slot.runtime_key);
+        let workload = test_vm("exec sleep 60", port);
+        let candidate_pid = match &workload {
+            DeployWorkload::Microvm { vm_child, .. } => vm_child.id().unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(
+            pipeline
+                .switch_back(id, Some(&(9101, vec![])))
+                .await
+                .is_err()
+        );
+        let error = pipeline
+            .recover_failed_switch(
+                id,
+                &slot,
+                workload,
+                anyhow::anyhow!("proxy did not take candidate"),
+                Some((9101, vec![])),
+                Some(PortReservation::new(&slot.runtime_key)),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("rollback was not confirmed"));
+        assert_eq!(
+            pipeline.state.status(&slot.runtime_key).unwrap().host_port,
+            Some(port)
+        );
+        assert!(PortAllocator::reserve("review-other", port).is_err());
+        assert!(!crate::microvm::wait_for_process_exit(candidate_pid, Duration::ZERO).await);
+        assert!(!crate::microvm::wait_for_process_exit(old_pid, Duration::ZERO).await);
+        assert!(
+            ingress
+                .registered
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, port, _)| *port == 9101)
+        );
+        for key in [id, &slot.runtime_key] {
+            let (vm, aux) = pipeline.state.take_processes(key).unwrap();
+            kill_and_wait_children(vm, aux).await;
+        }
+        PortAllocator::release_service(&slot.runtime_key);
+    }
+
+    // Serialize the global port registry through async recovery and cleanup.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn confirmed_rollback_cleans_up_candidate_ports() {
+        let _lock = port_test_lock();
+        let id = "review-back-confirmed";
+        let slot = dual_slot(id);
+        let (pipeline, ingress) = pipeline_with(FakeIngress::default());
+        let port = reserve_test_port(&slot.runtime_key);
+        let result = pipeline
+            .recover_failed_switch(
+                id,
+                &slot,
+                test_vm("exec sleep 60", port),
+                anyhow::anyhow!("candidate not served"),
+                Some((9101, vec![])),
+                Some(PortReservation::new(&slot.runtime_key)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(pipeline.state.status(&slot.runtime_key).is_none());
+        assert_eq!(ingress.registered.lock().unwrap()[0].1, 9101);
+        PortAllocator::reserve("review-freed", port).unwrap();
+        PortAllocator::release_service("review-freed");
     }
 }

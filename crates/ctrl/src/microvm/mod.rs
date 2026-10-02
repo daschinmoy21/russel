@@ -8,6 +8,7 @@ mod runner;
 mod spec;
 
 // Stable crate::microvm::* surface (pre-split public API).
+pub(crate) use process::wait_for_process_exit;
 pub use process::{
     BootOutput, cloud_hypervisor_cmdline_matches, cloud_hypervisor_cmdline_matches_under,
 };

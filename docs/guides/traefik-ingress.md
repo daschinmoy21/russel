@@ -120,10 +120,11 @@ All of these go in `/etc/russel/env`, followed by `sudo systemctl restart russel
 | `RUSSEL_TRAEFIK_TLS` | off | `1` adds HTTPS to every route. |
 | `RUSSEL_TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Must match the resolver name in Traefik's static config. |
 | `RUSSEL_TRAEFIK_BACKEND` | `127.0.0.1` | The address Traefik uses to reach apps. Change it only when Traefik runs in its own network namespace, such as a rootless Podman container, where the host is `10.89.0.1`. |
+| `RUSSEL_TRAEFIK_ENTRYPOINT` | `http://127.0.0.1:80`, best effort | Where Russel checks, during an update, that Traefik serves the new version. Set it when Traefik's `web` entry point is elsewhere (`http://127.0.0.1:8080`, or `https://…` for a TLS-only one); a set value makes the check strict. `off` skips it. |
 
 ## What Russel writes
 
-For a service named `api` on port 3100, the file `api.json` looks like this:
+For a service named `api` on port 3100, the file `api.yaml` looks like this. It is JSON, which Traefik reads as YAML; Traefik skips files with other extensions, such as the `.json` files earlier Russel releases wrote. Russel removes an old `.json` file the next time it writes the route.
 
 ```json
 {
@@ -132,7 +133,15 @@ For a service named `api` on port 3100, the file `api.json` looks like this:
       "russel-api": {
         "rule": "Host(`api.russel.local`)",
         "entryPoints": ["web"],
-        "service": "russel-api"
+        "service": "russel-api",
+        "middlewares": ["russel-api"]
+      }
+    },
+    "middlewares": {
+      "russel-api": {
+        "headers": {
+          "customResponseHeaders": { "X-Russel-Route": "cbfac658a2deb196" }
+        }
       }
     },
     "services": {
@@ -147,6 +156,8 @@ For a service named `api` on port 3100, the file `api.json` looks like this:
 ```
 
 Russel writes each file in one step, so Traefik never sees half a file. On an update the file switches to the new version's port once it answers; on `stop` or `destroy` the file is deleted. [Networking](../concepts/networking.md#during-an-update) explains the switch.
+
+The `X-Russel-Route` header names the backend the route points at. During an update Russel sends requests for the host to `RUSSEL_TRAEFIK_ENTRYPOINT` until the new version's value comes back, and only then retires the old version. [What zero downtime covers](../concepts/lifecycle.md#what-zero-downtime-covers) explains what happens when Traefik doesn't switch, or isn't there.
 
 ## Related
 

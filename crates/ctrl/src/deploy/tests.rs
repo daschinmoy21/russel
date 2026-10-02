@@ -444,6 +444,8 @@ fn write_deploy_env_writes_argv_and_user_and_clears_them() {
         std::fs::read_to_string(format!("{cfg}/user")).unwrap(),
         format!("{uid} {gid}\n")
     );
+    // A retirement's stop request must not reach the next boot (#562).
+    std::fs::write(format!("{cfg}/{}", super::STOP_FILE), "").unwrap();
     super::write_deploy_env(
         cfg,
         "10.0.0.2",
@@ -458,4 +460,5 @@ fn write_deploy_env_writes_argv_and_user_and_clears_them() {
     .unwrap();
     assert_eq!(std::fs::read_to_string(format!("{cfg}/argv")).unwrap(), "");
     assert!(!std::path::Path::new(&format!("{cfg}/user")).exists());
+    assert!(!std::path::Path::new(&format!("{cfg}/{}", super::STOP_FILE)).exists());
 }

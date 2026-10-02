@@ -195,8 +195,8 @@ fn agent_init_script_uses_short_usleep_retries() {
 }
 
 #[test]
-fn agent_initramfs_cache_version_is_v10() {
-    assert_eq!(AGENT_INITRAMFS_BASENAME, "agent-initramfs-v10.cpio");
+fn agent_initramfs_cache_version_is_v11() {
+    assert_eq!(AGENT_INITRAMFS_BASENAME, "agent-initramfs-v11.cpio");
 }
 
 #[test]
@@ -240,6 +240,23 @@ fn agent_logs_app_exit_and_powers_off() {
     let off = AGENT_INIT_SCRIPT.find("/bin/poweroff -f").unwrap();
     assert!(app < logged && logged < off);
     assert!(AGENT_BUSYBOX_APPLETS.contains(&"poweroff"));
+}
+
+/// #562: retirement writes `cfg/stop`; the guest turns it into SIGTERM for
+/// the app (not for itself) and still powers off once the app is gone.
+#[test]
+fn agent_passes_a_stop_request_to_the_app() {
+    let at = |s: &str| AGENT_INIT_SCRIPT.find(s).unwrap();
+    let started = at("$RUN_AS \"$APP\" \"$@\" &\nAPP_PID=$!");
+    let watch = at(&format!(
+        "while [ ! -f /config/{} ]",
+        crate::deploy::STOP_FILE
+    ));
+    let term = at("/bin/kill -TERM \"$APP_PID\"");
+    let wait = at("wait \"$APP_PID\"");
+    let off = at("/bin/poweroff -f");
+    assert!(started < watch && watch < term && term < wait && wait < off);
+    assert!(AGENT_BUSYBOX_APPLETS.contains(&"kill"));
 }
 
 #[test]

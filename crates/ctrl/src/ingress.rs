@@ -174,6 +174,16 @@ pub struct HostRule {
     pub host: String,
 }
 
+/// What [`Ingress::wait_served`] found out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Served {
+    /// The proxy answered a request for the route from the new backend.
+    Confirmed,
+    /// Nothing could be asked; the reason says why. Deploy goes on and says
+    /// so in its progress output.
+    Unchecked(String),
+}
+
 /// Pluggable ingress / reverse-proxy control plane.
 ///
 /// Deploy, stop, destroy talk only to this trait — never Traefik types.
@@ -207,13 +217,30 @@ pub trait Ingress: Send + Sync {
     async fn deregister(&self, service_id: &str) -> anyhow::Result<()>;
 
     /// Point an existing service at a new backend without dropping the route
-    /// (zero-downtime generation swap). v1 may re-write the same file.
+    /// (zero-downtime generation swap). v1 may re-write the same file. The
+    /// proxy may still serve the old backend when this returns; see
+    /// [`Ingress::wait_served`].
     async fn swap(
         &self,
         service_id: &str,
         new_backend: &Backend,
         host_rules: &[HostRule],
     ) -> anyhow::Result<()>;
+
+    /// Wait until the proxy serves the route from `backend` (#562). Deploy
+    /// calls it after `swap` and retires the previous generation only after
+    /// it returns. An error means the proxy kept serving something else.
+    /// The default has no way to ask and reports [`Served::Unchecked`].
+    async fn wait_served(
+        &self,
+        _service_id: &str,
+        _backend: &Backend,
+        _host_rules: &[HostRule],
+    ) -> anyhow::Result<Served> {
+        Ok(Served::Unchecked(
+            "this ingress cannot report what it serves".into(),
+        ))
+    }
 
     /// Primary public host for CLI display (first rule or derived default).
     fn primary_host(&self, service_id: &str) -> Option<String>;

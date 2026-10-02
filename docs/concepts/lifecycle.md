@@ -26,12 +26,33 @@ stateDiagram-v2
 An update normally runs the old and new versions side by side:
 
 1. The new version starts on a fresh host port while the old one keeps serving.
-2. Once the new version answers, Traefik's route switches to it.
-3. The old version keeps running for 2 s in case the new one crashes, then stops.
+2. Once the new version answers, Russel points the Traefik route at it and waits until Traefik actually serves it.
+3. The old version gets no new requests from then on. It keeps running for 5 s so the requests it already has can finish (Russel watches the new version for crashes throughout this drain).
+4. Russel asks the old version to stop and gives it 5 s more before killing it.
 
 A service with `[[ports]]` or a pinned `[ingress].port` can't do that, because both versions would need the same fixed host ports. A service with a writable volume (`rw = true`) doesn't do it either: two versions would write to the same data. For those services Russel backs up the old version's files, stops it (waiting up to 5 s before killing it), and then starts the new one. There is a short gap in service.
 
 For containers, the old container is only stopped after the new one's Podman command has been checked, so a bad flag never takes the running version down.
+
+### What zero downtime covers
+
+| Update | New requests during the update | Requests the old version is serving |
+|---|---|---|
+| **Side by side**: no `[[ports]]`, no pinned `[ingress].port`, no writable volume | None fail. The route moves once Traefik serves the new version, and the old one keeps answering until then. | No new ones arrive after the switch. They get 5 s to finish, then a stop request and 5 s more, then the old version is killed. |
+| **Stop first**: `[[ports]]`, a pinned `[ingress].port`, or a writable volume | Fail from the moment the old version stops until the new one answers (and, without a pinned port, until Traefik picks up the new port). | A stop request and 5 s to finish, then the old version is killed. |
+
+The stop request works the same way on both runtimes, as SIGTERM to the app:
+
+- **Containers:** `podman stop` sends SIGTERM to the container's main process and kills it after 5 s. An app that runs as process 1 and has no SIGTERM handler ignores the signal, so it is killed when the 5 s are up.
+- **MicroVMs:** Russel writes a stop request that the guest passes on to the app as SIGTERM. The VM powers off once the app exits, and is killed if it is still up after 5 s. A VM started by a Russel release before this one doesn't see the request and is killed after the 5 s.
+
+Connections from clients end at Traefik, so keep-alive connections stay open through the switch. What can still be cut is anything the old version is still doing when it is killed: a request that takes longer than the drain and the grace period together, or a WebSocket or streaming response to the old version. Apps that finish their requests on SIGTERM get the full 10 s.
+
+**How Russel knows Traefik switched.** Every route Russel writes adds an `X-Russel-Route` response header that names its backend. After the switch, Russel sends requests for the service's host name through Traefik's entry point (`RUSSEL_TRAEFIK_ENTRYPOINT`, default `http://127.0.0.1:80`) until one comes back with the new version's header, for up to 10 s. Traefik applies route changes at most every 2 s, so this usually takes a second or two.
+
+- Traefik keeps serving the old version: the update fails and Russel points the route back at the old version, which kept running. The new one is removed after rollback confirmation. If confirmation fails, both generations stay running, the candidate remains managed under its generation key with its port reserved, and the failure reports that key. Confirm traffic has moved back before stopping or destroying that candidate.
+- Nothing listens at the default entry point, or the proxy there never adds the header (it isn't Traefik reading Russel's routes): Russel can't confirm the switch. `update` prints a warning and goes on with the drain.
+- `RUSSEL_TRAEFIK_ENTRYPOINT` set to an address makes the check strict: anything short of the new version answering fails the update. `off` skips the check.
 
 ## When a deploy counts as ready
 
@@ -42,16 +63,16 @@ Some apps listen and then crash a moment later. Postgres without `/dev/shm`, for
 | Deploy | What Russel waits for | If the app crashes right after answering |
 |---|---|---|
 | **First deploy** (nothing running yet) | The first answer. | `deploy` has already reported `deployed`. The service reads `failed` within about a second. With `restart = "unless-stopped"` it is restarted ([Restart on exit](#restart-on-exit)). |
-| **Update or rollback, side by side** | The first answer. Traffic switches at once, and the previous version keeps running for **2 s**. | Traffic goes back to the previous version, which never stopped. The new one is removed, and `update` fails with `new version crashed within 2s of answering` plus the app's last output. |
+| **Update or rollback, side by side** | The first answer. Traffic switches as soon as Traefik serves the new version, and the previous version keeps running for the **5 s drain**, with the new version watched throughout. | Traffic goes back to the previous version, which never stopped. The new one is removed, and `update` fails with a candidate crash error plus the app's last output. |
 | **Update with `[[ports]]`, `[ingress].port`, or a writable volume** | The first answer, then **2 s** in which the new version must stay up. The previous version is already stopped. | The previous version is restored from its backup, and `update` fails with `rolled_back`. |
 | **Relaunch** (`restart = "unless-stopped"`) | The first answer. | Russel waits a little longer before the next try ([Restart on exit](#restart-on-exit)). |
 
 Why it works this way:
 
 - **Crashes are caught during the deploy only when there's a working version to protect.** A first deploy has nothing older to keep, so waiting would only slow every deploy down. Russel reports the crash right afterwards instead.
-- **Updates switch traffic straight away.** Users get the new version as soon as it answers. Only the `update` command waits the extra 2 s, so its exit code is reliable: `russel update … && next-step` never continues past a version that died.
+- **Updates switch traffic straight away.** Users get the new version as soon as it answers and Traefik serves it. Only the `update` command waits the extra time, so its exit code is reliable: `russel update … && next-step` never continues past a version that died.
 - **Russel watches for the process to exit.** A microVM powers itself off when the app exits, and a container shows as exited or restarted in Podman. An app that exits before it ever answers fails the deploy at once, without waiting out the 30 s timeout.
-- **2 s catches start-up failures**: bad config, a missing file, a failed migration. An app that crashes later still deploys, and is then caught like a first deploy.
+- **The watch catches start-up failures**: bad config, a missing file, a failed migration. Cold updates watch for 2 s; side-by-side updates watch through the 5 s drain and recheck before retiring the old generation. Crashes after retirement are handled by the supervisor.
 - **Updates with pinned ports are the slow case.** The 2 s pass before Traefik routes to the new version, and a crash means a restore from backup. Leave `[[ports]]` and `[ingress].port` out unless the service needs them.
 
 ## Rollback

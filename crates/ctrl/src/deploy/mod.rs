@@ -14,17 +14,30 @@ pub use crate::metadata::prior_runtime_from_disk;
 pub use env::{build_container_env, shell_quote, validate_bin_name};
 pub use pipeline::DeployPipeline;
 pub(crate) use pipeline::{DeployJob, Relaunch};
-pub(crate) use rollback::{FailedLaunch, RecordedMicrovm};
+pub(crate) use rollback::{FailedLaunch, RecordedMicrovm, STOP_FILE};
 
 /// How long a new generation that replaces a live one must keep running after
 /// its app first answers, before the old one is gone for good (#493). An app
 /// that listens and then crashes (postgres without /dev/shm died ~200 ms after
 /// its port opened) fails the deploy inside this window, and the previous
 /// generation keeps its traffic or gets it back. First deploys and relaunches
-/// have nothing live to protect and skip it; later crashes are the
+/// have nothing live to protect and skip it. Dual-live watches throughout
+/// the longer drain and rechecks before retirement; later crashes are the
 /// supervisor's job. See docs/concepts/lifecycle.md, "When a deploy counts as
 /// ready".
 pub(crate) const WATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Dual-live only (#562): how long the previous generation keeps running
+/// after the proxy serves the new one, before it is asked to stop. It gets no
+/// new requests in that time, and the requests it already has can finish,
+/// even in an app that exits at once on SIGTERM. Counts from the switch, so
+/// the [`WATCH_WINDOW`] is part of it.
+pub(crate) const DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a retired generation gets between the stop request and SIGKILL
+/// (#562). A container gets SIGTERM from `podman stop -t 5`; a microVM's app
+/// gets it from the guest init ([`STOP_FILE`]).
+pub(crate) const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 type Events = tokio::sync::mpsc::Sender<russel_core::api::DeployEvent>;
 
@@ -175,6 +188,14 @@ pub(crate) fn write_deploy_env(
             Err(e) => anyhow::bail!("remove {}: {e}", user_path.display()),
         },
     }
+    // A dir that comes back from `.bak` (rollback) holds the stop request
+    // its last retirement wrote; a VM that saw it would stop again (#562).
+    let stop_path = std::path::PathBuf::from(format!("{cfg_dir}/{STOP_FILE}"));
+    match std::fs::remove_file(&stop_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("remove {}: {e}", stop_path.display()),
+    }
     let deploy_env_path = std::path::PathBuf::from(format!("{cfg_dir}/deploy.env"));
     crate::secrets::secure_write(&deploy_env_path, deploy_env.as_bytes())
 }
@@ -195,3 +216,7 @@ pub(crate) fn render_argv(args: &[String]) -> anyhow::Result<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod traffic_tests;
