@@ -372,6 +372,13 @@ impl JournalEntry {
     }
 
     pub fn to_record(&self) -> DeploymentRecord {
+        // The commit lives in `desired_state`, or only in the artifact on rows
+        // that lack one. `dirty` is only meaningful with a known `rev`.
+        let (rev, dirty) = match (&self.desired_state, &self.artifact) {
+            (Some(d), _) if d.rev.is_some() => (d.rev.clone(), Some(d.dirty)),
+            (_, Some(a)) if a.rev.is_some() => (a.rev.clone(), Some(a.dirty)),
+            _ => (None, None),
+        };
         DeploymentRecord {
             version: self.version,
             generation_id: self.generation_id.clone(),
@@ -385,6 +392,8 @@ impl JournalEntry {
             guest_port: self.guest_port,
             message: self.message.clone(),
             rollback_ready: self.rollback_ready,
+            rev,
+            dirty,
         }
     }
 }
@@ -1391,5 +1400,26 @@ mod tests {
         // Only active, no previous
         let err = select_rollback_target_at(&path, None).unwrap_err();
         assert!(err.to_string().contains("no previous rollback-ready"));
+    }
+
+    #[test]
+    fn record_exposes_rev_and_dirty() {
+        let mut e: JournalEntry = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "status": "active",
+            "deployed_at": "2026-07-28T09:00:00Z",
+            "desired_state": { "rev": "abc123", "dirty": true }
+        }))
+        .unwrap();
+        let r = e.to_record();
+        assert_eq!(r.rev.as_deref(), Some("abc123"));
+        assert_eq!(r.dirty, Some(true));
+
+        // Old record without rev: still served, fields absent.
+        e.desired_state = None;
+        let r = e.to_record();
+        assert!(r.rev.is_none() && r.dirty.is_none());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("rev") && !json.contains("dirty"));
     }
 }

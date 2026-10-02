@@ -114,6 +114,8 @@ export interface DeploymentRecord {
 	guest_port?: number;
 	message?: string;
 	rollback_ready?: boolean;
+	rev?: string;
+	dirty?: boolean;
 }
 
 export interface DeploymentsResponse {

@@ -50,8 +50,20 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7878/vm/my-app/deploy
 |---|---|
 | `version` | Number that goes up with each deployment of this service |
 | `status` | `active` (running now), `previous` (the one before), `superseded` (older), or `rolled_back` |
-| `desired_state` | What was deployed: repo, Russelfile path, commit (`rev`), whether the tree was dirty, runtime, env, ports |
+| `deployed_at` | When the deployment happened (RFC 3339 timestamp) |
+| `rev` | Full commit the version was built from, absent when not recorded |
+| `dirty` | `true` when the tree had changes `rev` does not contain, absent when `rev` is absent |
+| `generation_id` | Id of the build generation |
+| `runtime` | `container` or `microvm` |
+| `store_path` | Nix store path of the build |
+| `repo_url` | Repository the version came from, with credentials removed |
+| `config_path` | Russelfile path inside the repo |
+| `host_port` | Port published on the host |
+| `guest_port` | Port the service listens on |
+| `message` | Note recorded with the deployment |
 | `rollback_ready` | Whether you can roll back to it |
+
+Fields with no value are left out of the response.
 
 ## Roll back
 

@@ -355,6 +355,13 @@ pub struct DeploymentRecord {
     /// (desired_state / source recorded so redeploy-from-history works).
     #[serde(default)]
     pub rollback_ready: bool,
+    /// Full commit this version was built from; absent when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// The deployed tree had changes `rev` does not contain. Absent when
+    /// `rev` is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
 }
 
 /// Response for `GET /vm/{service_id}/deployments`.
@@ -730,6 +737,8 @@ mod tests {
                     guest_port: Some(3000),
                     message: Some("deploy complete".into()),
                     rollback_ready: false,
+                    rev: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    dirty: Some(true),
                 },
                 DeploymentRecord {
                     version: 1,
@@ -744,6 +753,8 @@ mod tests {
                     guest_port: Some(3000),
                     message: None,
                     rollback_ready: true,
+                    rev: None,
+                    dirty: None,
                 },
             ],
         };
@@ -752,6 +763,15 @@ mod tests {
         assert_eq!(parsed.active_version, Some(2));
         assert_eq!(parsed.deployments.len(), 2);
         assert!(parsed.deployments[1].rollback_ready);
+        assert_eq!(parsed.deployments[0].dirty, Some(true));
+        assert_eq!(json.matches("\"rev\"").count(), 1);
+
+        // Older servers omit both fields.
+        let old: DeploymentRecord = serde_json::from_str(
+            r#"{"version":1,"status":"active","deployed_at":"2026-07-28T09:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(old.rev.is_none() && old.dirty.is_none());
     }
 
     #[test]
