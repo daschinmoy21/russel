@@ -9,7 +9,7 @@ use std::{
 };
 
 use russel_core::{
-    api::{DeployRequest, DeployTiming, PortMapping},
+    api::{DeployRequest, DeployTiming, PortMapping, ServiceStatus},
     config::{
         RuntimeKind, Russelfile, resolve_ingress_host, resolve_primary_publish, validate_env_map,
     },
@@ -463,10 +463,12 @@ impl DeployPipeline {
                 let name = crate::container::resolve_container_name(service_id);
                 container_is_live(&crate::container::observe(&name).await)
             }
+            // `claim` already moved the status to `building`, so read the one
+            // it saved. A service the state does not know counts as live.
             RuntimeKind::Microvm => self
                 .state
-                .status(service_id)
-                .is_none_or(|s| s.status != "stopped"),
+                .status_before_deploy(service_id)
+                .is_none_or(|s| s != ServiceStatus::Stopped),
         }
     }
 
@@ -2223,14 +2225,35 @@ GREETING = "from the recorded file"
         PortAllocator::release_service(id);
     }
 
+    /// Undo what a successful cutover leaves behind: the port claims, the
+    /// children handed to AppState, and the generated service dir.
+    async fn release_cutover_test(pipeline: &DeployPipeline, id: &str, runtime_key: &str) {
+        for key in [id, runtime_key] {
+            if let Some((vm, aux)) = pipeline.state.take_processes(key) {
+                kill_and_wait_children(vm, aux).await;
+            }
+            PortAllocator::release_service(key);
+            assert_eq!(
+                PortAllocator::allocated_port(key),
+                None,
+                "claim left on {key}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(crate::paths::service_dir(id));
+        let _ = std::fs::remove_dir_all(crate::paths::service_dir(runtime_key));
+    }
+
     /// #575: the wait for the previous generation shows up in the timing as
     /// its own drain phase, covering the time since the switch.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn dual_live_cutover_reports_the_drain() {
+        let _lock = port_test_lock();
         let id = "drain-timing";
         let slot = dual_slot(id);
         let pipeline = DeployPipeline::new(crate::state::AppState::default());
-        let mut workload = test_vm("exec sleep 60", 9102);
+        let port = reserve_test_port(&slot.runtime_key);
+        let mut workload = test_vm("exec sleep 60", port);
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         // Switched 3s ago: the watch window (2s) is what is left to wait for.
         let switched_at = Instant::now().checked_sub(Duration::from_secs(3)).unwrap();
@@ -2247,13 +2270,15 @@ GREETING = "from the recorded file"
             .unwrap();
         assert!(retired.drain_ms >= 4900, "drain_ms {}", retired.drain_ms);
 
-        let _ = std::fs::remove_dir_all(crate::paths::service_dir(id));
+        release_cutover_test(&pipeline, id, &slot.runtime_key).await;
     }
 
     /// A cold replace stops the previous generation before boot, so cutover
     /// reports no drain.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cold_cutover_reports_no_drain() {
+        let _lock = port_test_lock();
         let id = "cold-timing";
         let slot = Slot {
             dual_live: false,
@@ -2261,7 +2286,8 @@ GREETING = "from the recorded file"
             ..dual_slot(id)
         };
         let pipeline = DeployPipeline::new(crate::state::AppState::default());
-        let mut workload = test_vm("exec sleep 60", 9103);
+        let port = reserve_test_port(&slot.runtime_key);
+        let mut workload = test_vm("exec sleep 60", port);
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let retired = pipeline
             .cutover(
@@ -2275,6 +2301,7 @@ GREETING = "from the recorded file"
             .await
             .unwrap();
         assert_eq!((retired.drain_ms, retired.retire_ms), (0, 0));
+        release_cutover_test(&pipeline, id, &slot.runtime_key).await;
     }
 
     #[tokio::test]
@@ -2399,5 +2426,26 @@ GREETING = "from the recorded file"
         // released port before a rebind, even with the in-process test lock.
         assert_eq!(PortAllocator::allocated_port(&slot.runtime_key), None);
         assert!(!PortAllocator::has_hold(&slot.runtime_key));
+    }
+
+    /// #575: the deploy claim turns the status into `building`, which must not
+    /// make a stopped microVM look like a live generation.
+    #[tokio::test]
+    async fn stopped_microvm_is_not_live_after_deploy_claim() {
+        let id = "stopped-vm-claimed";
+        let state = crate::state::AppState::default();
+        state.mark_stopped_from_disk(id, RuntimeKind::Microvm, Some(25001), Some(3000));
+        state.mark_building(id).unwrap();
+        let pipeline = DeployPipeline::new(state);
+        assert!(
+            !pipeline.is_generation_live(id, RuntimeKind::Microvm).await,
+            "the deploy claim must not turn a stopped VM into a live generation"
+        );
+        // A service the state does not know still counts as live.
+        assert!(
+            pipeline
+                .is_generation_live("never-seen-vm", RuntimeKind::Microvm)
+                .await
+        );
     }
 }

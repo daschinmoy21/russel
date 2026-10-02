@@ -727,6 +727,16 @@ impl AppState {
         detached
     }
 
+    /// The status the service had before the in-flight deploy claimed it
+    /// (`prebuild_status`), or its current one when no deploy is in flight.
+    /// The claim overwrites `status` with `building`, so a deploy deciding
+    /// what was running before it must read this, not `status`.
+    pub fn status_before_deploy(&self, service_id: &str) -> Option<ServiceStatus> {
+        let inner = self.lock_inner();
+        let s = inner.services.get(service_id)?;
+        Some(s.prebuild_status.unwrap_or(s.status))
+    }
+
     pub fn status(&self, service_id: &str) -> Option<StatusResponse> {
         // Snapshot needed fields under the lock, then release before the disk
         // read (same pattern as `logs`). `started_at.elapsed()` is wall-clock
