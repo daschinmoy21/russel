@@ -61,10 +61,10 @@ There is currently no switch that disables Russel's ingress adapter entirely. Ev
 
 - Russel's generated routes expect Traefik entry points named `web` and, for HTTPS, `websecure`. Existing installations with other names need compatible static configuration.
 - Manual proxy configuration needs a pinned backend port. Turning off a future adapter alone would not make an unpinned port stable or provide automatic zero-downtime routing.
-- If your Russel release writes route files with a `.json` extension, Traefik's file provider does not load them. This was fixed in [PR #569](https://github.com/daschinmoy21/russel-dev/pull/569), which changes these files to `.yaml` and adds proxy-confirmed cutover and drain handling.
+- If your Russel release writes route files with a `.json` extension, Traefik's file provider does not load them. This was fixed in [the cutover fix](https://github.com/daschinmoy21/russel/commit/fb3b6fa8), which changes these files to `.yaml` and adds proxy-confirmed cutover and drain handling.
 - `RUSSEL_TRAEFIK_ENTRYPOINT` selects the address for cutover confirmation. A dedicated Traefik on an internal port needs this variable set to its internal address, for example `http://127.0.0.1:8080`. `off` disables only the probe, not route-file creation or hostname checks. Confirmation at an internal Traefik does not validate DNS or the outer proxy.
 
-An explicit optional ingress adapter and its stable-port/migration behavior are being assessed in [issue #570](https://github.com/daschinmoy21/russel-dev/issues/570). There is no supported ingress-off mode or plugin system yet.
+An explicit optional ingress adapter and its stable-port/migration behavior are being assessed in [issue #92](https://github.com/daschinmoy21/russel/issues/92). There is no supported ingress-off mode or plugin system yet.
 
 ## What you'll need
 
