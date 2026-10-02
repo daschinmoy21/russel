@@ -225,7 +225,7 @@ sudo ./contrib/install.sh uninstall
 
 The command stops and disables `russel-ctrl`, turns off linger for `russel`, ends its remaining processes, and deletes the unit, `/usr/local/bin/russel-ctrl` (and the `.previous` backup next to it), and `/usr/local/share/russel`. It keeps `/var/lib/russel` and `/etc/russel/env`, so a later `install.sh host` picks up your services, volumes, and token. It also keeps the `russel` account and its subuid/subgid ranges.
 
-Containers live in the `russel` account's Podman store, so the command stops when services still exist. Run `russel ps`, then `russel destroy` each service, then uninstall. `--force` skips that check and leaves the containers orphaned.
+Containers live in the `russel` account's Podman store, so the command stops when services still exist. Run `russel ps`, then `russel destroy` each service, then uninstall. `sudo ./contrib/install.sh uninstall --force` skips that check and leaves the containers orphaned.
 
 To remove everything, add `--purge`:
 
@@ -233,7 +233,7 @@ To remove everything, add `--purge`:
 sudo ./contrib/install.sh uninstall --purge
 ```
 
-This also deletes `/var/lib/russel` (secrets, history, volumes), `/etc/russel`, the `russel` user and group, and its lines in `/etc/subuid` and `/etc/subgid`. Back up anything you need first: [Upgrades + backups](../operations/upgrades-backup.md). The CLI on your laptop is separate: delete `~/.local/bin/russel` if you want it gone.
+This also deletes `/var/lib/russel` (secrets, history, volumes), `/etc/russel`, the `russel` user and group, and its lines in `/etc/subuid` and `/etc/subgid`. Back up anything you need first: [Upgrades + backups](../operations/upgrades-backup.md). The flags also work before the subcommand, so `--force --purge uninstall` does the same thing. The CLI on your laptop is separate: delete `~/.local/bin/russel` if you want it gone.
 
 ## Installer reference
 

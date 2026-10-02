@@ -1121,6 +1121,11 @@ expect_main_rc 2 --purge status
 expect_main_rc 2 --force host
 expect_main_rc 2 --skip-checks uninstall
 expect_main_rc 2 uninstall extra
+expect_main_rc 2 uninstall --purge extra
+expect_main_rc 2 uninstall --bogus
+expect_main_rc 2 uninstall --skip-checks
+expect_main_rc 2 status --purge
+expect_main_rc 2 host --force
 pass "uninstall refuses non-root, NixOS, and stray arguments"
 
 new_case
@@ -1135,7 +1140,7 @@ assert_output_contains 'russel destroy'
 assert_output_lacks 'secrets'
 [[ -f "$CASE_DEST" && -f "$(system_unit_path)" ]] || die "refused uninstall removed files"
 [[ ! -e "${CASE_ROOT}/systemctl-system.log" ]] || die "refused uninstall touched systemd"
-expect_main_rc 0 --force uninstall
+expect_main_rc 0 uninstall --force
 [[ ! -e "$CASE_DEST" ]] || die "--force did not uninstall"
 [[ -d "${CASE_STATE}/api" ]] || die "--force without --purge removed service data"
 pass "uninstall refuses while services exist unless --force"
@@ -1156,7 +1161,7 @@ assert_file_contains "${CASE_ROOT}/systemctl-system.log" 'daemon-reload'
 assert_file_contains "${CASE_ROOT}/loginctl.log" 'disable-linger russel'
 assert_file_contains "${CASE_ROOT}/pkill.log" '-u russel'
 assert_output_contains 'removed:'
-assert_output_contains 'kept (run again with --purge'
+assert_output_contains 'kept (run again with: uninstall --purge'
 assert_output_contains "$CASE_STATE"
 assert_output_contains "$(env_file_path)"
 pass "uninstall keeps data, token, and account by default"
@@ -1170,7 +1175,7 @@ pass "uninstall is safe to run twice"
 new_case
 make_installed_host
 make_service api
-expect_main_rc 0 --force --purge uninstall
+expect_main_rc 0 uninstall --force --purge
 [[ ! -e "$CASE_STATE" ]] || die "--purge kept the state dir"
 [[ ! -e "$(env_dir_path)" ]] || die "--purge kept the token"
 ! account_exists russel || die "--purge kept the user"
@@ -1183,5 +1188,38 @@ has_subid_range "$(subuid_file_path)" alice || die "--purge removed another user
 has_subid_range "$(subgid_file_path)" alice || die "--purge removed another user's subgid line"
 assert_output_contains 'group russel'
 pass "uninstall --purge removes data, token, account, group, and id ranges"
+
+# Both flag orders work: documented (after) and prefix (before).
+new_case
+make_installed_host
+make_service api
+expect_main_rc 1 uninstall --purge
+[[ -d "$CASE_STATE" ]] || die "refused uninstall --purge removed state"
+expect_main_rc 0 uninstall --force
+[[ ! -e "$CASE_DEST" ]] || die "uninstall --force did not uninstall"
+[[ -d "${CASE_STATE}/api" ]] || die "uninstall --force removed service data"
+pass "uninstall --force works after the subcommand"
+
+new_case
+make_installed_host
+make_service api
+expect_main_rc 0 --force --purge uninstall
+[[ ! -e "$CASE_STATE" ]] || die "--force --purge uninstall kept the state dir"
+! account_exists russel || die "--force --purge uninstall kept the user"
+pass "prefix flags before uninstall still work"
+
+new_case
+make_installed_host
+make_service api
+expect_main_rc 0 uninstall --force --purge
+[[ ! -e "$CASE_STATE" ]] || die "uninstall --force --purge kept the state dir"
+pass "uninstall --force --purge works in either flag order"
+
+new_case
+make_installed_host
+expect_main_rc 0 uninstall --purge
+[[ ! -e "$CASE_STATE" ]] || die "uninstall --purge kept the state dir"
+! account_exists russel || die "uninstall --purge kept the user"
+pass "uninstall --purge works after the subcommand"
 
 echo "all installer tests passed"

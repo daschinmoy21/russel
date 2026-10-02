@@ -8,7 +8,7 @@
 #   sudo ./contrib/install.sh [--force-unit] [--take-state-ownership] [--skip-checks] host
 #   ./contrib/install.sh connect <user@host-or-ssh-alias>
 #   ./contrib/install.sh status
-#   sudo ./contrib/install.sh [--force] [--purge] uninstall
+#   sudo ./contrib/install.sh uninstall [--force] [--purge]
 #
 # `host` runs as root. It creates the unprivileged `russel` service account
 # (subuid/subgid range, linger), installs a system unit that runs russel-ctrl
@@ -17,7 +17,8 @@
 #
 # `uninstall` removes the unit, binary, and dashboard but keeps /var/lib/russel
 # and the token unless --purge is given. It refuses while services exist
-# (destroy them first) unless --force is given.
+# (destroy them first) unless --force is given. The flags work before or after
+# `uninstall`; the documented spelling is `uninstall --purge`.
 #
 # Without a local target/release build the installer downloads release assets
 # for RUSSEL_VERSION and verifies each one against the release SHA256SUMS:
@@ -67,7 +68,7 @@ usage() {
   echo "       sudo $0 [--force-unit] [--take-state-ownership] [--skip-checks] host" >&2
   echo "       $0 connect <user@host-or-ssh-alias>" >&2
   echo "       $0 status" >&2
-  echo "       sudo $0 [--force] [--purge] uninstall" >&2
+  echo "       sudo $0 uninstall [--force] [--purge]" >&2
   return 2
 }
 
@@ -1949,7 +1950,7 @@ uninstall_host() {
     printf '  %s\n' "${removed[@]}"
   fi
   if (( ${#kept[@]} )); then
-    echo "kept (run again with --purge to remove):"
+    echo "kept (run again with: uninstall --purge):"
     printf '  %s\n' "${kept[@]}"
   fi
   return 0
@@ -2010,6 +2011,15 @@ main() {
       install_host
       ;;
     uninstall)
+      # --force and --purge are accepted after the subcommand too.
+      while (( $# )); do
+        case "$1" in
+          --force) FORCE=1 ;;
+          --purge) PURGE=1 ;;
+          *) break ;;
+        esac
+        shift
+      done
       if (( $# != 0 || FORCE_UNIT || TAKE_STATE_OWNERSHIP || SKIP_CHECKS )); then
         usage
         return 2
