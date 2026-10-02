@@ -8,11 +8,16 @@
 #   sudo ./contrib/install.sh [--force-unit] [--take-state-ownership] [--skip-checks] host
 #   ./contrib/install.sh connect <user@host-or-ssh-alias>
 #   ./contrib/install.sh status
+#   sudo ./contrib/install.sh [--force] [--purge] uninstall
 #
 # `host` runs as root. It creates the unprivileged `russel` service account
 # (subuid/subgid range, linger), installs a system unit that runs russel-ctrl
 # as that account, and adds the invoking sudo user to the `russel` group so it
 # can read the API token. Nothing runs as root after the install.
+#
+# `uninstall` removes the unit, binary, and dashboard but keeps /var/lib/russel
+# and the token unless --purge is given. It refuses while services exist
+# (destroy them first) unless --force is given.
 #
 # Without a local target/release build the installer downloads release assets
 # for RUSSEL_VERSION and verifies each one against the release SHA256SUMS:
@@ -54,12 +59,15 @@ UNIT_SOURCE_OVERRIDE=
 FORCE_UNIT=0
 TAKE_STATE_OWNERSHIP=0
 SKIP_CHECKS=0
+FORCE=0
+PURGE=0
 
 usage() {
   echo "usage: $0 cli|ctrl|all|check" >&2
   echo "       sudo $0 [--force-unit] [--take-state-ownership] [--skip-checks] host" >&2
   echo "       $0 connect <user@host-or-ssh-alias>" >&2
   echo "       $0 status" >&2
+  echo "       sudo $0 [--force] [--purge] uninstall" >&2
   return 2
 }
 
@@ -81,6 +89,8 @@ run_systemctl_system() { systemctl "$@"; }
 run_loginctl() { loginctl "$@"; }
 run_getent() { getent "$@"; }
 run_useradd() { useradd "$@"; }
+run_userdel() { userdel "$@"; }
+run_groupdel() { groupdel "$@"; }
 run_usermod() { usermod "$@"; }
 run_groupadd() { groupadd "$@"; }
 run_podman() { podman "$@"; }
@@ -179,6 +189,10 @@ os_release_is_nixos() {
 
 host_binary_path() {
   printf '%s\n' /usr/local/bin/russel-ctrl
+}
+
+share_dir_path() {
+  printf '%s\n' /usr/local/share/russel
 }
 
 state_dir_path() {
@@ -1798,6 +1812,149 @@ install_ctrl() {
   install_dashboard_dist
 }
 
+# --- Uninstall ------------------------------------------------------------------
+
+# Service ids with a metadata.json under the state dir. Reserved dirs such as
+# _pool and secrets never have one.
+list_service_ids() {
+  local state_dir=$1 metadata
+  for metadata in "$state_dir"/*/metadata.json; do
+    [[ -f "$metadata" ]] || continue
+    basename -- "$(dirname -- "$metadata")"
+  done
+}
+
+check_uninstall_prereqs() {
+  if [[ "$(current_uid)" != 0 ]]; then
+    echo "uninstall must run as root" >&2
+    echo "run: $(installer_command) uninstall" >&2
+    return 2
+  fi
+  if [[ "$(host_os_name)" != Linux ]]; then
+    echo "uninstall supports Linux only" >&2
+    return 2
+  fi
+  if nixos_marker_present || os_release_is_nixos; then
+    echo "uninstall refuses NixOS; remove services.russel instead" >&2
+    return 2
+  fi
+  require_command systemctl getent userdel groupdel loginctl || return $?
+}
+
+# Drop a user's lines from a subuid/subgid file.
+remove_subid_lines() {
+  local file=$1 user=$2 tmp
+  has_subid_range "$file" "$user" || return 0
+  if ! tmp="$(run_mktemp -- "$(dirname -- "$file")/.russel-subid.tmp.XXXXXX")"; then
+    echo "cannot edit ${file}" >&2
+    return 1
+  fi
+  if ! awk -F: -v user="$user" '$1 != user { print }' "$file" >"$tmp" \
+    || ! run_install -m 0644 -- "$tmp" "$file"; then
+    run_rm -f -- "$tmp" 2>/dev/null || true
+    echo "cannot edit ${file}" >&2
+    return 1
+  fi
+  run_rm -f -- "$tmp"
+}
+
+uninstall_host() {
+  local user group state_dir env_dir unit binary share uid='' service_ids
+  local -a removed=() kept=()
+  user="$(service_user)"
+  group="$(service_group)"
+  state_dir="$(state_dir_path)"
+  env_dir="$(env_dir_path)"
+  unit="$(system_unit_path)"
+  binary="$(host_binary_path)"
+  share="$(share_dir_path)"
+
+  check_uninstall_prereqs || return $?
+
+  service_ids="$(list_service_ids "$state_dir")"
+  if [[ -n "$service_ids" ]] && (( ! FORCE )); then
+    echo "refusing to uninstall: these services still exist:" >&2
+    printf '  %s\n' "${service_ids//$'\n'/$'\n  '}" >&2
+    echo "Their containers live in the ${user} account's Podman store and would be orphaned." >&2
+    echo "Run \`russel destroy <service>\` for each one first, or pass --force to skip this check." >&2
+    return 1
+  fi
+
+  run_systemctl_system disable --now russel-ctrl.service >/dev/null 2>&1 || true
+  if account_exists "$user"; then
+    uid="$(account_uid "$user")"
+    run_loginctl disable-linger "$user" >/dev/null 2>&1 || true
+    if [[ -n "$uid" ]]; then
+      run_systemctl_system stop "user@${uid}.service" >/dev/null 2>&1 || true
+    fi
+    run_pkill -KILL -u "$user" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -e "$unit" || -L "$unit" ]]; then
+    run_rm -f -- "$unit"
+    removed+=("$unit")
+  fi
+  run_systemctl_system daemon-reload >/dev/null 2>&1 || true
+  if [[ -e "$binary" || -L "$binary" ]]; then
+    run_rm -f -- "$binary"
+    removed+=("$binary")
+  fi
+  if [[ -e "${binary}.previous" || -L "${binary}.previous" ]]; then
+    run_rm -f -- "${binary}.previous"
+    removed+=("${binary}.previous")
+  fi
+  if [[ -d "$share" ]]; then
+    run_rm -rf -- "$share"
+    removed+=("$share")
+  fi
+
+  if (( PURGE )); then
+    if [[ -e "$state_dir" ]]; then
+      run_rm -rf -- "$state_dir"
+      removed+=("$state_dir")
+    fi
+    if [[ -e "$env_dir" ]]; then
+      run_rm -rf -- "$env_dir"
+      removed+=("$env_dir")
+    fi
+    if account_exists "$user"; then
+      run_userdel "$user" || {
+        echo "cannot remove user ${user}" >&2
+        return 1
+      }
+      removed+=("user ${user}")
+    fi
+    # userdel keeps the group while the operator is still a member of it.
+    if group_exists "$group"; then
+      run_groupdel "$group" || {
+        echo "cannot remove group ${group}" >&2
+        return 1
+      }
+      removed+=("group ${group}")
+    fi
+    if has_subid_range "$(subuid_file_path)" "$user" || has_subid_range "$(subgid_file_path)" "$user"; then
+      remove_subid_lines "$(subuid_file_path)" "$user" || return 1
+      remove_subid_lines "$(subgid_file_path)" "$user" || return 1
+      removed+=("${user} lines in $(subuid_file_path) and $(subgid_file_path)")
+    fi
+  else
+    [[ -e "$state_dir" ]] && kept+=("$state_dir (services, volumes, Podman store)")
+    [[ -e "$(env_file_path)" ]] && kept+=("$(env_file_path) (API token)")
+    account_exists "$user" && kept+=("user and group ${user}, subuid/subgid ranges")
+  fi
+
+  echo "uninstalled Russel"
+  if (( ${#removed[@]} )); then
+    echo "removed:"
+    printf '  %s\n' "${removed[@]}"
+  fi
+  if (( ${#kept[@]} )); then
+    echo "kept (run again with --purge to remove):"
+    printf '  %s\n' "${kept[@]}"
+  fi
+  return 0
+}
+
 main() {
   local command=
   local destination=
@@ -1805,18 +1962,27 @@ main() {
   FORCE_UNIT=0
   TAKE_STATE_OWNERSHIP=0
   SKIP_CHECKS=0
+  FORCE=0
+  PURGE=0
 
   while (( $# )); do
     case "$1" in
       --force-unit) FORCE_UNIT=1 ;;
       --take-state-ownership) TAKE_STATE_OWNERSHIP=1 ;;
       --skip-checks) SKIP_CHECKS=1 ;;
+      --force) FORCE=1 ;;
+      --purge) PURGE=1 ;;
       -*) usage; return 2 ;;
       *) command=$1; shift; break ;;
     esac
     shift
   done
   if [[ -z "$command" ]]; then
+    usage
+    return 2
+  fi
+
+  if [[ "$command" != uninstall ]] && (( FORCE || PURGE )); then
     usage
     return 2
   fi
@@ -1842,6 +2008,13 @@ main() {
         return 2
       fi
       install_host
+      ;;
+    uninstall)
+      if (( $# != 0 || FORCE_UNIT || TAKE_STATE_OWNERSHIP || SKIP_CHECKS )); then
+        usage
+        return 2
+      fi
+      uninstall_host
       ;;
     connect)
       if (( $# != 1 || FORCE_UNIT || TAKE_STATE_OWNERSHIP || SKIP_CHECKS )); then

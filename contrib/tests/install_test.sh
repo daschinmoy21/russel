@@ -138,6 +138,7 @@ new_case() {
   ENABLE_RESULT=0
   RESTART_FAIL_FIRST=0
   LINGER_FAIL=0
+  USERDEL_KEEPS_GROUP=1
   SSH_RESULT=0
   SSH_ESTABLISH=0
   MOCK_LISTENER_STATE=absent
@@ -176,7 +177,7 @@ new_case() {
   rm -f "${CASE_ROOT}/ssh-args"
   rm -f "${CASE_ROOT}/systemctl-user.log" "${CASE_ROOT}/systemctl-system.log"
   rm -f "${CASE_ROOT}/loginctl.log" "${CASE_ROOT}/sudo.log" "${CASE_ROOT}/usermod.log"
-  rm -f "${CASE_ROOT}/chown.log"
+  rm -f "${CASE_ROOT}/chown.log" "${CASE_ROOT}/pkill.log"
 }
 
 UNIT_FILE_REL=etc/systemd/system/russel-ctrl.service
@@ -291,6 +292,7 @@ nixos_marker_present() { [[ "$FAKE_NIXOS_MARKER" == 1 ]]; }
 os_release_is_nixos() { [[ "$FAKE_NIXOS_RELEASE" == 1 ]]; }
 host_binary_path() { printf '%s\n' "$CASE_DEST"; }
 state_dir_path() { printf '%s\n' "$CASE_STATE"; }
+share_dir_path() { printf '%s\n' "${CASE_ROOT}/share/russel"; }
 system_unit_path() { printf '%s\n' "${CASE_ROOT}/${UNIT_FILE_REL}"; }
 env_dir_path() { printf '%s\n' "${CASE_ROOT}/etc/russel"; }
 subuid_file_path() { printf '%s\n' "${CASE_ROOT}/etc/subuid"; }
@@ -320,7 +322,7 @@ command_available() {
     ss) [[ "$MOCK_SS_AVAILABLE" == 1 ]] ;;
     lsof) [[ "$MOCK_LSOF_AVAILABLE" == 1 ]] ;;
     systemctl) [[ "$MOCK_SYSTEMCTL_AVAILABLE" == 1 ]] ;;
-    podman|newuidmap|newgidmap|git|getent|useradd|usermod|loginctl) return 0 ;;
+    podman|newuidmap|newgidmap|git|getent|useradd|usermod|userdel|groupdel|loginctl) return 0 ;;
     *) command -v "$1" >/dev/null 2>&1 ;;
   esac
 }
@@ -339,6 +341,19 @@ run_groupadd() {
 run_useradd() {
   printf 'useradd %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
   printf '%s\n' "${*: -1}:x:990:990::${CASE_STATE}:/usr/sbin/nologin" >>"${CASE_ROOT}/passwd"
+}
+run_userdel() {
+  printf 'userdel %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
+  local user=${*: -1}
+  sed -i "/^${user}:/d" "${CASE_ROOT}/passwd"
+  # Like the real userdel, keep the group while another account is in it.
+  if [[ "$USERDEL_KEEPS_GROUP" != 1 ]]; then
+    sed -i "/^${user}:/d" "${CASE_ROOT}/group"
+  fi
+}
+run_groupdel() {
+  printf 'groupdel %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
+  sed -i "/^${*: -1}:/d" "${CASE_ROOT}/group"
 }
 run_usermod() {
   printf 'usermod %s\n' "$*" >>"${CASE_ROOT}/usermod.log"
@@ -1071,5 +1086,102 @@ set_curl_mode 401
 expect_main_rc 0 status
 assert_output_contains 'unit: not installed on this machine'
 pass "status reports the system unit and flags the old per-user unit"
+
+# Lay out what `host` leaves behind, so `uninstall` has something to remove.
+make_installed_host() {
+  mkdir -p "$CASE_STATE/_pool/kernel" "$(env_dir_path)" "${CASE_ROOT}/share/russel/dashboard"
+  printf '%s\n' bin >"$CASE_DEST"
+  printf '%s\n' old-bin >"${CASE_DEST}.previous"
+  printf '%s\n' unit >"$(system_unit_path)"
+  printf '%s\n' RUSSEL_TOKEN=x >"$(env_file_path)"
+  printf '%s\n' '<html></html>' >"${CASE_ROOT}/share/russel/dashboard/index.html"
+  printf '%s\n' 'russel:x:990:990::/var/lib/russel:/usr/sbin/nologin' >>"${CASE_ROOT}/passwd"
+  printf '%s\n' 'russel:x:990:alice' >>"${CASE_ROOT}/group"
+  printf '%s\n' 'russel:165536:65536' >>"$(subuid_file_path)"
+  printf '%s\n' 'russel:165536:65536' >>"$(subgid_file_path)"
+}
+
+make_service() {
+  mkdir -p "${CASE_STATE}/$1"
+  printf '%s\n' '{}' >"${CASE_STATE}/$1/metadata.json"
+}
+
+# Uninstall refusals and the default (keep data) path.
+new_case
+make_installed_host
+FAKE_UID=1000
+expect_main_rc 2 uninstall
+assert_output_contains 'uninstall must run as root'
+FAKE_UID=0
+FAKE_NIXOS_MARKER=1
+expect_main_rc 2 uninstall
+assert_output_contains 'uninstall refuses NixOS'
+[[ -f "$CASE_DEST" ]] || die "refused uninstall removed the binary"
+expect_main_rc 2 --purge status
+expect_main_rc 2 --force host
+expect_main_rc 2 --skip-checks uninstall
+expect_main_rc 2 uninstall extra
+pass "uninstall refuses non-root, NixOS, and stray arguments"
+
+new_case
+make_installed_host
+make_service api
+make_service web
+mkdir -p "${CASE_STATE}/secrets"
+expect_main_rc 1 uninstall
+assert_output_contains 'api'
+assert_output_contains 'web'
+assert_output_contains 'russel destroy'
+assert_output_lacks 'secrets'
+[[ -f "$CASE_DEST" && -f "$(system_unit_path)" ]] || die "refused uninstall removed files"
+[[ ! -e "${CASE_ROOT}/systemctl-system.log" ]] || die "refused uninstall touched systemd"
+expect_main_rc 0 --force uninstall
+[[ ! -e "$CASE_DEST" ]] || die "--force did not uninstall"
+[[ -d "${CASE_STATE}/api" ]] || die "--force without --purge removed service data"
+pass "uninstall refuses while services exist unless --force"
+
+new_case
+make_installed_host
+expect_main_rc 0 uninstall
+[[ ! -e "$CASE_DEST" && ! -e "${CASE_DEST}.previous" ]] || die "binary or its backup survived"
+[[ ! -e "$(system_unit_path)" ]] || die "unit survived"
+[[ ! -e "${CASE_ROOT}/share/russel" ]] || die "dashboard share dir survived"
+[[ -d "$CASE_STATE" && -f "$(env_file_path)" ]] || die "state or token was removed without --purge"
+account_exists russel || die "account was removed without --purge"
+group_exists russel || die "group was removed without --purge"
+has_subid_range "$(subuid_file_path)" russel || die "subuid line was removed without --purge"
+assert_file_contains "${CASE_ROOT}/systemctl-system.log" 'disable --now russel-ctrl.service'
+assert_file_contains "${CASE_ROOT}/systemctl-system.log" 'stop user@990.service'
+assert_file_contains "${CASE_ROOT}/systemctl-system.log" 'daemon-reload'
+assert_file_contains "${CASE_ROOT}/loginctl.log" 'disable-linger russel'
+assert_file_contains "${CASE_ROOT}/pkill.log" '-u russel'
+assert_output_contains 'removed:'
+assert_output_contains 'kept (run again with --purge'
+assert_output_contains "$CASE_STATE"
+assert_output_contains "$(env_file_path)"
+pass "uninstall keeps data, token, and account by default"
+
+new_case
+make_installed_host
+expect_main_rc 0 uninstall
+expect_main_rc 0 uninstall
+pass "uninstall is safe to run twice"
+
+new_case
+make_installed_host
+make_service api
+expect_main_rc 0 --force --purge uninstall
+[[ ! -e "$CASE_STATE" ]] || die "--purge kept the state dir"
+[[ ! -e "$(env_dir_path)" ]] || die "--purge kept the token"
+! account_exists russel || die "--purge kept the user"
+! group_exists russel || die "--purge kept the group (userdel leaves it behind while the operator is a member)"
+assert_file_contains "${CASE_ROOT}/usermod.log" 'userdel russel'
+assert_file_contains "${CASE_ROOT}/usermod.log" 'groupdel russel'
+! has_subid_range "$(subuid_file_path)" russel || die "--purge kept the subuid line"
+! has_subid_range "$(subgid_file_path)" russel || die "--purge kept the subgid line"
+has_subid_range "$(subuid_file_path)" alice || die "--purge removed another user's subuid line"
+has_subid_range "$(subgid_file_path)" alice || die "--purge removed another user's subgid line"
+assert_output_contains 'group russel'
+pass "uninstall --purge removes data, token, account, group, and id ranges"
 
 echo "all installer tests passed"

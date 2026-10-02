@@ -215,6 +215,26 @@ Earlier builds of `install.sh host` ran russel-ctrl as your own user, from `~/.c
 
 Then `russel deploy` your services again.
 
+## Uninstall
+
+Remove the control plane with:
+
+```bash
+sudo ./contrib/install.sh uninstall
+```
+
+The command stops and disables `russel-ctrl`, turns off linger for `russel`, ends its remaining processes, and deletes the unit, `/usr/local/bin/russel-ctrl` (and the `.previous` backup next to it), and `/usr/local/share/russel`. It keeps `/var/lib/russel` and `/etc/russel/env`, so a later `install.sh host` picks up your services, volumes, and token. It also keeps the `russel` account and its subuid/subgid ranges.
+
+Containers live in the `russel` account's Podman store, so the command stops when services still exist. Run `russel ps`, then `russel destroy` each service, then uninstall. `--force` skips that check and leaves the containers orphaned.
+
+To remove everything, add `--purge`:
+
+```bash
+sudo ./contrib/install.sh uninstall --purge
+```
+
+This also deletes `/var/lib/russel` (secrets, history, volumes), `/etc/russel`, the `russel` user and group, and its lines in `/etc/subuid` and `/etc/subgid`. Back up anything you need first: [Upgrades + backups](../operations/upgrades-backup.md). The CLI on your laptop is separate: delete `~/.local/bin/russel` if you want it gone.
+
 ## Installer reference
 
 | Command | What it does |
@@ -226,6 +246,7 @@ Then `russel deploy` your services again.
 | `install.sh all` | `cli` + `ctrl`. |
 | `install.sh connect user@server` | Opens the SSH forward to the server's control plane. |
 | `install.sh status` | Shows the endpoint, the listener, the service, and the CLI's origin. |
+| `sudo install.sh uninstall` | Removes the unit, binary, and dashboard. Keeps your data and token unless you add `--purge`. See [Uninstall](#uninstall). |
 
 | Flag or variable | Meaning |
 |---|---|
@@ -234,6 +255,8 @@ Then `russel deploy` your services again.
 | `--take-state-ownership` | Give an existing `/var/lib/russel` owned by another user (and everything in it) to `russel`. |
 | `--force-unit` | Replace an existing `/etc/systemd/system/russel-ctrl.service` that differs from the shipped one. Review your changes first. |
 | `--skip-checks` | Install even when `check` reports problems. |
+| `--force` | With `uninstall`: continue even though services still exist. |
+| `--purge` | With `uninstall`: also delete `/var/lib/russel`, `/etc/russel`, the `russel` user and group, and its subuid/subgid ranges. |
 
 ## Related
 
