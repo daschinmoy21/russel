@@ -652,19 +652,12 @@ fn print_deploy_response(r: DeployResponse, wall: Duration) {
         );
     }
     if let Some(ip) = &r.vm_ip {
-        let gp = r
-            .port
-            .as_ref()
-            .map(|p| p.guest.to_string())
-            .unwrap_or_default();
+        // Under passt (the default) the guest address is not routable from
+        // the host, so point at the published port instead of a direct curl.
         step(
             "vm-ip",
             &format!("\x1b[2m{}\x1b[0m", sanitize_terminal(ip)),
-            &format!(
-                "  \x1b[2m(direct: curl {}:{})\x1b[0m",
-                sanitize_terminal(ip),
-                gp
-            ),
+            "  \x1b[2m(guest side; reach it through the port above)\x1b[0m",
         );
     }
     if let Some(store) = &r.store_path {

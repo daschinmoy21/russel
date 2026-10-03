@@ -66,7 +66,9 @@ Don't add these options back with `systemctl edit`. The control plane also runs 
 {
   services.russel.enable = true;
   services.russel.bin = "/usr/local/bin/russel-ctrl"; # or services.russel.package
-  services.russel.environmentFile = "/etc/russel/env"; # mode 0600, holds RUSSEL_API_TOKEN=...
+  services.russel.environmentFile = "/etc/russel/env"; # root:russel 0640, holds RUSSEL_API_TOKEN=...
+  # Lets your login user read the token (for russel login and scp):
+  # users.users.you.extraGroups = [ "russel" ];
   # Run as an existing account in place of a new "russel" one (linger is turned on for it):
   # services.russel.user = "you";
   # services.russel.group = "users";
@@ -80,7 +82,20 @@ Module behavior:
 
 - Listens on `127.0.0.1:7878`, requires the token, keeps `/var/lib/russel` at mode `0700`, and turns the experimental warm pool off.
 - `rootlessPodman` (on by default) sets up what rootless Podman needs: it enables Podman, puts `/run/wrappers` on `PATH` so `newuidmap` is found, turns on linger, and turns off `NoNewPrivileges`, which blocks `newuidmap`. Turn it off only if you won't run containers.
-- For microVMs, add `services.russel.microvms.enable = true;`. For HTTPS, put Caddy, nginx, or Traefik in front ([TLS reverse proxy](../guides/tls-reverse-proxy.md)).
+- For microVMs, add `services.russel.microvms.enable = true;` and point `services.russel.microvms.kernel` at Russel's kernel (the release's `russel-kernel-<version>-x86_64.bzImage`, or the flake's `microvm-kernel` package). For HTTPS, put Caddy, nginx, or Traefik in front ([TLS reverse proxy](../guides/tls-reverse-proxy.md)).
+- The unit waits for `network-online.target`, and sets `NIX_PATH` to the nixpkgs the module was built with, so ctrl can build its helpers.
+
+Create the token once, readable by root and the `russel` group, the same layout the installer uses. systemd reads it as root, so the group is only for people:
+
+```bash
+sudo install -d -m 0750 -o root -g russel /etc/russel
+sudo install -m 0640 -o root -g russel /dev/null /etc/russel/env
+echo "RUSSEL_API_TOKEN=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" | sudo tee /etc/russel/env >/dev/null
+```
+
+With your login user in the `russel` group, the laptop steps in [Installation](../getting-started/installation.md) work unchanged, `scp` of `/etc/russel/env` included.
+
+The module doesn't install the dashboard. With `services.russel.bin = "/usr/local/bin/russel-ctrl"`, unpack the release's `russel-dashboard-<version>.tar.gz` into `/usr/local/share/russel/dashboard` and ctrl finds it. Anywhere else, set `services.russel.extraEnvironment.RUSSEL_DASHBOARD_DIR`. Without either, ctrl serves the API only.
 
 Use `services.russel`, never `install.sh host`, on NixOS.
 

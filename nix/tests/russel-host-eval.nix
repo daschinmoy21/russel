@@ -73,6 +73,14 @@ let
     }
   ];
   microvmsSvc = microvms.config.systemd.services.russel;
+
+  microvmsLiteral = evalHost [
+    {
+      services.russel.microvms.enable = true;
+      services.russel.microvms.kernel = ./russel-host-eval.nix;
+    }
+  ];
+  literalKernel = microvmsLiteral.config.systemd.services.russel.environment.RUSSEL_KERNEL_PATH;
 in
 assert failedAssertions default == [ ];
 assert defaultSc.User == "russel";
@@ -86,6 +94,12 @@ assert default.config.users.users.russel.isSystemUser;
 assert default.config.users.users.russel.linger;
 assert default.config.users.groups ? russel;
 assert default.config.virtualisation.podman.enable;
+# Found by the #420 NixOS run: helper builds need <nixpkgs>, microVM stop needs
+# pkill, and passt must start after the uplink has an address.
+assert lib.hasPrefix "nixpkgs=/nix/store/" default.config.systemd.services.russel.environment.NIX_PATH;
+assert lib.hasInfix "procps" default.config.systemd.services.russel.environment.PATH;
+assert lib.elem "network-online.target" default.config.systemd.services.russel.wants;
+assert lib.elem "network-online.target" default.config.systemd.services.russel.after;
 
 assert failedAssertions existing == [ ];
 assert !(existingSc ? Group);
@@ -110,6 +124,9 @@ assert !(default.config.systemd.services.russel.environment ? RUSSEL_KERNEL_PATH
 assert failedAssertions microvms == [ ];
 assert microvmsSvc.serviceConfig.SupplementaryGroups == [ "kvm" ];
 assert microvmsSvc.environment.RUSSEL_KERNEL_PATH == "/srv/kernel/bzImage";
+# A path literal is copied into the store and kept in the closure (#420).
+assert lib.hasPrefix "/nix/store/" literalKernel;
+assert builtins.hasContext literalKernel;
 assert lib.hasInfix "passt" microvmsSvc.environment.PATH;
 assert lib.hasInfix "cloud-hypervisor" microvmsSvc.environment.PATH;
 # ctrl stays unprivileged: no capabilities, no root.

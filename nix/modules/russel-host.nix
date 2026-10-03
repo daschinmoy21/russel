@@ -1,8 +1,8 @@
 # NixOS module for russel-ctrl on a single trusted operator host.
 #
 # Defaults:
-#   bind 127.0.0.1:7878, RUSSEL_REQUIRE_AUTH=1, RUSSEL_API_TOKEN from a 0600
-#   EnvironmentFile, /var/lib/russel mode 0700, warm pool off,
+#   bind 127.0.0.1:7878, RUSSEL_REQUIRE_AUTH=1, RUSSEL_API_TOKEN from a
+#   root:russel 0640 EnvironmentFile, /var/lib/russel mode 0700, warm pool off,
 #   rootlessPodman = true (NoNewPrivileges off, /run/wrappers on PATH,
 #   virtualisation.podman.enable default on).
 #
@@ -141,8 +141,9 @@ in
       description = ''
         systemd `EnvironmentFile` path. Must contain
         `RUSSEL_API_TOKEN=` plus at least 32 printable ASCII characters.
-        Use mode 0600, readable by the service user. Typed as string so
-        Nix does not copy the secret into the store.
+        systemd reads it as root, so use root:<group> mode 0640 (the
+        installer's layout) and add operators to the group. Typed as string
+        so Nix does not copy the secret into the store.
       '';
     };
 
@@ -223,7 +224,11 @@ in
       documentation = [
         "https://github.com/daschinmoy21/russel"
       ];
-      after = [ "network.target" ];
+      # passt copies the host's address and routes when it starts. Under
+      # network.target alone it started before DHCP, so microVMs relaunched at
+      # boot were unreachable (#420).
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       path = [
         "/run/wrappers"
@@ -235,6 +240,8 @@ in
         git
         nix
         openssh
+        # pkill: microVM stop/destroy falls back to it for CH and passt.
+        procps
       ])
       ++ [ config.virtualisation.podman.package ]
       ++ lib.optionals cfg.microvms.enable (
@@ -253,9 +260,14 @@ in
         NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         # Keeps every root under /var/lib/russel (microVM markers included).
         RUSSEL_DATA_DIR = "/var/lib/russel";
+        # ctrl builds helpers (busybox, curl, bash) with `nix build -f <nixpkgs>`.
+        # Units get no NIX_PATH, so pin the nixpkgs this module was built with.
+        NIX_PATH = "nixpkgs=${pkgs.path}";
       }
       // lib.optionalAttrs (cfg.microvms.enable && cfg.microvms.kernel != null) {
-        RUSSEL_KERNEL_PATH = toString cfg.microvms.kernel;
+        # Interpolate, not toString: a path literal such as ./bzImage is copied
+        # into the store and the unit references it, so GC cannot collect it.
+        RUSSEL_KERNEL_PATH = "${cfg.microvms.kernel}";
       }
       // cfg.extraEnvironment
       // {

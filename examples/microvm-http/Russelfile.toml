@@ -1,6 +1,7 @@
 # microvm-http — same Go app as basic-http, but type = "microvm".
-# Requires KVM + TAP (often: sudo -E russel-ctrl). Sources live in this directory
-# (copied from basic-http; keep in sync if you change the demo app).
+# Requires KVM (/dev/kvm); ctrl runs unprivileged, passt publishes the port.
+# Sources live in this directory (copied from basic-http; keep in sync if you
+# change the demo app).
 
 [service]
 name = "microvm-http"

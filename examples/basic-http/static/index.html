@@ -97,11 +97,11 @@
               </div>
               <p>
                 Cloud Hypervisor guest with virtiofs <code>/nix/store</code>,
-                custom microvm kernel, TAP + socat publish.
+                custom microvm kernel, passt publish.
               </p>
               <ul class="list">
                 <li><code>type = "microvm"</code></li>
-                <li>needs KVM + often <code>sudo -E russel-ctrl</code></li>
+                <li>needs KVM; ctrl stays unprivileged</li>
                 <li>see <code>examples/microvm-http</code></li>
               </ul>
             </article>
